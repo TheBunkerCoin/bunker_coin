@@ -5,4 +5,5 @@ edition = "2021"
 description = "Core algorithms and data types for BunkerCoin"
 
 [dependencies]
-light-poseidon = "0.3" 
+light-poseidon = "0.3"
+ark-bn254 = "0.5" 
