@@ -2,13 +2,9 @@
 
 A low-bandwidth, short-wave-radio-compatible blockchain protocol.
 
-This repository is *work-in-progress*.  At the moment it only contains the `core` crate, which will house fundamental stuff such as cryptographic primitives and consensus logic.
+This repository is *work-in-progress*.
 
-```
-./Cargo.toml        # workspace manifest
-crates/
-  └── core/         # library crate (empty skeleton for now)
-```
+We're using Alpenglow for consensus with an adapted networking layer (to be developed) - status can be seen [here](https://github.com/TheBunkerCoin/alpenglow).
 
 ## Building
 
@@ -19,4 +15,4 @@ rustup update stable
 cargo check
 ```
 
-No public API is stabilised yet, expect rapid iteration. 
+Nothing is stabilised yet, expect rapid iteration. 
