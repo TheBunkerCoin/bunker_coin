@@ -1,0 +1,30 @@
+[package]
+name = "bunker_coin_sim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "radio_sim"
+path = "src/bin/radio_sim.rs"
+
+[dependencies]
+bunker_coin_core = { workspace = true }
+bunker_coin_radio = { workspace = true }
+alpenglow = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+rand = { workspace = true }
+
+indicatif = "0.17"
+colored = "2" 
+
+hex = "0.4"
+bincode = "2"
+
+rpc = { path = "../rpc" } 
