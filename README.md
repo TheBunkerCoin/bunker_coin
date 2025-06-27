@@ -3,7 +3,7 @@ A low-bandwidth, shortwave radio-compatible blockchain protocol using Alpenglow 
 
 
 Note:\
-The full BunkerCoin source (plus our slightly adapted Alpenglow fork) will be open-sourced here very soon. We're only taking a short pause to create a public timestamp so no one can repost the code and claim they built it first. Thanks for your patience - this project is and will remain 100 % open source.
+Slightly adapted Alpenglow fork is being committed in 10 minutes :)
 
 ## Quick Start
 
