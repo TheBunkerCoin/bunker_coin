@@ -1,6 +1,8 @@
 # BunkerCoin
 A low-bandwidth, shortwave radio-compatible blockchain protocol using Alpenglow consensus.
 
+_NOTE: Recent Alpenglow upgrade still pending commit, cleaning up the code currently. Will get pushed later today!_
+
 Contributions welcomed!
 
 ## Quick Start
