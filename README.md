@@ -53,6 +53,7 @@ The radio layer right now simulates realistic HF (shortwave) conditions:
 
 - [Alpenglow](https://github.com/qkniep/alpenglow) (A true piece of art)
 - BunkerCoin Whitepaper: `bunker_coin.tex`
+- [BunkerCoin Whitepaper (PDF)](./bunker_coin.pdf)
 
 ## Building
 
