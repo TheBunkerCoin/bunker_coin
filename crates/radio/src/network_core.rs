@@ -91,7 +91,7 @@ impl RadioNetworkCore {
             let mut packets_processed = 0u64;
             while let Some(packet) = packet_rx.recv().await {
                 queue_depth_clone.fetch_sub(1, Ordering::Relaxed);
-                let mtu = config_clone.mtu;
+                let _mtu = config_clone.mtu;
                 let _header_size = 32;
                 let jitter_ms = config_clone.latency_jitter.as_millis() as f64;
                 let random_jitter = if jitter_ms > 0.0 {
@@ -113,46 +113,102 @@ impl RadioNetworkCore {
                     log::info!("Radio queue processed {} packets", packets_processed);
                 }
                 
-                log::trace!("Dequeued packet from {} to {} (payload: {} bytes), sleeping {:?}", packet.from, packet.to, packet.payload.len(), total_delay);
-                tokio::time::sleep(total_delay).await;
-                
-                let base_loss = config_clone.packet_loss as f64;
-                let r: f64 = rand::rng().random();
-                
-                // "bursty" packet loss model
-                let dynamic_factor = if r < 0.7 {
-                    0.8 + (r / 0.7) * 0.4 
-                } else if r < 0.95 {
-                    1.2 + ((r - 0.7) / 0.25) * 0.6 
-                } else {
-                    2.0 + ((r - 0.95) / 0.05) * 1.0
-                };
-                
-                let loss_prob = base_loss * dynamic_factor;
-                if rand::rng().random::<f64>() < loss_prob {
+                if packet.to == u64::MAX {
+                    log::trace!("Processing broadcast packet from {} (payload: {} bytes), sleeping {:?}", packet.from, packet.payload.len(), total_delay);
+                    tokio::time::sleep(total_delay).await;
+                    
+                    let base_loss = config_clone.packet_loss as f64;
+                    let r: f64 = rand::rng().random();
+                    
+                    // "bursty" packet loss
+                    let dynamic_factor = if r < 0.7 {
+                        0.8 + (r / 0.7) * 0.4 
+                    } else if r < 0.95 {
+                        1.2 + ((r - 0.7) / 0.25) * 0.6 
+                    } else {
+                        2.0 + ((r - 0.95) / 0.05) * 1.0
+                    };
+                    
+                    let loss_prob = base_loss * dynamic_factor;
+                    if rand::rng().random::<f64>() < loss_prob {
+                        let mut stats = stats_clone.lock().await;
+                        stats.packets_dropped += 1;
+                        log::debug!("Radio broadcast dropped during transmission (p={:.3})", loss_prob);
+                        continue;
+                    }
+                    
+                    let nodes = nodes_clone.read().await;
+                    let recipients: Vec<(ValidatorId, mpsc::Sender<RadioPacket>)> = nodes
+                        .iter()
+                        .filter(|(id, _)| **id != packet.from)
+                        .map(|(id, tx)| (*id, tx.clone()))
+                        .collect();
+                    drop(nodes);
+                    
                     let mut stats = stats_clone.lock().await;
-                    stats.packets_dropped += 1;
-                    log::debug!("Radio packet dropped during transmission (p={:.3})", loss_prob);
-                    continue;
-                }
-                
-                let n_guard = nodes_clone.read().await;
-                let to_node = packet.to;
-                let packet_size = packet.payload.len();
-                if let Some(channel) = n_guard.get(&to_node) {
-                    match channel.try_send(packet) {
-                        Ok(_) => {
-                            log::trace!("Packet delivered to node {}", to_node);
-                            let mut stats = stats_clone.lock().await;
-                            stats.packets_transmitted += 1;
-                            stats.bytes_transmitted += packet_size as u64;
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to deliver packet to node {}: channel full or closed: {}", to_node, e);
+                    stats.packets_transmitted += 1;  
+                    stats.bytes_transmitted += packet.payload.len() as u64;  
+                    drop(stats);
+                    
+                    let deliver_at = Instant::now() + config_clone.latency;
+                    for (to_id, channel) in recipients {
+                        let delivery_packet = RadioPacket {
+                            from: packet.from,
+                            to: to_id,
+                            payload: packet.payload.clone(),
+                            deliver_at,
+                        };
+                        
+                        match channel.try_send(delivery_packet) {
+                            Ok(_) => {
+                                log::trace!("broadcast from {} delivered to node {}", packet.from, to_id);
+                            }
+                            Err(e) => {
+                                log::warn!("failed to deliver broadcast to node {}: {}", to_id, e);
+                            }
                         }
                     }
                 } else {
-                    log::warn!("Node {} not found in network, dropping packet", to_node);
+                    log::trace!("dequeued packet from {} to {} (payload: {} bytes), sleeping {:?}", packet.from, packet.to, packet.payload.len(), total_delay);
+                    tokio::time::sleep(total_delay).await;
+                    
+                    let base_loss = config_clone.packet_loss as f64;
+                    let r: f64 = rand::rng().random();
+                    
+                    let dynamic_factor = if r < 0.7 {
+                        0.8 + (r / 0.7) * 0.4 
+                    } else if r < 0.95 {
+                        1.2 + ((r - 0.7) / 0.25) * 0.6 
+                    } else {
+                        2.0 + ((r - 0.95) / 0.05) * 1.0
+                    };
+                    
+                    let loss_prob = base_loss * dynamic_factor;
+                    if rand::rng().random::<f64>() < loss_prob {
+                        let mut stats = stats_clone.lock().await;
+                        stats.packets_dropped += 1;
+                        log::debug!("Radio packet dropped during transmission (p={:.3})", loss_prob);
+                        continue;
+                    }
+                    
+                    let n_guard = nodes_clone.read().await;
+                    let to_node = packet.to;
+                    let packet_size = packet.payload.len();
+                    if let Some(channel) = n_guard.get(&to_node) {
+                        match channel.try_send(packet) {
+                            Ok(_) => {
+                                log::trace!("Packet delivered to node {}", to_node);
+                                let mut stats = stats_clone.lock().await;
+                                stats.packets_transmitted += 1;
+                                stats.bytes_transmitted += packet_size as u64;
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to deliver packet to node {}: channel full or closed: {}", to_node, e);
+                            }
+                        }
+                    } else {
+                        log::warn!("Node {} not found in network, dropping packet", to_node);
+                    }
                 }
             }
         });
@@ -169,6 +225,43 @@ impl RadioNetworkCore {
         let (tx, rx) = mpsc::channel(1000);
         self.nodes.write().await.insert(id, tx);
         RadioNode::new(id, Arc::clone(self), rx)
+    }
+
+    /// Broadcast a packet that reaches all nodes in range
+    async fn broadcast_packet(&self, from: ValidatorId, payload: Vec<u8>) -> Result<(), RadioError> {
+        if payload.len() > self.config.mtu {
+            return Err(RadioError::PacketTooLarge);
+        }
+        
+        let packet = RadioPacket {
+            from,
+            to: u64::MAX,
+            payload,
+            deliver_at: Instant::now(),
+        };
+        
+        log::trace!("Attempting to enqueue broadcast packet from {}", from);
+        
+        match self.packet_queue.try_send(packet) {
+            Ok(_) => {
+                log::trace!("Successfully enqueued broadcast packet from {}", from);
+                self.queue_depth.fetch_add(1, Ordering::Relaxed);
+                let mut stats = self.stats.lock().await;
+                stats.packets_sent += 1;
+                Ok(())
+            }
+            Err(e) => {
+                match e {
+                    mpsc::error::TrySendError::Full(_) => {
+                        log::error!("Radio packet queue is FULL! Cannot send broadcast from {}. Consider increasing queue size.", from);
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        log::error!("Radio packet queue is closed! Cannot send broadcast from {}", from);
+                    }
+                }
+                Err(RadioError::TransmissionFailed)
+            }
+        }
     }
 
     async fn send_packet(&self, from: ValidatorId, to: ValidatorId, payload: Vec<u8>) -> Result<(), RadioError> {
@@ -334,9 +427,9 @@ impl RadioNode {
 
     async fn send_with_erasure(&self, data: &[u8], to: ValidatorId) -> Result<(), NetworkError> {
         
-        // for now 2:6 due to empty blocks
-        const DATA_SHARDS: usize = 2;
-        const PARITY_SHARDS: usize = 4;
+        // 1:6 for (technically too much) resilience w/ high packet loss
+        const DATA_SHARDS: usize = 1;
+        const PARITY_SHARDS: usize = 5;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
         const MIN_SHARD_SIZE: usize = 32;
         
@@ -400,8 +493,8 @@ impl RadioNode {
     }
 
     async fn try_reassemble_erasure(&self, from: ValidatorId, header: ShardHeader, data: Vec<u8>) -> Option<Vec<u8>> {
-        const DATA_SHARDS: usize = 2;
-        const PARITY_SHARDS: usize = 4;
+        const DATA_SHARDS: usize = 1;
+        const PARITY_SHARDS: usize = 5;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
         let key = (from, header.message_id);
         let mut reassembly = self.reassembly.lock().await;
@@ -468,24 +561,107 @@ impl RadioNode {
         log::debug!("RadioNode {} sending {} bytes to {} using erasure coding", self.id, data.len(), to);
         self.send_with_erasure(data, to).await
     }
+    
+    async fn broadcast_radio(&self, data: &[u8]) -> Result<(), NetworkError> {
+        log::debug!("RadioNode {} broadcasting {} bytes to all nodes", self.id, data.len());
+        
+        const DATA_SHARDS: usize = 1;
+        const PARITY_SHARDS: usize = 5;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const MIN_SHARD_SIZE: usize = 32;
+        
+        let mtu = self.network_core.config.mtu;
+        let header_size = bincode::serde::encode_to_vec(
+            &ShardHeader { message_id: 0, shard_index: 0, total_shards: TOTAL_SHARDS as u8, data_len: data.len() as u32 },
+            bincode::config::standard()
+        ).unwrap().len();
+        
+        let max_shard_payload_size = mtu.saturating_sub(header_size);
+        let min_total_size = DATA_SHARDS * MIN_SHARD_SIZE;
+        let required_total_size = data.len().max(min_total_size);
+        let shard_payload_size = ((required_total_size + DATA_SHARDS - 1) / DATA_SHARDS).max(MIN_SHARD_SIZE);
+        
+        if shard_payload_size > max_shard_payload_size {
+            log::warn!("Message too large for erasure coding with MTU {}, falling back to fragmented broadcast", mtu);
+            return Err(NetworkError::Unknown);
+        }
+
+        let total_data_len = DATA_SHARDS * shard_payload_size;
+        let mut padded = vec![0u8; total_data_len];
+        padded[..data.len()].copy_from_slice(data);
+
+        let mut shards: Vec<Vec<u8>> = padded
+            .chunks(shard_payload_size)
+            .map(|c| c.to_vec())
+            .collect();
+        shards.resize(TOTAL_SHARDS, vec![0u8; shard_payload_size]);
+
+        let mut shard_refs: Vec<&mut [u8]> = shards.iter_mut().map(|v| &mut v[..]).collect();
+        let r = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS).unwrap();
+        r.encode(&mut shard_refs).unwrap();
+
+        let message_id = {
+            let mut counter = self.message_counter.lock().await;
+            let id = *counter;
+            *counter += 1;
+            id
+        };
+
+        for (i, shard) in shard_refs.iter().enumerate() {
+            let header = ShardHeader {
+                message_id,
+                shard_index: i as u8,
+                total_shards: TOTAL_SHARDS as u8,
+                data_len: data.len() as u32,
+            };
+            let mut packet = bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
+            packet.extend_from_slice(shard);
+            
+            log::trace!("Broadcasting shard {}/{} for message {}, packet size: {} bytes", 
+                       i+1, TOTAL_SHARDS, message_id, packet.len());
+            
+            self.network_core.broadcast_packet(self.id, packet).await
+                .map_err(|_| NetworkError::Unknown)?;
+        }
+        
+        Ok(())
+    }
 }
 
 impl Network for RadioNode {
     type Address = String;
 
     async fn send(&self, msg: &NetworkMessage, to: impl AsRef<str> + Send) -> Result<(), NetworkError> {
-        let to_id: ValidatorId = to.as_ref().parse()
-            .map_err(|_| NetworkError::Unknown)?;
+        let to_str = to.as_ref();
         let data = msg.to_bytes();
-        trace!("RadioNode {} sending {} bytes to {}", self.id, data.len(), to_id);
-        self.send_radio(&data, to_id).await
+        
+        log::debug!("RadioNode.send() called with to='{}', checking if broadcast", to_str);
+        
+        if to_str.eq_ignore_ascii_case("BROADCAST") {
+            log::debug!("RadioNode {} BROADCAST DETECTED! Broadcasting message ({} bytes)", self.id, data.len());
+            trace!("RadioNode {} broadcasting message ({} bytes)", self.id, data.len());
+            self.broadcast_radio(&data).await
+        } else {
+            let to_id: ValidatorId = to_str.parse()
+                .map_err(|_| NetworkError::Unknown)?;
+            log::debug!("RadioNode {} unicast to {} ({} bytes)", self.id, to_id, data.len());
+            trace!("RadioNode {} sending {} bytes to {}", self.id, data.len(), to_id);
+            self.send_radio(&data, to_id).await
+        }
     }
 
     async fn send_serialized(&self, bytes: &[u8], to: impl AsRef<str> + Send) -> Result<(), NetworkError> {
-        let to_id: ValidatorId = to.as_ref().parse()
-            .map_err(|_| NetworkError::Unknown)?;
-        trace!("RadioNode {} sending {} serialized bytes to {}", self.id, bytes.len(), to_id);
-        self.send_radio(bytes, to_id).await
+        let to_str = to.as_ref();
+        
+        if to_str.eq_ignore_ascii_case("BROADCAST") {
+            trace!("RadioNode {} broadcasting {} serialized bytes", self.id, bytes.len());
+            self.broadcast_radio(bytes).await
+        } else {
+            let to_id: ValidatorId = to_str.parse()
+                .map_err(|_| NetworkError::Unknown)?;
+            trace!("RadioNode {} sending {} serialized bytes to {}", self.id, bytes.len(), to_id);
+            self.send_radio(bytes, to_id).await
+        }
     }
 
     async fn receive(&self) -> Result<NetworkMessage, NetworkError> {
@@ -498,6 +674,9 @@ impl Network for RadioNode {
             ) {
                 let data = packet.payload[header_len..].to_vec();
                 if let Some(complete) = self.try_reassemble_erasure(packet.from, header, data).await {
+                    if packet.from != self.id {
+                        // println!("RadioNode {} received broadcast from {} (reassembled message)", self.id, packet.from);
+                    }
                     match NetworkMessage::from_bytes(&complete) {
                         Ok(msg) => return Ok(msg),
                         Err(_) => {
