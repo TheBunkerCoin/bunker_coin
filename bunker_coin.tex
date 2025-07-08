@@ -1,21 +1,101 @@
 \documentclass{article}
 \usepackage[utf8]{inputenc}
+\usepackage{parskip}
+\usepackage{hyperref}
+\setcounter{secnumdepth}{3}
 
 \title{BunkerCoin: A Low Bandwidth, Shortwave Radio-Compatible Blockchain Protocol}
-\author{Anatoly Yakovenko}
-\date{April 1st, 2024}
+\author{Anatoly Yakovenko\thanks{Parts of the abstract and most core concepts by Anatoly Yakovenko. This paper is currently expanded and maintained by the BunkerCoin Team and external contributors, i.e. do not automatically expect content (especially beyond the abstract) to be endorsed by Anatoly.} \and BunkerCoin Team}
+\date{July 8th, 2025\\Version 0.0.1 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
 
 \begin{document}
 
 \maketitle
 
 \begin{abstract}
-The rapid evolution of blockchain technology has demanded innovative solutions that extend beyond conventional digital landscapes. This paper introduces BunkerCoin, a groundbreaking blockchain protocol designed to operate under the constraints of low bandwidth networks, specifically through shortwave radio channels. At the heart of BunkerCoin is the adoption of a recursive Poseidon hash function, which underpins a novel proof of elapsed time (PoET) verifiable delay function (VDF). This VDF serves as the cornerstone for miners to identify a 'golden ticket'—a unique sequence of bits that not only signifies the discovery of a valid block but also correlates with the miner's public key and the duration for which a specific amount of coin has been held.
+The rapid evolution of blockchain technology has demanded innovative solutions that extend beyond conventional digital landscapes. This paper introduces BunkerCoin, a groundbreaking blockchain protocol designed to operate under the constraints of low bandwidth networks, specifically through shortwave radio channels. At the heart of BunkerCoin is the Alpenglow consensus mechanism, which is adapted to the unique challenges of shortwave radio. 
 
-To ensure the integrity and confidentiality of this process, BunkerCoin leverages a recursive Zero-Knowledge Proof (ZKP), constructed using the Groth16 proving scheme. This allows miners to validate the existence of the golden ticket and concurrently seal the transaction block's hash without revealing the ticket itself. The propagation of these blocks over shortwave radio is meticulously engineered to accommodate the protocol's 300-byte Maximum Transmission Unit (MTU), with each block being disseminated through a series of 32:96 erasure coded frames over a fixed five-minute interval, ensuring reliability and redundancy.
+The protocol's network architecture is defined by two key components: a dynamic networking layer that leverages both broadcast and reliable P2P links, and a location-aware routing service (called Sherpa). Sherpa maintains a map of the nodes and peer information, allowing the system to route data efficiently across the globe. One central challenge lies in using this setup to aggregate the BLS multi-signatures required for voting within Alpenglow's consensus flow efficiently (routing and aggregating via optimal paths), minimizing the amount of data that needs to be transmitted for voting. The propagation of blocks and votes over shortwave radio is meticulously engineered to accommodate the protocol's 300-byte Maximum Transmission Unit (MTU). Each transmission is either disseminated through a series of 32:96 erasure coded frames, ensuring reliability and redundancy in the face of packet loss, or transferred via reliable  (TCP-like) ARQ links.
 
-Central to the protocol's consensus mechanism is the Nakamoto-style longest chain rule, which harmonizes with the unique transmission and validation processes to uphold network security and integrity. BunkerCoin's architecture not only challenges traditional blockchain paradigms but also paves the way for secure, decentralized communications in bandwidth-constrained environments worldwide, marking a significant leap forward in the field of distributed ledger technology.
+BunkerCoin's architecture not only challenges traditional blockchain paradigms but also paves the way for secure, decentralized communications in bandwidth-constrained environments worldwide, marking a significant leap forward in the field of distributed ledger technology.
 \end{abstract}
 
-\end{document}
+%------------------------------------------------------------
+\section{Physical (Network) Layer}
+\label{sec:physical}
 
+This section outlines the low-bandwidth communication substrate that enables BunkerCoin to propagate blocks, votes and other data across the globe, even under contested or spectrum-constrained conditions.
+
+\subsection{Reliability over Throughput: P2P vs. Broadcast}
+
+A fundamental requirement for BunkerCoin's transport layer is a reliable peer-to-peer (P2P) network that serves as a robust foundation. This mesh of acknowledged, 1:1 links guarantees that any node can eventually retrieve any piece of data it needs. Upon this foundation, two distinct strategies for block and vote propagation can be implemented, presenting a trade-off between simplicity and peak performance.
+
+The first strategy is P2P-first. In this model, blocks and other data (such as votes) are disseminated primarily through the reliable P2P links. It is inherently predictable and robust. Opportunistic broadcasts can be introduced as a throughput-accelerating optimization, but they are not required for the network's core operation. This offers a simpler implementation path.
+
+The second strategy is broadcast-first. This model leverages wide-area, connectionless broadcasts for the initial, high-speed dissemination of erasure-coded block and vote data. The P2P network serves purely as a fallback mechanism for nodes to request specific missing fragments needed for reconstruction ("repair traffic"). While this approach promises higher raw throughput under ideal conditions, it is operationally more complex, as it requires a seamless and difficult-to-manage interplay between multiple broadcasts and P2P modes, as well as better optimization of frequencies chosen for local broadcasts (there's far more free frequencies for a narrow link compared to a wide broadcast). It is also more susceptible to volatile ionospheric conditions, where widespread packet loss could create network storms as many nodes fall back to the P2P network for repairs simultaneously.
+
+Given these considerations, the current BunkerCoin specification prioritizes the P2P-first strategy. This ensures a baseline of predictable and robust performance. Unreliable, opportunistic broadcasts are therefore treated as an enhancement for throughput acceleration (see Section~\ref{sec:opportunistic_broadcasts}), not as the primary means of dissemination.
+
+This preliminary choice was made based on pessimistic assumptions about the availability of global spectrum, and will be validated through real-world testing.
+
+\subsubsection{Sherpa: A Location-Aware Routing Layer}
+
+To manage the complexity of routing data across a dynamic global network, both block and vote propagation protocols rely on an underlying service called \textbf{Sherpa}. This layer is responsible for maintaining a map of the network topology, including peer locations and connections. By abstracting this logic into a shared service, higher-level protocols like Votor and Radiotor can simply request optimal routing paths without needing to implement this complex state management themselves.
+
+\subsubsection{Opportunistic Broadcasts as a Throughput Accelerator}
+\label{sec:opportunistic_broadcasts}
+
+While the P2P mesh provides a reliable baseline, network throughput can be significantly increased by layering opportunistic broadcasts on top. When spectrum conditions permit, a node can choose to broadcast erasure-coded block data to all listening peers in its vicinity instead of initiating multiple, sequential P2P links.
+
+This hybrid model allows a node to significantly accelerate propagation. After broadcasting the erasure-coded data, the node can check in with its designated P2P peers. If a peer does not respond promptly, it can be assumed to have successfully received the broadcast and is already busy forwarding it to its own neighbors. If a peer does respond, it signifies that it requires repair traffic via a standard ARQ link. This "silence is golden" approach minimizes latency, as nodes do not have to wait for explicit acknowledgements before continuing the propagation chain.
+
+Crucially, this allows for dynamic optimization at the individual node level. Each node can independently assess network conditions and decide whether broadcasting or initiating direct P2P transmissions is the more efficient strategy at any given moment, creating a resilient and adaptive data propagation fabric.
+
+\subsection{Radio Data Protocols}
+
+\subsubsection{PACTOR-IV}
+
+PACTOR-IV represents the state-of-the-art in high-frequency (HF) digital modems. It is a hardware-based solution requiring a dedicated SCS Dragon modem, but offers the highest publicly documented throughput, particularly under challenging and variable ionospheric conditions. A key advantage of this platform is its mature ``2G ALE'' functionality, which enables fully automated link establishment and management, allowing nodes to connect on autopilot. While the modem can be programmatically controlled for all essential operations, it does not offer the same low-level access as a software-defined radio (SDR) solution. PACTOR protocols have historically supported broadcast via Forward Error Correction (FEC), though documentation suggests this is primarily a feature of older, lower-speed versions (e.g., PACTOR-I), and its utility at PACTOR-IV speeds is not well-documented.
+
+\subsubsection{VARA HF}
+
+VARA HF offers a compelling alternative as a flexible, software-based modem. Its primary advantage is accessibility; it is significantly cheaper to deploy and can run on standard computing hardware. VARA natively supports both reliable ARQ links and an unreliable ``unproto'' broadcast mode, making it well-suited for a hybrid P2P/broadcast network architecture. When paired with an SDR, VARA provides extensive low-level control over the physical layer, but this flexibility comes with increased responsibility. For instance, a custom ALE solution would need to be developed and integrated, as VARA's native link management is not as field-proven as PACTOR's. While highly capable, VARA is generally not considered as performant or robust as PACTOR-IV under the most demanding HF conditions.
+
+\subsubsection{Summary and Outlook}
+\label{sec:phys_summary}
+
+The choice between PACTOR-IV and VARA HF presents a classic trade-off. PACTOR-IV is expected to deliver superior throughput and reliability across the board, backed by its robust hardware and mature ALE system, but at the cost of higher expense and less flexibility. Conversely, VARA offers a cheaper, more flexible software-based path, but is likely less performant in adverse conditions and places a greater implementation burden on the project.
+
+Ultimately, a definitive decision requires data. To this end, the project will establish a testnet incorporating nodes that utilize both PACTOR-IV and VARA HF stacks. A series of real-world benchmarks must be conducted to compare the two protocols, specifically evaluating their performance in both reliable P2P (ARQ) and broadcast (FEC/unproto) modes under a variety of ionospheric conditions. The results of these tests will inform the final choice for BunkerCoin's physical layer.
+
+%------------------------------------------------------------
+\section{Consensus Layer}
+\label{sec:consensus}
+
+BunkerCoin adopts Alpenglow, an advanced consensus protocol originally proposed for the Solana blockchain, to achieve rapid block finality under constrained network conditions. Alpenglow replaces legacy mechanisms like Proof of History and Tower BFT with a streamlined dual-component design, achieving deterministic finality in approximately 100-150 milliseconds under ideal conditions.
+
+\subsection{Votor: Voting and Finalization Engine}
+
+Votor handles block notarization and finalization through a concurrent dual-path voting system. If a block receives $\geq 80\%$ stake approval in the first round, it is immediately finalized with a Fast-Finalization Certificate. If it secures only $\geq 60\%$ approval, a second round begins; upon reaching $\geq 60\%$ again, a Finalized Certificate is issued. Both paths run in parallel, ensuring rapid consensus even under partial network participation. To adapt this to a high-latency environment, Votor relies on the Sherpa service for the "in-flight" aggregation of BLS signatures across geographically dispersed radio links, minimizing the amount of data that needs to be transmitted for voting.
+
+\subsection{Radiotor: Location-Aware Block Propagation}
+
+Radiotor is BunkerCoin's adaptation of Alpenglow's Rotor protocol, tailored specifically for block dissemination over shortwave radio. It follows an approach similar to Solana's Turbine, where each node forwards erasure-coded block shreds to multiple downstream peers. Radiotor leverages the Sherpa service to select geographically distinct paths, enabling multiple, parallel data transfers across different HF links and frequencies to maximize throughput. While opportunistic broadcasts (as described in Section \ref{sec:opportunistic_broadcasts}) can accelerate this process, Radiotor's multi-path forwarding is the primary mechanism for robust block propagation.
+
+\subsection{Fault Tolerance}
+
+To be added.
+
+%------------------------------------------------------------
+\section{Transaction and State Model}
+\label{sec:transaction_state}
+
+
+To be added.
+
+%------------------------------------------------------------
+\section{Call for Contribution}
+
+This paper serves as a working foundation for the BunkerCoin protocol and is under active development. We welcome contributions from the community to expand, refine, and challenge the concepts outlined here. For further information on how to contribute, and to join the ongoing technical discussions, please join our community on Discord: \url{https://discord.gg/DGBqm92VQm}.
+
+\end{document}
