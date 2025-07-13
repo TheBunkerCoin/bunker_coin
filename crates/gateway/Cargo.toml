@@ -1,0 +1,21 @@
+[package]
+name = "bunker_coin_gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = "0.7"
+bincode = { workspace = true }
+bunker_coin_radio = { workspace = true }
+env_logger = { workspace = true }
+futures-util = "0.3"
+log = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"

@@ -964,6 +964,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bunker_coin_gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bincode",
+ "bunker_coin_radio",
+ "env_logger",
+ "futures-util",
+ "log",
+ "rand 0.9.1",
+ "serde",
+ "thiserror 2.0.12",
+ "tokio",
+]
+
+[[package]]
 name = "bunker_coin_radio"
 version = "0.1.0"
 dependencies = [
