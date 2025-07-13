@@ -325,7 +325,8 @@ pub async fn multi_node_consensus_simulation_with_api(
     blocks: std::sync::Arc<tokio::sync::RwLock<Vec<rpc::Block>>>, 
     nodes: std::sync::Arc<tokio::sync::RwLock<Vec<rpc::NodeStatus>>>,
     radio_stats: std::sync::Arc<tokio::sync::RwLock<rpc::RadioStats>>,
-    updates_tx: tokio::sync::broadcast::Sender<rpc::WebSocketUpdate>
+    updates_tx: tokio::sync::broadcast::Sender<rpc::WebSocketUpdate>,
+    blockstore_ref: std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<tokio::sync::RwLock<alpenglow::consensus::Blockstore>>>>>
 ) {
     use std::sync::Arc;
     use alpenglow::all2all::TrivialAll2All;
@@ -405,6 +406,13 @@ pub async fn multi_node_consensus_simulation_with_api(
             node.blockstore(),
         ));
     }
+    
+    // first node's blockstore is used for api
+    if let Some((_, _, blockstore)) = pools_and_blockstores.first() {
+        let mut bs_ref = blockstore_ref.write().await;
+        *bs_ref = Some(blockstore.clone());
+    }
+    
     {
         let mut nodes_guard = nodes.write().await;
         nodes_guard.clear();

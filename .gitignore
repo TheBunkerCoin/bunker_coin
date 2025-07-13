@@ -7,3 +7,7 @@ heaptrack.*.gz
 
 soon.md
 /alp_ref
+
+# RocksDB
+/data
+/data-backup

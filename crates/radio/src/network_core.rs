@@ -170,44 +170,44 @@ impl RadioNetworkCore {
                     }
                 } else {
                     log::trace!("dequeued packet from {} to {} (payload: {} bytes), sleeping {:?}", packet.from, packet.to, packet.payload.len(), total_delay);
-                    tokio::time::sleep(total_delay).await;
-                    
-                    let base_loss = config_clone.packet_loss as f64;
-                    let r: f64 = rand::rng().random();
-                    
-                    let dynamic_factor = if r < 0.7 {
-                        0.8 + (r / 0.7) * 0.4 
-                    } else if r < 0.95 {
-                        1.2 + ((r - 0.7) / 0.25) * 0.6 
-                    } else {
-                        2.0 + ((r - 0.95) / 0.05) * 1.0
-                    };
-                    
-                    let loss_prob = base_loss * dynamic_factor;
-                    if rand::rng().random::<f64>() < loss_prob {
-                        let mut stats = stats_clone.lock().await;
-                        stats.packets_dropped += 1;
-                        log::debug!("Radio packet dropped during transmission (p={:.3})", loss_prob);
-                        continue;
-                    }
-                    
-                    let n_guard = nodes_clone.read().await;
-                    let to_node = packet.to;
-                    let packet_size = packet.payload.len();
-                    if let Some(channel) = n_guard.get(&to_node) {
-                        match channel.try_send(packet) {
-                            Ok(_) => {
-                                log::trace!("Packet delivered to node {}", to_node);
-                                let mut stats = stats_clone.lock().await;
-                                stats.packets_transmitted += 1;
-                                stats.bytes_transmitted += packet_size as u64;
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to deliver packet to node {}: channel full or closed: {}", to_node, e);
-                            }
+                tokio::time::sleep(total_delay).await;
+                
+                let base_loss = config_clone.packet_loss as f64;
+                let r: f64 = rand::rng().random();
+                
+                let dynamic_factor = if r < 0.7 {
+                    0.8 + (r / 0.7) * 0.4 
+                } else if r < 0.95 {
+                    1.2 + ((r - 0.7) / 0.25) * 0.6 
+                } else {
+                    2.0 + ((r - 0.95) / 0.05) * 1.0
+                };
+                
+                let loss_prob = base_loss * dynamic_factor;
+                if rand::rng().random::<f64>() < loss_prob {
+                    let mut stats = stats_clone.lock().await;
+                    stats.packets_dropped += 1;
+                    log::debug!("Radio packet dropped during transmission (p={:.3})", loss_prob);
+                    continue;
+                }
+                
+                let n_guard = nodes_clone.read().await;
+                let to_node = packet.to;
+                let packet_size = packet.payload.len();
+                if let Some(channel) = n_guard.get(&to_node) {
+                    match channel.try_send(packet) {
+                        Ok(_) => {
+                            log::trace!("Packet delivered to node {}", to_node);
+                            let mut stats = stats_clone.lock().await;
+                            stats.packets_transmitted += 1;
+                            stats.bytes_transmitted += packet_size as u64;
                         }
-                    } else {
-                        log::warn!("Node {} not found in network, dropping packet", to_node);
+                        Err(e) => {
+                            log::warn!("Failed to deliver packet to node {}: channel full or closed: {}", to_node, e);
+                        }
+                    }
+                } else {
+                    log::warn!("Node {} not found in network, dropping packet", to_node);
                     }
                 }
             }
@@ -246,15 +246,15 @@ impl RadioNetworkCore {
             Ok(_) => {
                 log::trace!("Successfully enqueued broadcast packet from {}", from);
                 self.queue_depth.fetch_add(1, Ordering::Relaxed);
-                let mut stats = self.stats.lock().await;
-                stats.packets_sent += 1;
+        let mut stats = self.stats.lock().await;
+        stats.packets_sent += 1;
                 Ok(())
-            }
-            Err(e) => {
+                }
+                Err(e) => {
                 match e {
                     mpsc::error::TrySendError::Full(_) => {
                         log::error!("Radio packet queue is FULL! Cannot send broadcast from {}. Consider increasing queue size.", from);
-                    }
+                }
                     mpsc::error::TrySendError::Closed(_) => {
                         log::error!("Radio packet queue is closed! Cannot send broadcast from {}", from);
                     }
@@ -427,9 +427,9 @@ impl RadioNode {
 
     async fn send_with_erasure(&self, data: &[u8], to: ValidatorId) -> Result<(), NetworkError> {
         
-        // 1:6 for (technically too much) resilience w/ high packet loss
-        const DATA_SHARDS: usize = 1;
-        const PARITY_SHARDS: usize = 5;
+        // for now 2:6 due to empty blocks
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 4;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
         const MIN_SHARD_SIZE: usize = 32;
         
@@ -493,8 +493,8 @@ impl RadioNode {
     }
 
     async fn try_reassemble_erasure(&self, from: ValidatorId, header: ShardHeader, data: Vec<u8>) -> Option<Vec<u8>> {
-        const DATA_SHARDS: usize = 1;
-        const PARITY_SHARDS: usize = 5;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 4;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
         let key = (from, header.message_id);
         let mut reassembly = self.reassembly.lock().await;
@@ -565,8 +565,8 @@ impl RadioNode {
     async fn broadcast_radio(&self, data: &[u8]) -> Result<(), NetworkError> {
         log::debug!("RadioNode {} broadcasting {} bytes to all nodes", self.id, data.len());
         
-        const DATA_SHARDS: usize = 1;
-        const PARITY_SHARDS: usize = 5;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 4;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
         const MIN_SHARD_SIZE: usize = 32;
         
