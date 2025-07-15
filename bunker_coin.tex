@@ -6,7 +6,7 @@
 
 \title{BunkerCoin: A Low Bandwidth, Shortwave Radio-Compatible Blockchain Protocol}
 \author{Anatoly Yakovenko\thanks{Parts of the abstract and most core concepts by Anatoly Yakovenko. This paper is currently expanded and maintained by the BunkerCoin Team and external contributors, i.e. do not automatically expect content (especially beyond the abstract) to be endorsed by Anatoly.} \and BunkerCoin Team}
-\date{July 8th, 2025\\Version 0.0.1 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
+\date{July 15th, 2025\\Version 0.0.2 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
 
 \begin{document}
 
@@ -90,8 +90,17 @@ To be added.
 \section{Transaction and State Model}
 \label{sec:transaction_state}
 
+\subsection{State Snapshots for Network Bootstrapping}
 
-To be added.
+Due to the low-bandwidth constraints of shortwave radio, full blockchain synchronization is infeasible for new nodes joining the network. To address this, BunkerCoin implements epoch-end state snapshots.
+
+At the conclusion of each epoch, validators collectively compute the current state and construct a Merkle tree over it. The Merkle root is included in a special ``snapshot block,'' which is then voted on and multi-signed using Votor's BLS aggregation mechanism via Sherpa routing.
+
+This signed Merkle root ensures network-wide agreement on the state.
+
+New nodes bootstrap by first obtaining the signed snapshot block containing the Merkle root. They then request portions of the state data from peers, verifying each subset against the root using Merkle proofs. This allows efficient, verifiable synchronization without transmitting the entire history.
+
+Additionally, zero-knowledge proofs could be employed to further compress these Merkle proofs, reducing bandwidth requirements for state verification (e.g. when new nodes joining load chunks of the state with the related Merkle proofs).
 
 %------------------------------------------------------------
 \section{Call for Contribution}
