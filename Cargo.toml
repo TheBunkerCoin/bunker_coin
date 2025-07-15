@@ -4,6 +4,7 @@ members = [
     "crates/radio",
     "crates/sim",
     "crates/rpc",
+    "crates/gateway"
 ]
 resolver = "2"
 
@@ -12,6 +13,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["BunkerCoin Contributors"]
 license = "Apache-2.0"
+
 
 [workspace.dependencies]
 bunker_coin_core = { path = "crates/core" }

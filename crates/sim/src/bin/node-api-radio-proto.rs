@@ -27,18 +27,33 @@ async fn main() {
         current_throughput_bps: 0.0,
     }));
     let (updates_tx, _) = broadcast::channel(1000);
+    
+    let num_nodes = 4;
+    log::info!("Starting {}-node consensus simulation over radio network", num_nodes);
+    
+    let blockstore_ref = Arc::new(RwLock::new(None));
+    let blockstore_for_api = blockstore_ref.clone();
+    
     let state = SharedState {
         blocks: blocks.clone(),
         nodes: nodes.clone(),
         radio_stats: radio_stats.clone(),
         updates: updates_tx.clone(),
+        blockstore: None,
     };
-    let api_handle = task::spawn(run_api(state));
     
-    let num_nodes = 4;
-    log::info!("Starting {}-node consensus simulation over radio network", num_nodes);
+    // api in dedicated task
+    let api_handle = task::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        
+        let bs = blockstore_for_api.read().await.clone();
+        let mut state = state;
+        state.blockstore = bs;
+        
+        run_api(state).await;
+    });
     
-    scenarios::multi_node_consensus_simulation_with_api(num_nodes, blocks, nodes, radio_stats, updates_tx).await;
+    scenarios::multi_node_consensus_simulation_with_api(num_nodes, blocks, nodes, radio_stats, updates_tx, blockstore_ref).await;
     
     log::info!("Simulation completed, shutting down API server");
     api_handle.await.unwrap();

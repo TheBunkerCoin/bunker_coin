@@ -41,8 +41,8 @@ impl RadioFramer {
         for shard in encoded.iter() {
             for chunk in shard.chunks(payload_size) {
                 frames.push(RadioFrame {
-                    slot: shred.slot(),
-                    shred_index: shred.index_in_slot(),
+                    slot: shred.payload().slot(),
+                    shred_index: shred.payload().index_in_slot(),
                     frame_index,
                     total_frames: 0,
                     data: chunk.to_vec(),
