@@ -13,7 +13,7 @@
 \maketitle
 
 \begin{abstract}
-The rapid evolution of blockchain technology has demanded innovative solutions that extend beyond conventional digital landscapes. This paper introduces BunkerCoin, a groundbreaking blockchain protocol designed to operate under the constraints of low bandwidth networks, specifically through shortwave radio channels. At the heart of BunkerCoin is the Alpenglow consensus mechanism, which is adapted to the unique challenges of shortwave radio. 
+The rapid evolution of blockchain technology has demanded innovative solutions that extend beyond conventional digital landscapes. This paper introduces BunkerCoin, a groundbreaking blockchain protocol designed to operate under the constraints of low bandwidth networks, specifically through shortwave radio channels. At the heart of BunkerCoin is the Alpenglow consensus mechanism, which is adapted to the unique challenges of shortwave radio.
 
 The protocol's network architecture is defined by two key components: a dynamic networking layer that leverages both broadcast and reliable P2P links, and a location-aware routing service (called Sherpa). Sherpa maintains a map of the nodes and peer information, allowing the system to route data efficiently across the globe. One central challenge lies in using this setup to aggregate the BLS multi-signatures required for voting within Alpenglow's consensus flow efficiently (routing and aggregating via optimal paths), minimizing the amount of data that needs to be transmitted for voting. The propagation of blocks and votes over shortwave radio is meticulously engineered to accommodate the protocol's 300-byte Maximum Transmission Unit (MTU). Each transmission is either disseminated through a series of 32:96 erasure coded frames, ensuring reliability and redundancy in the face of packet loss, or transferred via reliable  (TCP-like) ARQ links.
 
@@ -101,6 +101,34 @@ This signed Merkle root ensures network-wide agreement on the state.
 New nodes bootstrap by first obtaining the signed snapshot block containing the Merkle root. They then request portions of the state data from peers, verifying each subset against the root using Merkle proofs. This allows efficient, verifiable synchronization without transmitting the entire history.
 
 Additionally, zero-knowledge proofs could be employed to further compress these Merkle proofs, reducing bandwidth requirements for state verification (e.g. when new nodes joining load chunks of the state with the related Merkle proofs).
+
+%------------------------------------------------------------
+\section{Verified Offline Messaging}
+\label{sec:messaging}
+
+Beyond its primary function as a financial ledger, the BunkerCoin network is designed to support verified, asynchronous, and censorship-resistant messaging, even when direct, real-time connections (such as internet) are not possible. This is achieved through a deprioritized store-and-forward protocol that leverages the existing node infrastructure.
+
+\subsection{Store-and-Forward Transport}
+
+Messaging data is treated as lower-priority traffic compared to consensus votes and block/transaction data. When a node has available bandwidth after handling its critical consensus duties, it must accept and relay message packets as part of its core network responsibilities. Messages are passed from node to node opportunistically, stored temporarily at each hop until a suitable forward path becomes available.
+
+This store-and-forward model ensures that messages can eventually reach their destination even in highly partitioned or intermittent networks. To enable cryptographic verification of the relay path, each handoff between nodes generates a signed BLS receipt. These receipts are designed to be efficiently combined into a single, compact aggregate signature, which forms the basis for the final proof of delivery. This creates a verifiable chain of custody for the message as it traverses the network.
+
+\subsection{On-Chain Anchoring and Verification}
+
+To provide an immutable, on-chain proof of a message's existence and size, the sender broadcasts an anchor transaction. This transaction contains two key components: (1) the public key of the intended destination, and (2) a Zero-Knowledge (ZK) proof. The ZK proof is critical for the fee mechanism, as it cryptographically attests to the message's exact byte-length without revealing the content itself. This allows the protocol to calculate a fair, size-based fee. For efficiency, a compact proof system like Groth16 (288 bytes) can be used.
+
+\subsection{Fee and Incentive Structure}
+
+To be viable in a low-throughput environment, the messaging system's economic incentives must minimize on-chain traffic. The protocol therefore uses a streamlined two-transaction model: one to anchor the message and one to wrap up delivery.
+
+\begin{enumerate}
+    \item \textbf{Message Anchor Transaction:} The sender broadcasts the anchor transaction, containing the destination's public key and the ZK proof of length. The protocol verifies the proof and charges a messaging fee proportional to the proven length, which is then deposited into the epoch reward pool.
+    \item \textbf{Delivery Wrap-up Transaction:} Once the message is delivered, any node can submit a wrap-up transaction containing: (1) an aggregated BLS signature encompassing all handoff receipts from the relay chain, and (2) the destination's acknowledgement signature. The protocol verifies the destination's signature against the public key from the anchor transaction, and upon success, marks the message as complete. This design prioritizes verification simplicity and low computational overhead while maintaining cryptographic integrity.
+\end{enumerate}
+
+This model treats messaging as a public good that strengthens the entire network. By automatically pooling messaging fees, it incentivizes all nodes to maintain good connectivity and participate in forwarding. To ensure accountability, one could have the epoch reward pool distributing only to those validators who can prove they participated in at least one valid message relay during the epoch, 
+preventing free-riders from benefiting without contributing.
 
 %------------------------------------------------------------
 \section{Call for Contribution}
