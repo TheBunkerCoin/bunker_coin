@@ -6,7 +6,7 @@
 
 \title{BunkerCoin: A Low Bandwidth, Shortwave Radio-Compatible Blockchain Protocol}
 \author{Anatoly Yakovenko\thanks{Parts of the abstract and most core concepts by Anatoly Yakovenko. This paper is currently expanded and maintained by the BunkerCoin Team and external contributors, i.e. do not automatically expect content (especially beyond the abstract) to be endorsed by Anatoly.} \and BunkerCoin Team}
-\date{July 26th, 2025\\Version 0.0.3 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
+\date{July 29th, 2025\\Version 0.0.4 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
 
 \begin{document}
 
@@ -130,6 +130,47 @@ To be viable in a low-throughput environment, the messaging system's economic in
 This model treats messaging as a public good that strengthens the entire network. By automatically pooling messaging fees, it incentivizes all nodes to maintain good connectivity and participate in forwarding. To ensure accountability, one could have the epoch reward pool distributing only to those validators who can prove they participated in at least one valid message relay during the epoch, 
 preventing free-riders from benefiting without contributing.
 
+%------------------------------------------------------------
+\section{Bridging and Interoperability}
+\label{sec:bridge}
+
+One of BunkerCoin's primary value propositions is serving as a resilient custody layer for digital assets during periods of internet instability or outright failure. To fulfill this role, the protocol must support trustless asset transfers between BunkerCoin and high-throughput networks like Solana or similar chains. This section describes a cryptographically secure bridge architecture that leverages BunkerCoin's existing consensus mechanisms, offering security guarantees superior to federated or multisig-based models.
+
+\subsection{A Native Consensus Bridge}
+
+The bridge is not an external or secondary system; it is a native extension of the core protocol. Its security model is two-tiered, separating the slow, deliberate process of validator set authentication from the high-frequency task of attesting to individual asset transfers. This ensures the bridge's root of trust is always anchored to the full, radio-capable consensus. The system comprises:
+
+\begin{enumerate}
+    \item \textbf{The Full Validator Set}, which uses the core radio-based consensus mechanism at each epoch boundary to produce a signed \emph{Validator Set Update Certificate} (VSCert). This certificate is the ultimate source of authority for the bridge.
+    \item \textbf{An Internet-Connected Validator Subset}, composed of validators with stable IP connectivity. This dynamic subset is authorized---as per its stake recorded in the most recent VSCert---to produce and sign \emph{Bridge Certificates} (BCerts) for individual asset transfers, keeping this high-volume traffic off the radio network.
+    \item \textbf{An Immutable On-Chain Program} on the target chain (e.g., Solana) that verifies both certificate types. It only accepts a BCert if it is signed by a super-majority of the internet-connected validators authorized by the most recent VSCert.
+    \item \textbf{A Permissionless Relayer Network}, composed of off-chain actors who submit these certificates to the destination chain. Relayers are trusted for liveness only.
+\end{enumerate}
+
+\subsection{Certificate-Based Verification and Versioning}
+To allow for future upgrades without compromising the security of existing deployments, all certificates are versioned. An on-chain program can support multiple certificate versions, allowing for a seamless transition to new bridge contracts over time while ensuring old, immutable contracts remain fully functional and secure.
+
+\subsubsection{Validator Set Update Certificates (VSCerts)}
+The bridge's root of trust is established by VSCerts. At the end of each epoch, as part of the main state snapshot process, the entire validator set signs a message containing the version, the complete list of public keys, and stake weights for the upcoming epoch. This aggregated signature and validator list form the VSCert. Because this process is part of the core, radio-based consensus, it is as secure and censorship-resistant as BunkerCoin itself. A relayer submits this VSCert to the on-chain program, which verifies it against the previous validator set, thus securely rotating the authorized set for the new epoch.
+
+\subsubsection{Bridge Certificates (BCerts)}
+BCerts authorize individual asset transfers, primarily to facilitate the movement of external assets onto BunkerCoin for secure custody. For example, when a user locks native \texttt{SOL} in the bridge program on Solana, internet-connected validators observe the event and produce a BCert to authorize the minting of wrapped \texttt{SOL} on BunkerCoin. Conversely, when a user burns wrapped \texttt{SOL} on BunkerCoin, the validators generate a BCert to authorize the release of the native \texttt{SOL} on Solana. This signed message contains the certificate version and transfer details (amount, asset, source, destination, nonce). The on-chain program verifies the BCert against the public keys of the currently authorized internet-connected validators. If valid, the mint or release is executed. If fewer than 2/3 of the total stake has internet connectivity, no BCerts can be produced, and the bridge pauses until connectivity is restored.
+
+\subsection{Superiority over Federated Models}
+This native, two-tiered design is fundamentally more secure than common trust-based bridge models. Systems like Wormhole rely on a fixed, permissioned set of so-called Guardian nodes, while many Layer 2 rollups secure their bridges with a small multisig. In these models, the security of the bridge is delegated to a committee that is external to and significantly smaller than the full validator set of the chains they serve.
+
+BunkerCoin's bridge suffers from no such security degradation. Although only validators with stable IP connectivity can physically transmit their signatures, the BCert itself must carry an aggregated signature representing at least two-thirds of \emph{all} staked weight.  If this threshold is not met—because insufficient stake is online—the bridge simply pauses rather than falling back to a weaker committee.  The authority to produce BCerts therefore remains identical to that of the base chain; the internet-reachable validators are merely the portion of the full set that can currently participate.  The VSCerts that ratify this arrangement each epoch are signed by the 
+entire validator set over the radio network, so no smaller group can hijack the bridge.  Consequently, an attacker’s only viable path to stealing funds is to corrupt $\geq$\,2/3 of BunkerCoin’s total stake—the exact same condition required to break main-chain consensus.
+
+\subsection{Merkle Root Anchoring for Enhanced Security}
+Beyond basic asset transfers, the bridge could \emph{optionally} leverage BunkerCoin's existing state snapshot mechanism (Section~\ref{sec:transaction_state}) to post periodic commitments on external chains. These Merkle root anchors serve a dual purpose:
+
+\begin{enumerate}
+    \item \textbf{Checkpoint Finality:} Once BunkerCoin's state root is included in the consensus of Solana or a similar chain, reverting BunkerCoin's history would require reorganizing the external chain—a massive increase in attack cost.
+    \item \textbf{Generalized State Proofs:} Applications can verify arbitrary BunkerCoin state claims using Merkle proofs against these anchored roots, enabling complex cross-chain protocols beyond simple transfers.
+\end{enumerate}
+
+The same internet-connected validator subset that produces BCerts can generate these checkpoint certificates, reusing the existing BLS aggregation infrastructure without additional complexity.
 %------------------------------------------------------------
 \section{Call for Contribution}
 
