@@ -6,7 +6,7 @@
 
 \title{BunkerCoin: A Low Bandwidth, Shortwave Radio-Compatible Blockchain Protocol}
 \author{Anatoly Yakovenko\thanks{Parts of the abstract and most core concepts by Anatoly Yakovenko. This paper is currently expanded and maintained by the BunkerCoin Team and external contributors, i.e. do not automatically expect content (especially beyond the abstract) to be endorsed by Anatoly.} \and BunkerCoin Team}
-\date{July 29th, 2025\\Version 0.0.4 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
+\date{July 31st, 2025\\Version 0.0.5 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
 
 \begin{document}
 
@@ -51,6 +51,24 @@ This hybrid model allows a node to significantly accelerate propagation. After b
 
 Crucially, this allows for dynamic optimization at the individual node level. Each node can independently assess network conditions and decide whether broadcasting or initiating direct P2P transmissions is the more efficient strategy at any given moment, creating a resilient and adaptive data propagation fabric.
 
+\subsection{Proof of Location}
+\label{sec:proof_of_location}
+
+Accurate validator locations are essential for Sherpa's routing decisions. To prevent location spoofing, validators must obtain cryptographic attestations from neighboring nodes:
+
+\begin{enumerate}
+    \item \textbf{Location Claim:} A validator announces its approximate location (precision ~50km).
+    \item \textbf{Neighbor Attestations:} At least min(3, total validators) existing validators within radio range must sign attestations. Attesters must have held stake for at least one prior epoch to prevent collusion attacks. Each attestation confirms:
+        \begin{itemize}
+            \item Successful bidirectional radio contact
+            \item Propagation delay consistent with claimed distance
+            \item Signal characteristics matching expected ionospheric conditions
+        \end{itemize}
+    \item \textbf{Verification:} The attestations are submitted during epoch transitions and verified by the network.
+\end{enumerate}
+
+Radio physics makes location fraud extremely difficult—signal delay, strength, and skip patterns are inherently tied to geographic distance. This natural constraint provides strong sybil resistance while ensuring Sherpa has reliable topology data.
+
 \subsection{Radio Data Protocols}
 
 \subsubsection{PACTOR-IV}
@@ -72,7 +90,22 @@ Ultimately, a definitive decision requires data. To this end, the project will e
 \section{Consensus Layer}
 \label{sec:consensus}
 
-BunkerCoin adopts Alpenglow, an advanced consensus protocol originally proposed for the Solana blockchain, to achieve rapid block finality under constrained network conditions. Alpenglow replaces legacy mechanisms like Proof of History and Tower BFT with a streamlined dual-component design, achieving deterministic finality in approximately 100-150 milliseconds under ideal conditions.
+BunkerCoin adopts Alpenglow, an advanced consensus protocol originally proposed for the Solana blockchain, to achieve rapid block finality under constrained network conditions. Alpenglow replaces legacy mechanisms like Proof of History and Tower BFT with a streamlined dual-component design, achieving deterministic finality in record time.
+
+\subsection{Staking and Validator Selection}
+\label{sec:staking}
+
+BunkerCoin employs a stake-weighted validator system where the natural barrier of expensive radio equipment limits participation. All validators with sufficient stake participate in consensus, with voting power proportional to their total stake (self-bonded plus delegations). Stake changes only activate at epoch boundaries to maintain a stable validator set throughout each epoch.
+
+\subsection{Fee Distribution}
+\label{sec:fees}
+
+Network fees are collected into three separate pools, each rewarding different network contributions:
+\begin{itemize}
+    \item \textbf{Transaction Pool:} Fees from regular transactions, distributed to all active validators proportionally by stake.
+    \item \textbf{Message Pool:} Fees from the messaging service, distributed only to validators who participated in message relay during the epoch.
+    \item \textbf{Bridge Pool:} Fees from bridge operations, preferentially rewarding validators with stable internet connectivity who can produce Bridge Certificates.
+\end{itemize}
 
 \subsection{Votor: Voting and Finalization Engine}
 
@@ -82,6 +115,21 @@ Votor handles block notarization and finalization through a concurrent dual-path
 
 Radiotor is BunkerCoin's adaptation of Alpenglow's Rotor protocol, tailored specifically for block dissemination over shortwave radio. It follows an approach similar to Solana's Turbine, where each node forwards erasure-coded block shreds to multiple downstream peers. Radiotor leverages the Sherpa service to select geographically distinct paths, enabling multiple, parallel data transfers across different HF links and frequencies to maximize throughput. While opportunistic broadcasts (as described in Section \ref{sec:opportunistic_broadcasts}) can accelerate this process, Radiotor's multi-path forwarding is the primary mechanism for robust block propagation.
 
+\subsection{Epoch Transitions}
+\label{sec:epoch_transitions}
+
+At each epoch boundary, the network pauses block production to execute critical maintenance tasks. During this window, submitted transactions remain queued at their originating nodes while the following operations occur in sequence:
+
+\begin{enumerate}
+    \item \textbf{State Snapshot:} Validators compute and sign the Merkle root of the current state (see Section~\ref{sec:transaction_state}).
+    \item \textbf{Validator Set Update:} Pending stake changes are processed, and the new validator set is finalized. A Validator Set Update Certificate (VSCert) is generated for the bridge (see Section~\ref{sec:bridge}).
+    \item \textbf{Location Attestations:} New validators submit proof-of-location claims, and existing validators may need to refresh their attestations (see Section~\ref{sec:proof_of_location}).
+    \item \textbf{Fee Distribution:} The three fee pools are distributed according to each validator's contributions during the ending epoch.
+    \item \textbf{Epoch Transition Block:} A special block containing all transition metadata is produced and voted on.
+\end{enumerate}
+
+Once the transition block achieves consensus, normal block production resumes with the new validator set and updated network state.
+
 \subsection{Fault Tolerance}
 
 To be added.
@@ -89,6 +137,31 @@ To be added.
 %------------------------------------------------------------
 \section{Transaction and State Model}
 \label{sec:transaction_state}
+
+\subsection{Account Model}
+\label{sec:account_model}
+
+BunkerCoin uses a simplified account model with no smart contracts. Each account is identified by a public key and contains:
+
+\begin{itemize}
+    \item \textbf{Native Balance:} Amount of native BunkerCoin tokens for fees and staking.
+    \item \textbf{Token Balances:} A sparse array mapping token IDs to amounts. Only non-zero balances are stored.
+    \item \textbf{Nonce:} Transaction replay prevention counter.
+\end{itemize}
+
+\subsection{Token System}
+\label{sec:tokens}
+
+Tokens are created via special mint transactions that assign a unique 4-byte token ID. Each token stores minimal on-chain data:
+
+\begin{itemize}
+    \item \textbf{Token ID:} Unique 4-byte identifier
+    \item \textbf{Supply:} Current and maximum supply
+    \item \textbf{Ticker:} 3-8 character symbol (e.g., "USDC")
+    \item \textbf{Metadata Hash:} SHA-256 of off-chain JSON file containing name, description, logo, etc.
+\end{itemize}
+
+This design keeps account entries compact—most accounts will hold only 1-5 different tokens, requiring just 8 bytes per token type (4 for ID, 8 for amount when packed efficiently).
 
 \subsection{State Snapshots for Network Bootstrapping}
 
