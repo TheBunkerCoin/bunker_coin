@@ -97,6 +97,43 @@ BunkerCoin adopts Alpenglow, an advanced consensus protocol originally proposed 
 
 BunkerCoin employs a stake-weighted validator system where the natural barrier of expensive radio equipment limits participation. All validators with sufficient stake participate in consensus, with voting power proportional to their total stake (self-bonded plus delegations). Stake changes only activate at epoch boundaries to maintain a stable validator set throughout each epoch.
 
+\subsubsection{Stake Lifecycle} 
+\label{sec:stake_lifecycle}
+
+Stake (either self-bonded or delegated) follows a simple two–step lifecycle that is tightly coupled to the fixed–length epoch schedule:
+\begin{itemize}
+    \item \textbf{Bonding:} A {\em bond} transaction locks the indicated amount immediately, but the stake becomes \emph{active} only at the next epoch boundary~$(T+1)$.  Until then it is counted as ``pending stake'' and is not eligible for rewards or voting power.
+    \item \textbf{Unbonding:} A {\em retire} transaction flags the stake for withdrawal.  It becomes \emph{inactive} at the next epoch boundary and then enters a fixed unbonding delay of~$U$ epochs (parameterised, default $U=2$).  During the delay the tokens remain locked and subject to slashing.  After $U$ epochs the owner may withdraw them with a {\em withdraw} transaction.
+\end{itemize}
+
+Validators must maintain a minimum self-bond (parameter \texttt{MIN\_SELF\_STAKE}).  Falling below this threshold—whether by withdrawal or slashing—causes automatic deactivation at the next epoch boundary.
+
+\subsubsection{Reward Accrual and Distribution}
+\label{sec:stake_rewards}
+
+Epoch rewards are \emph{fee-driven}: the native protocol does not mint inflationary rewards; instead it redistributes the contents of the three fee pools described in Section~\ref{sec:fees}.  The distribution procedure at the end of each epoch is:
+
+\begin{enumerate}
+    \item Split each fee pool \emph{pro-rata by active stake} across all validators who are \texttt{ACTIVE} at the instant the epoch ends.  Validators that were jailed at any time during the epoch receive no reward.
+    \item Apply the validator’s self-declared commission rate (bounded to $\le 20\%$ and changeable only at epoch boundaries).  Delegators receive the remainder proportionally to their stake.
+    \item Rewards below a dust threshold of $1\,\mu$BUNKER are rolled over to the next epoch to avoid radio transmissions for micro-rewards.
+\end{enumerate}
+
+\subsubsection{Slashing and Jailing}
+\label{sec:slashing}
+
+Misbehaviour is deterred through stake slashing and temporary exclusion (\emph{jailing}).  Only two slashable offences are recognised to keep the protocol lightweight:
+
+\begin{center}
+\begin{tabular}{l c c}
+\textbf{Offence} & \textbf{Slash} & \textbf{Jail}\;\\\hline
+Double-vote / equivocation & 100\% & until re-stake \\
+Excessive downtime ($>$20\% votes missed in an epoch) & 0\% & 1 epoch \\
+\end{tabular}
+\end{center}
+
+Slash evidence is a pair of conflicting vote signatures in the case of double-signing. Upon inclusion of valid evidence, the protocol burns the slashed stake and moves the validator to the \texttt{JAILED} state.  After the jail period elapses the operator may send an \emph{un-jail} transaction at any time; their stake becomes active again at the following epoch boundary provided the minimum self-stake is satisfied.
+
 \subsection{Fee Distribution}
 \label{sec:fees}
 
