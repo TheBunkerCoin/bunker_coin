@@ -6,7 +6,7 @@
 
 \title{BunkerCoin: A Low Bandwidth, Shortwave Radio-Compatible Blockchain Protocol}
 \author{Anatoly Yakovenko\thanks{Parts of the abstract and most core concepts by Anatoly Yakovenko. This paper is currently expanded and maintained by the BunkerCoin Team and external contributors, i.e. do not automatically expect content (especially beyond the abstract) to be endorsed by Anatoly.} \and BunkerCoin Team}
-\date{August 1st, 2025\\Version 0.0.6 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
+\date{August 7th, 2025\\Version 0.1.0 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
 
 \begin{document}
 
@@ -85,6 +85,48 @@ VARA HF offers a compelling alternative as a flexible, software-based modem. Its
 The choice between PACTOR-IV and VARA HF presents a classic trade-off. PACTOR-IV is expected to deliver superior throughput and reliability across the board, backed by its robust hardware and mature ALE system, but at the cost of higher expense and less flexibility. Conversely, VARA offers a cheaper, more flexible software-based path, but is likely less performant in adverse conditions and places a greater implementation burden on the project.
 
 Ultimately, a definitive decision requires data. To this end, the project will establish a testnet incorporating nodes that utilize both PACTOR-IV and VARA HF stacks. A series of real-world benchmarks must be conducted to compare the two protocols, specifically evaluating their performance in both reliable P2P (ARQ) and broadcast (FEC/unproto) modes under a variety of ionospheric conditions. The results of these tests will inform the final choice for BunkerCoin's physical layer.
+
+%------------------------------------------------------------
+\subsection{Last-Mile Access via LoRa}
+\label{sec:lora}
+
+While HF links connect validators over intercontinental distances, the network also requires a resilient, accessible ``last mile'' so users can originate transactions without relying on the public internet. BunkerCoin therefore supports LoRa-based uplinks in license-free ISM bands as an ingress path operated by community or private gateways. This complements the long-haul radio backbone and preserves the protocol’s end-to-end assumptions: authenticated messages, eventual delivery over a reliable P2P mesh, and tolerance of intermittent connectivity and asymmetric links.
+
+\subsubsection{Access Models}
+
+Two representative models are envisioned, selected per deployment context rather than mandated by the protocol:
+\begin{itemize}
+    \item \textbf{LoRaWAN Class~A:} Uses existing gateway infrastructure where available. Downlink capacity is scarce; the protocol treats LoRaWAN primarily as a best-effort uplink for user submissions.
+    \item \textbf{Raw LoRa:} Self-managed gateways for communities or operators without LoRaWAN coverage. Link parameters and channel plans follow regional regulations and are left to deployment guidance.
+\end{itemize}
+
+Where public LoRa deployments exist (e.g., Helium), the project will explore optional interoperability to opportunistically extend coverage. However, such networks depend on internet-connected network servers and backhaul; the last-mile design therefore remains self-sufficient by default. Deployments must not assume public infrastructure availability, and gateways should function without IP reachability, using HF or private backhaul when necessary.
+
+\subsubsection{Submission Model}
+
+User transactions are wrapped into compact, authenticated envelopes (\emph{capsules}) suitable for low-power radios. Capsules may be submitted as a single transmission or as a small set of fragments when needed. Gateways can verify authenticity and de-duplicate submissions without accessing any confidential payload beyond what is necessary for admission control. The on-air representation is intentionally minimal and agnostic to the underlying access model.
+
+\subsubsection{Gateway Responsibilities}
+
+Gateways act as stateless ingress relays between the LoRa access and validator-facing network paths. Their responsibilities are:
+\begin{itemize}
+    \item \textbf{Admission and Validation:} Check capsule integrity and authenticity; discard malformed or obviously replayed submissions.
+    \item \textbf{Forwarding:} On acceptance, relay toward validators via HF backhaul or IP when available, conforming to the core 300-byte MTU framing and P2P-first policy.
+    \item \textbf{Fairness and Resilience:} Apply simple, stake-agnostic fairness to share limited airtime and gateway queues; provide optional best-effort acknowledgements when a downlink opportunity exists.
+    \item \textbf{Privacy:} Avoid retaining user content beyond what is required for routing and de-duplication.
+\end{itemize}
+
+\subsubsection{Interoperability and Backhaul}
+
+The last-mile path does not alter the semantics of transactions or consensus. Capsules are forwarded unchanged into the validator mempool and subject to the same fee, ordering, and slashing rules as IP- or HF-originated traffic. Gateways must cooperate with back-pressure from the validator-facing P2P network to avoid congestion collapse; when in doubt, buffering and eventual repair over reliable links take precedence over retries on the access side.
+
+\subsubsection{Deployment Considerations}
+
+Deployments must adhere to local spectrum rules and duty-cycle constraints in the chosen ISM bands. Community gateways can be co-located with validators or placed opportunistically in population centers; private gateways may be used by institutions with specific availability requirements. Gateways are not consensus participants and do not require stake; they may optionally register coarse location with Sherpa for operational visibility without affecting routing decisions.
+
+\subsubsection{Evaluation Plan}
+
+The reference implementation will be validated through field trials across urban and rural settings. Measurements will focus on submission success under varying link qualities, time-to-mempool for single- and multi-fragment capsules, and energy usage on handheld devices. Results will inform parameter recommendations and any future access extensions without changing core consensus assumptions.
 
 %------------------------------------------------------------
 \section{Consensus Layer}
@@ -169,7 +211,17 @@ Once the transition block achieves consensus, normal block production resumes wi
 
 \subsection{Fault Tolerance}
 
-To be added.
+BunkerCoin is engineered for resilience in contested and unreliable network environments. Its fault tolerance model is built on redundancy at every layer of the stack, from physical data transmission to consensus.
+
+\begin{itemize}
+    \item \textbf{Network Partitions and Link Failure:} The protocol's P2P-first strategy (see Section~\ref{sec:physical}) ensures a baseline of connectivity. If direct links fail, the Sherpa routing service dynamically finds alternative paths through the multi-hop radio mesh. Erasure coding in broadcast modes and the reliable ARQ protocol for P2P links protect against transient packet loss. In the event of a large-scale network partition, nodes within each disconnected segment can continue to operate and will automatically repair and synchronize state once connectivity is restored.
+
+    \item \textbf{Validator Downtime:} The Alpenglow consensus mechanism is intrinsically tolerant to validator downtime. While Fast-Finalization requires high participation ($\geq 80\%$), the standard finalization path can succeed with only $\geq 60\%$ of stake online. This allows the chain to continue making progress even if a significant portion of the network is temporarily unreachable.
+
+    \item \textbf{Catastrophic Data Loss:} The epoch-end state snapshot mechanism is the ultimate backstop for data integrity. A validator that suffers a catastrophic failure (e.g., total data loss) does not need to synchronize the entire blockchain history over a low-bandwidth link. Instead, it can bootstrap from the latest multi-signed state snapshot, verifying data chunks with Merkle proofs, enabling rapid and secure recovery.
+
+    \item \textbf{Bridge Pauses:} The interoperability bridge is designed to fail safely. If fewer than two-thirds of the total staked weight has stable internet connectivity required to sign Bridge Certificates (BCerts), the bridge automatically pauses all operations. No funds can be moved until sufficient stake comes back online. This prevents a smaller, potentially compromised subset of validators from controlling the bridge, ensuring bridge security is never weaker than the main consensus.
+\end{itemize}
 
 %------------------------------------------------------------
 \section{Transaction and State Model}
@@ -281,6 +333,47 @@ Beyond basic asset transfers, the bridge could \emph{optionally} leverage Bunker
 \end{enumerate}
 
 The same internet-connected validator subset that produces BCerts can generate these checkpoint certificates, reusing the existing BLS aggregation infrastructure without additional complexity.
+
+%------------------------------------------------------------
+%------------------------------------------------------------
+\section{Security Considerations}
+\label{sec:security}
+
+The protocol's security model assumes a sophisticated adversary capable of both on-chain and physical-layer attacks. This section outlines key risks and their mitigations.
+
+\begin{itemize}
+    \item \textbf{Location Spoofing and Sybil Attacks:} The Proof of Location mechanism (Section~\ref{sec:proof_of_location}) is the primary defense against Sybil attacks. An adversary cannot easily fake a geographic location due to the physical constraints of radio wave propagation. Signal delay, multipath characteristics, and strength are difficult to forge and must be attested to by established, staked neighbors, making it computationally and logistically expensive to create a cluster of fake nodes in one location.
+
+    \item \textbf{Physical Layer Attacks:} An adversary may attempt to disrupt the network through jamming or spoofing.
+        \begin{itemize}
+            \item \textbf{Jamming:} While targeted jamming can disrupt specific links, the global, decentralized nature of the network provides inherent resilience. Sherpa can route around localized interference. Because each P2P link can operate on a different frequency, an attacker must jam a wide portion of the HF spectrum to cause large-scale disruption. Furthermore, the use of licensed amateur radio bands in some regions provides a layer of legal protection and regulatory recourse against malicious interference, a deterrent not present in unlicensed bands.
+            \item \textbf{Spoofing:} Cryptographic authentication at every layer prevents spoofed data from being accepted. All peer-to-peer links are authenticated, and all consensus messages (blocks, votes) are signed. An attacker cannot inject false data without compromising a validator's private keys.
+        \end{itemize}
+
+    \item \textbf{Censorship Resistance:} Censorship can be attempted at multiple points.
+        \begin{itemize}
+            \item \textbf{Gateway Level:} LoRa gateways (Section~\ref{sec:lora}) could attempt to censor user transactions. However, since gateways are numerous and operated by independent entities, a user can simply submit their transaction via a different gateway or directly to a validator if they have HF capability.
+            \item \textbf{Validator Level:} A cabal of validators could attempt to censor transactions by refusing to include them in blocks. Because block producers are selected on a rotating basis, this would require sustained collusion. Furthermore, the store-and-forward messaging system (Section~\ref{sec:messaging}) provides a parallel, albeit slower, path for data propagation that is difficult to censor system-wide.
+        \end{itemize}
+
+    \item \textbf{Long-Range and Re-org Attacks:} The cost of a 51\% attack is equivalent to acquiring a majority of the total stake, which is economically significant. The use of epoch-end state snapshots, especially when anchored to a high-throughput chain (Section~\ref{sec:bridge}), dramatically increases the cost of attempting a long-range rewrite of history. To revert a finalized snapshot, an attacker would not only need to corrupt BunkerCoin but also the external chain where the snapshot is anchored.
+
+    \item \textbf{Bridge Security:} The native consensus bridge is designed to be as secure as the L1 itself. Its security relies on the VSCerts being signed by the full radio-capable validator set and BCerts requiring a super-majority of staked weight. An attacker cannot drain funds from the bridge without compromising the economic majority of the entire BunkerCoin network, eliminating the risk of a small committee being the single point of failure.
+\end{itemize}
+
+\section{Future Work}
+\label{sec:future}
+
+The core protocol is intentionally extensible. Two directions may be explored without altering L1 security:
+
+\subsection{Geo-Anchored L2s}
+
+In crises, usage concentrates locally rather than across continents. A geo-anchored L2 executing regional transactions and periodically anchoring a concise state root to BunkerCoin L1, effective throughput could be increased by orders of magnitude. The security implications of delayed anchoring and regional execution must be assessed before adoption.
+
+\subsection{LEO Bent-Pipe Relay}
+
+LEO satellites can serve as transparent 1:1 bridges: receive a BunkerCoin frame and immediately re-transmit it within the current footprint. There is no buffering or store-and-forward; satellites are untrusted transport only and do not participate in consensus. This predictable alternate path can bypass poor HF propagation, increasing network reliability and throughput. With declining launch costs, bent-pipe relays are a practical, optional operational enhancement.
+
 %------------------------------------------------------------
 \section{Call for Contribution}
 
