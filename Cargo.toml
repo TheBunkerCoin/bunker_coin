@@ -1,10 +1,12 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/gateway",
     "crates/radio",
-    "crates/sim",
     "crates/rpc",
-    "crates/gateway"
+    "crates/scs_pactor",
+    "crates/sim",
+    "crates/vara",
 ]
 resolver = "2"
 
