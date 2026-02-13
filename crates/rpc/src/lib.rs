@@ -167,7 +167,7 @@ async fn blocks(Query(p): Query<Pagination>, state: axum::extract::State<SharedS
         blocks.clone()
     };
     
-    // query blocksotre for more blocks if present
+    // query blockstore for more blocks if present
     if let Some(bs_arc) = &state.blockstore {
         let bs = bs_arc.read().await;
         

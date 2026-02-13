@@ -112,15 +112,16 @@ impl VaraClient {
 
     pub async fn connect_peer(&self, remote_call: &str) -> Result<(), VaraError> {
         self.send_command(&format!("CONNECT {}", remote_call)).await?;
-        loop {
+        for _ in 0..60 {
             let line = self.read_status_line().await?;
-            if line.starts_with("CONNECTED") {
-                return Ok(());
-            }
             if line.starts_with("DISCONNECTED") || line.starts_with("WRONG") {
                 return Err(VaraError::UnexpectedResponse(line));
             }
+            if line.starts_with("CONNECTED") {
+                return Ok(());
+            }
         }
+        Err(VaraError::Timeout)
     }
 
     pub async fn listen_on(&self, on: bool) -> Result<(), VaraError> {

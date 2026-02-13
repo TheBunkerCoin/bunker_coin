@@ -89,12 +89,12 @@ impl ScsPactorClient {
         let fut = writer.send(line.to_string());
         if let Some(d) = self.write_timeout {
             let res = timeout(d, fut).await.map_err(|_| ScsPactorError::Timeout)?;
-            res.map_err(|e| ScsPactorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            res.map_err(|e| ScsPactorError::Io(std::io::Error::other(e.to_string())))?;
         } else {
             writer
                 .send(line.to_string())
                 .await
-                .map_err(|e| ScsPactorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                .map_err(|e| ScsPactorError::Io(std::io::Error::other(e.to_string())))?;
         }
         Ok(())
     }
@@ -108,7 +108,7 @@ impl ScsPactorClient {
         };
         match next {
             Some(Ok(line)) => Ok(line),
-            Some(Err(e)) => Err(ScsPactorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
+            Some(Err(e)) => Err(ScsPactorError::Io(std::io::Error::other(e.to_string()))),
             None => Err(ScsPactorError::Disconnected),
         }
     }
@@ -119,13 +119,16 @@ impl ScsPactorClient {
 
     pub async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
         self.send_command(&format!("CONNECT {}", remote_call)).await?;
-        loop {
+        for _ in 0..60 {
             let line = self.read_status_line().await?;
-            if line.contains("CONNECTED") { return Ok(()); }
-            if line.contains("FAIL") || line.contains("NO") || line.contains("DISCONNECT") {
-                return Err(ScsPactorError::Io(std::io::Error::new(std::io::ErrorKind::Other, line)));
+            if line.starts_with("DISCONNECTED") || line.starts_with("FAIL") || line.starts_with("NO ") {
+                return Err(ScsPactorError::Io(std::io::Error::other(line)));
+            }
+            if line.starts_with("CONNECTED") {
+                return Ok(());
             }
         }
+        Err(ScsPactorError::Timeout)
     }
 
     pub async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
