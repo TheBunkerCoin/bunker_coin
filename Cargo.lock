@@ -562,6 +562,7 @@ version = "0.1.0"
 dependencies = [
  "ark-bn254",
  "light-poseidon",
+ "serde",
 ]
 
 [[package]]

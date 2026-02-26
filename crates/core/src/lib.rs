@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
-// todo @ ilj: add modules (hash, vdf, types, etc.)
-
+pub mod account;
 pub mod hash;
+pub mod transaction;
+pub mod types;
