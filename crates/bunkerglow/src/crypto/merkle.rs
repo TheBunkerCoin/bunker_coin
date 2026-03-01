@@ -49,8 +49,8 @@ const RIGHT_LABEL: [u8; 32] = *b"ALPENGLOW-MERKLE-TREE RIGHT-NODE";
 /// These are calculated by running `cargo test -- empty_roots --no-capture`,
 /// which is much faster than but equivalent to this straightforward snippet:
 /// ```no_run
-/// use alpenglow::crypto::hash::Hash;
-/// use alpenglow::crypto::merkle::{MAX_MERKLE_TREE_HEIGHT, PlainMerkleTree};
+/// use bunkerglow::crypto::hash::Hash;
+/// use bunkerglow::crypto::merkle::{MAX_MERKLE_TREE_HEIGHT, PlainMerkleTree};
 ///
 /// for height in 0..MAX_MERKLE_TREE_HEIGHT {
 ///     let data = vec![vec![]; 1 << height];

@@ -1,11 +1,11 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use alpenglow::crypto::signature::SecretKey;
-use alpenglow::disseminator::Turbine;
-use alpenglow::network::UdpNetwork;
-use alpenglow::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder};
-use alpenglow::types::slice::create_slice_with_invalid_txs;
+use bunkerglow::crypto::signature::SecretKey;
+use bunkerglow::disseminator::Turbine;
+use bunkerglow::network::UdpNetwork;
+use bunkerglow::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder};
+use bunkerglow::types::slice::create_slice_with_invalid_txs;
 use divan::counter::ItemsCount;
 
 fn main() {

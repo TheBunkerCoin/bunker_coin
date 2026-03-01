@@ -10,8 +10,8 @@
 pub mod latency;
 pub mod robustness;
 
-use alpenglow::ValidatorId;
-use alpenglow::disseminator::rotor::SamplingStrategy;
+use bunkerglow::ValidatorId;
+use bunkerglow::disseminator::rotor::SamplingStrategy;
 use rand::prelude::*;
 
 pub use self::latency::{LatencyEvent, RotorLatencySimulation};

@@ -16,7 +16,7 @@
 //! # Examples
 //!
 //! ```rust
-//! use alpenglow::network::{Network, localhost_ip_sockaddr};
+//! use bunkerglow::network::{Network, localhost_ip_sockaddr};
 //!
 //! async fn send_ping_receive_pong(network: impl Network<Send = String, Recv = String>) {
 //!     let msg = "ping".to_string();

@@ -10,8 +10,8 @@
 
 use std::fs::File;
 
-use alpenglow::disseminator::rotor::FaitAccompli1Sampler;
-use alpenglow::network::simulated::stake_distribution::{
+use bunkerglow::disseminator::rotor::FaitAccompli1Sampler;
+use bunkerglow::network::simulated::stake_distribution::{
     VALIDATOR_DATA, validators_from_validator_data,
 };
 use color_eyre::Result;

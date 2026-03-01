@@ -1,5 +1,5 @@
-use alpenglow::shredder::Shred;
-use alpenglow::Slot;
+use bunkerglow::shredder::Shred;
+use bunkerglow::Slot;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use serde::{Deserialize, Serialize};
 use crate::RadioError;

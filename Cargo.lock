@@ -68,54 +68,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "alpenglow"
-version = "0.1.0"
-dependencies = [
- "aes",
- "async-trait",
- "bitvec",
- "blst",
- "clap",
- "color-eyre",
- "colored 3.0.0",
- "csv",
- "ctr",
- "derive_more",
- "divan",
- "ed25519-consensus",
- "either",
- "fastrace",
- "fastrace-opentelemetry",
- "futures",
- "geo",
- "hex",
- "hex-literal",
- "log",
- "logforth",
- "mockall",
- "moka",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "rand 0.9.1",
- "rayon",
- "reed-solomon-simd",
- "rocksdb",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "smallvec",
- "static_assertions",
- "statrs",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-util",
- "toml",
- "wincode",
-]
-
-[[package]]
 name = "anstream"
 version = "0.6.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -563,6 +515,7 @@ dependencies = [
  "ark-bn254",
  "light-poseidon",
  "serde",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -586,11 +539,11 @@ dependencies = [
 name = "bunker_coin_radio"
 version = "0.1.0"
 dependencies = [
- "alpenglow",
  "anyhow",
  "async-trait",
  "bincode",
  "bunker_coin_core",
+ "bunkerglow",
  "bytes",
  "log",
  "rand 0.9.1",
@@ -606,11 +559,11 @@ dependencies = [
 name = "bunker_coin_sim"
 version = "0.1.0"
 dependencies = [
- "alpenglow",
  "anyhow",
  "bincode",
  "bunker_coin_core",
  "bunker_coin_radio",
+ "bunkerglow",
  "colored 2.2.0",
  "env_logger",
  "hex",
@@ -620,6 +573,54 @@ dependencies = [
  "rpc",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "bunkerglow"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "async-trait",
+ "bitvec",
+ "blst",
+ "clap",
+ "color-eyre",
+ "colored 3.0.0",
+ "csv",
+ "ctr",
+ "derive_more",
+ "divan",
+ "ed25519-consensus",
+ "either",
+ "fastrace",
+ "fastrace-opentelemetry",
+ "futures",
+ "geo",
+ "hex",
+ "hex-literal",
+ "log",
+ "logforth",
+ "mockall",
+ "moka",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "rand 0.9.1",
+ "rayon",
+ "reed-solomon-simd",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smallvec",
+ "static_assertions",
+ "statrs",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "wincode",
 ]
 
 [[package]]
@@ -3051,8 +3052,9 @@ dependencies = [
 name = "rpc"
 version = "0.1.0"
 dependencies = [
- "alpenglow",
  "axum",
+ "bunker_coin_core",
+ "bunkerglow",
  "futures",
  "hex",
  "serde",

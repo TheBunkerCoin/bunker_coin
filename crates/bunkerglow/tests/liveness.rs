@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-use alpenglow::create_test_nodes;
-use alpenglow::types::Slot;
+use bunkerglow::create_test_nodes;
+use bunkerglow::types::Slot;
 use log::debug;
 use rand::prelude::*;
 

@@ -10,7 +10,7 @@
 //! # Examples
 //!
 //! ```
-//! use alpenglow::network::simulated::stake_distribution::{VALIDATOR_DATA, ValidatorData};
+//! use bunkerglow::network::simulated::stake_distribution::{VALIDATOR_DATA, ValidatorData};
 //!
 //! let mut stakes = VALIDATOR_DATA
 //!     .iter()

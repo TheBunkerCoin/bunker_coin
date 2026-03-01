@@ -1,9 +1,9 @@
 //! Simulation scenarios for testing BunkerCoin over radio
 
 use bunker_coin_radio::{SimulatedRadioNetwork, RadioConfig, RadioNetworkCore};
-use alpenglow::shredder::{Slice, RegularShredder, Shredder, MAX_DATA_PER_SLICE};
-use alpenglow::network::{Network, NetworkMessage};
-use alpenglow::crypto::signature::SecretKey;
+use bunkerglow::shredder::{Slice, RegularShredder, Shredder, MAX_DATA_PER_SLICE};
+use bunkerglow::network::{Network, NetworkMessage};
+use bunkerglow::crypto::signature::SecretKey;
 use hex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use bincode;
@@ -161,7 +161,7 @@ pub async fn multi_node_radio_simulation(num_nodes: usize, config: RadioConfig) 
     use tokio::sync::Mutex;
     use std::collections::HashMap;
     use bunker_coin_radio::SimulatedRadioNetwork;
-    use alpenglow::network::NetworkMessage;
+    use bunkerglow::network::NetworkMessage;
 
     println!("\n>>> Multi-Node Radio Simulation <<<");
     println!("spinning up {} nodes with config: {:?}", num_nodes, config);
@@ -196,8 +196,8 @@ pub async fn multi_node_radio_simulation(num_nodes: usize, config: RadioConfig) 
 
 pub async fn multi_node_real_radio_simulation(num_nodes: usize) {
     use std::sync::Arc;
-    use alpenglow::network::simulated::SimulatedNetworkCore;
-    use alpenglow::network::{Network, NetworkMessage};
+    use bunkerglow::network::simulated::SimulatedNetworkCore;
+    use bunkerglow::network::{Network, NetworkMessage};
 
     println!("\n-- nodes on top of Alpenglow test (via simulated radio)");
     let core = Arc::new(SimulatedNetworkCore::new());
@@ -222,13 +222,13 @@ pub async fn multi_node_real_radio_simulation(num_nodes: usize) {
 
 pub async fn multi_node_consensus_simulation(num_nodes: usize) {
     use std::sync::Arc;
-    use alpenglow::all2all::TrivialAll2All;
-    use alpenglow::consensus::{Alpenglow, EpochInfo};
-    use alpenglow::crypto::{aggsig, signature::SecretKey};
-    use alpenglow::disseminator::{Rotor, rotor::StakeWeightedSampler};
-    use alpenglow::network::simulated::SimulatedNetworkCore;
-    use alpenglow::network::SimulatedNetwork;
-    use alpenglow::ValidatorInfo;
+    use bunkerglow::all2all::TrivialAll2All;
+    use bunkerglow::consensus::{Alpenglow, EpochInfo};
+    use bunkerglow::crypto::{aggsig, signature::SecretKey};
+    use bunkerglow::disseminator::{Rotor, rotor::StakeWeightedSampler};
+    use bunkerglow::network::simulated::SimulatedNetworkCore;
+    use bunkerglow::network::SimulatedNetwork;
+    use bunkerglow::ValidatorInfo;
     use tokio::time::Duration;
 
     println!("\n>> Multi-Node Alpenglow Consensus Simulation <<");
@@ -326,15 +326,15 @@ pub async fn multi_node_consensus_simulation_with_api(
     nodes: std::sync::Arc<tokio::sync::RwLock<Vec<rpc::NodeStatus>>>,
     radio_stats: std::sync::Arc<tokio::sync::RwLock<rpc::RadioStats>>,
     updates_tx: tokio::sync::broadcast::Sender<rpc::WebSocketUpdate>,
-    blockstore_ref: std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<tokio::sync::RwLock<alpenglow::consensus::Blockstore>>>>>
+    blockstore_ref: std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<tokio::sync::RwLock<bunkerglow::consensus::Blockstore>>>>>
 ) {
     use std::sync::Arc;
-    use alpenglow::all2all::TrivialAll2All;
-    use alpenglow::consensus::{Alpenglow, EpochInfo};
-    use alpenglow::crypto::{aggsig, signature::SecretKey};
-    use alpenglow::disseminator::Rotor;
+    use bunkerglow::all2all::TrivialAll2All;
+    use bunkerglow::consensus::{Alpenglow, EpochInfo};
+    use bunkerglow::crypto::{aggsig, signature::SecretKey};
+    use bunkerglow::disseminator::Rotor;
     use bunker_coin_radio::{RadioNetworkCore, RadioConfig};
-    use alpenglow::ValidatorInfo;
+    use bunkerglow::ValidatorInfo;
     use tokio::time::Duration;
     use hex;
 
@@ -434,7 +434,7 @@ pub async fn multi_node_consensus_simulation_with_api(
         let validators = validators.clone();
         
         tokio::spawn(async move {
-            let epoch_info = alpenglow::consensus::EpochInfo::new(0, validators.clone());
+            let epoch_info = bunkerglow::consensus::EpochInfo::new(0, validators.clone());
             let mut last_stats = (0u64, 0u64, 0u64, 0u64);
             
             loop {

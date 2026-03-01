@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use alpenglow::network::{Network, NetworkError, NetworkMessage};
+use bunkerglow::network::{Network, NetworkError, NetworkMessage};
 use rand::Rng;
 use log::{debug, trace};
 

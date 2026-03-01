@@ -5,8 +5,8 @@
 //!
 //!
 
-use alpenglow::ValidatorId;
-use alpenglow::disseminator::rotor::SamplingStrategy;
+use bunkerglow::ValidatorId;
+use bunkerglow::disseminator::rotor::SamplingStrategy;
 use log::info;
 use rand::prelude::*;
 use statrs::distribution::{Binomial, DiscreteCDF};

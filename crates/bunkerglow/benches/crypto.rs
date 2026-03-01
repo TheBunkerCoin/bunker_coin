@@ -1,9 +1,9 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use alpenglow::crypto::merkle::{SliceMerkleTree, SliceProof};
-use alpenglow::crypto::{IndividualSignature, Signature, aggsig, hash, signature};
-use alpenglow::shredder::{MAX_DATA_PER_SHRED, MAX_DATA_PER_SLICE};
+use bunkerglow::crypto::merkle::{SliceMerkleTree, SliceProof};
+use bunkerglow::crypto::{IndividualSignature, Signature, aggsig, hash, signature};
+use bunkerglow::shredder::{MAX_DATA_PER_SHRED, MAX_DATA_PER_SLICE};
 use divan::counter::{BytesCount, ItemsCount};
 use rand::RngCore;
 

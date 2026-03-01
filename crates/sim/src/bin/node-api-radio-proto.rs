@@ -40,6 +40,8 @@ async fn main() {
         radio_stats: radio_stats.clone(),
         updates: updates_tx.clone(),
         blockstore: None,
+        mempool: Arc::new(RwLock::new(Vec::new())),
+        tx_sender: None,
     };
     
     // api in dedicated task

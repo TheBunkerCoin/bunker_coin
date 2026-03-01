@@ -19,8 +19,8 @@
 //! # Examples
 //!
 //! ```rust
-//! use alpenglow::all2all::All2All;
-//! use alpenglow::consensus::ConsensusMessage;
+//! use bunkerglow::all2all::All2All;
+//! use bunkerglow::consensus::ConsensusMessage;
 //!
 //! async fn broadcast_all(msgs: &[ConsensusMessage], all2all: impl All2All) -> std::io::Result<()> {
 //!     for msg in msgs {

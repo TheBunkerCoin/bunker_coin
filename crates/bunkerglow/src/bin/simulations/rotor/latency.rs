@@ -7,9 +7,9 @@
 
 use std::marker::PhantomData;
 
-use alpenglow::ValidatorId;
-use alpenglow::disseminator::rotor::SamplingStrategy;
-use alpenglow::shredder::MAX_DATA_PER_SHRED;
+use bunkerglow::ValidatorId;
+use bunkerglow::disseminator::rotor::SamplingStrategy;
+use bunkerglow::shredder::MAX_DATA_PER_SHRED;
 
 use super::{RotorInstance, RotorInstanceBuilder, RotorParams};
 use crate::discrete_event_simulator::{

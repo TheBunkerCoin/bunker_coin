@@ -14,8 +14,8 @@
 
 use std::fs::File;
 
-use alpenglow::disseminator::rotor::StakeWeightedSampler;
-use alpenglow::network::simulated::stake_distribution::{
+use bunkerglow::disseminator::rotor::StakeWeightedSampler;
+use bunkerglow::network::simulated::stake_distribution::{
     VALIDATOR_DATA, validators_from_validator_data,
 };
 use color_eyre::Result;

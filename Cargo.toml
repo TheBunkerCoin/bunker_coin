@@ -22,7 +22,7 @@ license = "Apache-2.0"
 bunker_coin_core = { path = "crates/core" }
 bunker_coin_radio = { path = "crates/radio" }
 
-alpenglow = { path = "crates/bunkerglow" }
+bunkerglow = { path = "crates/bunkerglow" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

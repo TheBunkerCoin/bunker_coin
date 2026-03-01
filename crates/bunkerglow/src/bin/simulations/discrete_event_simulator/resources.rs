@@ -7,7 +7,7 @@
 
 // TODO: introduce notion of a shared resource?
 
-use alpenglow::ValidatorId;
+use bunkerglow::ValidatorId;
 
 use crate::discrete_event_simulator::SimTime;
 

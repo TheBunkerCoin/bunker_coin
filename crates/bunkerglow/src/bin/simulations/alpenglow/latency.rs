@@ -8,7 +8,7 @@
 use std::hash::Hash;
 use std::marker::PhantomData;
 
-use alpenglow::disseminator::rotor::{SamplingStrategy, StakeWeightedSampler};
+use bunkerglow::disseminator::rotor::{SamplingStrategy, StakeWeightedSampler};
 use rand::prelude::*;
 
 use crate::discrete_event_simulator::{

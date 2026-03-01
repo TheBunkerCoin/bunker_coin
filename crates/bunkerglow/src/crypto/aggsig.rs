@@ -9,7 +9,7 @@
 //! # Examples
 //!
 //! ```
-//! use alpenglow::crypto::aggsig::{AggregateSignature, SecretKey};
+//! use bunkerglow::crypto::aggsig::{AggregateSignature, SecretKey};
 //!
 //! let msg = b"hello world";
 //!

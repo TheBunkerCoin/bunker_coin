@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use alpenglow::logging;
+use bunkerglow::logging;
 use clap::Parser;
 use color_eyre::Result;
 use log::{debug, info};

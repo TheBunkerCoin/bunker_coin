@@ -8,3 +8,4 @@ description = "Core algorithms and data types for BunkerCoin"
 light-poseidon = "0.3"
 ark-bn254 = "0.5"
 serde = { workspace = true }
+sha2 = "0.10"

@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 bunker_coin_core = { workspace = true }
-alpenglow = { workspace = true }
+bunkerglow = { workspace = true }
 
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -18,9 +18,9 @@
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 
-use alpenglow::disseminator::rotor::SamplingStrategy;
-use alpenglow::shredder::MAX_DATA_PER_SHRED;
-use alpenglow::{ValidatorId, ValidatorInfo};
+use bunkerglow::disseminator::rotor::SamplingStrategy;
+use bunkerglow::shredder::MAX_DATA_PER_SHRED;
+use bunkerglow::{ValidatorId, ValidatorInfo};
 use rand::prelude::*;
 
 /// Instance of a bandwidth requirements test.

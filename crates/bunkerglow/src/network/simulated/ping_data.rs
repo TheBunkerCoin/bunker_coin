@@ -15,7 +15,7 @@
 //! # Examples
 //!
 //! ```
-//! use alpenglow::network::simulated::ping_data::{find_closest_ping_server, get_ping};
+//! use bunkerglow::network::simulated::ping_data::{find_closest_ping_server, get_ping};
 //!
 //! let berlin = find_closest_ping_server(52.516, 13.378);
 //! let zurich = find_closest_ping_server(47.376, 8.547);

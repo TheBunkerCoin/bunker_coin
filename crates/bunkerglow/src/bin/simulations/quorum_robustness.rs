@@ -16,8 +16,8 @@ use std::cmp::Reverse;
 use std::fs::File;
 use std::sync::RwLock;
 
-use alpenglow::disseminator::rotor::{FaitAccompli1Sampler, SamplingStrategy};
-use alpenglow::{Stake, ValidatorInfo};
+use bunkerglow::disseminator::rotor::{FaitAccompli1Sampler, SamplingStrategy};
+use bunkerglow::{Stake, ValidatorInfo};
 use color_eyre::Result;
 use log::debug;
 use rand::prelude::*;

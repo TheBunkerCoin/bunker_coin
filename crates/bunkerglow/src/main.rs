@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use alpenglow::{create_test_nodes, logging};
+use bunkerglow::{create_test_nodes, logging};
 use color_eyre::Result;
 use fastrace::collector::Config;
 use fastrace::prelude::*;

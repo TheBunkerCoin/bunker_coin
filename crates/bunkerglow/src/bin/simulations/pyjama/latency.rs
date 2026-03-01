@@ -7,9 +7,9 @@
 
 use std::marker::PhantomData;
 
-use alpenglow::ValidatorId;
-use alpenglow::disseminator::rotor::{SamplingStrategy, StakeWeightedSampler};
-use alpenglow::shredder::{DATA_SHREDS, MAX_DATA_PER_SHRED, TOTAL_SHREDS};
+use bunkerglow::ValidatorId;
+use bunkerglow::disseminator::rotor::{SamplingStrategy, StakeWeightedSampler};
+use bunkerglow::shredder::{DATA_SHREDS, MAX_DATA_PER_SHRED, TOTAL_SHREDS};
 
 use super::{PyjamaInstance, PyjamaInstanceBuilder, PyjamaParams};
 use crate::alpenglow::AlpenglowLatencySimulation;

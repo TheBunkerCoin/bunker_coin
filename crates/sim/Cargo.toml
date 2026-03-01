@@ -12,7 +12,7 @@ path = "src/bin/radio_sim.rs"
 [dependencies]
 bunker_coin_core = { workspace = true }
 bunker_coin_radio = { workspace = true }
-alpenglow = { workspace = true }
+bunkerglow = { workspace = true }
 
 tokio = { workspace = true }
 serde = { workspace = true }

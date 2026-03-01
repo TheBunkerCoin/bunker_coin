@@ -14,8 +14,8 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{RwLock, RwLockReadGuard};
 
-use alpenglow::network::simulated::ping_data::{PingServer, get_ping};
-use alpenglow::{Stake, ValidatorId, ValidatorInfo};
+use bunkerglow::network::simulated::ping_data::{PingServer, get_ping};
+use bunkerglow::{Stake, ValidatorId, ValidatorInfo};
 use rand::prelude::*;
 use rayon::prelude::*;
 
@@ -449,7 +449,7 @@ pub fn broadcast(
 
 #[cfg(test)]
 mod tests {
-    use alpenglow::network::simulated::stake_distribution::{
+    use bunkerglow::network::simulated::stake_distribution::{
         VALIDATOR_DATA, validators_from_validator_data,
     };
 
