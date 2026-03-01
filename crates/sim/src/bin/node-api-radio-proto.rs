@@ -2,6 +2,7 @@
 
 use bunker_coin_sim::scenarios;
 use bunker_coin_radio::RadioConfig;
+use bunker_coin_core::execution::State as ExecutionState;
 use rpc::{run_api, Block, NodeStatus, RadioStats, SharedState, WebSocketUpdate};
 use std::sync::Arc;
 use tokio::task;
@@ -33,7 +34,8 @@ async fn main() {
     
     let blockstore_ref = Arc::new(RwLock::new(None));
     let blockstore_for_api = blockstore_ref.clone();
-    
+    let execution_state = Arc::new(RwLock::new(ExecutionState::new()));
+
     let state = SharedState {
         blocks: blocks.clone(),
         nodes: nodes.clone(),
@@ -42,6 +44,7 @@ async fn main() {
         blockstore: None,
         mempool: Arc::new(RwLock::new(Vec::new())),
         tx_sender: None,
+        execution_state: execution_state.clone(),
     };
     
     // api in dedicated task
@@ -55,7 +58,7 @@ async fn main() {
         run_api(state).await;
     });
     
-    scenarios::multi_node_consensus_simulation_with_api(num_nodes, blocks, nodes, radio_stats, updates_tx, blockstore_ref).await;
+    scenarios::multi_node_consensus_simulation_with_api(num_nodes, blocks, nodes, radio_stats, updates_tx, blockstore_ref, execution_state).await;
     
     log::info!("Simulation completed, shutting down API server");
     api_handle.await.unwrap();

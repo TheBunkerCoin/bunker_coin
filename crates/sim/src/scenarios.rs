@@ -321,12 +321,13 @@ pub async fn multi_node_consensus_simulation(num_nodes: usize) {
 }
 
 pub async fn multi_node_consensus_simulation_with_api(
-    num_nodes: usize, 
-    blocks: std::sync::Arc<tokio::sync::RwLock<Vec<rpc::Block>>>, 
+    num_nodes: usize,
+    blocks: std::sync::Arc<tokio::sync::RwLock<Vec<rpc::Block>>>,
     nodes: std::sync::Arc<tokio::sync::RwLock<Vec<rpc::NodeStatus>>>,
     radio_stats: std::sync::Arc<tokio::sync::RwLock<rpc::RadioStats>>,
     updates_tx: tokio::sync::broadcast::Sender<rpc::WebSocketUpdate>,
-    blockstore_ref: std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<tokio::sync::RwLock<bunkerglow::consensus::Blockstore>>>>>
+    blockstore_ref: std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<tokio::sync::RwLock<bunkerglow::consensus::Blockstore>>>>>,
+    execution_state: std::sync::Arc<tokio::sync::RwLock<bunker_coin_core::execution::State>>,
 ) {
     use std::sync::Arc;
     use bunkerglow::all2all::TrivialAll2All;
@@ -432,10 +433,12 @@ pub async fn multi_node_consensus_simulation_with_api(
         let radio_core = radio_core.clone();
         let pools_and_blockstores = pools_and_blockstores.clone();
         let validators = validators.clone();
-        
+        let execution_state = execution_state.clone();
+
         tokio::spawn(async move {
             let epoch_info = bunkerglow::consensus::EpochInfo::new(0, validators.clone());
             let mut last_stats = (0u64, 0u64, 0u64, 0u64);
+            let mut last_executed_slot: u64 = 0;
             
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -704,14 +707,40 @@ pub async fn multi_node_consensus_simulation_with_api(
                 println!("Block status summary: {} finalized, {} notarized, {} proposed (total: {})",
                     finalized_count, notarized_count, proposed_count, total_count);
                 
-                // Print node finalized slots summary
-                println!("Node finalized slots: {:?}", 
+                println!("Node finalized slots: {:?}",
                     nodes_guard.iter()
                         .map(|n| format!("Node {}: slot {}", n.node_id, n.finalized_slot))
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
-                
+
+                // execute transactions from newly finalized blocks
+                if consensus_finalized_slot > last_executed_slot {
+                    let (_i, _pool, blockstore) = &pools_and_blockstores[0];
+                    if let Ok(bs) = blockstore.try_read() {
+                        for slot in (last_executed_slot + 1)..=consensus_finalized_slot {
+                            if let Some(hash) = bs.canonical_block_hash(slot) {
+                                if let Some(block) = bs.get_block(slot, hash) {
+                                    let raw_txs = block.transactions();
+                                    let core_txs: Vec<bunker_coin_core::transaction::Transaction> = raw_txs
+                                        .iter()
+                                        .filter_map(|raw| bincode::serde::decode_from_slice(&raw.0, bincode::config::standard()).ok())
+                                        .map(|(tx, _)| tx)
+                                        .collect();
+
+                                    if !core_txs.is_empty() {
+                                        let results = execution_state.write().await.execute_block(&core_txs);
+                                        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+                                        let err_count = results.len() - ok_count;
+                                        println!("Executed slot {}: {} ok, {} failed ({} total txs)", slot, ok_count, err_count, core_txs.len());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    last_executed_slot = consensus_finalized_slot;
+                }
+
                 for (_i, pool, blockstore) in &pools_and_blockstores {
                     let finalized = pool.read().await.finalized_slot();
                     let prune_slot = finalized.saturating_sub(200);

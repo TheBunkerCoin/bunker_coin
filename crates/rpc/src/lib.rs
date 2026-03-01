@@ -8,6 +8,7 @@ use axum::http::{Method, HeaderValue};
 use futures::{sink::SinkExt, stream::StreamExt};
 use bunkerglow::consensus::Blockstore;
 use bunkerglow::crypto::Hash;
+use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::{Transaction as CoreTransaction, TransactionBody};
 use bunker_coin_core::types::MAX_TICKER_LEN;
 use hex;
@@ -203,6 +204,7 @@ pub struct SharedState {
     pub blockstore: Option<Arc<RwLock<Blockstore>>>,
     pub mempool: Arc<RwLock<Vec<MempoolEntry>>>,
     pub tx_sender: Option<mpsc::UnboundedSender<CoreTransaction>>,
+    pub execution_state: Arc<RwLock<ExecutionState>>,
 }
 
 // -- hex decode helpers --
@@ -573,6 +575,61 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
     }
 }
 
+// -- account / token handlers --
+
+async fn get_account(
+    Path(pubkey_hex): Path<String>,
+    state: axum::extract::State<SharedState>,
+) -> impl IntoResponse {
+    let pubkey = match decode_pubkey(&pubkey_hex) {
+        Ok(pk) => pk,
+        Err(e) => return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid pubkey: {e}") })),
+        ).into_response(),
+    };
+
+    let exec = state.execution_state.read().await;
+    if let Some(account) = exec.get_account(&pubkey) {
+        let token_balances: serde_json::Map<String, serde_json::Value> = account
+            .token_balances
+            .iter()
+            .map(|(id, bal)| (hex::encode(id), serde_json::json!(*bal)))
+            .collect();
+
+        Json(serde_json::json!({
+            "pubkey": pubkey_hex,
+            "native_balance": account.native_balance,
+            "token_balances": token_balances,
+            "nonce": account.nonce,
+        })).into_response()
+    } else {
+        Json(serde_json::json!({
+            "pubkey": pubkey_hex,
+            "native_balance": 0,
+            "token_balances": {},
+            "nonce": 0,
+        })).into_response()
+    }
+}
+
+async fn get_tokens(
+    state: axum::extract::State<SharedState>,
+) -> Json<serde_json::Value> {
+    let exec = state.execution_state.read().await;
+    let tokens: Vec<serde_json::Value> = exec.tokens.values().map(|t| {
+        serde_json::json!({
+            "id": hex::encode(t.id),
+            "ticker": t.ticker,
+            "current_supply": t.current_supply,
+            "max_supply": t.max_supply,
+            "metadata_hash": hex::encode(t.metadata_hash),
+            "creator": hex::encode(t.creator),
+        })
+    }).collect();
+    Json(serde_json::json!({ "tokens": tokens }))
+}
+
 // -- server --
 
 pub async fn run_api(state: SharedState) {
@@ -594,6 +651,8 @@ pub async fn run_api(state: SharedState) {
         .route("/transactions", post(submit_transaction))
         .route("/mempool", get(mempool))
         .route("/mempool/{hash}", get(mempool_transaction))
+        .route("/accounts/{pubkey}", get(get_account))
+        .route("/tokens", get(get_tokens))
         .route("/ws", get(websocket_handler))
         .layer(cors)
         .with_state(state);

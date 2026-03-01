@@ -364,7 +364,7 @@ impl Blockstore for BlockstoreImpl {
         // TODO: reconstruct actual block content
         let block = Block {
             slot,
-            block_hash,
+            hash: block_hash,
             parent: parent_slot,
             parent_hash,
             transactions: vec![],

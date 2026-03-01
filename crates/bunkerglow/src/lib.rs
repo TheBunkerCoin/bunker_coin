@@ -61,13 +61,11 @@ const MAX_TRANSACTION_SIZE: usize = 512;
 /// Parsed block with information about parent and transactions as payload.
 #[derive(Clone, Debug)]
 pub struct Block {
-    // TODO: unused
-    _slot: Slot,
+    slot: Slot,
     hash: BlockHash,
     parent: Slot,
     parent_hash: BlockHash,
-    // TODO: unused
-    _transactions: Vec<Transaction>,
+    transactions: Vec<Transaction>,
 }
 
 impl Block {
@@ -75,7 +73,7 @@ impl Block {
         self.parent
     }
 
-    pub fn parent_hash(&self) -> Hash {
+    pub fn parent_hash(&self) -> BlockHash {
         self.parent_hash
     }
 
@@ -83,8 +81,12 @@ impl Block {
         self.slot
     }
 
-    pub fn block_hash(&self) -> Hash {
-        self.block_hash
+    pub fn block_hash(&self) -> BlockHash {
+        self.hash
+    }
+
+    pub fn transactions(&self) -> &[Transaction] {
+        &self.transactions
     }
 }
 

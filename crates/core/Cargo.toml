@@ -9,3 +9,7 @@ light-poseidon = "0.3"
 ark-bn254 = "0.5"
 serde = { workspace = true }
 sha2 = "0.10"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+
+[dev-dependencies]
+rand = "0.8"
