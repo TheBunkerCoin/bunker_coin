@@ -20,9 +20,6 @@ use crate::network::{Network, ShredNetwork};
 use crate::shredder::Shred;
 use crate::{Slot, ValidatorId, ValidatorInfo};
 
-use super::Disseminator;
-
-pub(crate) use weighted_shuffle::WeightedShuffle;
 /// 2 for bandwidth-constrained HF radio.
 pub const DEFAULT_FANOUT: usize = 2;
 

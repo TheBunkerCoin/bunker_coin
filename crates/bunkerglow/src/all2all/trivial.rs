@@ -33,11 +33,14 @@ impl<N: Network> TrivialAll2All<N> {
     }
 }
 
-impl<N: Network> All2All for TrivialAll2All<N> {
-    async fn broadcast(&self, msg: &NetworkMessage) -> Result<(), NetworkError> {
-        log::info!("trivialAll2All broadcasting message type {:?} via BROADCAST", 
-                   std::mem::discriminant(msg));
-        self.network.send(msg, "BROADCAST").await
+#[async_trait]
+impl<N: Network> All2All for TrivialAll2All<N>
+where
+    N: ConsensusNetwork,
+{
+    async fn broadcast(&self, msg: &ConsensusMessage) -> std::io::Result<()> {
+        let addrs = self.validators.iter().map(|v| v.all2all_address);
+        self.network.send_to_many(msg, addrs).await
     }
 
     async fn receive(&self) -> std::io::Result<ConsensusMessage> {

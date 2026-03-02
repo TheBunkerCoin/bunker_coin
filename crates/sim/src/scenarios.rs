@@ -1,8 +1,7 @@
 //! Simulation scenarios for testing BunkerCoin over radio
 
-use bunker_coin_radio::{SimulatedRadioNetwork, RadioConfig, RadioNetworkCore};
+use bunker_coin_radio::{SimulatedRadioNetwork, RadioConfig, RadioNetworkCore, Network as RadioNetwork, NetworkMessage};
 use bunkerglow::shredder::{Slice, RegularShredder, Shredder, MAX_DATA_PER_SLICE};
-use bunkerglow::network::{Network, NetworkMessage};
 use bunkerglow::crypto::signature::SecretKey;
 use hex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -161,7 +160,7 @@ pub async fn multi_node_radio_simulation(num_nodes: usize, config: RadioConfig) 
     use tokio::sync::Mutex;
     use std::collections::HashMap;
     use bunker_coin_radio::SimulatedRadioNetwork;
-    use bunkerglow::network::NetworkMessage;
+    use bunker_coin_radio::NetworkMessage;
 
     println!("\n>>> Multi-Node Radio Simulation <<<");
     println!("spinning up {} nodes with config: {:?}", num_nodes, config);
@@ -195,21 +194,20 @@ pub async fn multi_node_radio_simulation(num_nodes: usize, config: RadioConfig) 
 }
 
 pub async fn multi_node_real_radio_simulation(num_nodes: usize) {
-    use std::sync::Arc;
-    use bunkerglow::network::simulated::SimulatedNetworkCore;
-    use bunkerglow::network::{Network, NetworkMessage};
+    use bunker_coin_radio::{RadioNetworkCore, RadioConfig, NetworkMessage};
+    use bunker_coin_radio::Network as RadioNet;
 
-    println!("\n-- nodes on top of Alpenglow test (via simulated radio)");
-    let core = Arc::new(SimulatedNetworkCore::new());
+    println!("\n-- nodes on top of radio network test");
+    let config = RadioConfig::default();
+    let core = RadioNetworkCore::new(config);
     let mut nets = Vec::new();
     for node_id in 0..num_nodes {
-        let net = core.join_unlimited(node_id as u64).await;
-        nets.push(net);
+        nets.push(core.join(node_id as u64).await);
     }
 
     let msg = NetworkMessage::Ping;
     for i in 1..num_nodes {
-        nets[0].send(&msg, &(i as u64).to_string()).await.unwrap();
+        nets[0].send(&msg, &i.to_string()).await.unwrap();
         println!("node 0 sent ping to node {}", i);
     }
 
@@ -223,20 +221,23 @@ pub async fn multi_node_real_radio_simulation(num_nodes: usize) {
 pub async fn multi_node_consensus_simulation(num_nodes: usize) {
     use std::sync::Arc;
     use bunkerglow::all2all::TrivialAll2All;
-    use bunkerglow::consensus::{Alpenglow, EpochInfo};
+    use bunkerglow::consensus::{Alpenglow, EpochInfo, ConsensusMessage};
     use bunkerglow::crypto::{aggsig, signature::SecretKey};
-    use bunkerglow::disseminator::{Rotor, rotor::StakeWeightedSampler};
+    use bunkerglow::disseminator::Rotor;
     use bunkerglow::network::simulated::SimulatedNetworkCore;
-    use bunkerglow::network::SimulatedNetwork;
+    use bunkerglow::network::{SimulatedNetwork, localhost_ip_sockaddr};
+    use bunkerglow::shredder::Shred;
+    use bunkerglow::repair::{RepairRequest, RepairResponse};
+    use bunkerglow::Transaction;
     use bunkerglow::ValidatorInfo;
     use tokio::time::Duration;
 
     println!("\n>> Multi-Node Alpenglow Consensus Simulation <<");
-    let core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
-    let mut networks = Vec::new();
-    for i in 0..3 * num_nodes {
-        networks.push(core.join_unlimited(i as u64).await);
-    }
+    let a2a_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
+    let dis_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
+    let rep_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
+    let rep_req_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
+    let txs_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
 
     let mut rng = rand::rng();
     let mut sks = Vec::new();
@@ -245,33 +246,46 @@ pub async fn multi_node_consensus_simulation(num_nodes: usize) {
     for id in 0..num_nodes {
         sks.push(SecretKey::new(&mut rng));
         voting_sks.push(aggsig::SecretKey::new(&mut rng));
-        let a2a_port = 3 * id;
-        let dis_port = 3 * id + 1;
-        let rep_port = 3 * id + 2;
+        let a2a_port = (5 * id) as u16;
+        let dis_port = (5 * id + 1) as u16;
+        let rep_port = (5 * id + 2) as u16;
+        let rep_req_port = (5 * id + 3) as u16;
         validators.push(ValidatorInfo {
             id: id as u64,
             stake: 1,
             pubkey: sks[id].to_pk(),
             voting_pubkey: voting_sks[id].to_pk(),
-            all2all_address: format!("{a2a_port}"),
-            disseminator_address: format!("{dis_port}"),
-            repair_address: format!("{rep_port}"),
+            all2all_address: localhost_ip_sockaddr(a2a_port),
+            disseminator_address: localhost_ip_sockaddr(dis_port),
+            repair_request_address: localhost_ip_sockaddr(rep_req_port),
+            repair_response_address: localhost_ip_sockaddr(rep_port),
         });
     }
 
     let mut nodes_with_id = Vec::new();
     for (i, v) in validators.iter().enumerate() {
         let epoch_info = Arc::new(EpochInfo::new(v.id, validators.clone()));
-        let all2all = TrivialAll2All::new(validators.clone(), networks.remove(0));
-        let disseminator = Rotor::new(networks.remove(0), epoch_info.clone());
-        let repair_network = networks.remove(0);
+        let a2a_net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
+            a2a_core.join_unlimited(i as u64).await;
+        let dis_net: SimulatedNetwork<Shred, Shred> =
+            dis_core.join_unlimited(i as u64).await;
+        let rep_net: SimulatedNetwork<RepairRequest, RepairResponse> =
+            rep_core.join_unlimited(i as u64).await;
+        let rep_req_net: SimulatedNetwork<RepairResponse, RepairRequest> =
+            rep_req_core.join_unlimited(i as u64).await;
+        let txs_net: SimulatedNetwork<Transaction, Transaction> =
+            txs_core.join_unlimited(i as u64).await;
+        let all2all = TrivialAll2All::new(validators.clone(), a2a_net);
+        let disseminator = Rotor::new(dis_net, epoch_info.clone());
         let node = Alpenglow::new(
             sks[i].clone(),
             voting_sks[i].clone(),
             all2all,
             disseminator,
-            repair_network,
+            rep_net,
+            rep_req_net,
             epoch_info,
+            txs_net,
         );
         nodes_with_id.push((i, node));
     }
@@ -331,35 +345,26 @@ pub async fn multi_node_consensus_simulation_with_api(
 ) {
     use std::sync::Arc;
     use bunkerglow::all2all::TrivialAll2All;
-    use bunkerglow::consensus::{Alpenglow, EpochInfo};
+    use bunkerglow::consensus::{Alpenglow, EpochInfo, ConsensusMessage};
     use bunkerglow::crypto::{aggsig, signature::SecretKey};
     use bunkerglow::disseminator::Rotor;
-    use bunker_coin_radio::{RadioNetworkCore, RadioConfig};
+    use bunkerglow::network::simulated::SimulatedNetworkCore;
+    use bunkerglow::network::{SimulatedNetwork, localhost_ip_sockaddr};
+    use bunkerglow::shredder::Shred;
+    use bunkerglow::repair::{RepairRequest, RepairResponse};
+    use bunkerglow::Transaction;
     use bunkerglow::ValidatorInfo;
     use tokio::time::Duration;
     use hex;
 
-    log::info!(">> Multi-Node Alpenglow Consensus Simulation (Radio Network) <<");
-    println!("\n>> Multi-Node Alpenglow Consensus Simulation (Radio Network) <<");
-    
-    let radio_config = RadioConfig {
-        mtu: 300,                              
-        bandwidth_bps: 4800,                   
-        packet_loss: 0.15,                     
-        latency: Duration::from_millis(250),   
-        latency_jitter: Duration::from_millis(50), 
-        transmission_window: Duration::from_secs(300),
-    };
-    
-    
-    println!("Radio config: {:?}", radio_config);
-    
-    let radio_core = RadioNetworkCore::new(radio_config);
-    let mut networks = Vec::new();
-    
-    for i in 0..(3 * num_nodes) {
-        networks.push(radio_core.join(i as u64).await);
-    }
+    log::info!(">> Multi-Node Alpenglow Consensus Simulation <<");
+    println!("\n>> Multi-Node Alpenglow Consensus Simulation <<");
+
+    let a2a_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
+    let dis_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
+    let rep_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
+    let rep_req_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
+    let txs_core = Arc::new(SimulatedNetworkCore::new().with_packet_loss(0.05));
 
     let mut rng = rand::rng();
     let mut sks = Vec::new();
@@ -368,33 +373,46 @@ pub async fn multi_node_consensus_simulation_with_api(
     for id in 0..num_nodes {
         sks.push(SecretKey::new(&mut rng));
         voting_sks.push(aggsig::SecretKey::new(&mut rng));
-        let a2a_port = 3 * id;
-        let dis_port = 3 * id + 1;
-        let rep_port = 3 * id + 2;
+        let a2a_port = (5 * id) as u16;
+        let dis_port = (5 * id + 1) as u16;
+        let rep_port = (5 * id + 2) as u16;
+        let rep_req_port = (5 * id + 3) as u16;
         validators.push(ValidatorInfo {
             id: id as u64,
             stake: 1,
             pubkey: sks[id].to_pk(),
             voting_pubkey: voting_sks[id].to_pk(),
-            all2all_address: format!("{a2a_port}"),
-            disseminator_address: format!("{dis_port}"),
-            repair_address: format!("{rep_port}"),
+            all2all_address: localhost_ip_sockaddr(a2a_port),
+            disseminator_address: localhost_ip_sockaddr(dis_port),
+            repair_request_address: localhost_ip_sockaddr(rep_req_port),
+            repair_response_address: localhost_ip_sockaddr(rep_port),
         });
     }
 
     let mut nodes_with_id = Vec::new();
     for (i, v) in validators.iter().enumerate() {
         let epoch_info = Arc::new(EpochInfo::new(v.id, validators.clone()));
-        let all2all = TrivialAll2All::new(validators.clone(), networks.remove(0));
-        let disseminator = Rotor::new(networks.remove(0), epoch_info.clone());
-        let repair_network = networks.remove(0);
+        let a2a_net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
+            a2a_core.join_unlimited(i as u64).await;
+        let dis_net: SimulatedNetwork<Shred, Shred> =
+            dis_core.join_unlimited(i as u64).await;
+        let rep_net: SimulatedNetwork<RepairRequest, RepairResponse> =
+            rep_core.join_unlimited(i as u64).await;
+        let rep_req_net: SimulatedNetwork<RepairResponse, RepairRequest> =
+            rep_req_core.join_unlimited(i as u64).await;
+        let txs_net: SimulatedNetwork<Transaction, Transaction> =
+            txs_core.join_unlimited(i as u64).await;
+        let all2all = TrivialAll2All::new(validators.clone(), a2a_net);
+        let disseminator = Rotor::new(dis_net, epoch_info.clone());
         let node = Alpenglow::new(
             sks[i].clone(),
             voting_sks[i].clone(),
             all2all,
             disseminator,
-            repair_network,
+            rep_net,
+            rep_req_net,
             epoch_info,
+            txs_net,
         );
         nodes_with_id.push((i, node));
     }
@@ -428,56 +446,27 @@ pub async fn multi_node_consensus_simulation_with_api(
     let monitoring_task = {
         let blocks = blocks.clone();
         let nodes = nodes.clone();
-        let radio_stats = radio_stats.clone();
+        let _radio_stats = radio_stats.clone();
         let updates_tx = updates_tx.clone();
-        let radio_core = radio_core.clone();
         let pools_and_blockstores = pools_and_blockstores.clone();
         let validators = validators.clone();
         let execution_state = execution_state.clone();
 
         tokio::spawn(async move {
             let epoch_info = bunkerglow::consensus::EpochInfo::new(0, validators.clone());
-            let mut last_stats = (0u64, 0u64, 0u64, 0u64);
             let mut last_executed_slot: u64 = 0;
-            
+
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                
-                let (sent, dropped, transmitted, bytes, queued) = radio_core.get_stats().await;
-                let (delta_sent, delta_dropped, delta_transmitted, delta_bytes) = (
-                    sent - last_stats.0,
-                    dropped - last_stats.1,
-                    transmitted - last_stats.2,
-                    bytes - last_stats.3,
-                );
-                last_stats = (sent, dropped, transmitted, bytes);
 
-                if delta_sent > 0 || delta_dropped > 0 || delta_transmitted > 0 || queued > 0 {
-                    println!("\n📡 Radio Network Stats (last 2s):");
-                    println!("  Packets sent: {} (total: {})", delta_sent, sent);
-                    println!("  Packets dropped: {} (total: {})", delta_dropped, dropped);
-                    println!("  Packets transmitted: {} (total: {})", delta_transmitted, transmitted);
-                    println!("  Packets queued: {} (current queue depth)", queued);
-                    println!("  Bytes transmitted: {} (total: {})", delta_bytes, bytes);
-                    println!("  Effective throughput: {:.2} bps", (delta_bytes * 8) as f64 / 2.0);
-                    println!("  Packet loss rate: {:.1}%", 
-                        if delta_dropped + delta_transmitted > 0 {
-                            (delta_dropped as f64 / (delta_dropped + delta_transmitted) as f64) * 100.0
-                        } else { 0.0 }
-                    );
-                }
                 let _ = updates_tx.send(rpc::WebSocketUpdate::RadioStats {
-                    packets_sent_2s: delta_sent,
-                    packets_dropped_2s: delta_dropped,
-                    packets_transmitted_2s: delta_transmitted,
-                    bytes_transmitted_2s: delta_bytes,
-                    effective_throughput_bps_2s: (delta_bytes * 8) as f64 / 2.0,
-                    packet_loss_rate_2s: if delta_dropped + delta_transmitted > 0 {
-                        (delta_dropped as f64 / (delta_dropped + delta_transmitted) as f64) * 100.0
-                    } else { 
-                        0.0 
-                    },
-                    packets_queued: queued,
+                    packets_sent_2s: 0,
+                    packets_dropped_2s: 0,
+                    packets_transmitted_2s: 0,
+                    bytes_transmitted_2s: 0,
+                    effective_throughput_bps_2s: 0.0,
+                    packet_loss_rate_2s: 0.0,
+                    packets_queued: 0,
                 });
 
                 let blocks_result = blocks.try_write();

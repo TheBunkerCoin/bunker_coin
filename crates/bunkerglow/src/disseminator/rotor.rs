@@ -77,30 +77,11 @@ where
         Self { sampler, ..self }
     }
 
-    /// Sends the shred to the correct relay or broadcasts if on radio.
-    async fn send_as_leader(&self, shred: &Shred) -> Result<(), NetworkError> {
-        #[cfg(feature = "radio_broadcast")]
-        {
-            let msg = NetworkMessage::Shred(shred.clone());
-            println!("rotor leader broadcasting shred slot={} index={} via BROADCAST (radio mode)", shred.payload().slot, shred.payload().index_in_slot());
-            return self.network.send(&msg, "BROADCAST").await;
-        }
-        #[cfg(not(feature = "radio_broadcast"))]
-        {
-            let type_name = std::any::type_name::<N>();
-            if type_name.contains("Radio") {
-                let msg = NetworkMessage::Shred(shred.clone());
-                println!("rotor leader broadcasting shred slot={} index={} via BROADCAST (radio detected)", shred.payload().slot, shred.payload().index_in_slot());
-                return self.network.send(&msg, "BROADCAST").await;
-            }
-            // fallback to relay if !radio
+    /// Sends the shred to the correct relay validator.
+    async fn send_as_leader(&self, shred: &Shred) -> std::io::Result<()> {
         let relay = self.sample_relay(shred.payload().slot, shred.payload().index_in_slot());
-        let msg = NetworkMessage::Shred(shred.clone());
-        let v = &self.epoch_info.validator(relay);
-            println!("rotor leader sending shred slot={} index={} to relay {} at address '{}'", 
-                   shred.payload().slot, shred.payload().index_in_slot(), relay, v.disseminator_address);
-        self.network.send(&msg, &v.disseminator_address).await
-        }
+        let addr = self.epoch_info.validator(relay).disseminator_address;
+        self.network.send(shred, addr).await
     }
 
     /// Broadcasts a shred to all validators except for the leader and itself.
@@ -108,20 +89,18 @@ where
     async fn broadcast_if_relay(&self, shred: &Shred) -> std::io::Result<()> {
         let leader = self.epoch_info.leader(shred.payload().header.slot).id;
 
-        // do nothing if we are not the relay
         let relay = self.sample_relay(shred.payload().header.slot, shred.payload().index_in_slot());
         if self.epoch_info.own_id != relay {
             return Ok(());
         }
 
-        log::info!("rotor relay {} broadcasting shred slot={} index={} to BROADCAST", 
-                   self.epoch_info.own_id, shred.payload().slot, shred.payload().index_in_slot());
-
-        let msg = NetworkMessage::Shred(shred.clone());
-        
-        self.network.send(&msg, "BROADCAST").await?;
-        
-        
+        let addrs = self
+            .epoch_info
+            .validators
+            .iter()
+            .filter(|v| v.id != leader && v.id != self.epoch_info.own_id)
+            .map(|v| v.disseminator_address);
+        self.network.send_to_many(shred, addrs).await?;
         Ok(())
     }
 

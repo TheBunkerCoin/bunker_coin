@@ -22,7 +22,6 @@ use thiserror::Error;
 use tokio::sync::{mpsc::Sender, RwLock};
 
 use crate::crypto::Hash;
-use crate::{Slot, ValidatorId};
 
 use super::blockstore::BlockInfo;
 use super::blockstore::Blockstore;

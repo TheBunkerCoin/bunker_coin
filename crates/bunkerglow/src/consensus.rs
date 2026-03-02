@@ -39,8 +39,8 @@ use tokio_util::sync::CancellationToken;
 use wincode::{SchemaRead, SchemaWrite};
 
 use crate::crypto::{Hash, aggsig, signature};
-use crate::network::{Network, NetworkError, NetworkMessage};
-use crate::repair::{Repair, RepairMessage};
+use crate::network::{Network, RepairNetwork, RepairRequestNetwork, TransactionNetwork};
+use crate::repair::{Repair, RepairRequestHandler};
 use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shred, Shredder, Slice};
 use crate::shredder;
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
