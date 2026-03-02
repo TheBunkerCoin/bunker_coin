@@ -19,7 +19,7 @@ use either::Either;
 use log::{debug, info, trace, warn};
 use mockall::automock;
 use thiserror::Error;
-use tokio::sync::{mpsc::Sender, RwLock};
+use tokio::sync::{mpsc::Sender, oneshot, RwLock};
 
 use crate::crypto::Hash;
 
@@ -33,6 +33,7 @@ use crate::crypto::merkle::{BlockHash, MerkleRoot};
 use crate::types::{SLOTS_PER_EPOCH, SLOTS_PER_WINDOW};
 use crate::{BlockId, Slot, ValidatorId};
 
+use self::finality_tracker::FinalityTracker;
 use parent_ready_tracker::ParentReadyTracker;
 use slot_state::SlotState;
 
@@ -133,7 +134,7 @@ pub struct PoolImpl {
     /// RocksDB handle for persisting certificates & metadata.
     db: DB,
     /// Reference to blockstore for updating finalized timestamps.
-    blockstore: Option<Arc<RwLock<Blockstore>>>,
+    blockstore: Option<Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>>,
     /// Channel for signaling epoch boundary crossings.
     epoch_boundary_channel: Option<Sender<EpochBoundaryEvent>>,
     /// Channel for reporting slashable offences to execution layer.
@@ -200,7 +201,7 @@ impl PoolImpl {
     }
 
     /// Sets the blockstore reference for updating finalized timestamps.
-    pub fn set_blockstore(&mut self, blockstore: Arc<RwLock<Blockstore>>) {
+    pub fn set_blockstore(&mut self, blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>) {
         self.blockstore = Some(blockstore);
     }
 
@@ -649,7 +650,9 @@ impl Pool for PoolImpl {
     fn wait_for_parent_ready(&mut self, slot: Slot) -> Either<BlockId, oneshot::Receiver<BlockId>> {
         self.parent_ready_tracker.wait_for_parent_ready(slot)
     }
+}
 
+impl PoolImpl {
     pub fn slot_states_len(&self) -> usize {
         self.slot_states.len()
     }

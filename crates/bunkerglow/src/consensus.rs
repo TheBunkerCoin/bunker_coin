@@ -45,16 +45,16 @@ use crate::shredder::Shred;
 use crate::snapshot::SnapshotStore;
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
 
-pub use blockstore::{BlockInfo, Blockstore};
-pub use blockstore::BlockMetadata;
+pub use blockstore::{BlockInfo, BlockMetadata, Blockstore, BlockstoreImpl};
 pub use cert::Cert;
 pub use epoch_info::EpochInfo;
-pub use pool::{AddVoteError, EpochBoundaryEvent, Pool, PoolError, SlashingReport};
+pub use pool::{AddVoteError, EpochBoundaryEvent, Pool, PoolError, PoolImpl, SlashingReport};
 pub use vote::Vote;
+use block_producer::BlockProducer;
 use votor::{Votor, VotorEvent};
 
 /// Time bound assumed on network transmission delays during periods of synchrony.
-const DELTA: Duration = Duration::from_millis(8_000);
+pub(crate) const DELTA: Duration = Duration::from_millis(8_000);
 /// Target time for block production (slot length)
 const TARGET_BLOCK_TIME: Duration = Duration::from_millis(60_000);
 /// Time the leader has for producing and sending the block.
@@ -164,10 +164,11 @@ where
         let blockstore: Box<dyn Blockstore + Send + Sync> =
             Box::new(BlockstoreImpl::new(epoch_info.clone(), votor_tx.clone()));
         let blockstore = Arc::new(RwLock::new(blockstore));
-        let mut pool = Pool::new(epoch_info.clone(), votor_tx.clone(), repair_tx.clone());
+        let mut pool = PoolImpl::new(epoch_info.clone(), votor_tx.clone(), repair_tx.clone());
         pool.set_blockstore(Arc::clone(&blockstore));
         pool.set_epoch_boundary_channel(epoch_boundary_tx);
         pool.set_slashing_channel(slashing_tx);
+        let pool: Box<dyn Pool + Send + Sync> = Box::new(pool);
         let pool = Arc::new(RwLock::new(pool));
 
         let repair_request_handler = RepairRequestHandler::new(
@@ -406,8 +407,8 @@ where
         Ok(())
     }
 
-    pub fn blockstore(&self) -> std::sync::Arc<tokio::sync::RwLock<crate::consensus::Blockstore>> {
-        std::sync::Arc::clone(&self.blockstore)
+    pub fn blockstore(&self) -> Arc<RwLock<Box<dyn Blockstore + Send + Sync>>> {
+        Arc::clone(&self.blockstore)
     }
 
     pub fn epoch_info_rx(&self) -> watch::Receiver<Arc<EpochInfo>> {

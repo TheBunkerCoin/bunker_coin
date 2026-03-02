@@ -165,7 +165,7 @@ where
             }
             RepairRequestType::Shred(block_id, slice, shred) => {
                 let blockstore = self.blockstore.read().await;
-                let Some(shred) = blockstore.get_shred(block_id, *slice, *shred).cloned() else {
+                let Some(shred) = blockstore.get_shred(block_id, *slice, *shred) else {
                     return Ok(());
                 };
                 RepairResponse::Shred(request.req_type, shred.into_shred())
@@ -651,7 +651,7 @@ mod tests {
         }
         assert_eq!(
             blockstore.read().await.disseminated_block_hash(slot),
-            Some(&block_hash)
+            Some(block_hash.clone())
         );
         assert!(
             blockstore
