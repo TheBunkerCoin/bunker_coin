@@ -1,4 +1,4 @@
-use crate::staking::{PendingBond, PendingRetire};
+use crate::staking::{JailRecord, PendingBond, PendingRetire};
 use crate::types::{Amount, PublicKey};
 
 #[derive(Clone, Debug)]
@@ -10,4 +10,5 @@ pub struct EpochTransitionBlock {
     pub retires_completed: Vec<PendingRetire>,
     pub new_validator_set: Vec<(PublicKey, Amount)>,
     pub state_hash: [u8; 32],
+    pub slashes_applied: Vec<JailRecord>,
 }

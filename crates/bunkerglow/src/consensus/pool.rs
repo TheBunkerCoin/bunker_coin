@@ -45,6 +45,13 @@ pub struct EpochBoundaryEvent {
     pub finalized_slot: Slot,
 }
 
+#[derive(Clone, Debug)]
+pub struct SlashingReport {
+    pub validator_id: ValidatorId,
+    pub offence: SlashableOffence,
+    pub slot: Slot,
+}
+
 /// Errors the Pool may throw when adding a vote or certificate.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum PoolError {
@@ -83,6 +90,8 @@ pub enum SlashableOffence {
     #[error("Validator {0} voted both notar-fallback and finalize on slot {1}")]
     NotarFallbackAndFinalize(ValidatorId, Slot),
 }
+
+pub type AddVoteError = PoolError;
 
 /// Interface for the Pool.
 ///
@@ -127,6 +136,8 @@ pub struct PoolImpl {
     blockstore: Option<Arc<RwLock<Blockstore>>>,
     /// Channel for signaling epoch boundary crossings.
     epoch_boundary_channel: Option<Sender<EpochBoundaryEvent>>,
+    /// Channel for reporting slashable offences to execution layer.
+    slashing_channel: Option<Sender<SlashingReport>>,
 
     highest_finalized_slot: u64,
     highest_notarized_fallback_slot: u64,
@@ -159,6 +170,7 @@ impl PoolImpl {
             db,
             blockstore: None,
             epoch_boundary_channel: None,
+            slashing_channel: None,
             highest_finalized_slot: 0,
             highest_notarized_fallback_slot: 0,
         };
@@ -169,6 +181,10 @@ impl PoolImpl {
 
     pub fn set_epoch_boundary_channel(&mut self, tx: Sender<EpochBoundaryEvent>) {
         self.epoch_boundary_channel = Some(tx);
+    }
+
+    pub fn set_slashing_channel(&mut self, tx: Sender<SlashingReport>) {
+        self.slashing_channel = Some(tx);
     }
 
     async fn check_epoch_boundary(&self, slot: Slot) {
@@ -524,6 +540,14 @@ impl Pool for PoolImpl {
         let voter = vote.signer();
         let voter_stake = self.epoch_info.validator(voter).stake;
         if let Some(offence) = self.slot_state(slot).check_slashable_offence(&vote) {
+            if let Some(ref tx) = self.slashing_channel {
+                let report = SlashingReport {
+                    validator_id: voter,
+                    offence: offence.clone(),
+                    slot,
+                };
+                let _ = tx.try_send(report);
+            }
             return Err(AddVoteError::Slashable(offence));
         } else if self.slot_state(slot).should_ignore_vote(&vote) {
             return Err(AddVoteError::Duplicate);

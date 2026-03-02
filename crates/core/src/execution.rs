@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
 use ed25519_dalek::{Verifier, VerifyingKey, Signature as DalekSignature};
+use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 
 use crate::account::{Account, TokenMeta};
-use crate::staking::{StakingLedger, PendingBond, PendingRetire};
+use crate::staking::{StakingLedger, JailRecord, PendingBond, PendingRetire, UnjailError};
 use crate::transaction::{Transaction, TransactionBody};
 use crate::types::{Amount, PublicKey, TokenId, MAX_TICKER_LEN, MIN_TICKER_LEN};
 
@@ -19,6 +21,9 @@ pub enum ExecutionError {
     SelfTransfer,
     ZeroAmount,
     Overflow,
+    NotJailed,
+    JailPeriodNotElapsed,
+    NoStake,
 }
 
 impl std::fmt::Display for ExecutionError {
@@ -42,27 +47,33 @@ impl std::fmt::Display for ExecutionError {
             Self::SelfTransfer => write!(f, "cannot transfer to self"),
             Self::ZeroAmount => write!(f, "amount must be non-zero"),
             Self::Overflow => write!(f, "arithmetic overflow"),
+            Self::NotJailed => write!(f, "validator is not jailed"),
+            Self::JailPeriodNotElapsed => write!(f, "jail period has not elapsed"),
+            Self::NoStake => write!(f, "validator has no stake"),
         }
     }
 }
 
 impl std::error::Error for ExecutionError {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
     pub accounts: HashMap<PublicKey, Account>,
     pub tokens: HashMap<TokenId, TokenMeta>,
     pub next_token_id: u32,
     pub fee_pool: Amount,
     pub staking: StakingLedger,
+    pub current_epoch: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EpochTransitionResult {
     pub new_validators: Vec<(PublicKey, Amount)>,
     pub fees_distributed: Amount,
     pub bonds_activated: Vec<PendingBond>,
     pub retires_completed: Vec<PendingRetire>,
+    pub slashes_applied: Vec<JailRecord>,
+    pub state_hash: [u8; 32],
 }
 
 impl Default for State {
@@ -79,6 +90,7 @@ impl State {
             next_token_id: 1,
             fee_pool: 0,
             staking: StakingLedger::new(),
+            current_epoch: 0,
         }
     }
 
@@ -252,21 +264,31 @@ impl State {
                 Ok(())
             }
 
-            TransactionBody::UnJail => Ok(()),
+            TransactionBody::UnJail => {
+                self.staking.unjail(&sender, self.current_epoch).map_err(|e| match e {
+                    UnjailError::NotJailed => ExecutionError::NotJailed,
+                    UnjailError::JailPeriodNotElapsed => ExecutionError::JailPeriodNotElapsed,
+                    UnjailError::NoStake => ExecutionError::NoStake,
+                })
+            }
         }
     }
 
     pub fn process_epoch_transition(&mut self, completed_epoch: u64) -> EpochTransitionResult {
         let current_epoch = completed_epoch + 1;
+        self.current_epoch = current_epoch;
 
-        // 1. activate pending bonds from ACTIVATION_DELAY_EPOCHS ago
+        // 1. process slashes first (before bond activation)
+        let slashes_applied = self.staking.process_slashes(current_epoch);
+
+        // 2. activate pending bonds from ACTIVATION_DELAY_EPOCHS ago
         let bonds_activated = self.staking.activate_pending_bonds(current_epoch);
 
-        // 2. complete retirements past UNBONDING_PERIOD_EPOCHS
+        // 3. complete retirements past UNBONDING_PERIOD_EPOCHS
         let retires_completed = self.staking.complete_pending_retires(current_epoch);
 
-        // 3. distribute fees pro-rata by stake
-        let total_stake = self.staking.total_stake();
+        // 4. distribute fees pro-rata by active (non-jailed) stake
+        let total_stake = self.staking.total_active_stake();
         let mut distributed: Amount = 0;
 
         if total_stake > 0 && self.fee_pool > 0 {
@@ -274,6 +296,7 @@ impl State {
                 .staking
                 .delegations
                 .iter()
+                .filter(|(pk, _)| !self.staking.jailed.contains_key(*pk))
                 .map(|(&k, &v)| (k, v))
                 .collect();
 
@@ -286,18 +309,99 @@ impl State {
             }
         }
 
-        // dust stays in fee_pool for next epoch
         self.fee_pool -= distributed;
 
-        // 4. derive new validator set
+        // 5. derive new validator set (excludes jailed)
         let new_validators = self.staking.validator_set();
+
+        // 6. compute state hash
+        let state_hash = self.compute_state_hash();
 
         EpochTransitionResult {
             new_validators,
             fees_distributed: distributed,
             bonds_activated,
             retires_completed,
+            slashes_applied,
+            state_hash,
         }
+    }
+
+    pub fn compute_state_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+
+        // accounts — sort by key for determinism
+        let mut accounts: Vec<_> = self.accounts.iter().collect();
+        accounts.sort_by_key(|(k, _)| *k);
+        for (pk, acc) in &accounts {
+            hasher.update(*pk);
+            hasher.update(acc.native_balance.to_le_bytes());
+            hasher.update(acc.nonce.to_le_bytes());
+            // token_balances is BTreeMap so already sorted
+            for (tid, bal) in &acc.token_balances {
+                hasher.update(tid);
+                hasher.update(bal.to_le_bytes());
+            }
+        }
+
+        // tokens — sort by key
+        let mut tokens: Vec<_> = self.tokens.iter().collect();
+        tokens.sort_by_key(|(k, _)| *k);
+        for (tid, meta) in &tokens {
+            hasher.update(*tid);
+            hasher.update(meta.ticker.as_bytes());
+            hasher.update(meta.current_supply.to_le_bytes());
+            hasher.update(meta.max_supply.to_le_bytes());
+            hasher.update(meta.metadata_hash);
+            hasher.update(meta.creator);
+        }
+
+        hasher.update(self.next_token_id.to_le_bytes());
+        hasher.update(self.fee_pool.to_le_bytes());
+        hasher.update(self.current_epoch.to_le_bytes());
+
+        // staking delegations — sort by key
+        let mut delegations: Vec<_> = self.staking.delegations.iter().collect();
+        delegations.sort_by_key(|(k, _)| *k);
+        for (pk, amount) in &delegations {
+            hasher.update(*pk);
+            hasher.update(amount.to_le_bytes());
+        }
+
+        // jailed — sort by key
+        let mut jailed: Vec<_> = self.staking.jailed.iter().collect();
+        jailed.sort_by_key(|(k, _)| *k);
+        for (pk, record) in &jailed {
+            hasher.update(*pk);
+            hasher.update(record.epoch_jailed.to_le_bytes());
+            hasher.update(record.amount_slashed.to_le_bytes());
+        }
+
+        // pending bonds
+        for bond in &self.staking.pending_bonds {
+            hasher.update(bond.delegator);
+            hasher.update(bond.validator);
+            hasher.update(bond.amount.to_le_bytes());
+            hasher.update(bond.epoch_queued.to_le_bytes());
+        }
+
+        // pending retires
+        for retire in &self.staking.pending_retires {
+            hasher.update(retire.delegator);
+            hasher.update(retire.validator);
+            hasher.update(retire.amount.to_le_bytes());
+            hasher.update(retire.epoch_queued.to_le_bytes());
+        }
+
+        // completed retires
+        for retire in &self.staking.completed_retires {
+            hasher.update(retire.delegator);
+            hasher.update(retire.validator);
+            hasher.update(retire.amount.to_le_bytes());
+            hasher.update(retire.epoch_completed.to_le_bytes());
+        }
+
+        hasher.finalize().into()
     }
 }
 
@@ -623,5 +727,126 @@ mod tests {
         let result = state.process_epoch_transition(0);
         assert_eq!(result.fees_distributed, 0);
         assert_eq!(state.fee_pool, 1000);
+    }
+
+    #[test]
+    fn epoch_transition_processes_slashes() {
+        use crate::staking::{SlashingEvent, SlashOffenceKind};
+
+        let mut state = State::new();
+        let validator: PublicKey = [1u8; 32];
+        state.staking.delegations.insert(validator, 1000);
+
+        state.staking.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+
+        let result = state.process_epoch_transition(0);
+        assert_eq!(result.slashes_applied.len(), 1);
+        assert_eq!(result.slashes_applied[0].amount_slashed, 100);
+        assert_eq!(*state.staking.delegations.get(&validator).unwrap(), 900);
+        assert!(state.staking.jailed.contains_key(&validator));
+    }
+
+    #[test]
+    fn unjail_transaction() {
+        use crate::staking::{SlashingEvent, SlashOffenceKind};
+
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        // set up as validator with delegation
+        state.staking.delegations.insert(pk, 1000);
+
+        // jail the validator
+        state.staking.report_offence(SlashingEvent {
+            validator: pk,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+        state.staking.process_slashes(0);
+        assert!(state.staking.jailed.contains_key(&pk));
+
+        // unjail too early — current_epoch=3, need 4
+        state.current_epoch = 3;
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::UnJail,
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::JailPeriodNotElapsed));
+
+        // unjail succeeds at epoch 4
+        state.current_epoch = 4;
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::UnJail,
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+        assert!(!state.staking.jailed.contains_key(&pk));
+    }
+
+    #[test]
+    fn state_hash_deterministic() {
+        let mut state = State::new();
+        let v: PublicKey = [1u8; 32];
+        state.staking.delegations.insert(v, 500);
+        state.fee_pool = 100;
+
+        let h1 = state.compute_state_hash();
+        let h2 = state.compute_state_hash();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn state_hash_changes() {
+        let mut state = State::new();
+        let v: PublicKey = [1u8; 32];
+        state.staking.delegations.insert(v, 500);
+
+        let h1 = state.compute_state_hash();
+        state.fee_pool += 1;
+        let h2 = state.compute_state_hash();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn fee_distribution_excludes_jailed() {
+        use crate::staking::{SlashingEvent, SlashOffenceKind};
+
+        let mut state = State::new();
+        let validator_a: PublicKey = [1u8; 32];
+        let validator_b: PublicKey = [2u8; 32];
+
+        state.staking.delegations.insert(validator_a, 500);
+        state.staking.delegations.insert(validator_b, 500);
+        state.fee_pool = 1000;
+
+        // jail validator_a
+        state.staking.report_offence(SlashingEvent {
+            validator: validator_a,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+
+        let result = state.process_epoch_transition(0);
+
+        // validator_a is jailed — should receive no fees
+        // validator_b gets all fees (relative to active stake only)
+        let a_balance = state.get_account(&validator_a).map(|a| a.native_balance).unwrap_or(0);
+        let b_balance = state.get_account(&validator_b).unwrap().native_balance;
+        assert_eq!(a_balance, 0);
+        assert_eq!(b_balance, 1000);
+        assert_eq!(result.fees_distributed, 1000);
     }
 }

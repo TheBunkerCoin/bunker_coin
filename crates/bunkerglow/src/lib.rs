@@ -15,6 +15,7 @@ pub mod logging;
 pub mod network;
 pub mod repair;
 pub mod shredder;
+pub mod snapshot;
 #[cfg(test)]
 pub mod test_utils;
 pub mod types;

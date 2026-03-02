@@ -14,6 +14,7 @@ publish = false
 
 [dependencies]
 bunker_coin_core = { path = "../core" }
+bincode = { workspace = true }
 aes = { version = "=0.9.0-rc.2", features = ["hazmat", "zeroize"] }
 async-trait = "0.1"
 bitvec = { version = "1", features = ["serde"] }

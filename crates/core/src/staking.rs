@@ -1,19 +1,53 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::{Amount, PublicKey};
 
 pub const ACTIVATION_DELAY_EPOCHS: u64 = 1;
 pub const UNBONDING_PERIOD_EPOCHS: u64 = 2;
+pub const SLASH_FRACTION_PERCENT: u64 = 10;
+pub const JAIL_PERIOD_EPOCHS: u64 = 4;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlashOffenceKind {
+    DoubleVote,
+    ConflictingVote,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashingEvent {
+    pub validator: PublicKey,
+    pub offence: SlashOffenceKind,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JailRecord {
+    pub validator: PublicKey,
+    pub epoch_jailed: u64,
+    pub offence: SlashOffenceKind,
+    pub amount_slashed: Amount,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnjailError {
+    NotJailed,
+    JailPeriodNotElapsed,
+    NoStake,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StakingLedger {
     pub delegations: HashMap<PublicKey, Amount>,
     pub pending_bonds: Vec<PendingBond>,
     pub pending_retires: Vec<PendingRetire>,
     pub completed_retires: Vec<CompletedRetire>,
+    pub jailed: HashMap<PublicKey, JailRecord>,
+    pub pending_slashes: Vec<SlashingEvent>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingBond {
     pub delegator: PublicKey,
     pub validator: PublicKey,
@@ -21,7 +55,7 @@ pub struct PendingBond {
     pub epoch_queued: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRetire {
     pub delegator: PublicKey,
     pub validator: PublicKey,
@@ -29,7 +63,7 @@ pub struct PendingRetire {
     pub epoch_queued: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletedRetire {
     pub delegator: PublicKey,
     pub validator: PublicKey,
@@ -50,6 +84,8 @@ impl StakingLedger {
             pending_bonds: Vec::new(),
             pending_retires: Vec::new(),
             completed_retires: Vec::new(),
+            jailed: HashMap::new(),
+            pending_slashes: Vec::new(),
         }
     }
 
@@ -128,14 +164,72 @@ impl StakingLedger {
         total
     }
 
+    pub fn report_offence(&mut self, event: SlashingEvent) {
+        self.pending_slashes.push(event);
+    }
+
+    /// drain pending slashes, deduct SLASH_FRACTION_PERCENT, jail offenders
+    pub fn process_slashes(&mut self, current_epoch: u64) -> Vec<JailRecord> {
+        let events: Vec<SlashingEvent> = self.pending_slashes.drain(..).collect();
+        let mut records = Vec::new();
+
+        for event in events {
+            if self.jailed.contains_key(&event.validator) {
+                continue;
+            }
+
+            let stake = self.delegations.get(&event.validator).copied().unwrap_or(0);
+            let slash_amount = stake * SLASH_FRACTION_PERCENT / 100;
+
+            if let Some(s) = self.delegations.get_mut(&event.validator) {
+                *s = s.saturating_sub(slash_amount);
+            }
+
+            let record = JailRecord {
+                validator: event.validator,
+                epoch_jailed: current_epoch,
+                offence: event.offence,
+                amount_slashed: slash_amount,
+            };
+            self.jailed.insert(event.validator, record.clone());
+            records.push(record);
+        }
+
+        records
+    }
+
+    pub fn unjail(&mut self, validator: &PublicKey, current_epoch: u64) -> Result<(), UnjailError> {
+        let record = self.jailed.get(validator).ok_or(UnjailError::NotJailed)?;
+
+        if current_epoch < record.epoch_jailed + JAIL_PERIOD_EPOCHS {
+            return Err(UnjailError::JailPeriodNotElapsed);
+        }
+
+        let stake = self.delegations.get(validator).copied().unwrap_or(0);
+        if stake == 0 {
+            return Err(UnjailError::NoStake);
+        }
+
+        self.jailed.remove(validator);
+        Ok(())
+    }
+
     pub fn total_stake(&self) -> Amount {
         self.delegations.values().sum()
+    }
+
+    pub fn total_active_stake(&self) -> Amount {
+        self.delegations
+            .iter()
+            .filter(|(pk, _)| !self.jailed.contains_key(*pk))
+            .map(|(_, &stake)| stake)
+            .sum()
     }
 
     pub fn validator_set(&self) -> Vec<(PublicKey, Amount)> {
         self.delegations
             .iter()
-            .filter(|(_, &stake)| stake > 0)
+            .filter(|(pk, &stake)| stake > 0 && !self.jailed.contains_key(*pk))
             .map(|(&pk, &stake)| (pk, stake))
             .collect()
     }
@@ -211,5 +305,123 @@ mod tests {
 
         let set = ledger.validator_set();
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn slash_reduces_stake() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 1000);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 5,
+        });
+
+        let records = ledger.process_slashes(5);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].amount_slashed, 100); // 10% of 1000
+        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 900);
+    }
+
+    #[test]
+    fn slash_jails_validator() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 1000);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::ConflictingVote,
+            epoch: 3,
+        });
+
+        let records = ledger.process_slashes(3);
+        assert_eq!(records.len(), 1);
+        assert!(ledger.jailed.contains_key(&validator));
+        assert_eq!(ledger.jailed[&validator].epoch_jailed, 3);
+    }
+
+    #[test]
+    fn slash_already_jailed_skipped() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 1000);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 5,
+        });
+        ledger.process_slashes(5);
+        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 900);
+
+        // second slash should be skipped
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 5,
+        });
+        let records = ledger.process_slashes(5);
+        assert!(records.is_empty());
+        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 900);
+    }
+
+    #[test]
+    fn unjail_success() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 1000);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+        ledger.process_slashes(0);
+        assert!(ledger.jailed.contains_key(&validator));
+
+        // epoch 4 = 0 + JAIL_PERIOD_EPOCHS(4), should succeed
+        let result = ledger.unjail(&validator, 4);
+        assert!(result.is_ok());
+        assert!(!ledger.jailed.contains_key(&validator));
+    }
+
+    #[test]
+    fn unjail_too_early() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 1000);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+        ledger.process_slashes(0);
+
+        let result = ledger.unjail(&validator, 3);
+        assert_eq!(result, Err(UnjailError::JailPeriodNotElapsed));
+    }
+
+    #[test]
+    fn validator_set_excludes_jailed() {
+        let mut ledger = StakingLedger::new();
+        let v1 = pk(1);
+        let v2 = pk(2);
+        ledger.delegations.insert(v1, 500);
+        ledger.delegations.insert(v2, 500);
+
+        ledger.report_offence(SlashingEvent {
+            validator: v1,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+        ledger.process_slashes(0);
+
+        let set = ledger.validator_set();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].0, v2);
     }
 }

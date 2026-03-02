@@ -589,6 +589,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "async-trait",
+ "bincode",
  "bitvec",
  "blst",
  "bunker_coin_core",

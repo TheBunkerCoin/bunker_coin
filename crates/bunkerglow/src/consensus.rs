@@ -42,13 +42,14 @@ use crate::crypto::{aggsig, signature};
 use crate::network::{RepairNetwork, RepairRequestNetwork, TransactionNetwork};
 use crate::repair::{Repair, RepairRequestHandler};
 use crate::shredder::Shred;
+use crate::snapshot::SnapshotStore;
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
 
 pub use blockstore::{BlockInfo, Blockstore};
 pub use blockstore::BlockMetadata;
 pub use cert::Cert;
 pub use epoch_info::EpochInfo;
-pub use pool::{EpochBoundaryEvent, Pool, PoolError};
+pub use pool::{AddVoteError, EpochBoundaryEvent, Pool, PoolError, SlashingReport};
 pub use vote::Vote;
 use votor::{Votor, VotorEvent};
 
@@ -118,8 +119,12 @@ where
     epoch_info_rx: watch::Receiver<Arc<EpochInfo>>,
     /// receiver for epoch boundary events from the pool
     epoch_boundary_rx: mpsc::Receiver<EpochBoundaryEvent>,
+    /// receiver for slashing reports from the pool
+    slashing_rx: mpsc::Receiver<SlashingReport>,
     /// optional execution state for epoch transitions
     execution_state: Option<Arc<RwLock<bunker_coin_core::execution::State>>>,
+    /// optional snapshot store for persisting state at epoch boundaries
+    snapshot_store: Option<SnapshotStore>,
 }
 
 impl<A, D, T> Alpenglow<A, D, T>
@@ -152,6 +157,7 @@ where
         let (votor_tx, votor_rx) = mpsc::channel(1024);
         let (repair_tx, repair_rx) = mpsc::channel(1024);
         let (epoch_boundary_tx, epoch_boundary_rx) = mpsc::channel(16);
+        let (slashing_tx, slashing_rx) = mpsc::channel(256);
         let (epoch_info_tx, epoch_info_rx) = watch::channel(epoch_info.clone());
         let all2all = Arc::new(all2all);
 
@@ -161,6 +167,7 @@ where
         let mut pool = Pool::new(epoch_info.clone(), votor_tx.clone(), repair_tx.clone());
         pool.set_blockstore(Arc::clone(&blockstore));
         pool.set_epoch_boundary_channel(epoch_boundary_tx);
+        pool.set_slashing_channel(slashing_tx);
         let pool = Arc::new(RwLock::new(pool));
 
         let repair_request_handler = RepairRequestHandler::new(
@@ -210,6 +217,8 @@ where
             epoch_info_rx.clone(),
         ));
 
+        let snapshot_store = SnapshotStore::new(epoch_info.own_id);
+
         Self {
             epoch_info,
             blockstore,
@@ -222,7 +231,9 @@ where
             epoch_info_tx,
             epoch_info_rx,
             epoch_boundary_rx,
+            slashing_rx,
             execution_state: None,
+            snapshot_store: Some(snapshot_store),
         }
     }
 
@@ -249,12 +260,25 @@ where
             &mut self.epoch_boundary_rx,
             mpsc::channel(1).1,
         );
+        let slashing_rx = std::mem::replace(
+            &mut self.slashing_rx,
+            mpsc::channel(1).1,
+        );
+        let snapshot_store = self.snapshot_store.take();
         let epoch_info_tx = self.epoch_info_tx.clone();
         let execution_state = self.execution_state.clone();
+        let epoch_info_clone = self.epoch_info.clone();
         let epoch_transition_span = Span::enter_with_local_parent("epoch transition loop");
         let epoch_loop = tokio::spawn(
             async move {
-                epoch_transition_loop(epoch_boundary_rx, epoch_info_tx, execution_state).await;
+                epoch_transition_loop(
+                    epoch_boundary_rx,
+                    epoch_info_tx,
+                    execution_state,
+                    slashing_rx,
+                    snapshot_store,
+                    epoch_info_clone,
+                ).await;
             }
             .in_span(epoch_transition_span),
         );
@@ -399,6 +423,9 @@ async fn epoch_transition_loop(
     mut epoch_boundary_rx: mpsc::Receiver<EpochBoundaryEvent>,
     epoch_info_tx: watch::Sender<Arc<EpochInfo>>,
     execution_state: Option<Arc<RwLock<bunker_coin_core::execution::State>>>,
+    mut slashing_rx: mpsc::Receiver<SlashingReport>,
+    snapshot_store: Option<SnapshotStore>,
+    epoch_info: Arc<EpochInfo>,
 ) {
     while let Some(event) = epoch_boundary_rx.recv().await {
         let completed_epoch = event.epoch;
@@ -408,14 +435,43 @@ async fn epoch_transition_loop(
         // run state transition if execution state is available
         if let Some(ref state) = execution_state {
             let mut state_guard = state.write().await;
+
+            // drain slashing reports and convert to offence reports
+            while let Ok(report) = slashing_rx.try_recv() {
+                let validator_pk = *epoch_info.validator(report.validator_id).pubkey.as_bytes();
+                let offence_kind = match report.offence {
+                    pool::SlashableOffence::NotarDifferentHash(_, _) |
+                    pool::SlashableOffence::SkipAndNotarize(_, _) => {
+                        bunker_coin_core::staking::SlashOffenceKind::ConflictingVote
+                    }
+                    pool::SlashableOffence::SkipAndFinalize(_, _) |
+                    pool::SlashableOffence::NotarFallbackAndFinalize(_, _) => {
+                        bunker_coin_core::staking::SlashOffenceKind::DoubleVote
+                    }
+                };
+                state_guard.staking.report_offence(bunker_coin_core::staking::SlashingEvent {
+                    validator: validator_pk,
+                    offence: offence_kind,
+                    epoch: completed_epoch,
+                });
+            }
+
             let result = state_guard.process_epoch_transition(completed_epoch);
             info!(
-                "epoch transition: {} fees distributed, {} bonds activated, {} retires completed, {} validators",
+                "epoch transition: {} fees distributed, {} bonds activated, {} retires completed, {} slashes applied, {} validators, state_hash={:x?}",
                 result.fees_distributed,
                 result.bonds_activated.len(),
                 result.retires_completed.len(),
+                result.slashes_applied.len(),
                 result.new_validators.len(),
+                &result.state_hash[..8],
             );
+
+            // save snapshot
+            if let Some(ref store) = snapshot_store {
+                store.save_snapshot(new_epoch, &state_guard);
+                store.prune_old_snapshots(5);
+            }
         }
 
         // build new epoch info from current (for now, same validator set)
