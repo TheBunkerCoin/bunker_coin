@@ -91,6 +91,26 @@ impl Slot {
     pub fn is_genesis(&self) -> bool {
         self.0 == 0
     }
+
+    pub fn epoch(self) -> u64 {
+        self.0 / SLOTS_PER_EPOCH
+    }
+
+    pub fn first_slot_in_epoch(self) -> Slot {
+        Slot(self.epoch() * SLOTS_PER_EPOCH)
+    }
+
+    pub fn last_slot_in_epoch(self) -> Slot {
+        Slot((self.epoch() + 1) * SLOTS_PER_EPOCH - 1)
+    }
+
+    pub fn is_last_in_epoch(self) -> bool {
+        (self.0 + 1) % SLOTS_PER_EPOCH == 0
+    }
+
+    pub fn is_first_in_epoch(self) -> bool {
+        self.0 % SLOTS_PER_EPOCH == 0
+    }
 }
 
 impl Default for Slot {
@@ -119,5 +139,41 @@ mod tests {
             assert_eq!(last_slot.next(), window_slots[window + 1]);
             assert_eq!(last_slot, window_slots[window + 1].prev());
         }
+    }
+
+    #[test]
+    fn epoch_arithmetic() {
+        assert_eq!(Slot::new(0).epoch(), 0);
+        assert_eq!(Slot::new(SLOTS_PER_EPOCH - 1).epoch(), 0);
+        assert_eq!(Slot::new(SLOTS_PER_EPOCH).epoch(), 1);
+        assert_eq!(Slot::new(2 * SLOTS_PER_EPOCH + 5).epoch(), 2);
+    }
+
+    #[test]
+    fn epoch_boundaries() {
+        assert!(Slot::new(0).is_first_in_epoch());
+        assert!(!Slot::new(0).is_last_in_epoch());
+
+        let last = Slot::new(SLOTS_PER_EPOCH - 1);
+        assert!(last.is_last_in_epoch());
+        assert!(!last.is_first_in_epoch());
+
+        let first_e1 = Slot::new(SLOTS_PER_EPOCH);
+        assert!(first_e1.is_first_in_epoch());
+        assert!(!first_e1.is_last_in_epoch());
+
+        let last_e1 = Slot::new(2 * SLOTS_PER_EPOCH - 1);
+        assert!(last_e1.is_last_in_epoch());
+    }
+
+    #[test]
+    fn first_last_slot_in_epoch() {
+        let slot = Slot::new(100);
+        assert_eq!(slot.first_slot_in_epoch(), Slot::new(0));
+        assert_eq!(slot.last_slot_in_epoch(), Slot::new(SLOTS_PER_EPOCH - 1));
+
+        let slot = Slot::new(SLOTS_PER_EPOCH + 42);
+        assert_eq!(slot.first_slot_in_epoch(), Slot::new(SLOTS_PER_EPOCH));
+        assert_eq!(slot.last_slot_in_epoch(), Slot::new(2 * SLOTS_PER_EPOCH - 1));
     }
 }

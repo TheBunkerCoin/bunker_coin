@@ -104,7 +104,7 @@ async fn create_test_nodes(count: u64) -> Vec<TestNode> {
     validators
         .iter()
         .map(|v| {
-            let epoch_info = Arc::new(EpochInfo::new(v.id, validators.clone()));
+            let epoch_info = Arc::new(EpochInfo::new(0, v.id, validators.clone()));
             let all2all =
                 TrivialAll2All::new(validators.clone(), all2all_networks.pop_front().unwrap());
             let disseminator = Rotor::new(

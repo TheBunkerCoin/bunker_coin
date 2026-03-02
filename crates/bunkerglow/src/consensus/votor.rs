@@ -289,7 +289,7 @@ impl<A: All2All> Votor<A> {
             hash,
             parent: (parent_slot, parent_hash),
         } = block_info;
-        let first_slot = slot / SLOTS_PER_WINDOW * SLOTS_PER_WINDOW;
+        let first_slot = slot.first_slot_in_window();
         if slot == first_slot {
             let valid_parent = self
                 .parents_ready

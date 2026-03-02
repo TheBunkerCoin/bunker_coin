@@ -117,7 +117,7 @@ type Node = Alpenglow<
 
 fn create_node(config: ConfigFile) -> Node {
     // turn ConfigFile into an actual node
-    let epoch_info = Arc::new(EpochInfo::new(config.id, config.gossip.clone()));
+    let epoch_info = Arc::new(EpochInfo::new(0, config.id, config.gossip.clone()));
     let start_port = config.port;
     let network = UdpNetwork::new(start_port);
     let all2all = TrivialAll2All::new(config.gossip, network);

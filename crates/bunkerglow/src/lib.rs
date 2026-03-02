@@ -176,7 +176,7 @@ pub fn create_test_nodes(count: u64) -> Vec<TestNode> {
         .into_iter()
         .enumerate()
         .map(|(id, network)| {
-            let epoch_info = Arc::new(EpochInfo::new(id as u64, validators.clone()));
+            let epoch_info = Arc::new(EpochInfo::new(0, id as u64, validators.clone()));
             let all2all = TrivialAll2All::new(validators.clone(), network.all2all);
             let disseminator = Rotor::new(network.disseminator, epoch_info.clone());
             let repair_network = network.repair;

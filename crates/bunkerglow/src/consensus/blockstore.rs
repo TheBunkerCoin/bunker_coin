@@ -574,7 +574,7 @@ mod tests {
             repair_response_address: dontcare_sockaddr(),
         };
         let validators = vec![info];
-        let epoch_info = EpochInfo::new(0, validators);
+        let epoch_info = EpochInfo::new(0, 0, validators);
         (sk, BlockstoreImpl::new(Arc::new(epoch_info), tx))
     }
 

@@ -591,6 +591,7 @@ dependencies = [
  "async-trait",
  "bitvec",
  "blst",
+ "bunker_coin_core",
  "clap",
  "color-eyre",
  "colored 3.0.0",

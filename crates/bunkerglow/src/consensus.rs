@@ -33,30 +33,25 @@ use color_eyre::Result;
 use fastrace::Span;
 use fastrace::future::FutureExt;
 use log::{trace, warn};
-use static_assertions::const_assert;
-use tokio::sync::{RwLock, mpsc};
+use log::info;
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use wincode::{SchemaRead, SchemaWrite};
 
-use crate::crypto::{Hash, aggsig, signature};
-use crate::network::{Network, RepairNetwork, RepairRequestNetwork, TransactionNetwork};
+use crate::crypto::{aggsig, signature};
+use crate::network::{RepairNetwork, RepairRequestNetwork, TransactionNetwork};
 use crate::repair::{Repair, RepairRequestHandler};
-use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shred, Shredder, Slice};
-use crate::shredder;
+use crate::shredder::Shred;
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
 
 pub use blockstore::{BlockInfo, Blockstore};
 pub use blockstore::BlockMetadata;
 pub use cert::Cert;
 pub use epoch_info::EpochInfo;
-pub use pool::{Pool, PoolError};
+pub use pool::{EpochBoundaryEvent, Pool, PoolError};
 pub use vote::Vote;
 use votor::{Votor, VotorEvent};
 
-/// Number of slots in each leader window.
-pub const SLOTS_PER_WINDOW: u64 = 2;
-/// Number of slots in each epoch.
-pub const SLOTS_PER_EPOCH: u64 = 4_500;
 /// Time bound assumed on network transmission delays during periods of synchrony.
 const DELTA: Duration = Duration::from_millis(8_000);
 /// Target time for block production (slot length)
@@ -71,8 +66,8 @@ const DELTA_TIMEOUT: Duration = Duration::from_millis(240_000);
 // const DELTA_TIMEOUT: Duration = DELTA_EARLY_TIMEOUT.checked_add(DELTA_BLOCK).unwrap();
 /// Timeout for standstill detection mechanism.
 const DELTA_STANDSTILL: Duration = Duration::from_millis(300_000);
-
-
+/// Max time to produce and send the first slice of a block.
+pub(crate) const DELTA_FIRST_SLICE: Duration = Duration::from_millis(30_000);
 
 #[derive(Clone, Debug, SchemaRead, SchemaWrite)]
 pub enum ConsensusMessage {
@@ -117,6 +112,14 @@ where
     cancel_token: CancellationToken,
     /// Votor task handle.
     votor_handle: tokio::task::JoinHandle<()>,
+
+    /// watch channel for broadcasting epoch info updates across tasks
+    epoch_info_tx: watch::Sender<Arc<EpochInfo>>,
+    epoch_info_rx: watch::Receiver<Arc<EpochInfo>>,
+    /// receiver for epoch boundary events from the pool
+    epoch_boundary_rx: mpsc::Receiver<EpochBoundaryEvent>,
+    /// optional execution state for epoch transitions
+    execution_state: Option<Arc<RwLock<bunker_coin_core::execution::State>>>,
 }
 
 impl<A, D, T> Alpenglow<A, D, T>
@@ -148,6 +151,8 @@ where
         let cancel_token = CancellationToken::new();
         let (votor_tx, votor_rx) = mpsc::channel(1024);
         let (repair_tx, repair_rx) = mpsc::channel(1024);
+        let (epoch_boundary_tx, epoch_boundary_rx) = mpsc::channel(16);
+        let (epoch_info_tx, epoch_info_rx) = watch::channel(epoch_info.clone());
         let all2all = Arc::new(all2all);
 
         let blockstore: Box<dyn Blockstore + Send + Sync> =
@@ -155,6 +160,7 @@ where
         let blockstore = Arc::new(RwLock::new(blockstore));
         let mut pool = Pool::new(epoch_info.clone(), votor_tx.clone(), repair_tx.clone());
         pool.set_blockstore(Arc::clone(&blockstore));
+        pool.set_epoch_boundary_channel(epoch_boundary_tx);
         let pool = Arc::new(RwLock::new(pool));
 
         let repair_request_handler = RepairRequestHandler::new(
@@ -201,6 +207,7 @@ where
             cancel_token.clone(),
             DELTA_BLOCK,
             DELTA_FIRST_SLICE,
+            epoch_info_rx.clone(),
         ));
 
         Self {
@@ -212,6 +219,10 @@ where
             disseminator,
             cancel_token,
             votor_handle,
+            epoch_info_tx,
+            epoch_info_rx,
+            epoch_boundary_rx,
+            execution_state: None,
         }
     }
 
@@ -221,17 +232,32 @@ where
     ///
     /// Returns an error only if any of the tasks panics.
     #[fastrace::trace(short_name = true)]
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         // clean load after startup
         {
             let pool_guard = self.pool.read().await;
             let highest_finalized = pool_guard.finalized_slot();
             drop(pool_guard);
-            
+
             let mut blockstore_guard = self.blockstore.write().await;
             blockstore_guard.clean_beyond_finalized(highest_finalized);
             drop(blockstore_guard);
         }
+
+        // take the epoch boundary receiver out so we can move it into the task
+        let epoch_boundary_rx = std::mem::replace(
+            &mut self.epoch_boundary_rx,
+            mpsc::channel(1).1,
+        );
+        let epoch_info_tx = self.epoch_info_tx.clone();
+        let execution_state = self.execution_state.clone();
+        let epoch_transition_span = Span::enter_with_local_parent("epoch transition loop");
+        let epoch_loop = tokio::spawn(
+            async move {
+                epoch_transition_loop(epoch_boundary_rx, epoch_info_tx, execution_state).await;
+            }
+            .in_span(epoch_transition_span),
+        );
 
         let msg_loop_span = Span::enter_with_local_parent("message loop");
         let node = Arc::new(self);
@@ -255,6 +281,7 @@ where
         msg_loop.abort();
         standstill_loop.abort();
         prod_loop.abort();
+        epoch_loop.abort();
 
         let (msg_res, prod_res) = tokio::join!(msg_loop, prod_loop);
         msg_res??;
@@ -311,151 +338,6 @@ where
         }
     }
 
-    /// Handles the leader side of the consensus protocol.
-    ///
-    /// Once all previous blocks have been notarized or skipped and the next
-    /// slot belongs to our leader window, we will produce a block.
-    async fn block_production_loop(&self) -> Result<()> {
-        let mut parent: Slot = 0;
-        let mut parent_hash = Hash::default();
-        let mut parent_ready = true;
-
-        'outer: for window in 0.. {
-            if self.cancel_token.is_cancelled() {
-                break;
-            }
-
-            let first_slot_in_window = window * SLOTS_PER_WINDOW;
-            let last_slot_in_window = (window + 1) * SLOTS_PER_WINDOW - 1;
-
-            // don't do anything if we are not the leader
-            let leader = self.epoch_info.leader(first_slot_in_window);
-            if leader.id != self.epoch_info.own_id {
-                continue;
-            }
-
-            if self.pool.read().await.finalized_slot() >= last_slot_in_window {
-                warn!(
-                    "ignoring window {}..{} for block production",
-                    first_slot_in_window, last_slot_in_window
-                );
-                continue;
-            }
-
-            // wait for potential parent of first slot (except if first window)
-            if window > 0 {
-                // PERF: maybe replace busy loop with events
-                (parent, parent_hash, parent_ready) = loop {
-                    // build on ready parent, if any
-                    let pool = self.pool.read().await;
-                    if let Some((slot, hash)) = pool.parents_ready(first_slot_in_window).first() {
-                        let h = &hex::encode(hash)[..8];
-                        debug!("building block on ready parent {h} in slot {slot}");
-                        break (*slot, *hash, true);
-                    }
-                    drop(pool);
-
-                    // optimisitically build on block in previous slot, if any
-                    let blockstore = self.blockstore.read().await;
-                    if let Some(hash) = blockstore.canonical_block_hash(first_slot_in_window - 1) {
-                        let slot = first_slot_in_window - 1;
-                        let h = &hex::encode(hash)[..8];
-                        debug!("optimistically building block on parent {h} in slot {slot}",);
-                        break (slot, hash, false);
-                    }
-                    drop(blockstore);
-
-                    if self.pool.read().await.finalized_slot() >= last_slot_in_window {
-                        warn!(
-                            "ignoring window {}..{} for block production",
-                            first_slot_in_window, last_slot_in_window
-                        );
-                        continue 'outer;
-                    }
-
-                    sleep(Duration::from_millis(1)).await;
-                };
-            }
-
-            // produce blocks for all slots in window
-            let mut block = parent;
-            let mut block_hash = parent_hash;
-            for slot in first_slot_in_window..=last_slot_in_window {
-                self.produce_block(slot, (block, block_hash), parent_ready)
-                    .await?;
-                parent_ready = true;
-
-                // build off own block next
-                let blockstore = self.blockstore.read().await;
-                block = slot;
-                block_hash = blockstore.canonical_block_hash(slot).unwrap();
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn produce_block(
-        &self,
-        slot: Slot,
-        parent: (Slot, Hash),
-        parent_ready: bool,
-    ) -> Result<()> {
-        let (parent_slot, parent_hash) = parent;
-        let _slot_span = Span::enter_with_local_parent(format!("slot {slot}"));
-        let mut rng = SmallRng::seed_from_u64(slot);
-        let ph = &hex::encode(parent_hash)[..8];
-        info!("producing block in slot {slot} with parent {ph} in slot {parent_slot}",);
-
-        for slice_index in 0..1 {
-            let start_time = Instant::now();
-            let min_len = 48;
-            let padded_len = ((min_len + shredder::DATA_SHREDS - 1) / shredder::DATA_SHREDS) * shredder::DATA_SHREDS;
-            let mut data = vec![0u8; padded_len]; // pad to next multiple of DATA_SHREDS
-            // pack parent information in first slice
-            if slice_index == 0 {
-                data[0..8].copy_from_slice(&parent_slot.to_be_bytes());
-                data[8..40].copy_from_slice(&parent_hash);
-            }
-            let slice = Slice {
-                slot,
-                slice_index,
-                is_last: slice_index == 0,
-                merkle_root: None,
-                data,
-            };
-
-            // shred and disseminate slice
-            let shreds = RegularShredder::shred(&slice, &self.secret_key).unwrap();
-            for s in shreds {
-                self.disseminator.send(&s).await?;
-                // PERF: move expensive add_shred() call out of block production
-                let mut blockstore = self.blockstore.write().await;
-                let block = blockstore.add_shred(s, true).await;
-                if let Some((slot, block_info)) = block {
-                    let mut pool = self.pool.write().await;
-                    pool.add_block(slot, block_info).await;
-                }
-            }
-
-            // switch parent if necessary (for optimistic handover)
-            if !parent_ready {
-                let pool = self.pool.read().await;
-                if let Some(p) = pool.parents_ready(slot).first() {
-                    if *p != parent {
-                        warn!("switching block production parent");
-                        unimplemented!("have to switch parents");
-                    }
-                }
-            }
-
-            // artificially ensure block time close to target (400ms in good conditions)
-            sleep(TARGET_BLOCK_TIME.saturating_sub(start_time.elapsed())).await;
-        }
-
-        Ok(())
-    }
-
     #[fastrace::trace(short_name = true)]
     async fn handle_all2all_message(&self, msg: ConsensusMessage) {
         trace!("received all2all msg: {msg:?}");
@@ -502,5 +384,50 @@ where
 
     pub fn blockstore(&self) -> std::sync::Arc<tokio::sync::RwLock<crate::consensus::Blockstore>> {
         std::sync::Arc::clone(&self.blockstore)
+    }
+
+    pub fn epoch_info_rx(&self) -> watch::Receiver<Arc<EpochInfo>> {
+        self.epoch_info_rx.clone()
+    }
+
+    pub fn set_execution_state(&mut self, state: Arc<RwLock<bunker_coin_core::execution::State>>) {
+        self.execution_state = Some(state);
+    }
+}
+
+async fn epoch_transition_loop(
+    mut epoch_boundary_rx: mpsc::Receiver<EpochBoundaryEvent>,
+    epoch_info_tx: watch::Sender<Arc<EpochInfo>>,
+    execution_state: Option<Arc<RwLock<bunker_coin_core::execution::State>>>,
+) {
+    while let Some(event) = epoch_boundary_rx.recv().await {
+        let completed_epoch = event.epoch;
+        let new_epoch = completed_epoch + 1;
+        info!("epoch boundary reached: epoch {} completed at slot {}", completed_epoch, event.finalized_slot);
+
+        // run state transition if execution state is available
+        if let Some(ref state) = execution_state {
+            let mut state_guard = state.write().await;
+            let result = state_guard.process_epoch_transition(completed_epoch);
+            info!(
+                "epoch transition: {} fees distributed, {} bonds activated, {} retires completed, {} validators",
+                result.fees_distributed,
+                result.bonds_activated.len(),
+                result.retires_completed.len(),
+                result.new_validators.len(),
+            );
+        }
+
+        // build new epoch info from current (for now, same validator set)
+        let current = epoch_info_tx.borrow().clone();
+        let new_epoch_info = Arc::new(EpochInfo::new(
+            new_epoch,
+            current.own_id,
+            current.validators.clone(),
+        ));
+
+        // unblock block production with the new epoch info
+        let _ = epoch_info_tx.send(new_epoch_info);
+        info!("epoch {} started", new_epoch);
     }
 }

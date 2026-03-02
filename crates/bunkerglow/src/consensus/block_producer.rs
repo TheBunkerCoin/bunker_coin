@@ -12,11 +12,12 @@ use fastrace::Span;
 use log::{debug, info, warn};
 use static_assertions::const_assert;
 use tokio::pin;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{RwLock, oneshot, watch};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::consensus::{Blockstore, EpochInfo, Pool};
+use crate::types::SLOTS_PER_EPOCH;
 use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH, MerkleRoot};
 use crate::crypto::signature;
 use crate::network::{Network, TransactionNetwork};
@@ -56,6 +57,9 @@ pub(super) struct BlockProducer<D: Disseminator, T: Network> {
     /// Should be set to [`super::DELTA_FIRST_SLICE`] in production.
     /// Stored as a field to aid in testing.
     delta_first_slice: Duration,
+
+    /// watch channel for receiving epoch info updates at epoch boundaries
+    epoch_info_rx: watch::Receiver<Arc<EpochInfo>>,
 }
 
 impl<D, T> BlockProducer<D, T>
@@ -74,6 +78,7 @@ where
         cancel_token: CancellationToken,
         delta_block: Duration,
         delta_first_slice: Duration,
+        epoch_info_rx: watch::Receiver<Arc<EpochInfo>>,
     ) -> Self {
         assert!(delta_block >= delta_first_slice);
         Self {
@@ -86,6 +91,7 @@ where
             cancel_token,
             delta_block,
             delta_first_slice,
+            epoch_info_rx,
         }
     }
 
@@ -94,9 +100,28 @@ where
     /// Once all previous blocks have been notarized or skipped and the next
     /// slot belongs to our leader window, we will produce a block.
     pub(super) async fn block_production_loop(&self) -> Result<()> {
+        let mut current_epoch = self.epoch_info.epoch();
+        let mut epoch_info_rx = self.epoch_info_rx.clone();
+
         for first_slot_in_window in Slot::windows() {
             if self.cancel_token.is_cancelled() {
                 break;
+            }
+
+            // pause at epoch boundaries and wait for the new epoch info
+            let window_epoch = first_slot_in_window.inner() / SLOTS_PER_EPOCH;
+            if window_epoch > current_epoch {
+                info!(
+                    "[val {}] waiting for epoch {} transition before producing window {}",
+                    self.epoch_info.own_id, window_epoch, first_slot_in_window
+                );
+                while epoch_info_rx.borrow().epoch() < window_epoch {
+                    if epoch_info_rx.changed().await.is_err() {
+                        return Ok(());
+                    }
+                }
+                current_epoch = window_epoch;
+                info!("[val {}] epoch {} ready, resuming block production", self.epoch_info.own_id, current_epoch);
             }
 
             let last_slot_in_window = first_slot_in_window.last_slot_in_window();
@@ -644,6 +669,7 @@ mod tests {
         let disseminator = Arc::new(disseminator);
         let txs_receiver = UdpNetwork::new_with_any_port();
         let cancel_token = CancellationToken::new();
+        let (_epoch_info_tx, epoch_info_rx) = watch::channel(epoch_info.clone());
 
         BlockProducer::new(
             secret_key,
@@ -655,6 +681,7 @@ mod tests {
             cancel_token,
             delta_block,
             delta_first_slice,
+            epoch_info_rx,
         )
     }
 

@@ -264,7 +264,7 @@ pub async fn multi_node_consensus_simulation(num_nodes: usize) {
 
     let mut nodes_with_id = Vec::new();
     for (i, v) in validators.iter().enumerate() {
-        let epoch_info = Arc::new(EpochInfo::new(v.id, validators.clone()));
+        let epoch_info = Arc::new(EpochInfo::new(0, v.id, validators.clone()));
         let a2a_net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
             a2a_core.join_unlimited(i as u64).await;
         let dis_net: SimulatedNetwork<Shred, Shred> =
@@ -391,7 +391,7 @@ pub async fn multi_node_consensus_simulation_with_api(
 
     let mut nodes_with_id = Vec::new();
     for (i, v) in validators.iter().enumerate() {
-        let epoch_info = Arc::new(EpochInfo::new(v.id, validators.clone()));
+        let epoch_info = Arc::new(EpochInfo::new(0, v.id, validators.clone()));
         let a2a_net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
             a2a_core.join_unlimited(i as u64).await;
         let dis_net: SimulatedNetwork<Shred, Shred> =
@@ -453,7 +453,7 @@ pub async fn multi_node_consensus_simulation_with_api(
         let execution_state = execution_state.clone();
 
         tokio::spawn(async move {
-            let epoch_info = bunkerglow::consensus::EpochInfo::new(0, validators.clone());
+            let epoch_info = bunkerglow::consensus::EpochInfo::new(0, 0, validators.clone());
             let mut last_executed_slot: u64 = 0;
 
             loop {

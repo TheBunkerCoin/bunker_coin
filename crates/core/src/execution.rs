@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use ed25519_dalek::{Verifier, VerifyingKey, Signature as DalekSignature};
 
 use crate::account::{Account, TokenMeta};
+use crate::staking::{StakingLedger, PendingBond, PendingRetire};
 use crate::transaction::{Transaction, TransactionBody};
 use crate::types::{Amount, PublicKey, TokenId, MAX_TICKER_LEN, MIN_TICKER_LEN};
 
@@ -53,6 +54,15 @@ pub struct State {
     pub tokens: HashMap<TokenId, TokenMeta>,
     pub next_token_id: u32,
     pub fee_pool: Amount,
+    pub staking: StakingLedger,
+}
+
+#[derive(Clone, Debug)]
+pub struct EpochTransitionResult {
+    pub new_validators: Vec<(PublicKey, Amount)>,
+    pub fees_distributed: Amount,
+    pub bonds_activated: Vec<PendingBond>,
+    pub retires_completed: Vec<PendingRetire>,
 }
 
 impl Default for State {
@@ -68,6 +78,7 @@ impl State {
             tokens: HashMap::new(),
             next_token_id: 1,
             fee_pool: 0,
+            staking: StakingLedger::new(),
         }
     }
 
@@ -196,7 +207,7 @@ impl State {
                 Ok(())
             }
 
-            TransactionBody::Bond { amount, .. } => {
+            TransactionBody::Bond { validator, amount } => {
                 if *amount == 0 {
                     return Err(ExecutionError::ZeroAmount);
                 }
@@ -208,15 +219,84 @@ impl State {
                     });
                 }
                 acc.native_balance -= amount;
+                // epoch 0 as placeholder; real epoch comes from consensus context
+                self.staking.queue_bond(sender, *validator, *amount, 0);
                 Ok(())
             }
 
-            // fee deducted + nonce bumped; future: start unbonding timer
-            TransactionBody::Retire { .. } => Ok(()),
-            // fee deducted + nonce bumped; future: credit unbonded stake
-            TransactionBody::Withdraw { .. } => Ok(()),
-            // fee deducted + nonce bumped
+            TransactionBody::Retire { validator, amount } => {
+                if *amount == 0 {
+                    return Err(ExecutionError::ZeroAmount);
+                }
+                let delegated = self.staking.delegations.get(validator).copied().unwrap_or(0);
+                if delegated < *amount {
+                    return Err(ExecutionError::InsufficientBalance {
+                        required: *amount,
+                        available: delegated,
+                    });
+                }
+                self.staking.queue_retire(sender, *validator, *amount, 0);
+                Ok(())
+            }
+
+            TransactionBody::Withdraw { validator } => {
+                let amount = self.staking.withdraw(&sender, validator);
+                if amount == 0 {
+                    return Err(ExecutionError::ZeroAmount);
+                }
+                let acc = self.get_or_create_account(&sender);
+                acc.native_balance = acc
+                    .native_balance
+                    .checked_add(amount)
+                    .ok_or(ExecutionError::Overflow)?;
+                Ok(())
+            }
+
             TransactionBody::UnJail => Ok(()),
+        }
+    }
+
+    pub fn process_epoch_transition(&mut self, completed_epoch: u64) -> EpochTransitionResult {
+        let current_epoch = completed_epoch + 1;
+
+        // 1. activate pending bonds from ACTIVATION_DELAY_EPOCHS ago
+        let bonds_activated = self.staking.activate_pending_bonds(current_epoch);
+
+        // 2. complete retirements past UNBONDING_PERIOD_EPOCHS
+        let retires_completed = self.staking.complete_pending_retires(current_epoch);
+
+        // 3. distribute fees pro-rata by stake
+        let total_stake = self.staking.total_stake();
+        let mut distributed: Amount = 0;
+
+        if total_stake > 0 && self.fee_pool > 0 {
+            let delegations: Vec<(PublicKey, Amount)> = self
+                .staking
+                .delegations
+                .iter()
+                .map(|(&k, &v)| (k, v))
+                .collect();
+
+            for (validator, stake) in &delegations {
+                let share = (self.fee_pool as u128 * *stake as u128 / total_stake as u128) as Amount;
+                if share > 0 {
+                    self.get_or_create_account(validator).native_balance += share;
+                    distributed += share;
+                }
+            }
+        }
+
+        // dust stays in fee_pool for next epoch
+        self.fee_pool -= distributed;
+
+        // 4. derive new validator set
+        let new_validators = self.staking.validator_set();
+
+        EpochTransitionResult {
+            new_validators,
+            fees_distributed: distributed,
+            bonds_activated,
+            retires_completed,
         }
     }
 }
@@ -494,5 +574,54 @@ mod tests {
 
         assert_eq!(state.get_account(&pk_a).unwrap().native_balance, 890);
         assert_eq!(state.get_account(&pk_b).unwrap().native_balance, 100);
+    }
+
+    #[test]
+    fn process_epoch_transition_distributes_fees() {
+        let mut state = State::new();
+
+        let validator_a: PublicKey = [1u8; 32];
+        let validator_b: PublicKey = [2u8; 32];
+
+        // set up delegations directly
+        state.staking.delegations.insert(validator_a, 750);
+        state.staking.delegations.insert(validator_b, 250);
+        state.fee_pool = 1000;
+
+        let result = state.process_epoch_transition(0);
+
+        // 750/1000 * 1000 = 750 for validator_a
+        // 250/1000 * 1000 = 250 for validator_b
+        assert_eq!(state.get_account(&validator_a).unwrap().native_balance, 750);
+        assert_eq!(state.get_account(&validator_b).unwrap().native_balance, 250);
+        assert_eq!(result.fees_distributed, 1000);
+        assert_eq!(state.fee_pool, 0);
+    }
+
+    #[test]
+    fn process_epoch_transition_activates_bonds() {
+        let mut state = State::new();
+
+        let delegator: PublicKey = [1u8; 32];
+        let validator: PublicKey = [2u8; 32];
+
+        // queue a bond at epoch 0
+        state.staking.queue_bond(delegator, validator, 500, 0);
+        assert!(state.staking.delegations.is_empty());
+
+        // epoch 0 -> 1 transition: bond should activate (ACTIVATION_DELAY = 1)
+        let result = state.process_epoch_transition(0);
+        assert_eq!(result.bonds_activated.len(), 1);
+        assert_eq!(*state.staking.delegations.get(&validator).unwrap(), 500);
+    }
+
+    #[test]
+    fn process_epoch_transition_no_fees_if_no_stake() {
+        let mut state = State::new();
+        state.fee_pool = 1000;
+
+        let result = state.process_epoch_transition(0);
+        assert_eq!(result.fees_distributed, 0);
+        assert_eq!(state.fee_pool, 1000);
     }
 }

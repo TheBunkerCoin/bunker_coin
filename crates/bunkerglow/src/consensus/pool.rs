@@ -30,7 +30,7 @@ use super::{Cert, EpochInfo, Vote};
 use crate::consensus::cert::NotarCert;
 use crate::consensus::pool::finality_tracker::FinalizationEvent;
 use crate::crypto::merkle::{BlockHash, MerkleRoot};
-use crate::types::SLOTS_PER_EPOCH;
+use crate::types::{SLOTS_PER_EPOCH, SLOTS_PER_WINDOW};
 use crate::{BlockId, Slot, ValidatorId};
 
 use parent_ready_tracker::ParentReadyTracker;
@@ -38,6 +38,12 @@ use slot_state::SlotState;
 
 use rocksdb::{DB, Options, IteratorMode};
 use bincode;
+
+#[derive(Clone, Debug)]
+pub struct EpochBoundaryEvent {
+    pub epoch: u64,
+    pub finalized_slot: Slot,
+}
 
 /// Errors the Pool may throw when adding a vote or certificate.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -119,6 +125,11 @@ pub struct PoolImpl {
     db: DB,
     /// Reference to blockstore for updating finalized timestamps.
     blockstore: Option<Arc<RwLock<Blockstore>>>,
+    /// Channel for signaling epoch boundary crossings.
+    epoch_boundary_channel: Option<Sender<EpochBoundaryEvent>>,
+
+    highest_finalized_slot: u64,
+    highest_notarized_fallback_slot: u64,
 }
 
 impl PoolImpl {
@@ -147,10 +158,29 @@ impl PoolImpl {
             repair_channel,
             db,
             blockstore: None,
+            epoch_boundary_channel: None,
+            highest_finalized_slot: 0,
+            highest_notarized_fallback_slot: 0,
         };
 
         s.load_from_db();
         s
+    }
+
+    pub fn set_epoch_boundary_channel(&mut self, tx: Sender<EpochBoundaryEvent>) {
+        self.epoch_boundary_channel = Some(tx);
+    }
+
+    async fn check_epoch_boundary(&self, slot: Slot) {
+        if slot.is_last_in_epoch() {
+            if let Some(ref tx) = self.epoch_boundary_channel {
+                let event = EpochBoundaryEvent {
+                    epoch: slot.epoch(),
+                    finalized_slot: slot,
+                };
+                let _ = tx.send(event).await;
+            }
+        }
     }
 
     /// Sets the blockstore reference for updating finalized timestamps.
@@ -232,7 +262,7 @@ impl PoolImpl {
             Cert::FastFinal(ff_cert) => {
                 info!("fast finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
-                
+
                 if let Some(ref blockstore) = self.blockstore {
                     if let Some(hash) = cert.block_hash() {
                         let timestamp = std::time::SystemTime::now()
@@ -244,13 +274,14 @@ impl PoolImpl {
                         }
                     }
                 }
-                
+
+                self.check_epoch_boundary(slot).await;
                 self.prune();
             }
             Cert::Final(_) => {
                 info!("slow finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
-                
+
                 if let Some(ref blockstore) = self.blockstore {
                     if let Some(state) = self.slot_states.get(&slot) {
                         if let Some(ref notar_cert) = state.certificates.notar {
@@ -266,7 +297,8 @@ impl PoolImpl {
                         }
                     }
                 }
-                
+
+                self.check_epoch_boundary(slot).await;
                 self.prune();
             }
         }
