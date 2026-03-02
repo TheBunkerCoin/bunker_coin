@@ -7,6 +7,9 @@ pub type Nonce = u64;
 pub const MAX_TRANSACTION_SIZE: usize = 512;
 pub const MAX_TICKER_LEN: usize = 8;
 pub const MIN_TICKER_LEN: usize = 3;
+pub const MIN_SELF_STAKE: Amount = 1_000_000;
+pub const DUST_THRESHOLD: Amount = 1;
+pub const MAX_COMMISSION_BPS: u16 = 2000;
 
 pub mod serde_signature {
     use serde::{Deserialize, Deserializer, Serializer};

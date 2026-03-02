@@ -7,7 +7,7 @@ use sha2::{Sha256, Digest};
 use crate::account::{Account, TokenMeta};
 use crate::staking::{StakingLedger, JailRecord, PendingBond, PendingRetire, UnjailError};
 use crate::transaction::{Transaction, TransactionBody};
-use crate::types::{Amount, PublicKey, TokenId, MAX_TICKER_LEN, MIN_TICKER_LEN};
+use crate::types::{Amount, PublicKey, TokenId, MAX_TICKER_LEN, MIN_TICKER_LEN, MAX_COMMISSION_BPS, DUST_THRESHOLD};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionError {
@@ -24,6 +24,9 @@ pub enum ExecutionError {
     NotJailed,
     JailPeriodNotElapsed,
     NoStake,
+    InsufficientSelfStake,
+    CommissionTooHigh,
+    NotValidator,
 }
 
 impl std::fmt::Display for ExecutionError {
@@ -50,6 +53,9 @@ impl std::fmt::Display for ExecutionError {
             Self::NotJailed => write!(f, "validator is not jailed"),
             Self::JailPeriodNotElapsed => write!(f, "jail period has not elapsed"),
             Self::NoStake => write!(f, "validator has no stake"),
+            Self::InsufficientSelfStake => write!(f, "self-bond below minimum"),
+            Self::CommissionTooHigh => write!(f, "commission rate exceeds maximum"),
+            Self::NotValidator => write!(f, "sender is not a validator"),
         }
     }
 }
@@ -61,7 +67,9 @@ pub struct State {
     pub accounts: HashMap<PublicKey, Account>,
     pub tokens: HashMap<TokenId, TokenMeta>,
     pub next_token_id: u32,
-    pub fee_pool: Amount,
+    pub tx_fee_pool: Amount,
+    pub msg_fee_pool: Amount,
+    pub bridge_fee_pool: Amount,
     pub staking: StakingLedger,
     pub current_epoch: u64,
 }
@@ -73,6 +81,7 @@ pub struct EpochTransitionResult {
     pub bonds_activated: Vec<PendingBond>,
     pub retires_completed: Vec<PendingRetire>,
     pub slashes_applied: Vec<JailRecord>,
+    pub deactivated: Vec<PublicKey>,
     pub state_hash: [u8; 32],
 }
 
@@ -88,7 +97,9 @@ impl State {
             accounts: HashMap::new(),
             tokens: HashMap::new(),
             next_token_id: 1,
-            fee_pool: 0,
+            tx_fee_pool: 0,
+            msg_fee_pool: 0,
+            bridge_fee_pool: 0,
             staking: StakingLedger::new(),
             current_epoch: 0,
         }
@@ -131,7 +142,7 @@ impl State {
         // deduct fee and bump nonce
         account.native_balance -= tx.fee;
         account.nonce += 1;
-        self.fee_pool += tx.fee;
+        self.tx_fee_pool += tx.fee;
 
         self.apply_body(tx.sender, &tx.body)
     }
@@ -269,7 +280,20 @@ impl State {
                     UnjailError::NotJailed => ExecutionError::NotJailed,
                     UnjailError::JailPeriodNotElapsed => ExecutionError::JailPeriodNotElapsed,
                     UnjailError::NoStake => ExecutionError::NoStake,
+                    UnjailError::InsufficientSelfStake => ExecutionError::InsufficientSelfStake,
                 })
+            }
+
+            TransactionBody::SetCommission { rate } => {
+                if *rate > MAX_COMMISSION_BPS {
+                    return Err(ExecutionError::CommissionTooHigh);
+                }
+                let has_stake = self.staking.delegations.contains_key(&sender);
+                if !has_stake {
+                    return Err(ExecutionError::NotValidator);
+                }
+                self.staking.queue_commission_change(sender, *rate);
+                Ok(())
             }
         }
     }
@@ -278,43 +302,47 @@ impl State {
         let current_epoch = completed_epoch + 1;
         self.current_epoch = current_epoch;
 
-        // 1. process slashes first (before bond activation)
+        // 1. process slashes
         let slashes_applied = self.staking.process_slashes(current_epoch);
 
-        // 2. activate pending bonds from ACTIVATION_DELAY_EPOCHS ago
+        // 2. activate pending bonds
         let bonds_activated = self.staking.activate_pending_bonds(current_epoch);
 
-        // 3. complete retirements past UNBONDING_PERIOD_EPOCHS
+        // 3. complete retirements
         let retires_completed = self.staking.complete_pending_retires(current_epoch);
 
-        // 4. distribute fees pro-rata by active (non-jailed) stake
+        // 4. apply pending commission changes
+        self.staking.apply_commission_changes();
+
+        // 5. distribute tx_fee_pool pro-rata by active stake (with dust threshold)
         let total_stake = self.staking.total_active_stake();
         let mut distributed: Amount = 0;
 
-        if total_stake > 0 && self.fee_pool > 0 {
-            let delegations: Vec<(PublicKey, Amount)> = self
+        if total_stake > 0 && self.tx_fee_pool > 0 {
+            let active_validators: Vec<(PublicKey, Amount)> = self
                 .staking
-                .delegations
-                .iter()
-                .filter(|(pk, _)| !self.staking.jailed.contains_key(*pk))
-                .map(|(&k, &v)| (k, v))
+                .validator_set()
+                .into_iter()
                 .collect();
 
-            for (validator, stake) in &delegations {
-                let share = (self.fee_pool as u128 * *stake as u128 / total_stake as u128) as Amount;
-                if share > 0 {
+            for (validator, stake) in &active_validators {
+                let share = (self.tx_fee_pool as u128 * *stake as u128 / total_stake as u128) as Amount;
+                if share >= DUST_THRESHOLD {
                     self.get_or_create_account(validator).native_balance += share;
                     distributed += share;
                 }
             }
         }
 
-        self.fee_pool -= distributed;
+        self.tx_fee_pool -= distributed;
 
-        // 5. derive new validator set (excludes jailed)
+        // 6. collect deactivated validators (below MIN_SELF_STAKE)
+        let deactivated = self.staking.validators_below_min_self_stake();
+
+        // 7. derive new validator set
         let new_validators = self.staking.validator_set();
 
-        // 6. compute state hash
+        // 8. compute state hash
         let state_hash = self.compute_state_hash();
 
         EpochTransitionResult {
@@ -323,6 +351,7 @@ impl State {
             bonds_activated,
             retires_completed,
             slashes_applied,
+            deactivated,
             state_hash,
         }
     }
@@ -357,7 +386,9 @@ impl State {
         }
 
         hasher.update(self.next_token_id.to_le_bytes());
-        hasher.update(self.fee_pool.to_le_bytes());
+        hasher.update(self.tx_fee_pool.to_le_bytes());
+        hasher.update(self.msg_fee_pool.to_le_bytes());
+        hasher.update(self.bridge_fee_pool.to_le_bytes());
         hasher.update(self.current_epoch.to_le_bytes());
 
         // staking delegations — sort by key
@@ -375,6 +406,28 @@ impl State {
             hasher.update(*pk);
             hasher.update(record.epoch_jailed.to_le_bytes());
             hasher.update(record.amount_slashed.to_le_bytes());
+        }
+
+        // self_bonds — sort by key
+        let mut self_bonds: Vec<_> = self.staking.self_bonds.iter().collect();
+        self_bonds.sort_by_key(|(k, _)| *k);
+        for (pk, amount) in &self_bonds {
+            hasher.update(*pk);
+            hasher.update(amount.to_le_bytes());
+        }
+
+        // commission_rates — sort by key
+        let mut commissions: Vec<_> = self.staking.commission_rates.iter().collect();
+        commissions.sort_by_key(|(k, _)| *k);
+        for (pk, rate) in &commissions {
+            hasher.update(*pk);
+            hasher.update(rate.to_le_bytes());
+        }
+
+        // pending commission changes
+        for (pk, rate) in &self.staking.pending_commission_changes {
+            hasher.update(pk);
+            hasher.update(rate.to_le_bytes());
         }
 
         // pending bonds
@@ -408,6 +461,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::MIN_SELF_STAKE;
     use ed25519_dalek::{SigningKey, Signer};
     use rand::rngs::OsRng;
 
@@ -447,7 +501,7 @@ mod tests {
 
         assert_eq!(state.get_account(&pk_a).unwrap().native_balance, 890);
         assert_eq!(state.get_account(&pk_b).unwrap().native_balance, 100);
-        assert_eq!(state.fee_pool, 10);
+        assert_eq!(state.tx_fee_pool, 10);
         assert_eq!(state.get_account(&pk_a).unwrap().nonce, 1);
     }
 
@@ -539,7 +593,7 @@ mod tests {
         state.execute_tx(&tx).unwrap();
 
         assert_eq!(state.get_account(&pk_a).unwrap().native_balance, 25);
-        assert_eq!(state.fee_pool, 25);
+        assert_eq!(state.tx_fee_pool, 25);
     }
 
     #[test]
@@ -687,19 +741,18 @@ mod tests {
         let validator_a: PublicKey = [1u8; 32];
         let validator_b: PublicKey = [2u8; 32];
 
-        // set up delegations directly
         state.staking.delegations.insert(validator_a, 750);
         state.staking.delegations.insert(validator_b, 250);
-        state.fee_pool = 1000;
+        state.staking.self_bonds.insert(validator_a, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(validator_b, MIN_SELF_STAKE);
+        state.tx_fee_pool = 1000;
 
         let result = state.process_epoch_transition(0);
 
-        // 750/1000 * 1000 = 750 for validator_a
-        // 250/1000 * 1000 = 250 for validator_b
         assert_eq!(state.get_account(&validator_a).unwrap().native_balance, 750);
         assert_eq!(state.get_account(&validator_b).unwrap().native_balance, 250);
         assert_eq!(result.fees_distributed, 1000);
-        assert_eq!(state.fee_pool, 0);
+        assert_eq!(state.tx_fee_pool, 0);
     }
 
     #[test]
@@ -722,11 +775,11 @@ mod tests {
     #[test]
     fn process_epoch_transition_no_fees_if_no_stake() {
         let mut state = State::new();
-        state.fee_pool = 1000;
+        state.tx_fee_pool = 1000;
 
         let result = state.process_epoch_transition(0);
         assert_eq!(result.fees_distributed, 0);
-        assert_eq!(state.fee_pool, 1000);
+        assert_eq!(state.tx_fee_pool, 1000);
     }
 
     #[test]
@@ -736,6 +789,7 @@ mod tests {
         let mut state = State::new();
         let validator: PublicKey = [1u8; 32];
         state.staking.delegations.insert(validator, 1000);
+        state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
 
         state.staking.report_offence(SlashingEvent {
             validator,
@@ -757,10 +811,9 @@ mod tests {
         let (sk, pk) = make_keypair();
         let mut state = funded_state(&pk, 10_000);
 
-        // set up as validator with delegation
-        state.staking.delegations.insert(pk, 1000);
+        state.staking.delegations.insert(pk, 2 * MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(pk, 2 * MIN_SELF_STAKE);
 
-        // jail the validator
         state.staking.report_offence(SlashingEvent {
             validator: pk,
             offence: SlashOffenceKind::DoubleVote,
@@ -801,7 +854,7 @@ mod tests {
         let mut state = State::new();
         let v: PublicKey = [1u8; 32];
         state.staking.delegations.insert(v, 500);
-        state.fee_pool = 100;
+        state.tx_fee_pool = 100;
 
         let h1 = state.compute_state_hash();
         let h2 = state.compute_state_hash();
@@ -815,7 +868,7 @@ mod tests {
         state.staking.delegations.insert(v, 500);
 
         let h1 = state.compute_state_hash();
-        state.fee_pool += 1;
+        state.tx_fee_pool += 1;
         let h2 = state.compute_state_hash();
         assert_ne!(h1, h2);
     }
@@ -830,9 +883,10 @@ mod tests {
 
         state.staking.delegations.insert(validator_a, 500);
         state.staking.delegations.insert(validator_b, 500);
-        state.fee_pool = 1000;
+        state.staking.self_bonds.insert(validator_a, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(validator_b, MIN_SELF_STAKE);
+        state.tx_fee_pool = 1000;
 
-        // jail validator_a
         state.staking.report_offence(SlashingEvent {
             validator: validator_a,
             offence: SlashOffenceKind::DoubleVote,
@@ -841,12 +895,170 @@ mod tests {
 
         let result = state.process_epoch_transition(0);
 
-        // validator_a is jailed — should receive no fees
-        // validator_b gets all fees (relative to active stake only)
         let a_balance = state.get_account(&validator_a).map(|a| a.native_balance).unwrap_or(0);
         let b_balance = state.get_account(&validator_b).unwrap().native_balance;
         assert_eq!(a_balance, 0);
         assert_eq!(b_balance, 1000);
         assert_eq!(result.fees_distributed, 1000);
+    }
+
+    #[test]
+    fn self_bond_tracked_on_activation() {
+        let mut state = State::new();
+        let validator: PublicKey = [1u8; 32];
+
+        state.staking.queue_bond(validator, validator, MIN_SELF_STAKE, 0);
+        state.process_epoch_transition(0);
+
+        assert_eq!(state.staking.self_bonds.get(&validator).copied().unwrap_or(0), MIN_SELF_STAKE);
+        assert_eq!(state.staking.delegations.get(&validator).copied().unwrap_or(0), MIN_SELF_STAKE);
+    }
+
+    #[test]
+    fn delegated_bond_not_tracked_as_self() {
+        let mut state = State::new();
+        let delegator: PublicKey = [1u8; 32];
+        let validator: PublicKey = [2u8; 32];
+
+        state.staking.queue_bond(delegator, validator, 5000, 0);
+        state.process_epoch_transition(0);
+
+        assert_eq!(state.staking.self_bonds.get(&validator).copied().unwrap_or(0), 0);
+        assert_eq!(state.staking.delegations.get(&validator).copied().unwrap_or(0), 5000);
+    }
+
+    #[test]
+    fn validator_set_excludes_below_min_self_stake() {
+        let mut state = State::new();
+        let v1: PublicKey = [1u8; 32];
+        let v2: PublicKey = [2u8; 32];
+
+        state.staking.delegations.insert(v1, 500);
+        state.staking.delegations.insert(v2, 500);
+        state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
+        // v2 has no self_bonds
+
+        let set = state.staking.validator_set();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].0, v1);
+    }
+
+    #[test]
+    fn commission_change_applied_at_epoch() {
+        let mut state = State::new();
+        let validator: PublicKey = [1u8; 32];
+        state.staking.delegations.insert(validator, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
+
+        state.staking.queue_commission_change(validator, 500);
+        assert!(state.staking.commission_rates.get(&validator).is_none());
+
+        state.process_epoch_transition(0);
+        assert_eq!(state.staking.commission_rates.get(&validator).copied().unwrap(), 500);
+    }
+
+    #[test]
+    fn slash_reduces_self_bonds_proportionally() {
+        use crate::staking::{SlashingEvent, SlashOffenceKind};
+
+        let mut ledger = StakingLedger::new();
+        let validator: PublicKey = [1u8; 32];
+        ledger.delegations.insert(validator, 2000);
+        ledger.self_bonds.insert(validator, 1000);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+
+        let records = ledger.process_slashes(0);
+        assert_eq!(records.len(), 1);
+        // total slash = 10% of 2000 = 200
+        // self_slash = 200 * 1000/2000 = 100
+        assert_eq!(ledger.self_bonds.get(&validator).copied().unwrap(), 900);
+        assert_eq!(ledger.delegations.get(&validator).copied().unwrap(), 1800);
+    }
+
+    #[test]
+    fn set_commission_tx() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        state.staking.delegations.insert(pk, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(pk, MIN_SELF_STAKE);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::SetCommission { rate: 1000 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+
+        assert_eq!(state.staking.pending_commission_changes.len(), 1);
+        assert_eq!(state.staking.pending_commission_changes[0], (pk, 1000));
+    }
+
+    #[test]
+    fn set_commission_rejects_above_max() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        state.staking.delegations.insert(pk, MIN_SELF_STAKE);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::SetCommission { rate: MAX_COMMISSION_BPS + 1 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::CommissionTooHigh));
+    }
+
+    #[test]
+    fn dust_threshold_skips_tiny_rewards() {
+        let mut state = State::new();
+        let v1: PublicKey = [1u8; 32];
+        let v2: PublicKey = [2u8; 32];
+
+        // v1 has 999x the delegation of v2
+        state.staking.delegations.insert(v1, 999);
+        state.staking.delegations.insert(v2, 1);
+        state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(v2, MIN_SELF_STAKE);
+        state.tx_fee_pool = 999;
+
+        let result = state.process_epoch_transition(0);
+
+        // v1 share = 999 * 999 / 1000 = 998 (>= DUST_THRESHOLD)
+        // v2 share = 999 * 1 / 1000 = 0 (< DUST_THRESHOLD, skipped)
+        assert_eq!(result.fees_distributed, 998);
+        assert_eq!(state.get_account(&v1).unwrap().native_balance, 998);
+        assert_eq!(state.get_account(&v2).map(|a| a.native_balance).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn three_fee_pools_independent() {
+        let mut state = State::new();
+        let validator: PublicKey = [1u8; 32];
+
+        state.staking.delegations.insert(validator, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
+        state.tx_fee_pool = 100;
+        state.msg_fee_pool = 200;
+        state.bridge_fee_pool = 300;
+
+        let result = state.process_epoch_transition(0);
+
+        // only tx_fee_pool should be distributed
+        assert_eq!(result.fees_distributed, 100);
+        assert_eq!(state.tx_fee_pool, 0);
+        assert_eq!(state.msg_fee_pool, 200);
+        assert_eq!(state.bridge_fee_pool, 300);
+        assert_eq!(state.get_account(&validator).unwrap().native_balance, 100);
     }
 }

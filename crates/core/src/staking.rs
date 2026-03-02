@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Amount, PublicKey};
+use crate::types::{Amount, PublicKey, MIN_SELF_STAKE};
 
 pub const ACTIVATION_DELAY_EPOCHS: u64 = 1;
 pub const UNBONDING_PERIOD_EPOCHS: u64 = 2;
@@ -35,6 +35,7 @@ pub enum UnjailError {
     NotJailed,
     JailPeriodNotElapsed,
     NoStake,
+    InsufficientSelfStake,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +46,9 @@ pub struct StakingLedger {
     pub completed_retires: Vec<CompletedRetire>,
     pub jailed: HashMap<PublicKey, JailRecord>,
     pub pending_slashes: Vec<SlashingEvent>,
+    pub self_bonds: HashMap<PublicKey, Amount>,
+    pub commission_rates: HashMap<PublicKey, u16>,
+    pub pending_commission_changes: Vec<(PublicKey, u16)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +90,9 @@ impl StakingLedger {
             completed_retires: Vec::new(),
             jailed: HashMap::new(),
             pending_slashes: Vec::new(),
+            self_bonds: HashMap::new(),
+            commission_rates: HashMap::new(),
+            pending_commission_changes: Vec::new(),
         }
     }
 
@@ -118,6 +125,9 @@ impl StakingLedger {
 
         for bond in &activate {
             *self.delegations.entry(bond.validator).or_insert(0) += bond.amount;
+            if bond.delegator == bond.validator {
+                *self.self_bonds.entry(bond.validator).or_insert(0) += bond.amount;
+            }
         }
 
         activate
@@ -137,6 +147,14 @@ impl StakingLedger {
                 *stake = stake.saturating_sub(retire.amount);
                 if *stake == 0 {
                     self.delegations.remove(&retire.validator);
+                }
+            }
+            if retire.delegator == retire.validator {
+                if let Some(sb) = self.self_bonds.get_mut(&retire.validator) {
+                    *sb = sb.saturating_sub(retire.amount);
+                    if *sb == 0 {
+                        self.self_bonds.remove(&retire.validator);
+                    }
                 }
             }
             self.completed_retires.push(CompletedRetire {
@@ -185,6 +203,14 @@ impl StakingLedger {
                 *s = s.saturating_sub(slash_amount);
             }
 
+            let self_stake = self.self_bonds.get(&event.validator).copied().unwrap_or(0);
+            if self_stake > 0 && stake > 0 {
+                let self_slash = (slash_amount as u128 * self_stake as u128 / stake as u128) as Amount;
+                if let Some(sb) = self.self_bonds.get_mut(&event.validator) {
+                    *sb = sb.saturating_sub(self_slash);
+                }
+            }
+
             let record = JailRecord {
                 validator: event.validator,
                 epoch_jailed: current_epoch,
@@ -210,6 +236,11 @@ impl StakingLedger {
             return Err(UnjailError::NoStake);
         }
 
+        let self_stake = self.self_bonds.get(validator).copied().unwrap_or(0);
+        if self_stake < MIN_SELF_STAKE {
+            return Err(UnjailError::InsufficientSelfStake);
+        }
+
         self.jailed.remove(validator);
         Ok(())
     }
@@ -221,7 +252,10 @@ impl StakingLedger {
     pub fn total_active_stake(&self) -> Amount {
         self.delegations
             .iter()
-            .filter(|(pk, _)| !self.jailed.contains_key(*pk))
+            .filter(|(pk, _)| {
+                !self.jailed.contains_key(*pk)
+                    && self.self_bonds.get(*pk).copied().unwrap_or(0) >= MIN_SELF_STAKE
+            })
             .map(|(_, &stake)| stake)
             .sum()
     }
@@ -229,8 +263,33 @@ impl StakingLedger {
     pub fn validator_set(&self) -> Vec<(PublicKey, Amount)> {
         self.delegations
             .iter()
-            .filter(|(pk, &stake)| stake > 0 && !self.jailed.contains_key(*pk))
+            .filter(|(pk, &stake)| {
+                stake > 0
+                    && !self.jailed.contains_key(*pk)
+                    && self.self_bonds.get(*pk).copied().unwrap_or(0) >= MIN_SELF_STAKE
+            })
             .map(|(&pk, &stake)| (pk, stake))
+            .collect()
+    }
+
+    pub fn queue_commission_change(&mut self, validator: PublicKey, rate: u16) {
+        self.pending_commission_changes.push((validator, rate));
+    }
+
+    pub fn apply_commission_changes(&mut self) {
+        for (validator, rate) in self.pending_commission_changes.drain(..) {
+            self.commission_rates.insert(validator, rate);
+        }
+    }
+
+    pub fn validators_below_min_self_stake(&self) -> Vec<PublicKey> {
+        self.delegations
+            .keys()
+            .filter(|pk| {
+                self.self_bonds.get(*pk).copied().unwrap_or(0) < MIN_SELF_STAKE
+                    && !self.jailed.contains_key(*pk)
+            })
+            .copied()
             .collect()
     }
 }
@@ -302,6 +361,9 @@ mod tests {
         ledger.delegations.insert(pk(1), 100);
         ledger.delegations.insert(pk(2), 0);
         ledger.delegations.insert(pk(3), 500);
+        ledger.self_bonds.insert(pk(1), MIN_SELF_STAKE);
+        ledger.self_bonds.insert(pk(2), MIN_SELF_STAKE);
+        ledger.self_bonds.insert(pk(3), MIN_SELF_STAKE);
 
         let set = ledger.validator_set();
         assert_eq!(set.len(), 2);
@@ -372,7 +434,8 @@ mod tests {
     fn unjail_success() {
         let mut ledger = StakingLedger::new();
         let validator = pk(1);
-        ledger.delegations.insert(validator, 1000);
+        ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
+        ledger.self_bonds.insert(validator, 2 * MIN_SELF_STAKE);
 
         ledger.report_offence(SlashingEvent {
             validator,
@@ -382,7 +445,7 @@ mod tests {
         ledger.process_slashes(0);
         assert!(ledger.jailed.contains_key(&validator));
 
-        // epoch 4 = 0 + JAIL_PERIOD_EPOCHS(4), should succeed
+        // after 10% slash: self_bonds = 1_800_000, still >= MIN_SELF_STAKE
         let result = ledger.unjail(&validator, 4);
         assert!(result.is_ok());
         assert!(!ledger.jailed.contains_key(&validator));
@@ -412,6 +475,8 @@ mod tests {
         let v2 = pk(2);
         ledger.delegations.insert(v1, 500);
         ledger.delegations.insert(v2, 500);
+        ledger.self_bonds.insert(v1, MIN_SELF_STAKE);
+        ledger.self_bonds.insert(v2, MIN_SELF_STAKE);
 
         ledger.report_offence(SlashingEvent {
             validator: v1,

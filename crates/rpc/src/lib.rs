@@ -191,6 +191,7 @@ enum TransactionBodyRequest {
     Retire { validator: String, amount: u64 },
     Withdraw { validator: String },
     UnJail,
+    SetCommission { rate: u16 },
 }
 
 // -- shared state --
@@ -265,6 +266,9 @@ fn convert_body(body: TransactionBodyRequest) -> Result<TransactionBody, String>
             Ok(TransactionBody::Withdraw { validator: decode_pubkey(&validator)? })
         }
         TransactionBodyRequest::UnJail => Ok(TransactionBody::UnJail),
+        TransactionBodyRequest::SetCommission { rate } => {
+            Ok(TransactionBody::SetCommission { rate })
+        }
     }
 }
 
@@ -277,6 +281,7 @@ fn body_type_name(body: &TransactionBody) -> &'static str {
         TransactionBody::Retire { .. } => "Retire",
         TransactionBody::Withdraw { .. } => "Withdraw",
         TransactionBody::UnJail => "UnJail",
+        TransactionBody::SetCommission { .. } => "SetCommission",
     }
 }
 

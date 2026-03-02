@@ -458,11 +458,12 @@ async fn epoch_transition_loop(
 
             let result = state_guard.process_epoch_transition(completed_epoch);
             info!(
-                "epoch transition: {} fees distributed, {} bonds activated, {} retires completed, {} slashes applied, {} validators, state_hash={:x?}",
+                "epoch transition: {} fees distributed, {} bonds activated, {} retires completed, {} slashes applied, {} deactivated, {} validators, state_hash={:x?}",
                 result.fees_distributed,
                 result.bonds_activated.len(),
                 result.retires_completed.len(),
                 result.slashes_applied.len(),
+                result.deactivated.len(),
                 result.new_validators.len(),
                 &result.state_hash[..8],
             );

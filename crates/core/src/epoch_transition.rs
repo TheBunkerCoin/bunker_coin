@@ -11,4 +11,5 @@ pub struct EpochTransitionBlock {
     pub new_validator_set: Vec<(PublicKey, Amount)>,
     pub state_hash: [u8; 32],
     pub slashes_applied: Vec<JailRecord>,
+    pub deactivated_validators: Vec<PublicKey>,
 }

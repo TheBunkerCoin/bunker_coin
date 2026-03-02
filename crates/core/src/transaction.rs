@@ -66,6 +66,10 @@ impl Transaction {
             TransactionBody::UnJail => {
                 hasher.update([6u8]);
             }
+            TransactionBody::SetCommission { rate } => {
+                hasher.update([7u8]);
+                hasher.update(rate.to_le_bytes());
+            }
         }
 
         hasher.finalize().into()
@@ -100,4 +104,7 @@ pub enum TransactionBody {
         validator: PublicKey,
     },
     UnJail,
+    SetCommission {
+        rate: u16,
+    },
 }
