@@ -1061,4 +1061,466 @@ mod tests {
         assert_eq!(state.bridge_fee_pool, 300);
         assert_eq!(state.get_account(&validator).unwrap().native_balance, 100);
     }
+
+    #[test]
+    fn retire_insufficient_delegation() {
+        let (sk, pk) = make_keypair();
+        let (_, validator) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        state.staking.delegations.insert(validator, 100);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Retire { validator, amount: 500 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::InsufficientBalance { .. }));
+    }
+
+    #[test]
+    fn retire_zero_amount() {
+        let (sk, pk) = make_keypair();
+        let (_, validator) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Retire { validator, amount: 0 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::ZeroAmount));
+    }
+
+    #[test]
+    fn bond_zero_amount() {
+        let (sk, pk) = make_keypair();
+        let (_, validator) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Bond { validator, amount: 0 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::ZeroAmount));
+    }
+
+    #[test]
+    fn bond_insufficient_balance() {
+        let (sk, pk) = make_keypair();
+        let (_, validator) = make_keypair();
+        let mut state = funded_state(&pk, 50);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::Bond { validator, amount: 100 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::InsufficientBalance { .. }));
+    }
+
+    #[test]
+    fn withdraw_nothing_available() {
+        let (sk, pk) = make_keypair();
+        let (_, validator) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Withdraw { validator },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::ZeroAmount));
+    }
+
+    #[test]
+    fn withdraw_credits_balance() {
+        let (sk, pk) = make_keypair();
+        let (_, validator) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        state.staking.completed_retires.push(crate::staking::CompletedRetire {
+            delegator: pk,
+            validator,
+            amount: 500,
+            epoch_completed: 0,
+        });
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Withdraw { validator },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+
+        assert_eq!(state.get_account(&pk).unwrap().native_balance, 10_499); // 10000 - 1 fee + 500
+    }
+
+    #[test]
+    fn mint_ticker_too_short() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Mint { ticker: "AB".into(), max_supply: 100, metadata_hash: [0; 32] },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::TickerLengthInvalid(2)));
+    }
+
+    #[test]
+    fn mint_ticker_too_long() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Mint { ticker: "TOOLONGTK".into(), max_supply: 100, metadata_hash: [0; 32] },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::TickerLengthInvalid(_)));
+    }
+
+    #[test]
+    fn mint_duplicate_ticker() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut tx1 = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Mint { ticker: "BNK".into(), max_supply: 100, metadata_hash: [0; 32] },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx1);
+        state.execute_tx(&tx1).unwrap();
+
+        let mut tx2 = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::Mint { ticker: "BNK".into(), max_supply: 200, metadata_hash: [1; 32] },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx2);
+        let err = state.execute_tx(&tx2).unwrap_err();
+        assert!(matches!(err, ExecutionError::TickerAlreadyExists(_)));
+    }
+
+    #[test]
+    fn token_transfer_nonexistent_token() {
+        let (sk, pk) = make_keypair();
+        let (_, pk_b) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::TokenTransfer { to: pk_b, token_id: [0, 0, 0, 99], amount: 50 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::TokenNotFound(_)));
+    }
+
+    #[test]
+    fn token_transfer_insufficient_balance() {
+        let (sk, pk) = make_keypair();
+        let (_, pk_b) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        // mint 100 tokens
+        let mut mint_tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Mint { ticker: "TKN".into(), max_supply: 100, metadata_hash: [0; 32] },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut mint_tx);
+        state.execute_tx(&mint_tx).unwrap();
+
+        let token_id = 1u32.to_le_bytes();
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::TokenTransfer { to: pk_b, token_id, amount: 200 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::InsufficientTokenBalance { .. }));
+    }
+
+    #[test]
+    fn token_transfer_self() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut mint_tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Mint { ticker: "TKN".into(), max_supply: 100, metadata_hash: [0; 32] },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut mint_tx);
+        state.execute_tx(&mint_tx).unwrap();
+
+        let token_id = 1u32.to_le_bytes();
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::TokenTransfer { to: pk, token_id, amount: 50 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::SelfTransfer));
+    }
+
+    #[test]
+    fn token_transfer_zero_amount() {
+        let (sk, pk) = make_keypair();
+        let (_, pk_b) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut mint_tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Mint { ticker: "TKN".into(), max_supply: 100, metadata_hash: [0; 32] },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut mint_tx);
+        state.execute_tx(&mint_tx).unwrap();
+
+        let token_id = 1u32.to_le_bytes();
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::TokenTransfer { to: pk_b, token_id, amount: 0 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::ZeroAmount));
+    }
+
+    #[test]
+    fn set_commission_not_validator() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        // pk has no delegation
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::SetCommission { rate: 500 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::NotValidator));
+    }
+
+    #[test]
+    fn set_commission_at_max() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        state.staking.delegations.insert(pk, MIN_SELF_STAKE);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::SetCommission { rate: MAX_COMMISSION_BPS },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+        assert_eq!(state.staking.pending_commission_changes[0], (pk, MAX_COMMISSION_BPS));
+    }
+
+    #[test]
+    fn sequential_nonces() {
+        let (sk, pk) = make_keypair();
+        let (_, pk_b) = make_keypair();
+        let mut state = funded_state(&pk, 100_000);
+
+        for i in 0..5 {
+            let mut tx = Transaction {
+                sender: pk,
+                nonce: i,
+                fee: 1,
+                body: TransactionBody::Transfer { to: pk_b, amount: 10 },
+                signature: [0u8; 64],
+            };
+            sign_tx(&sk, &mut tx);
+            state.execute_tx(&tx).unwrap();
+        }
+
+        assert_eq!(state.get_account(&pk).unwrap().nonce, 5);
+        assert_eq!(state.get_account(&pk_b).unwrap().native_balance, 50);
+    }
+
+    #[test]
+    fn fee_insufficient_for_fee() {
+        let (sk, pk) = make_keypair();
+        let (_, pk_b) = make_keypair();
+        let mut state = funded_state(&pk, 5);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::Transfer { to: pk_b, amount: 1 },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::InsufficientBalance { .. }));
+    }
+
+    #[test]
+    fn multiple_mints_increment_token_id() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        for (i, ticker) in ["AAA", "BBB", "CCC"].iter().enumerate() {
+            let mut tx = Transaction {
+                sender: pk,
+                nonce: i as u64,
+                fee: 1,
+                body: TransactionBody::Mint {
+                    ticker: ticker.to_string(),
+                    max_supply: 100,
+                    metadata_hash: [i as u8; 32],
+                },
+                signature: [0u8; 64],
+            };
+            sign_tx(&sk, &mut tx);
+            state.execute_tx(&tx).unwrap();
+        }
+
+        assert_eq!(state.tokens.len(), 3);
+        assert_eq!(state.next_token_id, 4);
+    }
+
+    #[test]
+    fn state_hash_includes_all_pools() {
+        let mut state = State::new();
+        let v: PublicKey = [1u8; 32];
+        state.staking.delegations.insert(v, 500);
+        state.staking.self_bonds.insert(v, MIN_SELF_STAKE);
+        state.tx_fee_pool = 100;
+
+        let h1 = state.compute_state_hash();
+        state.msg_fee_pool = 200;
+        let h2 = state.compute_state_hash();
+        assert_ne!(h1, h2);
+
+        state.bridge_fee_pool = 300;
+        let h3 = state.compute_state_hash();
+        assert_ne!(h2, h3);
+    }
+
+    #[test]
+    fn state_hash_includes_commission() {
+        let mut state = State::new();
+        let v: PublicKey = [1u8; 32];
+        state.staking.delegations.insert(v, 500);
+
+        let h1 = state.compute_state_hash();
+        state.staking.commission_rates.insert(v, 1000);
+        let h2 = state.compute_state_hash();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn state_hash_includes_self_bonds() {
+        let mut state = State::new();
+        let v: PublicKey = [1u8; 32];
+        state.staking.delegations.insert(v, 500);
+
+        let h1 = state.compute_state_hash();
+        state.staking.self_bonds.insert(v, 100);
+        let h2 = state.compute_state_hash();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn epoch_transition_completes_retires() {
+        let mut state = State::new();
+        let delegator: PublicKey = [1u8; 32];
+        let validator: PublicKey = [2u8; 32];
+
+        state.staking.delegations.insert(validator, 1000);
+        state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
+        state.staking.queue_retire(delegator, validator, 500, 0);
+
+        // epoch 0->1: too early (UNBONDING_PERIOD = 2)
+        let r1 = state.process_epoch_transition(0);
+        assert!(r1.retires_completed.is_empty());
+
+        // epoch 1->2: should complete
+        let r2 = state.process_epoch_transition(1);
+        assert_eq!(r2.retires_completed.len(), 1);
+        assert_eq!(state.staking.delegations.get(&validator).copied().unwrap(), 500);
+    }
+
+    #[test]
+    fn epoch_transition_deactivated_below_min_self_stake() {
+        let mut state = State::new();
+        let v1: PublicKey = [1u8; 32];
+        let v2: PublicKey = [2u8; 32];
+
+        state.staking.delegations.insert(v1, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
+        state.staking.delegations.insert(v2, 500);
+        // v2 has no self_bond
+
+        let result = state.process_epoch_transition(0);
+        assert!(result.deactivated.contains(&v2));
+        assert!(!result.deactivated.contains(&v1));
+    }
 }

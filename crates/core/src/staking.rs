@@ -469,6 +469,250 @@ mod tests {
     }
 
     #[test]
+    fn self_bond_tracked_on_activation() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.queue_bond(validator, validator, MIN_SELF_STAKE, 0);
+
+        let activated = ledger.activate_pending_bonds(1);
+        assert_eq!(activated.len(), 1);
+        assert_eq!(ledger.self_bonds.get(&validator).copied().unwrap(), MIN_SELF_STAKE);
+    }
+
+    #[test]
+    fn delegated_bond_not_self_bond() {
+        let mut ledger = StakingLedger::new();
+        let delegator = pk(1);
+        let validator = pk(2);
+        ledger.queue_bond(delegator, validator, 1000, 0);
+
+        ledger.activate_pending_bonds(1);
+        assert_eq!(ledger.self_bonds.get(&validator).copied().unwrap_or(0), 0);
+        assert_eq!(ledger.delegations.get(&validator).copied().unwrap(), 1000);
+    }
+
+    #[test]
+    fn self_retire_reduces_self_bond() {
+        let mut ledger = StakingLedger::new();
+        let v = pk(1);
+        ledger.delegations.insert(v, 2000);
+        ledger.self_bonds.insert(v, 2000);
+
+        ledger.queue_retire(v, v, 500, 0);
+        ledger.complete_pending_retires(2);
+
+        assert_eq!(ledger.delegations.get(&v).copied().unwrap(), 1500);
+        assert_eq!(ledger.self_bonds.get(&v).copied().unwrap(), 1500);
+    }
+
+    #[test]
+    fn delegator_retire_does_not_reduce_self_bond() {
+        let mut ledger = StakingLedger::new();
+        let delegator = pk(1);
+        let validator = pk(2);
+        ledger.delegations.insert(validator, 2000);
+        ledger.self_bonds.insert(validator, 1000);
+
+        ledger.queue_retire(delegator, validator, 500, 0);
+        ledger.complete_pending_retires(2);
+
+        assert_eq!(ledger.delegations.get(&validator).copied().unwrap(), 1500);
+        assert_eq!(ledger.self_bonds.get(&validator).copied().unwrap(), 1000);
+    }
+
+    #[test]
+    fn total_active_stake_excludes_jailed_and_low_self_bond() {
+        let mut ledger = StakingLedger::new();
+        let v1 = pk(1);
+        let v2 = pk(2);
+        let v3 = pk(3);
+        ledger.delegations.insert(v1, 1000);
+        ledger.delegations.insert(v2, 2000);
+        ledger.delegations.insert(v3, 3000);
+        ledger.self_bonds.insert(v1, MIN_SELF_STAKE);
+        ledger.self_bonds.insert(v3, MIN_SELF_STAKE);
+        // v2 has no self_bond -> excluded
+
+        ledger.report_offence(SlashingEvent {
+            validator: v1,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+        ledger.process_slashes(0);
+        // v1 jailed -> excluded
+
+        assert_eq!(ledger.total_active_stake(), 3000);
+    }
+
+    #[test]
+    fn commission_change_queue_and_apply() {
+        let mut ledger = StakingLedger::new();
+        let v = pk(1);
+
+        ledger.queue_commission_change(v, 500);
+        ledger.queue_commission_change(v, 1000);
+        assert!(ledger.commission_rates.is_empty());
+
+        ledger.apply_commission_changes();
+        // last queued wins
+        assert_eq!(ledger.commission_rates.get(&v).copied().unwrap(), 1000);
+        assert!(ledger.pending_commission_changes.is_empty());
+    }
+
+    #[test]
+    fn validators_below_min_self_stake() {
+        let mut ledger = StakingLedger::new();
+        let v1 = pk(1);
+        let v2 = pk(2);
+        let v3 = pk(3);
+        ledger.delegations.insert(v1, 1000);
+        ledger.delegations.insert(v2, 2000);
+        ledger.delegations.insert(v3, 3000);
+        ledger.self_bonds.insert(v1, MIN_SELF_STAKE);
+        // v2 has no self_bond
+        ledger.self_bonds.insert(v3, MIN_SELF_STAKE - 1);
+
+        let below = ledger.validators_below_min_self_stake();
+        assert_eq!(below.len(), 2);
+        assert!(below.contains(&v2));
+        assert!(below.contains(&v3));
+    }
+
+    #[test]
+    fn unjail_insufficient_self_stake() {
+        let mut ledger = StakingLedger::new();
+        let v = pk(1);
+        ledger.delegations.insert(v, 1000);
+        ledger.self_bonds.insert(v, MIN_SELF_STAKE - 1);
+
+        ledger.report_offence(SlashingEvent {
+            validator: v,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+        ledger.process_slashes(0);
+
+        let result = ledger.unjail(&v, 10);
+        assert_eq!(result, Err(UnjailError::InsufficientSelfStake));
+    }
+
+    #[test]
+    fn unjail_no_stake() {
+        let mut ledger = StakingLedger::new();
+        let v = pk(1);
+        ledger.delegations.insert(v, 100);
+
+        ledger.report_offence(SlashingEvent {
+            validator: v,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+        ledger.process_slashes(0);
+
+        // remove all stake
+        ledger.delegations.remove(&v);
+        let result = ledger.unjail(&v, 10);
+        assert_eq!(result, Err(UnjailError::NoStake));
+    }
+
+    #[test]
+    fn unjail_not_jailed() {
+        let mut ledger = StakingLedger::new();
+        let result = ledger.unjail(&pk(1), 10);
+        assert_eq!(result, Err(UnjailError::NotJailed));
+    }
+
+    #[test]
+    fn total_stake() {
+        let mut ledger = StakingLedger::new();
+        ledger.delegations.insert(pk(1), 100);
+        ledger.delegations.insert(pk(2), 200);
+        ledger.delegations.insert(pk(3), 300);
+        assert_eq!(ledger.total_stake(), 600);
+    }
+
+    #[test]
+    fn bond_activation_delay() {
+        let mut ledger = StakingLedger::new();
+        ledger.queue_bond(pk(1), pk(2), 500, 5);
+
+        // epoch 5: too early (need epoch_queued + ACTIVATION_DELAY_EPOCHS = 6)
+        assert!(ledger.activate_pending_bonds(5).is_empty());
+        // epoch 6: exact boundary
+        let activated = ledger.activate_pending_bonds(6);
+        assert_eq!(activated.len(), 1);
+    }
+
+    #[test]
+    fn retire_unbonding_period() {
+        let mut ledger = StakingLedger::new();
+        ledger.delegations.insert(pk(2), 1000);
+        ledger.queue_retire(pk(1), pk(2), 500, 5);
+
+        // epoch 6: too early (need epoch_queued + UNBONDING_PERIOD_EPOCHS = 7)
+        assert!(ledger.complete_pending_retires(6).is_empty());
+        // epoch 7: exact boundary
+        let completed = ledger.complete_pending_retires(7);
+        assert_eq!(completed.len(), 1);
+    }
+
+    #[test]
+    fn full_retire_removes_delegation() {
+        let mut ledger = StakingLedger::new();
+        let v = pk(1);
+        ledger.delegations.insert(v, 1000);
+        ledger.queue_retire(pk(2), v, 1000, 0);
+        ledger.complete_pending_retires(2);
+
+        assert!(!ledger.delegations.contains_key(&v));
+    }
+
+    #[test]
+    fn slash_reduces_self_bonds_proportionally() {
+        let mut ledger = StakingLedger::new();
+        let v = pk(1);
+        ledger.delegations.insert(v, 3000);
+        ledger.self_bonds.insert(v, 1000); // 1/3 of total
+
+        ledger.report_offence(SlashingEvent {
+            validator: v,
+            offence: SlashOffenceKind::DoubleVote,
+            epoch: 0,
+        });
+        ledger.process_slashes(0);
+
+        // total slash = 10% of 3000 = 300
+        // self_slash = 300 * 1000/3000 = 100
+        assert_eq!(ledger.self_bonds.get(&v).copied().unwrap(), 900);
+        assert_eq!(ledger.delegations.get(&v).copied().unwrap(), 2700);
+    }
+
+    #[test]
+    fn multiple_withdrawals_for_different_validators() {
+        let mut ledger = StakingLedger::new();
+        let delegator = pk(1);
+        let v1 = pk(2);
+        let v2 = pk(3);
+
+        ledger.completed_retires.push(CompletedRetire {
+            delegator,
+            validator: v1,
+            amount: 100,
+            epoch_completed: 1,
+        });
+        ledger.completed_retires.push(CompletedRetire {
+            delegator,
+            validator: v2,
+            amount: 200,
+            epoch_completed: 1,
+        });
+
+        assert_eq!(ledger.withdraw(&delegator, &v1), 100);
+        assert_eq!(ledger.withdraw(&delegator, &v2), 200);
+        assert!(ledger.completed_retires.is_empty());
+    }
+
+    #[test]
     fn validator_set_excludes_jailed() {
         let mut ledger = StakingLedger::new();
         let v1 = pk(1);
