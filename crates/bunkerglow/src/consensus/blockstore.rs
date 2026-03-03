@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use log::{debug, trace};
+use log::debug;
 use mockall::automock;
 use tokio::sync::mpsc::Sender;
 
@@ -90,7 +90,7 @@ impl BlockstoreImpl {
 
         Self {
             block_data: BTreeMap::new(),
-            shredders: ShredderPool::default(),
+            shredders: ShredderPool::with_size(1),
             votor_channel,
             epoch_info,
             db,
@@ -400,7 +400,7 @@ impl Blockstore for BlockstoreImpl {
             if let Ok((k, v)) = item {
                 if k.len() >= 16 + suffix_bytes.len() && &k[k.len()-suffix_bytes.len()..] == suffix_bytes {
                     let slot_str = std::str::from_utf8(&k[0..16]).ok()?;
-                    let slot = u64::from_str_radix(slot_str, 16).ok()?;
+                    let slot = Slot::new(u64::from_str_radix(slot_str, 16).ok()?);
                     if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(&v, bincode::config::standard()) {
                         return Some((slot, block));
                     }
@@ -421,10 +421,12 @@ impl Blockstore for BlockstoreImpl {
     }
 
     fn update_finalized_timestamp(&self, slot: Slot, hash: Hash, timestamp: u64) {
-        if let Some(mut metadata) = self.load_block_metadata(slot, hash) {
+        if let Some(mut metadata) = self.load_block_metadata(slot, hash.clone()) {
             metadata.finalized_timestamp = Some(timestamp);
-            let key = format!("meta|{:016X}{}", slot, hex::encode(hash));
-            if let Ok(value) = bincode::serde::encode_to_vec(&metadata, bincode::config::standard()) {
+            let key = format!("meta|{:016X}{}", slot, hex::encode(&hash));
+            if let Ok(value) =
+                bincode::serde::encode_to_vec(&metadata, bincode::config::standard())
+            {
                 let _ = self.db.put(key.as_bytes(), value);
             }
         }
@@ -438,11 +440,12 @@ impl Blockstore for BlockstoreImpl {
         let mut deleted_meta_count = 0;
         for item in self.db.iterator(IteratorMode::Start) {
             if let Ok((k, _v)) = item {
+                let finalized = highest_finalized_slot.inner();
                 if k.starts_with(b"meta|") {
                     if k.len() >= 21 {
                         if let Ok(slot_hex) = std::str::from_utf8(&k[5..21]) {
                             if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
-                                if slot_val > highest_finalized_slot {
+                                if slot_val > finalized {
                                     batch.delete(&k);
                                     deleted_meta_count += 1;
                                 }
@@ -452,7 +455,7 @@ impl Blockstore for BlockstoreImpl {
                 } else if k.len() >= 16 {
                     if let Ok(slot_hex) = std::str::from_utf8(&k[0..16]) {
                         if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
-                            if slot_val > highest_finalized_slot {
+                            if slot_val > finalized {
                                 batch.delete(&k);
                                 deleted_count += 1;
                             }

@@ -143,7 +143,7 @@ impl Shred {
     /// Returns the slot number this shred belongs to.
     #[must_use]
     pub const fn slot(&self) -> crate::Slot {
-        self.payload().slot
+        self.payload().header.slot
     }
 
     /// Returns the index of this shred within the entire slot.
@@ -197,7 +197,7 @@ impl ShredPayload {
     /// Returns the slot number this shred belongs to.
     #[must_use]
     pub const fn slot(&self) -> crate::Slot {
-        self.slot
+        self.header.slot
     }
 }
 

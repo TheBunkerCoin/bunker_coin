@@ -67,7 +67,7 @@ impl<N: Network> Rotor<N, FaitAccompli1Sampler<PartitionSampler>> {
     }
 }
 
-impl<N, S: SamplingStrategy> Rotor<N, S>
+impl<N, S: SamplingStrategy + Sync> Rotor<N, S>
 where
     N: ShredNetwork,
 {
@@ -79,7 +79,7 @@ where
 
     /// Sends the shred to the correct relay validator.
     async fn send_as_leader(&self, shred: &Shred) -> std::io::Result<()> {
-        let relay = self.sample_relay(shred.payload().slot, shred.payload().index_in_slot());
+        let relay = self.sample_relay(shred.payload().slot(), shred.payload().index_in_slot());
         let addr = self.epoch_info.validator(relay).disseminator_address;
         self.network.send(shred, addr).await
     }

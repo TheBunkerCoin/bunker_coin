@@ -60,7 +60,7 @@ pub type BlockId = (Slot, BlockHash);
 const MAX_TRANSACTION_SIZE: usize = 512;
 
 /// Parsed block with information about parent and transactions as payload.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     slot: Slot,
     hash: BlockHash,
@@ -75,7 +75,7 @@ impl Block {
     }
 
     pub fn parent_hash(&self) -> BlockHash {
-        self.parent_hash
+        self.parent_hash.clone()
     }
 
     pub fn slot(&self) -> Slot {
@@ -83,7 +83,7 @@ impl Block {
     }
 
     pub fn block_hash(&self) -> BlockHash {
-        self.hash
+        self.hash.clone()
     }
 
     pub fn transactions(&self) -> &[Transaction] {
@@ -94,7 +94,7 @@ impl Block {
 /// Dummy transaction containing payload bytes.
 ///
 /// A transaction cannot hold more than [`MAX_TRANSACTION_SIZE`] payload bytes.
-#[derive(Clone, Debug, SchemaRead, SchemaWrite)]
+#[derive(Clone, Debug, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Transaction(pub Vec<u8>);
 
 /// Validator information as known about other validators.

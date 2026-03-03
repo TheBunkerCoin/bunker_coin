@@ -293,12 +293,7 @@ impl<A: All2All> Votor<A> {
         if slot == first_slot {
             let valid_parent = self
                 .parents_ready
-                .contains(&(slot, parent_slot, parent_hash));
-            let h = &hex::encode(parent_hash)[..8];
-            //println!(
-            //    "[Votor {}] try_notar slot {} parent {}@{} valid={}",
-            //    self.validator_id, slot, h, parent_slot, valid_parent
-            //);
+                .contains(&(slot, parent_slot, parent_hash.clone()));
             if !valid_parent {
                 return false;
             }
@@ -307,8 +302,7 @@ impl<A: All2All> Votor<A> {
         {
             return false;
         }
-        //println!("[Votor {}] VOTE_NOTAR slot {} hash {}", self.validator_id, slot, &hex::encode(hash)[..8]);
-        let vote = Vote::new_notar(slot, hash, &self.voting_key, self.validator_id);
+        let vote = Vote::new_notar(slot, hash.clone(), &self.voting_key, self.validator_id);
         self.all2all.broadcast(&vote.into()).await.unwrap();
         self.voted.insert(slot);
         self.voted_notar.insert(slot, hash.clone());

@@ -51,7 +51,7 @@ pub use epoch_info::EpochInfo;
 pub use pool::{AddVoteError, EpochBoundaryEvent, Pool, PoolError, PoolImpl, SlashingReport};
 pub use vote::Vote;
 use block_producer::BlockProducer;
-use votor::{Votor, VotorEvent};
+use votor::Votor;
 
 /// Time bound assumed on network transmission delays during periods of synchrony.
 pub(crate) const DELTA: Duration = Duration::from_millis(8_000);

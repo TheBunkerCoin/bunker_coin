@@ -6,6 +6,7 @@
 //! This module abstratcs the hash function used throughout the entire library.
 //! Currently, SHA-256, specifically the implementation from the [`sha2`] crate is used.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wincode::{SchemaRead, SchemaWrite};
 
@@ -13,7 +14,7 @@ use wincode::{SchemaRead, SchemaWrite};
 ///
 /// This provides 256-bit resistance against (second) preimage attacks.
 /// It also provides 128-bit resistance against collision attacks.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, SchemaRead, SchemaWrite)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Hash(pub(super) [u8; 32]);
 
 impl Hash {

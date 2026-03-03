@@ -3,8 +3,9 @@
 
 //! Defines the [`Slot`] type.
 
-use std::fmt::Display;
+use std::fmt::{Display, UpperHex};
 
+use serde::{Deserialize, Serialize};
 use wincode::{SchemaRead, SchemaWrite};
 
 /// Number of slots in each leader window.
@@ -18,7 +19,10 @@ pub const SLOTS_PER_EPOCH: u64 = 18_000;
 
 /// Slot number type.
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, SchemaRead, SchemaWrite)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, SchemaRead,
+    SchemaWrite,
+)]
 pub struct Slot(u64);
 
 impl Slot {
@@ -122,6 +126,12 @@ impl Default for Slot {
 impl Display for Slot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl UpperHex for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        UpperHex::fmt(&self.0, f)
     }
 }
 

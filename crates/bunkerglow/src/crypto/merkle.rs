@@ -208,7 +208,19 @@ impl AsRef<[Hash]> for SliceProof {
 
 #[repr(transparent)]
 #[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, From, Into, SchemaRead, SchemaWrite,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    From,
+    Into,
+    serde::Serialize,
+    serde::Deserialize,
+    SchemaRead,
+    SchemaWrite,
 )]
 pub struct DoubleMerkleRoot(Hash);
 impl MerkleRoot for DoubleMerkleRoot {
