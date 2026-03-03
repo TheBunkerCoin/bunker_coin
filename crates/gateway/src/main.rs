@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -65,19 +65,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn process_packets(
-    mut packet_rx: mpsc::Receiver<RadioPacket>,
-    gateway: Arc<Gateway>,
-) {
+async fn process_packets(mut packet_rx: mpsc::Receiver<RadioPacket>, gateway: Arc<Gateway>) {
     while let Some(packet) = packet_rx.recv().await {
         gateway.queue_depth.fetch_sub(1, Ordering::Relaxed);
         let size = packet.payload.len();
         if size > gateway.config.mtu {
-            warn!("Packet too large: {} bytes > MTU {}", size, gateway.config.mtu);
+            warn!(
+                "Packet too large: {} bytes > MTU {}",
+                size, gateway.config.mtu
+            );
             continue;
         }
 
-        let trans_time = Duration::from_secs_f64((size * 8) as f64 / gateway.config.bandwidth_bps as f64);
+        let trans_time =
+            Duration::from_secs_f64((size * 8) as f64 / gateway.config.bandwidth_bps as f64);
         let jitter_ms = gateway.config.latency_jitter.as_millis() as f64;
         let jitter = if jitter_ms > 0.0 {
             let mut rng = rand::rng();
@@ -126,7 +127,8 @@ async fn process_packets(
 async fn root_handler(State(gateway): State<Arc<Gateway>>) -> Html<String> {
     let depth = gateway.queue_depth.load(Ordering::Relaxed);
     let connected = gateway.nodes.read().await.len();
-    let html = format!(r#"
+    let html = format!(
+        r#"
         <html>
         <head>
             <title>BunkerCoin Radio Gateway</title>
@@ -148,7 +150,8 @@ async fn root_handler(State(gateway): State<Arc<Gateway>>) -> Html<String> {
         </pre>
         </body>
         </html>
-        "#);
+        "#
+    );
     Html(html)
 }
 
@@ -162,7 +165,7 @@ async fn ws_handler(
 async fn handle_socket(socket: WebSocket, gateway: Arc<Gateway>) {
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(tokio::sync::Mutex::new(sender));
-    
+
     let id = {
         let sender_clone = sender.clone();
         let registration_result = handle_registration(&mut receiver, sender_clone, &gateway).await;
@@ -176,7 +179,7 @@ async fn handle_socket(socket: WebSocket, gateway: Arc<Gateway>) {
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1000);
     gateway.nodes.write().await.insert(id, tx);
-    
+
     let sender_clone = sender.clone();
     tokio::spawn(async move {
         while let Some(payload) = rx.recv().await {
@@ -204,7 +207,11 @@ async fn handle_socket(socket: WebSocket, gateway: Arc<Gateway>) {
                                 }
                             }
                         };
-                        let packet = RadioPacket { from: id, to, payload };
+                        let packet = RadioPacket {
+                            from: id,
+                            to,
+                            payload,
+                        };
                         gateway.queue_depth.fetch_add(1, Ordering::Relaxed);
                         if let Err(e) = gateway.packet_queue.send(packet).await {
                             gateway.queue_depth.fetch_sub(1, Ordering::Relaxed);
@@ -242,22 +249,30 @@ async fn handle_registration(
                     let guard = gateway.nodes.read().await;
                     if guard.contains_key(&parsed_id) {
                         let mut sender_guard = sender.lock().await;
-                        let _ = sender_guard.send(WsMessage::Text("ID_ALREADY_REGISTERED".to_string())).await;
+                        let _ = sender_guard
+                            .send(WsMessage::Text("ID_ALREADY_REGISTERED".to_string()))
+                            .await;
                         return None;
                     }
                     drop(guard);
-                    
+
                     let mut sender_guard = sender.lock().await;
-                    let _ = sender_guard.send(WsMessage::Text("REGISTERED".to_string())).await;
+                    let _ = sender_guard
+                        .send(WsMessage::Text("REGISTERED".to_string()))
+                        .await;
                     return Some(parsed_id);
                 } else {
                     let mut sender_guard = sender.lock().await;
-                    let _ = sender_guard.send(WsMessage::Text("INVALID_ID".to_string())).await;
+                    let _ = sender_guard
+                        .send(WsMessage::Text("INVALID_ID".to_string()))
+                        .await;
                 }
             }
             Ok(_) => {
                 let mut sender_guard = sender.lock().await;
-                let _ = sender_guard.send(WsMessage::Text("EXPECT_REGISTER".to_string())).await;
+                let _ = sender_guard
+                    .send(WsMessage::Text("EXPECT_REGISTER".to_string()))
+                    .await;
             }
             Err(e) => {
                 error!("WebSocket error during registration: {}", e);

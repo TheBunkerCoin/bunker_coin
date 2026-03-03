@@ -14,7 +14,9 @@ use wincode::{SchemaRead, SchemaWrite};
 ///
 /// This provides 256-bit resistance against (second) preimage attacks.
 /// It also provides 128-bit resistance against collision attacks.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, SchemaRead, SchemaWrite)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, SchemaRead, SchemaWrite,
+)]
 pub struct Hash(pub(super) [u8; 32]);
 
 impl Hash {

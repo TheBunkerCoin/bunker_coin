@@ -77,7 +77,8 @@ mod tests {
         };
 
         for i in 1..=5u32 {
-            acc.token_balances.insert(i.to_le_bytes(), i as Amount * 100);
+            acc.token_balances
+                .insert(i.to_le_bytes(), i as Amount * 100);
         }
 
         assert_eq!(acc.token_balances.len(), 5);

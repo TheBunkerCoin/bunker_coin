@@ -37,9 +37,9 @@ pub struct ScsPactorConfig {
 impl ScsPactorConfig {
     pub async fn resolve(host: &str, port: u16) -> Result<Self, ScsPactorError> {
         let mut addrs = lookup_host((host, port)).await?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no addresses"))?;
+        let addr = addrs.next().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no addresses")
+        })?;
         Ok(Self {
             addr,
             read_timeout: Some(Duration::from_secs(10)),
@@ -83,7 +83,9 @@ impl ScsPactorClient {
         })
     }
 
-    pub fn peer_addr(&self) -> SocketAddr { self.peer_addr }
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
     pub async fn send_command(&self, line: &str) -> Result<(), ScsPactorError> {
         let mut writer = self.cmd_writer.lock().await;
         let fut = writer.send(line.to_string());
@@ -102,7 +104,9 @@ impl ScsPactorClient {
     pub async fn read_status_line(&self) -> Result<String, ScsPactorError> {
         let mut reader = self.cmd_reader.lock().await;
         let next = if let Some(d) = self.read_timeout {
-            timeout(d, reader.next()).await.map_err(|_| ScsPactorError::Timeout)?
+            timeout(d, reader.next())
+                .await
+                .map_err(|_| ScsPactorError::Timeout)?
         } else {
             reader.next().await
         };
@@ -118,10 +122,14 @@ impl ScsPactorClient {
     }
 
     pub async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
-        self.send_command(&format!("CONNECT {}", remote_call)).await?;
+        self.send_command(&format!("CONNECT {}", remote_call))
+            .await?;
         for _ in 0..60 {
             let line = self.read_status_line().await?;
-            if line.starts_with("DISCONNECTED") || line.starts_with("FAIL") || line.starts_with("NO ") {
+            if line.starts_with("DISCONNECTED")
+                || line.starts_with("FAIL")
+                || line.starts_with("NO ")
+            {
                 return Err(ScsPactorError::Io(std::io::Error::other(line)));
             }
             if line.starts_with("CONNECTED") {
@@ -135,7 +143,9 @@ impl ScsPactorClient {
         let mut w = self.data_writer.lock().await;
         let fut = w.write_all(data);
         if let Some(d) = self.write_timeout {
-            timeout(d, fut).await.map_err(|_| ScsPactorError::Timeout)??;
+            timeout(d, fut)
+                .await
+                .map_err(|_| ScsPactorError::Timeout)??;
         } else {
             w.write_all(data).await?;
         }
@@ -147,11 +157,15 @@ impl ScsPactorClient {
         let mut buf = vec![0u8; max_len];
         let fut = r.read(&mut buf);
         let n = if let Some(d) = self.read_timeout {
-            timeout(d, fut).await.map_err(|_| ScsPactorError::Timeout)??
+            timeout(d, fut)
+                .await
+                .map_err(|_| ScsPactorError::Timeout)??
         } else {
             r.read(&mut buf).await?
         };
-        if n == 0 { return Err(ScsPactorError::Disconnected); }
+        if n == 0 {
+            return Err(ScsPactorError::Disconnected);
+        }
         buf.truncate(n);
         Ok(buf)
     }
@@ -170,4 +184,3 @@ mod tests {
         let _ = ScsPactorConfig::resolve("localhost", 9).await;
     }
 }
- 

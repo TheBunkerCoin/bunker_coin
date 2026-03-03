@@ -11,6 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use log::debug;
 use mockall::automock;
+use rocksdb::{DB, IteratorMode, Options, WriteBatch};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
 use self::slot_block_data::{AddShredError, SlotBlockData};
@@ -22,9 +24,6 @@ use crate::crypto::merkle::{BlockHash, DoubleMerkleProof, MerkleRoot, SliceRoot}
 use crate::shredder::{RegularShredder, Shred, ShredIndex, ShredderPool, ValidatedShred};
 use crate::types::SliceIndex;
 use crate::{Block, BlockId, Slot};
-
-use rocksdb::{DB, Options, IteratorMode, WriteBatch};
-use serde::{Serialize, Deserialize};
 
 /// additional metadata (might need refactor @e)
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -224,11 +223,7 @@ pub trait Blockstore {
         shred_index: ShredIndex,
     ) -> Option<ValidatedShred>;
 
-    fn get_slice_root(
-        &self,
-        block_id: &BlockId,
-        slice_index: SliceIndex,
-    ) -> Option<SliceRoot>;
+    fn get_slice_root(&self, block_id: &BlockId, slice_index: SliceIndex) -> Option<SliceRoot>;
 
     fn create_double_merkle_proof(
         &self,
@@ -374,11 +369,7 @@ impl Blockstore for BlockstoreImpl {
         Some(tree.create_proof(slice_index.inner()))
     }
 
-    fn get_slice_root(
-        &self,
-        block_id: &BlockId,
-        slice_index: SliceIndex,
-    ) -> Option<SliceRoot> {
+    fn get_slice_root(&self, block_id: &BlockId, slice_index: SliceIndex) -> Option<SliceRoot> {
         let block_data = self.get_block_data(block_id)?;
         block_data.merkle_root_cache.get(&slice_index).cloned()
     }
@@ -386,7 +377,9 @@ impl Blockstore for BlockstoreImpl {
     fn load_block_from_db(&self, slot: Slot, hash: Hash) -> Option<Block> {
         let key = format!("{:016X}{}", slot, hex::encode(hash));
         if let Ok(Some(val)) = self.db.get(key.as_bytes()) {
-            if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(&val, bincode::config::standard()) {
+            if let Ok((block, _)) =
+                bincode::serde::decode_from_slice::<Block, _>(&val, bincode::config::standard())
+            {
                 return Some(block);
             }
         }
@@ -398,10 +391,15 @@ impl Blockstore for BlockstoreImpl {
         let suffix_bytes = suffix.as_bytes();
         for item in self.db.iterator(IteratorMode::Start) {
             if let Ok((k, v)) = item {
-                if k.len() >= 16 + suffix_bytes.len() && &k[k.len()-suffix_bytes.len()..] == suffix_bytes {
+                if k.len() >= 16 + suffix_bytes.len()
+                    && &k[k.len() - suffix_bytes.len()..] == suffix_bytes
+                {
                     let slot_str = std::str::from_utf8(&k[0..16]).ok()?;
                     let slot = Slot::new(u64::from_str_radix(slot_str, 16).ok()?);
-                    if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(&v, bincode::config::standard()) {
+                    if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(
+                        &v,
+                        bincode::config::standard(),
+                    ) {
                         return Some((slot, block));
                     }
                 }
@@ -413,7 +411,10 @@ impl Blockstore for BlockstoreImpl {
     fn load_block_metadata(&self, slot: Slot, hash: Hash) -> Option<BlockMetadata> {
         let key = format!("meta|{:016X}{}", slot, hex::encode(hash));
         if let Ok(Some(val)) = self.db.get(key.as_bytes()) {
-            if let Ok((metadata, _)) = bincode::serde::decode_from_slice::<BlockMetadata, _>(&val, bincode::config::standard()) {
+            if let Ok((metadata, _)) = bincode::serde::decode_from_slice::<BlockMetadata, _>(
+                &val,
+                bincode::config::standard(),
+            ) {
                 return Some(metadata);
             }
         }
@@ -424,8 +425,7 @@ impl Blockstore for BlockstoreImpl {
         if let Some(mut metadata) = self.load_block_metadata(slot, hash.clone()) {
             metadata.finalized_timestamp = Some(timestamp);
             let key = format!("meta|{:016X}{}", slot, hex::encode(&hash));
-            if let Ok(value) =
-                bincode::serde::encode_to_vec(&metadata, bincode::config::standard())
+            if let Ok(value) = bincode::serde::encode_to_vec(&metadata, bincode::config::standard())
             {
                 let _ = self.db.put(key.as_bytes(), value);
             }
@@ -433,7 +433,10 @@ impl Blockstore for BlockstoreImpl {
     }
 
     fn clean_beyond_finalized(&mut self, highest_finalized_slot: Slot) {
-        println!("[Blockstore::clean_beyond_finalized] pruning blocks beyond slot {}", highest_finalized_slot);
+        println!(
+            "[Blockstore::clean_beyond_finalized] pruning blocks beyond slot {}",
+            highest_finalized_slot
+        );
 
         let mut batch = WriteBatch::default();
         let mut deleted_count = 0;
@@ -471,8 +474,10 @@ impl Blockstore for BlockstoreImpl {
         let pruned = beyond.len();
         drop(beyond);
 
-        println!("[Blockstore::clean_beyond_finalized] deleted {} blocks and {} metadata entries from DB, pruned {} in-memory slots",
-                 deleted_count, deleted_meta_count, pruned);
+        println!(
+            "[Blockstore::clean_beyond_finalized] deleted {} blocks and {} metadata entries from DB, pruned {} in-memory slots",
+            deleted_count, deleted_meta_count, pruned
+        );
     }
 }
 

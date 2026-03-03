@@ -15,7 +15,11 @@ pub struct EpochInfo {
 impl EpochInfo {
     /// Creates a new `EpochInfo` instance with the given validators.
     pub const fn new(epoch: u64, own_id: ValidatorId, validators: Vec<ValidatorInfo>) -> Self {
-        Self { epoch, own_id, validators }
+        Self {
+            epoch,
+            own_id,
+            validators,
+        }
     }
 
     pub fn epoch(&self) -> u64 {

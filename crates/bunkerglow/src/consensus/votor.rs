@@ -217,7 +217,10 @@ impl<A: All2All> Votor<A> {
                     self.received_shred.insert(slot);
                 }
                 VotorEvent::Block { slot, block_info } => {
-                    println!("[Votor {}] BLOCK slot {} info {:?}", self.validator_id, slot, block_info);
+                    println!(
+                        "[Votor {}] BLOCK slot {} info {:?}",
+                        self.validator_id, slot, block_info
+                    );
                     if self.voted.contains(&slot) {
                         let h = &hex::encode(block_info.hash.as_hash())[..8];
                         warn!("not voting for block {h} in slot {slot}, already voted");
@@ -291,9 +294,9 @@ impl<A: All2All> Votor<A> {
         } = block_info;
         let first_slot = slot.first_slot_in_window();
         if slot == first_slot {
-            let valid_parent = self
-                .parents_ready
-                .contains(&(slot, parent_slot, parent_hash.clone()));
+            let valid_parent =
+                self.parents_ready
+                    .contains(&(slot, parent_slot, parent_hash.clone()));
             if !valid_parent {
                 return false;
             }

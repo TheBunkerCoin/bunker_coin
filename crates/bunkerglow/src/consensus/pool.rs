@@ -18,9 +18,14 @@ use async_trait::async_trait;
 use either::Either;
 use log::{debug, info, trace, warn};
 use mockall::automock;
+use parent_ready_tracker::ParentReadyTracker;
+use rocksdb::{DB, IteratorMode, Options};
+use slot_state::SlotState;
 use thiserror::Error;
-use tokio::sync::{mpsc::Sender, oneshot, RwLock};
+use tokio::sync::mpsc::Sender;
+use tokio::sync::{RwLock, oneshot};
 
+use self::finality_tracker::FinalityTracker;
 use super::blockstore::Blockstore;
 use super::votor::VotorEvent;
 use super::{Cert, EpochInfo, Vote};
@@ -29,12 +34,6 @@ use crate::consensus::pool::finality_tracker::FinalizationEvent;
 use crate::crypto::merkle::{BlockHash, MerkleRoot};
 use crate::types::{SLOTS_PER_EPOCH, SLOTS_PER_WINDOW};
 use crate::{BlockId, Slot, ValidatorId};
-
-use self::finality_tracker::FinalityTracker;
-use parent_ready_tracker::ParentReadyTracker;
-use slot_state::SlotState;
-
-use rocksdb::{DB, Options, IteratorMode};
 
 #[derive(Clone, Debug)]
 pub struct EpochBoundaryEvent {
@@ -283,11 +282,7 @@ impl PoolImpl {
                             .unwrap()
                             .as_millis() as u64;
                         if let Ok(bs) = blockstore.try_read() {
-                            bs.update_finalized_timestamp(
-                                slot,
-                                hash.as_hash().clone(),
-                                timestamp,
-                            );
+                            bs.update_finalized_timestamp(slot, hash.as_hash().clone(), timestamp);
                         }
                     }
                 }
@@ -306,7 +301,8 @@ impl PoolImpl {
                                 let timestamp = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
-                                    .as_millis() as u64;
+                                    .as_millis()
+                                    as u64;
                                 if let Ok(bs) = blockstore.try_read() {
                                     bs.update_finalized_timestamp(
                                         slot,
@@ -731,13 +727,12 @@ impl PoolImpl {
                         let newly = self.parent_ready_tracker.mark_notar_fallback(&block_id);
                         for (s, (p_slot, p_hash)) in newly {
                             if s > self.highest_finalized_slot {
-                                let _ = self.votor_event_channel.try_send(
-                                    VotorEvent::ParentReady {
+                                let _ =
+                                    self.votor_event_channel.try_send(VotorEvent::ParentReady {
                                         slot: s,
                                         parent_slot: p_slot,
                                         parent_hash: p_hash,
-                                    },
-                                );
+                                    });
                             }
                         }
                     }
@@ -748,13 +743,11 @@ impl PoolImpl {
                     let newly = self.parent_ready_tracker.mark_skipped(slot);
                     for (s, (p_slot, p_hash)) in newly {
                         if s > self.highest_finalized_slot {
-                            let _ = self.votor_event_channel.try_send(
-                                VotorEvent::ParentReady {
-                                    slot: s,
-                                    parent_slot: p_slot,
-                                    parent_hash: p_hash,
-                                },
-                            );
+                            let _ = self.votor_event_channel.try_send(VotorEvent::ParentReady {
+                                slot: s,
+                                parent_slot: p_slot,
+                                parent_hash: p_hash,
+                            });
                         }
                     }
                 }
@@ -762,9 +755,10 @@ impl PoolImpl {
             }
         }
 
-        let _ = self
-            .db
-            .put(b"meta|final_slot", self.highest_finalized_slot.inner().to_be_bytes());
+        let _ = self.db.put(
+            b"meta|final_slot",
+            self.highest_finalized_slot.inner().to_be_bytes(),
+        );
 
         let fin = self.highest_finalized_slot.inner();
         let next_slot = fin + 1;

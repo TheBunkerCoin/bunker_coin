@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::types::{Amount, Nonce, PublicKey, Signature, TokenId};
 
@@ -36,13 +36,21 @@ impl Transaction {
                 hasher.update(to);
                 hasher.update(amount.to_le_bytes());
             }
-            TransactionBody::TokenTransfer { to, token_id, amount } => {
+            TransactionBody::TokenTransfer {
+                to,
+                token_id,
+                amount,
+            } => {
                 hasher.update([1u8]);
                 hasher.update(to);
                 hasher.update(token_id);
                 hasher.update(amount.to_le_bytes());
             }
-            TransactionBody::Mint { ticker, max_supply, metadata_hash } => {
+            TransactionBody::Mint {
+                ticker,
+                max_supply,
+                metadata_hash,
+            } => {
                 hasher.update([2u8]);
                 hasher.update((ticker.len() as u32).to_le_bytes());
                 hasher.update(ticker.as_bytes());
@@ -131,7 +139,10 @@ mod tests {
 
     #[test]
     fn signing_hash_deterministic() {
-        let tx = dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 });
+        let tx = dummy_tx(TransactionBody::Transfer {
+            to: pk(2),
+            amount: 100,
+        });
         let h1 = tx.signing_hash();
         let h2 = tx.signing_hash();
         assert_eq!(h1, h2);
@@ -139,79 +150,171 @@ mod tests {
 
     #[test]
     fn signing_hash_differs_by_body_type() {
-        let transfer = dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 });
-        let bond = dummy_tx(TransactionBody::Bond { validator: pk(2), amount: 100 });
+        let transfer = dummy_tx(TransactionBody::Transfer {
+            to: pk(2),
+            amount: 100,
+        });
+        let bond = dummy_tx(TransactionBody::Bond {
+            validator: pk(2),
+            amount: 100,
+        });
         assert_ne!(transfer.signing_hash(), bond.signing_hash());
     }
 
     #[test]
     fn signing_hash_differs_by_amount() {
-        let tx1 = dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 });
-        let tx2 = dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 200 });
+        let tx1 = dummy_tx(TransactionBody::Transfer {
+            to: pk(2),
+            amount: 100,
+        });
+        let tx2 = dummy_tx(TransactionBody::Transfer {
+            to: pk(2),
+            amount: 200,
+        });
         assert_ne!(tx1.signing_hash(), tx2.signing_hash());
     }
 
     #[test]
     fn signing_hash_differs_by_recipient() {
-        let tx1 = dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 });
-        let tx2 = dummy_tx(TransactionBody::Transfer { to: pk(3), amount: 100 });
+        let tx1 = dummy_tx(TransactionBody::Transfer {
+            to: pk(2),
+            amount: 100,
+        });
+        let tx2 = dummy_tx(TransactionBody::Transfer {
+            to: pk(3),
+            amount: 100,
+        });
         assert_ne!(tx1.signing_hash(), tx2.signing_hash());
     }
 
     #[test]
     fn signing_hash_differs_by_nonce() {
-        let tx1 = Transaction { nonce: 0, ..dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 }) };
-        let tx2 = Transaction { nonce: 1, ..dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 }) };
+        let tx1 = Transaction {
+            nonce: 0,
+            ..dummy_tx(TransactionBody::Transfer {
+                to: pk(2),
+                amount: 100,
+            })
+        };
+        let tx2 = Transaction {
+            nonce: 1,
+            ..dummy_tx(TransactionBody::Transfer {
+                to: pk(2),
+                amount: 100,
+            })
+        };
         assert_ne!(tx1.signing_hash(), tx2.signing_hash());
     }
 
     #[test]
     fn signing_hash_differs_by_fee() {
-        let tx1 = Transaction { fee: 10, ..dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 }) };
-        let tx2 = Transaction { fee: 20, ..dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 }) };
+        let tx1 = Transaction {
+            fee: 10,
+            ..dummy_tx(TransactionBody::Transfer {
+                to: pk(2),
+                amount: 100,
+            })
+        };
+        let tx2 = Transaction {
+            fee: 20,
+            ..dummy_tx(TransactionBody::Transfer {
+                to: pk(2),
+                amount: 100,
+            })
+        };
         assert_ne!(tx1.signing_hash(), tx2.signing_hash());
     }
 
     #[test]
     fn signing_hash_excludes_signature() {
-        let tx1 = Transaction { signature: [0u8; 64], ..dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 }) };
-        let tx2 = Transaction { signature: [0xFF; 64], ..dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 }) };
+        let tx1 = Transaction {
+            signature: [0u8; 64],
+            ..dummy_tx(TransactionBody::Transfer {
+                to: pk(2),
+                amount: 100,
+            })
+        };
+        let tx2 = Transaction {
+            signature: [0xFF; 64],
+            ..dummy_tx(TransactionBody::Transfer {
+                to: pk(2),
+                amount: 100,
+            })
+        };
         assert_eq!(tx1.signing_hash(), tx2.signing_hash());
     }
 
     #[test]
     fn hash_includes_signature() {
-        let tx1 = Transaction { signature: [0u8; 64], ..dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 }) };
-        let tx2 = Transaction { signature: [0xFF; 64], ..dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 }) };
+        let tx1 = Transaction {
+            signature: [0u8; 64],
+            ..dummy_tx(TransactionBody::Transfer {
+                to: pk(2),
+                amount: 100,
+            })
+        };
+        let tx2 = Transaction {
+            signature: [0xFF; 64],
+            ..dummy_tx(TransactionBody::Transfer {
+                to: pk(2),
+                amount: 100,
+            })
+        };
         assert_ne!(tx1.hash(), tx2.hash());
     }
 
     #[test]
     fn signing_hash_each_body_variant() {
         let variants = vec![
-            TransactionBody::Transfer { to: pk(2), amount: 50 },
-            TransactionBody::TokenTransfer { to: pk(2), token_id: [0, 0, 0, 1], amount: 50 },
-            TransactionBody::Mint { ticker: "BNK".into(), max_supply: 1000, metadata_hash: [0xAB; 32] },
-            TransactionBody::Bond { validator: pk(2), amount: 500 },
-            TransactionBody::Retire { validator: pk(2), amount: 500 },
+            TransactionBody::Transfer {
+                to: pk(2),
+                amount: 50,
+            },
+            TransactionBody::TokenTransfer {
+                to: pk(2),
+                token_id: [0, 0, 0, 1],
+                amount: 50,
+            },
+            TransactionBody::Mint {
+                ticker: "BNK".into(),
+                max_supply: 1000,
+                metadata_hash: [0xAB; 32],
+            },
+            TransactionBody::Bond {
+                validator: pk(2),
+                amount: 500,
+            },
+            TransactionBody::Retire {
+                validator: pk(2),
+                amount: 500,
+            },
             TransactionBody::Withdraw { validator: pk(2) },
             TransactionBody::UnJail,
             TransactionBody::SetCommission { rate: 500 },
         ];
 
-        let hashes: Vec<[u8; 32]> = variants.iter().map(|body| dummy_tx(body.clone()).signing_hash()).collect();
+        let hashes: Vec<[u8; 32]> = variants
+            .iter()
+            .map(|body| dummy_tx(body.clone()).signing_hash())
+            .collect();
 
         // all hashes must be unique
         for i in 0..hashes.len() {
             for j in (i + 1)..hashes.len() {
-                assert_ne!(hashes[i], hashes[j], "variant {i} and {j} produced same hash");
+                assert_ne!(
+                    hashes[i], hashes[j],
+                    "variant {i} and {j} produced same hash"
+                );
             }
         }
     }
 
     #[test]
     fn transaction_serde_roundtrip() {
-        let tx = dummy_tx(TransactionBody::Transfer { to: pk(2), amount: 100 });
+        let tx = dummy_tx(TransactionBody::Transfer {
+            to: pk(2),
+            amount: 100,
+        });
         let json = serde_json::to_string(&tx).unwrap();
         let deserialized: Transaction = serde_json::from_str(&json).unwrap();
         assert_eq!(tx, deserialized);
@@ -220,11 +323,28 @@ mod tests {
     #[test]
     fn all_body_variants_serde_roundtrip() {
         let variants = vec![
-            TransactionBody::Transfer { to: pk(2), amount: 50 },
-            TransactionBody::TokenTransfer { to: pk(2), token_id: [0, 0, 0, 1], amount: 50 },
-            TransactionBody::Mint { ticker: "BNK".into(), max_supply: 1000, metadata_hash: [0xAB; 32] },
-            TransactionBody::Bond { validator: pk(2), amount: 500 },
-            TransactionBody::Retire { validator: pk(2), amount: 500 },
+            TransactionBody::Transfer {
+                to: pk(2),
+                amount: 50,
+            },
+            TransactionBody::TokenTransfer {
+                to: pk(2),
+                token_id: [0, 0, 0, 1],
+                amount: 50,
+            },
+            TransactionBody::Mint {
+                ticker: "BNK".into(),
+                max_supply: 1000,
+                metadata_hash: [0xAB; 32],
+            },
+            TransactionBody::Bond {
+                validator: pk(2),
+                amount: 500,
+            },
+            TransactionBody::Retire {
+                validator: pk(2),
+                amount: 500,
+            },
             TransactionBody::Withdraw { validator: pk(2) },
             TransactionBody::UnJail,
             TransactionBody::SetCommission { rate: 500 },
@@ -240,8 +360,16 @@ mod tests {
 
     #[test]
     fn mint_signing_hash_differs_by_ticker() {
-        let tx1 = dummy_tx(TransactionBody::Mint { ticker: "AAA".into(), max_supply: 100, metadata_hash: [0; 32] });
-        let tx2 = dummy_tx(TransactionBody::Mint { ticker: "BBB".into(), max_supply: 100, metadata_hash: [0; 32] });
+        let tx1 = dummy_tx(TransactionBody::Mint {
+            ticker: "AAA".into(),
+            max_supply: 100,
+            metadata_hash: [0; 32],
+        });
+        let tx2 = dummy_tx(TransactionBody::Mint {
+            ticker: "BBB".into(),
+            max_supply: 100,
+            metadata_hash: [0; 32],
+        });
         assert_ne!(tx1.signing_hash(), tx2.signing_hash());
     }
 

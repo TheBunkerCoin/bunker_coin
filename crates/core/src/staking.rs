@@ -96,7 +96,13 @@ impl StakingLedger {
         }
     }
 
-    pub fn queue_bond(&mut self, delegator: PublicKey, validator: PublicKey, amount: Amount, epoch: u64) {
+    pub fn queue_bond(
+        &mut self,
+        delegator: PublicKey,
+        validator: PublicKey,
+        amount: Amount,
+        epoch: u64,
+    ) {
         self.pending_bonds.push(PendingBond {
             delegator,
             validator,
@@ -105,7 +111,13 @@ impl StakingLedger {
         });
     }
 
-    pub fn queue_retire(&mut self, delegator: PublicKey, validator: PublicKey, amount: Amount, epoch: u64) {
+    pub fn queue_retire(
+        &mut self,
+        delegator: PublicKey,
+        validator: PublicKey,
+        amount: Amount,
+        epoch: u64,
+    ) {
         self.pending_retires.push(PendingRetire {
             delegator,
             validator,
@@ -205,7 +217,8 @@ impl StakingLedger {
 
             let self_stake = self.self_bonds.get(&event.validator).copied().unwrap_or(0);
             if self_stake > 0 && stake > 0 {
-                let self_slash = (slash_amount as u128 * self_stake as u128 / stake as u128) as Amount;
+                let self_slash =
+                    (slash_amount as u128 * self_stake as u128 / stake as u128) as Amount;
                 if let Some(sb) = self.self_bonds.get_mut(&event.validator) {
                     *sb = sb.saturating_sub(self_slash);
                 }
@@ -476,7 +489,10 @@ mod tests {
 
         let activated = ledger.activate_pending_bonds(1);
         assert_eq!(activated.len(), 1);
-        assert_eq!(ledger.self_bonds.get(&validator).copied().unwrap(), MIN_SELF_STAKE);
+        assert_eq!(
+            ledger.self_bonds.get(&validator).copied().unwrap(),
+            MIN_SELF_STAKE
+        );
     }
 
     #[test]

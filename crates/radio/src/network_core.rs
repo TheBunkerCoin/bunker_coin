@@ -1,17 +1,16 @@
 //! Radio network core for routing messages between nodes with realistic HF radio constraints
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, mpsc};
 use crate::{Network, NetworkError, NetworkMessage, ValidatorId};
-use rand::Rng;
 use log::{debug, trace, warn};
-use serde::{Serialize, Deserialize};
+use rand::Rng;
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use tokio::sync::mpsc::{Sender, Receiver};
-
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::{RadioConfig, RadioError};
 
@@ -100,10 +99,13 @@ fn bursty_packet_loss(base_loss: f64) -> Option<f64> {
 
 impl RadioNetworkCore {
     pub fn new(config: RadioConfig) -> Arc<Self> {
-        let nodes = Arc::new(RwLock::new(HashMap::<ValidatorId, mpsc::Sender<RadioPacket>>::new()));
+        let nodes = Arc::new(RwLock::new(
+            HashMap::<ValidatorId, mpsc::Sender<RadioPacket>>::new(),
+        ));
         let stats = Arc::new(NetworkStats::default());
         let queue_depth = Arc::new(AtomicU64::new(0));
-        let (packet_queue, mut packet_rx): (Sender<RadioPacket>, Receiver<RadioPacket>) = mpsc::channel(100000);
+        let (packet_queue, mut packet_rx): (Sender<RadioPacket>, Receiver<RadioPacket>) =
+            mpsc::channel(100000);
         let nodes_clone = nodes.clone();
         let stats_clone = stats.clone();
         let config_clone = config.clone();
@@ -126,7 +128,7 @@ impl RadioNetworkCore {
                     Duration::ZERO
                 };
                 let transmission_time = Duration::from_secs_f64(
-                    (packet.payload.len() * 8) as f64 / config_clone.bandwidth_bps as f64
+                    (packet.payload.len() * 8) as f64 / config_clone.bandwidth_bps as f64,
                 );
                 let total_delay = Duration::from_millis(10) + random_jitter + transmission_time;
                 packets_processed += 1;
@@ -138,12 +140,20 @@ impl RadioNetworkCore {
                 let base_loss = config_clone.packet_loss as f64;
 
                 if packet.to == u64::MAX {
-                    log::trace!("Processing broadcast packet from {} (payload: {} bytes), sleeping {:?}", packet.from, packet.payload.len(), total_delay);
+                    log::trace!(
+                        "Processing broadcast packet from {} (payload: {} bytes), sleeping {:?}",
+                        packet.from,
+                        packet.payload.len(),
+                        total_delay
+                    );
                     tokio::time::sleep(total_delay).await;
 
                     if let Some(loss_prob) = bursty_packet_loss(base_loss) {
                         stats_clone.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        log::debug!("Radio broadcast dropped during transmission (p={:.3})", loss_prob);
+                        log::debug!(
+                            "Radio broadcast dropped during transmission (p={:.3})",
+                            loss_prob
+                        );
                         continue;
                     }
 
@@ -155,8 +165,12 @@ impl RadioNetworkCore {
                         .collect();
                     drop(nodes);
 
-                    stats_clone.packets_transmitted.fetch_add(1, Ordering::Relaxed);
-                    stats_clone.bytes_transmitted.fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
+                    stats_clone
+                        .packets_transmitted
+                        .fetch_add(1, Ordering::Relaxed);
+                    stats_clone
+                        .bytes_transmitted
+                        .fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
 
                     let deliver_at = Instant::now() + config_clone.latency;
                     for (to_id, channel) in recipients {
@@ -169,7 +183,11 @@ impl RadioNetworkCore {
 
                         match channel.try_send(delivery_packet) {
                             Ok(_) => {
-                                log::trace!("broadcast from {} delivered to node {}", packet.from, to_id);
+                                log::trace!(
+                                    "broadcast from {} delivered to node {}",
+                                    packet.from,
+                                    to_id
+                                );
                             }
                             Err(e) => {
                                 log::warn!("failed to deliver broadcast to node {}: {}", to_id, e);
@@ -177,12 +195,21 @@ impl RadioNetworkCore {
                         }
                     }
                 } else {
-                    log::trace!("dequeued packet from {} to {} (payload: {} bytes), sleeping {:?}", packet.from, packet.to, packet.payload.len(), total_delay);
+                    log::trace!(
+                        "dequeued packet from {} to {} (payload: {} bytes), sleeping {:?}",
+                        packet.from,
+                        packet.to,
+                        packet.payload.len(),
+                        total_delay
+                    );
                     tokio::time::sleep(total_delay).await;
 
                     if let Some(loss_prob) = bursty_packet_loss(base_loss) {
                         stats_clone.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        log::debug!("Radio packet dropped during transmission (p={:.3})", loss_prob);
+                        log::debug!(
+                            "Radio packet dropped during transmission (p={:.3})",
+                            loss_prob
+                        );
                         continue;
                     }
 
@@ -193,8 +220,12 @@ impl RadioNetworkCore {
                         match channel.try_send(packet) {
                             Ok(_) => {
                                 log::trace!("Packet delivered to node {}", to_node);
-                                stats_clone.packets_transmitted.fetch_add(1, Ordering::Relaxed);
-                                stats_clone.bytes_transmitted.fetch_add(packet_size as u64, Ordering::Relaxed);
+                                stats_clone
+                                    .packets_transmitted
+                                    .fetch_add(1, Ordering::Relaxed);
+                                stats_clone
+                                    .bytes_transmitted
+                                    .fetch_add(packet_size as u64, Ordering::Relaxed);
                             }
                             Err(e) => {
                                 log::warn!("Failed to deliver packet to node {}: channel full or closed: {}", to_node, e);
@@ -221,7 +252,11 @@ impl RadioNetworkCore {
         RadioNode::new(id, Arc::clone(self), rx)
     }
 
-    async fn broadcast_packet(&self, from: ValidatorId, payload: Vec<u8>) -> Result<(), RadioError> {
+    async fn broadcast_packet(
+        &self,
+        from: ValidatorId,
+        payload: Vec<u8>,
+    ) -> Result<(), RadioError> {
         if payload.len() > self.config.mtu {
             return Err(RadioError::PacketTooLarge);
         }
@@ -248,7 +283,10 @@ impl RadioNetworkCore {
                         log::error!("Radio packet queue is FULL! Cannot send broadcast from {}. Consider increasing queue size.", from);
                     }
                     mpsc::error::TrySendError::Closed(_) => {
-                        log::error!("Radio packet queue is closed! Cannot send broadcast from {}", from);
+                        log::error!(
+                            "Radio packet queue is closed! Cannot send broadcast from {}",
+                            from
+                        );
                     }
                 }
                 Err(RadioError::TransmissionFailed)
@@ -256,7 +294,12 @@ impl RadioNetworkCore {
         }
     }
 
-    async fn send_packet(&self, from: ValidatorId, to: ValidatorId, payload: Vec<u8>) -> Result<(), RadioError> {
+    async fn send_packet(
+        &self,
+        from: ValidatorId,
+        to: ValidatorId,
+        payload: Vec<u8>,
+    ) -> Result<(), RadioError> {
         if payload.len() > self.config.mtu {
             return Err(RadioError::PacketTooLarge);
         }
@@ -281,7 +324,11 @@ impl RadioNetworkCore {
                         log::error!("Radio packet queue is FULL! Cannot send packet from {} to {}. Consider increasing queue size.", from, to);
                     }
                     mpsc::error::TrySendError::Closed(_) => {
-                        log::error!("Radio packet queue is closed! Cannot send packet from {} to {}", from, to);
+                        log::error!(
+                            "Radio packet queue is closed! Cannot send packet from {} to {}",
+                            from,
+                            to
+                        );
                     }
                 }
                 Err(RadioError::TransmissionFailed)
@@ -316,7 +363,11 @@ struct ReassemblyState {
 }
 
 impl RadioNode {
-    fn new(id: ValidatorId, network_core: Arc<RadioNetworkCore>, receiver: mpsc::Receiver<RadioPacket>) -> Self {
+    fn new(
+        id: ValidatorId,
+        network_core: Arc<RadioNetworkCore>,
+        receiver: mpsc::Receiver<RadioPacket>,
+    ) -> Self {
         Self {
             id,
             network_core,
@@ -328,72 +379,89 @@ impl RadioNode {
 
     async fn send_fragmented(&self, data: &[u8], to: ValidatorId) -> Result<(), NetworkError> {
         let mtu = self.network_core.config.mtu;
-        
+
         let header_size = bincode::serde::encode_to_vec(
-            &FragmentHeader { message_id: 0, fragment_index: 0, total_fragments: 1 },
-            bincode::config::standard()
-        ).unwrap().len();
-        
+            &FragmentHeader {
+                message_id: 0,
+                fragment_index: 0,
+                total_fragments: 1,
+            },
+            bincode::config::standard(),
+        )
+        .unwrap()
+        .len();
+
         let effective_mtu = mtu.saturating_sub(header_size);
-        
+
         if data.len() <= effective_mtu {
             let message_id = self.message_counter.fetch_add(1, Ordering::Relaxed);
-            
+
             let header = FragmentHeader {
                 message_id,
                 fragment_index: 0,
                 total_fragments: 1,
             };
-            
-            let mut packet = bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
+
+            let mut packet =
+                bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
             packet.extend_from_slice(data);
-            
-            self.network_core.send_packet(self.id, to, packet).await
+
+            self.network_core
+                .send_packet(self.id, to, packet)
+                .await
                 .map_err(|_| NetworkError::Unknown)?;
         } else {
             let chunks: Vec<_> = data.chunks(effective_mtu).collect();
             let total_fragments = chunks.len() as u16;
-            
+
             let message_id = self.message_counter.fetch_add(1, Ordering::Relaxed);
-            
+
             for (index, chunk) in chunks.iter().enumerate() {
                 let header = FragmentHeader {
                     message_id,
                     fragment_index: index as u16,
                     total_fragments,
                 };
-                
-                let mut packet = bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
+
+                let mut packet =
+                    bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
                 packet.extend_from_slice(chunk);
-                
-                self.network_core.send_packet(self.id, to, packet).await
+
+                self.network_core
+                    .send_packet(self.id, to, packet)
+                    .await
                     .map_err(|_| NetworkError::Unknown)?;
             }
         }
-        
+
         Ok(())
     }
-    
-    async fn try_reassemble(&self, from: ValidatorId, header: FragmentHeader, data: Vec<u8>) -> Option<Vec<u8>> {
+
+    async fn try_reassemble(
+        &self,
+        from: ValidatorId,
+        header: FragmentHeader,
+        data: Vec<u8>,
+    ) -> Option<Vec<u8>> {
         let mut reassembly = self.reassembly.lock().await;
-        
+
         let now = Instant::now();
         reassembly.retain(|_, state| now.duration_since(state.last_seen) < Duration::from_secs(30));
-        
+
         if header.total_fragments == 1 {
             return Some(data);
         }
-        
+
         let key = (from, header.message_id);
         let state = reassembly.entry(key).or_insert_with(|| ReassemblyState {
             fragments: HashMap::new(),
             total_fragments: header.total_fragments,
             last_seen: now,
         });
-        
+
         state.last_seen = now;
         state.fragments.insert(header.fragment_index, data);
-        
+
         if state.fragments.len() == state.total_fragments as usize {
             let estimated_size: usize = state.fragments.values().map(|f| f.len()).sum();
             let mut complete_message = Vec::with_capacity(estimated_size);
@@ -413,26 +481,36 @@ impl RadioNode {
     }
 
     async fn send_with_erasure(&self, data: &[u8], to: ValidatorId) -> Result<(), NetworkError> {
-        
         // for now 2:6 due to empty blocks
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 4;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
         const MIN_SHARD_SIZE: usize = 32;
-        
+
         let mtu = self.network_core.config.mtu;
         let header_size = bincode::serde::encode_to_vec(
-            &ShardHeader { message_id: 0, shard_index: 0, total_shards: TOTAL_SHARDS as u8, data_len: data.len() as u32 },
-            bincode::config::standard()
-        ).unwrap().len();
-        
+            &ShardHeader {
+                message_id: 0,
+                shard_index: 0,
+                total_shards: TOTAL_SHARDS as u8,
+                data_len: data.len() as u32,
+            },
+            bincode::config::standard(),
+        )
+        .unwrap()
+        .len();
+
         let max_shard_payload_size = mtu.saturating_sub(header_size);
         let min_total_size = DATA_SHARDS * MIN_SHARD_SIZE;
         let required_total_size = data.len().max(min_total_size);
-        let shard_payload_size = ((required_total_size + DATA_SHARDS - 1) / DATA_SHARDS).max(MIN_SHARD_SIZE);
-        
+        let shard_payload_size =
+            ((required_total_size + DATA_SHARDS - 1) / DATA_SHARDS).max(MIN_SHARD_SIZE);
+
         if shard_payload_size > max_shard_payload_size {
-            log::warn!("Message too large for erasure coding with MTU {}, falling back to fragmentation", mtu);
+            log::warn!(
+                "Message too large for erasure coding with MTU {}, falling back to fragmentation",
+                mtu
+            );
             return self.send_fragmented(data, to).await;
         }
 
@@ -464,17 +542,31 @@ impl RadioNode {
                 total_shards: TOTAL_SHARDS as u8,
                 data_len: data.len() as u32,
             };
-            let mut packet = bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
+            let mut packet =
+                bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
             packet.extend_from_slice(shard);
-            log::trace!("Sending shard {}/{} for message {} to {}, packet size: {} bytes", 
-                       i+1, TOTAL_SHARDS, message_id, to, packet.len());
-            self.network_core.send_packet(self.id, to, packet).await
+            log::trace!(
+                "Sending shard {}/{} for message {} to {}, packet size: {} bytes",
+                i + 1,
+                TOTAL_SHARDS,
+                message_id,
+                to,
+                packet.len()
+            );
+            self.network_core
+                .send_packet(self.id, to, packet)
+                .await
                 .map_err(|_| NetworkError::Unknown)?;
         }
         Ok(())
     }
 
-    async fn try_reassemble_erasure(&self, from: ValidatorId, header: ShardHeader, data: Vec<u8>) -> Option<Vec<u8>> {
+    async fn try_reassemble_erasure(
+        &self,
+        from: ValidatorId,
+        header: ShardHeader,
+        data: Vec<u8>,
+    ) -> Option<Vec<u8>> {
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 4;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
@@ -496,13 +588,24 @@ impl RadioNode {
         });
         state.last_seen = now;
         state.fragments.insert(header.shard_index as u16, data);
-        log::trace!("Received shard {}/{} for message {} from {}, total received: {}", 
-                   header.shard_index + 1, state.total_fragments, header.message_id, from, state.fragments.len());
-        
+        log::trace!(
+            "Received shard {}/{} for message {} from {}, total received: {}",
+            header.shard_index + 1,
+            state.total_fragments,
+            header.message_id,
+            from,
+            state.fragments.len()
+        );
+
         if state.fragments.len() >= DATA_SHARDS {
-            log::info!("Attempting to reconstruct message {} from {} with {}/{} shards", 
-                      header.message_id, from, state.fragments.len(), TOTAL_SHARDS);
-            
+            log::info!(
+                "Attempting to reconstruct message {} from {} with {}/{} shards",
+                header.message_id,
+                from,
+                state.fragments.len(),
+                TOTAL_SHARDS
+            );
+
             let mut shards: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
             let mut shard_size = 0;
             for (&idx, frag) in &state.fragments {
@@ -524,45 +627,79 @@ impl RadioNode {
                         }
                     }
                     data.truncate(header.data_len as usize);
-                    log::info!("Successfully reconstructed message {} from {} with {}/{} shards", header.message_id, from, state.fragments.len(), TOTAL_SHARDS);
+                    log::info!(
+                        "Successfully reconstructed message {} from {} with {}/{} shards",
+                        header.message_id,
+                        from,
+                        state.fragments.len(),
+                        TOTAL_SHARDS
+                    );
                     reassembly.remove(&key);
                     return Some(data);
                 }
                 Err(e) => {
-                    log::debug!("Failed to reconstruct message {} from {} with {}/{} shards: {:?}", header.message_id, from, state.fragments.len(), TOTAL_SHARDS, e);
+                    log::debug!(
+                        "Failed to reconstruct message {} from {} with {}/{} shards: {:?}",
+                        header.message_id,
+                        from,
+                        state.fragments.len(),
+                        TOTAL_SHARDS,
+                        e
+                    );
                 }
             }
         } else {
-            log::trace!("Need {} more shards to attempt reconstruction for message {} from {}", 
-                       DATA_SHARDS.saturating_sub(state.fragments.len()), header.message_id, from);
+            log::trace!(
+                "Need {} more shards to attempt reconstruction for message {} from {}",
+                DATA_SHARDS.saturating_sub(state.fragments.len()),
+                header.message_id,
+                from
+            );
         }
         None
     }
 
     async fn send_radio(&self, data: &[u8], to: ValidatorId) -> Result<(), NetworkError> {
-        log::debug!("RadioNode {} sending {} bytes to {} using erasure coding", self.id, data.len(), to);
+        log::debug!(
+            "RadioNode {} sending {} bytes to {} using erasure coding",
+            self.id,
+            data.len(),
+            to
+        );
         self.send_with_erasure(data, to).await
     }
-    
+
     async fn broadcast_radio(&self, data: &[u8]) -> Result<(), NetworkError> {
-        log::debug!("RadioNode {} broadcasting {} bytes to all nodes", self.id, data.len());
-        
+        log::debug!(
+            "RadioNode {} broadcasting {} bytes to all nodes",
+            self.id,
+            data.len()
+        );
+
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 4;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
         const MIN_SHARD_SIZE: usize = 32;
-        
+
         let mtu = self.network_core.config.mtu;
         let header_size = bincode::serde::encode_to_vec(
-            &ShardHeader { message_id: 0, shard_index: 0, total_shards: TOTAL_SHARDS as u8, data_len: data.len() as u32 },
-            bincode::config::standard()
-        ).unwrap().len();
-        
+            &ShardHeader {
+                message_id: 0,
+                shard_index: 0,
+                total_shards: TOTAL_SHARDS as u8,
+                data_len: data.len() as u32,
+            },
+            bincode::config::standard(),
+        )
+        .unwrap()
+        .len();
+
         let max_shard_payload_size = mtu.saturating_sub(header_size);
         let min_total_size = DATA_SHARDS * MIN_SHARD_SIZE;
         let required_total_size = data.len().max(min_total_size);
-        let shard_payload_size = ((required_total_size + DATA_SHARDS - 1) / DATA_SHARDS).max(MIN_SHARD_SIZE);
-        
+        let shard_payload_size =
+            ((required_total_size + DATA_SHARDS - 1) / DATA_SHARDS).max(MIN_SHARD_SIZE);
+
         if shard_payload_size > max_shard_payload_size {
             log::warn!("Message too large for erasure coding with MTU {}, falling back to fragmented broadcast", mtu);
             return Err(NetworkError::Unknown);
@@ -591,16 +728,24 @@ impl RadioNode {
                 total_shards: TOTAL_SHARDS as u8,
                 data_len: data.len() as u32,
             };
-            let mut packet = bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
+            let mut packet =
+                bincode::serde::encode_to_vec(&header, bincode::config::standard()).unwrap();
             packet.extend_from_slice(shard);
-            
-            log::trace!("Broadcasting shard {}/{} for message {}, packet size: {} bytes", 
-                       i+1, TOTAL_SHARDS, message_id, packet.len());
-            
-            self.network_core.broadcast_packet(self.id, packet).await
+
+            log::trace!(
+                "Broadcasting shard {}/{} for message {}, packet size: {} bytes",
+                i + 1,
+                TOTAL_SHARDS,
+                message_id,
+                packet.len()
+            );
+
+            self.network_core
+                .broadcast_packet(self.id, packet)
+                .await
                 .map_err(|_| NetworkError::Unknown)?;
         }
-        
+
         Ok(())
     }
 }
@@ -608,49 +753,91 @@ impl RadioNode {
 impl Network for RadioNode {
     type Address = String;
 
-    async fn send(&self, msg: &NetworkMessage, to: impl AsRef<str> + Send) -> Result<(), NetworkError> {
+    async fn send(
+        &self,
+        msg: &NetworkMessage,
+        to: impl AsRef<str> + Send,
+    ) -> Result<(), NetworkError> {
         let to_str = to.as_ref();
         let data = msg.to_bytes();
-        
-        log::debug!("RadioNode.send() called with to='{}', checking if broadcast", to_str);
-        
+
+        log::debug!(
+            "RadioNode.send() called with to='{}', checking if broadcast",
+            to_str
+        );
+
         if to_str.eq_ignore_ascii_case("BROADCAST") {
-            log::debug!("RadioNode {} BROADCAST DETECTED! Broadcasting message ({} bytes)", self.id, data.len());
-            trace!("RadioNode {} broadcasting message ({} bytes)", self.id, data.len());
+            log::debug!(
+                "RadioNode {} BROADCAST DETECTED! Broadcasting message ({} bytes)",
+                self.id,
+                data.len()
+            );
+            trace!(
+                "RadioNode {} broadcasting message ({} bytes)",
+                self.id,
+                data.len()
+            );
             self.broadcast_radio(&data).await
         } else {
-            let to_id: ValidatorId = to_str.parse()
-                .map_err(|_| NetworkError::Unknown)?;
-            log::debug!("RadioNode {} unicast to {} ({} bytes)", self.id, to_id, data.len());
-            trace!("RadioNode {} sending {} bytes to {}", self.id, data.len(), to_id);
+            let to_id: ValidatorId = to_str.parse().map_err(|_| NetworkError::Unknown)?;
+            log::debug!(
+                "RadioNode {} unicast to {} ({} bytes)",
+                self.id,
+                to_id,
+                data.len()
+            );
+            trace!(
+                "RadioNode {} sending {} bytes to {}",
+                self.id,
+                data.len(),
+                to_id
+            );
             self.send_radio(&data, to_id).await
         }
     }
 
-    async fn send_serialized(&self, bytes: &[u8], to: impl AsRef<str> + Send) -> Result<(), NetworkError> {
+    async fn send_serialized(
+        &self,
+        bytes: &[u8],
+        to: impl AsRef<str> + Send,
+    ) -> Result<(), NetworkError> {
         let to_str = to.as_ref();
-        
+
         if to_str.eq_ignore_ascii_case("BROADCAST") {
-            trace!("RadioNode {} broadcasting {} serialized bytes", self.id, bytes.len());
+            trace!(
+                "RadioNode {} broadcasting {} serialized bytes",
+                self.id,
+                bytes.len()
+            );
             self.broadcast_radio(bytes).await
         } else {
-            let to_id: ValidatorId = to_str.parse()
-                .map_err(|_| NetworkError::Unknown)?;
-            trace!("RadioNode {} sending {} serialized bytes to {}", self.id, bytes.len(), to_id);
+            let to_id: ValidatorId = to_str.parse().map_err(|_| NetworkError::Unknown)?;
+            trace!(
+                "RadioNode {} sending {} serialized bytes to {}",
+                self.id,
+                bytes.len(),
+                to_id
+            );
             self.send_radio(bytes, to_id).await
         }
     }
 
     async fn receive(&self) -> Result<NetworkMessage, NetworkError> {
         loop {
-            let packet = self.receiver.lock().await.recv().await
+            let packet = self
+                .receiver
+                .lock()
+                .await
+                .recv()
+                .await
                 .ok_or(NetworkError::Unknown)?;
             if let Ok((header, header_len)) = bincode::serde::decode_from_slice::<ShardHeader, _>(
                 &packet.payload,
-                bincode::config::standard()
+                bincode::config::standard(),
             ) {
                 let data = packet.payload[header_len..].to_vec();
-                if let Some(complete) = self.try_reassemble_erasure(packet.from, header, data).await {
+                if let Some(complete) = self.try_reassemble_erasure(packet.from, header, data).await
+                {
                     if packet.from != self.id {
                         // println!("RadioNode {} received broadcast from {} (reassembled message)", self.id, packet.from);
                     }
@@ -666,7 +853,7 @@ impl Network for RadioNode {
             }
             let (header, header_len) = match bincode::serde::decode_from_slice::<FragmentHeader, _>(
                 &packet.payload,
-                bincode::config::standard()
+                bincode::config::standard(),
             ) {
                 Ok((h, header_len)) => (h, header_len),
                 Err(_) => {
@@ -686,4 +873,4 @@ impl Network for RadioNode {
             }
         }
     }
-} 
+}

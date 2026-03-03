@@ -1,18 +1,18 @@
 //! radio networking layer for BunkerCoin
 
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 
 pub mod framing;
+pub mod network_core;
 pub mod scheduler;
 pub mod simulated;
-pub mod network_core;
 
 pub use framing::{RadioFrame, RadioFramer};
+pub use network_core::RadioNetworkCore;
 pub use scheduler::RadioScheduler;
 pub use simulated::SimulatedRadioNetwork;
-pub use network_core::RadioNetworkCore;
 
 pub type ValidatorId = u64;
 
@@ -68,7 +68,9 @@ pub trait Network: Send + Sync {
         bytes: &[u8],
         to: impl AsRef<str> + Send,
     ) -> impl std::future::Future<Output = Result<(), NetworkError>> + Send;
-    fn receive(&self) -> impl std::future::Future<Output = Result<NetworkMessage, NetworkError>> + Send;
+    fn receive(
+        &self,
+    ) -> impl std::future::Future<Output = Result<NetworkMessage, NetworkError>> + Send;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,4 +94,4 @@ impl Default for RadioConfig {
             transmission_window: Duration::from_secs(300),
         }
     }
-} 
+}

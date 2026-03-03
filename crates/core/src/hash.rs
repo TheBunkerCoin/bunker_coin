@@ -1,21 +1,17 @@
 use ark_bn254::Fr as F;
-use light_poseidon::{Poseidon, PoseidonHasher, PoseidonBytesHasher};
+use light_poseidon::{Poseidon, PoseidonBytesHasher, PoseidonHasher};
 
 /// Computes Poseidon hash of `inputs` (field elements) and returns a field element
 pub fn hash(inputs: &[F]) -> F {
-    let mut poseidon = Poseidon::<F>::new_circom(inputs.len())
-        .expect("invalid arity for Poseidon");
+    let mut poseidon = Poseidon::<F>::new_circom(inputs.len()).expect("invalid arity for Poseidon");
     poseidon.hash(inputs).expect("hash failure")
 }
 
 /// Computes Poseidon hash over raw 32-byte big-endian blobs and returns a 32-byte BE digest
 pub fn hash_bytes_be(inputs: &[&[u8; 32]]) -> [u8; 32] {
     let slices: Vec<&[u8]> = inputs.iter().map(|arr| &arr[..]).collect();
-    let mut poseidon = Poseidon::<F>::new_circom(slices.len())
-        .expect("invalid arity for Poseidon");
-    poseidon
-        .hash_bytes_be(&slices)
-        .expect("hash failure")
+    let mut poseidon = Poseidon::<F>::new_circom(slices.len()).expect("invalid arity for Poseidon");
+    poseidon.hash_bytes_be(&slices).expect("hash failure")
 }
 
 #[cfg(test)]
@@ -33,4 +29,4 @@ mod tests {
         let digest = hash_bytes_be(&inputs);
         assert_eq!(digest, expected);
     }
-} 
+}

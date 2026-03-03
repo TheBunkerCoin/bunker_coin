@@ -1,7 +1,6 @@
+use bunker_coin_core::execution::State;
 use log::info;
 use rocksdb::{DB, IteratorMode, Options};
-
-use bunker_coin_core::execution::State;
 
 pub struct SnapshotStore {
     db: DB,
@@ -71,7 +70,10 @@ impl SnapshotStore {
             for key in &keys[keep_latest_n..] {
                 let _ = self.db.delete(key);
             }
-            info!("pruned {} old snapshots, keeping {keep_latest_n}", keys.len() - keep_latest_n);
+            info!(
+                "pruned {} old snapshots, keeping {keep_latest_n}",
+                keys.len() - keep_latest_n
+            );
         }
     }
 }

@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 
-use ed25519_dalek::{Verifier, VerifyingKey, Signature as DalekSignature};
+use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::account::{Account, TokenMeta};
-use crate::staking::{StakingLedger, JailRecord, PendingBond, PendingRetire, UnjailError};
+use crate::staking::{JailRecord, PendingBond, PendingRetire, StakingLedger, UnjailError};
 use crate::transaction::{Transaction, TransactionBody};
-use crate::types::{Amount, PublicKey, TokenId, MAX_TICKER_LEN, MIN_TICKER_LEN, MAX_COMMISSION_BPS, DUST_THRESHOLD};
+use crate::types::{
+    Amount, PublicKey, TokenId, DUST_THRESHOLD, MAX_COMMISSION_BPS, MAX_TICKER_LEN, MIN_TICKER_LEN,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionError {
@@ -36,15 +38,27 @@ impl std::fmt::Display for ExecutionError {
             Self::NonceMismatch { expected, got } => {
                 write!(f, "nonce mismatch: expected {expected}, got {got}")
             }
-            Self::InsufficientBalance { required, available } => {
+            Self::InsufficientBalance {
+                required,
+                available,
+            } => {
                 write!(f, "insufficient balance: need {required}, have {available}")
             }
-            Self::InsufficientTokenBalance { required, available } => {
-                write!(f, "insufficient token balance: need {required}, have {available}")
+            Self::InsufficientTokenBalance {
+                required,
+                available,
+            } => {
+                write!(
+                    f,
+                    "insufficient token balance: need {required}, have {available}"
+                )
             }
             Self::TickerAlreadyExists(t) => write!(f, "ticker already exists: {t}"),
             Self::TickerLengthInvalid(len) => {
-                write!(f, "ticker length {len} not in {MIN_TICKER_LEN}..={MAX_TICKER_LEN}")
+                write!(
+                    f,
+                    "ticker length {len} not in {MIN_TICKER_LEN}..={MAX_TICKER_LEN}"
+                )
             }
             Self::TokenNotFound(id) => write!(f, "token not found: {:?}", id),
             Self::SelfTransfer => write!(f, "cannot transfer to self"),
@@ -148,15 +162,19 @@ impl State {
     }
 
     fn verify_signature(tx: &Transaction) -> Result<(), ExecutionError> {
-        let vk = VerifyingKey::from_bytes(&tx.sender)
-            .map_err(|_| ExecutionError::InvalidSignature)?;
+        let vk =
+            VerifyingKey::from_bytes(&tx.sender).map_err(|_| ExecutionError::InvalidSignature)?;
         let sig = DalekSignature::from_bytes(&tx.signature);
         let msg = tx.signing_hash();
         vk.verify(&msg, &sig)
             .map_err(|_| ExecutionError::InvalidSignature)
     }
 
-    fn apply_body(&mut self, sender: PublicKey, body: &TransactionBody) -> Result<(), ExecutionError> {
+    fn apply_body(
+        &mut self,
+        sender: PublicKey,
+        body: &TransactionBody,
+    ) -> Result<(), ExecutionError> {
         match body {
             TransactionBody::Transfer { to, amount } => {
                 if *amount == 0 {
@@ -181,7 +199,11 @@ impl State {
                 Ok(())
             }
 
-            TransactionBody::TokenTransfer { to, token_id, amount } => {
+            TransactionBody::TokenTransfer {
+                to,
+                token_id,
+                amount,
+            } => {
                 if *amount == 0 {
                     return Err(ExecutionError::ZeroAmount);
                 }
@@ -192,7 +214,11 @@ impl State {
                     return Err(ExecutionError::TokenNotFound(*token_id));
                 }
                 let sender_acc = self.accounts.get_mut(&sender).unwrap();
-                let sender_token_bal = sender_acc.token_balances.get(token_id).copied().unwrap_or(0);
+                let sender_token_bal = sender_acc
+                    .token_balances
+                    .get(token_id)
+                    .copied()
+                    .unwrap_or(0);
                 if sender_token_bal < *amount {
                     return Err(ExecutionError::InsufficientTokenBalance {
                         required: *amount,
@@ -208,7 +234,11 @@ impl State {
                 Ok(())
             }
 
-            TransactionBody::Mint { ticker, max_supply, metadata_hash } => {
+            TransactionBody::Mint {
+                ticker,
+                max_supply,
+                metadata_hash,
+            } => {
                 if ticker.len() < MIN_TICKER_LEN || ticker.len() > MAX_TICKER_LEN {
                     return Err(ExecutionError::TickerLengthInvalid(ticker.len()));
                 }
@@ -217,14 +247,17 @@ impl State {
                 }
                 let id = self.next_token_id.to_le_bytes();
                 self.next_token_id += 1;
-                self.tokens.insert(id, TokenMeta {
+                self.tokens.insert(
                     id,
-                    ticker: ticker.clone(),
-                    current_supply: *max_supply,
-                    max_supply: *max_supply,
-                    metadata_hash: *metadata_hash,
-                    creator: sender,
-                });
+                    TokenMeta {
+                        id,
+                        ticker: ticker.clone(),
+                        current_supply: *max_supply,
+                        max_supply: *max_supply,
+                        metadata_hash: *metadata_hash,
+                        creator: sender,
+                    },
+                );
                 let acc = self.accounts.get_mut(&sender).unwrap();
                 acc.token_balances.insert(id, *max_supply);
                 Ok(())
@@ -251,7 +284,12 @@ impl State {
                 if *amount == 0 {
                     return Err(ExecutionError::ZeroAmount);
                 }
-                let delegated = self.staking.delegations.get(validator).copied().unwrap_or(0);
+                let delegated = self
+                    .staking
+                    .delegations
+                    .get(validator)
+                    .copied()
+                    .unwrap_or(0);
                 if delegated < *amount {
                     return Err(ExecutionError::InsufficientBalance {
                         required: *amount,
@@ -276,12 +314,14 @@ impl State {
             }
 
             TransactionBody::UnJail => {
-                self.staking.unjail(&sender, self.current_epoch).map_err(|e| match e {
-                    UnjailError::NotJailed => ExecutionError::NotJailed,
-                    UnjailError::JailPeriodNotElapsed => ExecutionError::JailPeriodNotElapsed,
-                    UnjailError::NoStake => ExecutionError::NoStake,
-                    UnjailError::InsufficientSelfStake => ExecutionError::InsufficientSelfStake,
-                })
+                self.staking
+                    .unjail(&sender, self.current_epoch)
+                    .map_err(|e| match e {
+                        UnjailError::NotJailed => ExecutionError::NotJailed,
+                        UnjailError::JailPeriodNotElapsed => ExecutionError::JailPeriodNotElapsed,
+                        UnjailError::NoStake => ExecutionError::NoStake,
+                        UnjailError::InsufficientSelfStake => ExecutionError::InsufficientSelfStake,
+                    })
             }
 
             TransactionBody::SetCommission { rate } => {
@@ -319,14 +359,12 @@ impl State {
         let mut distributed: Amount = 0;
 
         if total_stake > 0 && self.tx_fee_pool > 0 {
-            let active_validators: Vec<(PublicKey, Amount)> = self
-                .staking
-                .validator_set()
-                .into_iter()
-                .collect();
+            let active_validators: Vec<(PublicKey, Amount)> =
+                self.staking.validator_set().into_iter().collect();
 
             for (validator, stake) in &active_validators {
-                let share = (self.tx_fee_pool as u128 * *stake as u128 / total_stake as u128) as Amount;
+                let share =
+                    (self.tx_fee_pool as u128 * *stake as u128 / total_stake as u128) as Amount;
                 if share >= DUST_THRESHOLD {
                     self.get_or_create_account(validator).native_balance += share;
                     distributed += share;
@@ -462,7 +500,7 @@ impl State {
 mod tests {
     use super::*;
     use crate::types::MIN_SELF_STAKE;
-    use ed25519_dalek::{SigningKey, Signer};
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
     fn make_keypair() -> (SigningKey, PublicKey) {
@@ -493,7 +531,10 @@ mod tests {
             sender: pk_a,
             nonce: 0,
             fee: 10,
-            body: TransactionBody::Transfer { to: pk_b, amount: 100 },
+            body: TransactionBody::Transfer {
+                to: pk_b,
+                amount: 100,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk_a, &mut tx);
@@ -515,7 +556,10 @@ mod tests {
             sender: pk_a,
             nonce: 0,
             fee: 10,
-            body: TransactionBody::Transfer { to: pk_b, amount: 100 },
+            body: TransactionBody::Transfer {
+                to: pk_b,
+                amount: 100,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk_a, &mut tx);
@@ -532,7 +576,10 @@ mod tests {
             sender: pk_a,
             nonce: 0,
             fee: 10,
-            body: TransactionBody::Transfer { to: pk_a, amount: 100 },
+            body: TransactionBody::Transfer {
+                to: pk_a,
+                amount: 100,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk_a, &mut tx);
@@ -550,7 +597,10 @@ mod tests {
             sender: pk_a,
             nonce: 0,
             fee: 10,
-            body: TransactionBody::Transfer { to: pk_b, amount: 0 },
+            body: TransactionBody::Transfer {
+                to: pk_b,
+                amount: 0,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk_a, &mut tx);
@@ -568,12 +618,21 @@ mod tests {
             sender: pk_a,
             nonce: 5,
             fee: 10,
-            body: TransactionBody::Transfer { to: pk_b, amount: 100 },
+            body: TransactionBody::Transfer {
+                to: pk_b,
+                amount: 100,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk_a, &mut tx);
         let err = state.execute_tx(&tx).unwrap_err();
-        assert!(matches!(err, ExecutionError::NonceMismatch { expected: 0, got: 5 }));
+        assert!(matches!(
+            err,
+            ExecutionError::NonceMismatch {
+                expected: 0,
+                got: 5
+            }
+        ));
     }
 
     #[test]
@@ -586,7 +645,10 @@ mod tests {
             sender: pk_a,
             nonce: 0,
             fee: 25,
-            body: TransactionBody::Transfer { to: pk_b, amount: 50 },
+            body: TransactionBody::Transfer {
+                to: pk_b,
+                amount: 50,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk_a, &mut tx);
@@ -663,8 +725,24 @@ mod tests {
         sign_tx(&sk_a, &mut transfer_tx);
         state.execute_tx(&transfer_tx).unwrap();
 
-        assert_eq!(*state.get_account(&pk_a).unwrap().token_balances.get(&token_id).unwrap(), 300);
-        assert_eq!(*state.get_account(&pk_b).unwrap().token_balances.get(&token_id).unwrap(), 200);
+        assert_eq!(
+            *state
+                .get_account(&pk_a)
+                .unwrap()
+                .token_balances
+                .get(&token_id)
+                .unwrap(),
+            300
+        );
+        assert_eq!(
+            *state
+                .get_account(&pk_b)
+                .unwrap()
+                .token_balances
+                .get(&token_id)
+                .unwrap(),
+            200
+        );
     }
 
     #[test]
@@ -677,7 +755,10 @@ mod tests {
             sender: pk_a,
             nonce: 0,
             fee: 10,
-            body: TransactionBody::Bond { validator, amount: 500 },
+            body: TransactionBody::Bond {
+                validator,
+                amount: 500,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk_a, &mut tx);
@@ -696,7 +777,10 @@ mod tests {
             sender: pk_a,
             nonce: 0,
             fee: 10,
-            body: TransactionBody::Transfer { to: pk_b, amount: 100 },
+            body: TransactionBody::Transfer {
+                to: pk_b,
+                amount: 100,
+            },
             signature: [0xFF; 64],
         };
         let err = state.execute_tx(&tx).unwrap_err();
@@ -713,7 +797,10 @@ mod tests {
             sender: pk_a,
             nonce: 0,
             fee: 10,
-            body: TransactionBody::Transfer { to: pk_b, amount: 100 },
+            body: TransactionBody::Transfer {
+                to: pk_b,
+                amount: 100,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk_a, &mut good_tx);
@@ -722,7 +809,10 @@ mod tests {
             sender: pk_a,
             nonce: 99,
             fee: 10,
-            body: TransactionBody::Transfer { to: pk_b, amount: 100 },
+            body: TransactionBody::Transfer {
+                to: pk_b,
+                amount: 100,
+            },
             signature: [0xFF; 64],
         };
 
@@ -784,7 +874,7 @@ mod tests {
 
     #[test]
     fn epoch_transition_processes_slashes() {
-        use crate::staking::{SlashingEvent, SlashOffenceKind};
+        use crate::staking::{SlashOffenceKind, SlashingEvent};
 
         let mut state = State::new();
         let validator: PublicKey = [1u8; 32];
@@ -806,7 +896,7 @@ mod tests {
 
     #[test]
     fn unjail_transaction() {
-        use crate::staking::{SlashingEvent, SlashOffenceKind};
+        use crate::staking::{SlashOffenceKind, SlashingEvent};
 
         let (sk, pk) = make_keypair();
         let mut state = funded_state(&pk, 10_000);
@@ -875,7 +965,7 @@ mod tests {
 
     #[test]
     fn fee_distribution_excludes_jailed() {
-        use crate::staking::{SlashingEvent, SlashOffenceKind};
+        use crate::staking::{SlashOffenceKind, SlashingEvent};
 
         let mut state = State::new();
         let validator_a: PublicKey = [1u8; 32];
@@ -895,7 +985,10 @@ mod tests {
 
         let result = state.process_epoch_transition(0);
 
-        let a_balance = state.get_account(&validator_a).map(|a| a.native_balance).unwrap_or(0);
+        let a_balance = state
+            .get_account(&validator_a)
+            .map(|a| a.native_balance)
+            .unwrap_or(0);
         let b_balance = state.get_account(&validator_b).unwrap().native_balance;
         assert_eq!(a_balance, 0);
         assert_eq!(b_balance, 1000);
@@ -907,11 +1000,29 @@ mod tests {
         let mut state = State::new();
         let validator: PublicKey = [1u8; 32];
 
-        state.staking.queue_bond(validator, validator, MIN_SELF_STAKE, 0);
+        state
+            .staking
+            .queue_bond(validator, validator, MIN_SELF_STAKE, 0);
         state.process_epoch_transition(0);
 
-        assert_eq!(state.staking.self_bonds.get(&validator).copied().unwrap_or(0), MIN_SELF_STAKE);
-        assert_eq!(state.staking.delegations.get(&validator).copied().unwrap_or(0), MIN_SELF_STAKE);
+        assert_eq!(
+            state
+                .staking
+                .self_bonds
+                .get(&validator)
+                .copied()
+                .unwrap_or(0),
+            MIN_SELF_STAKE
+        );
+        assert_eq!(
+            state
+                .staking
+                .delegations
+                .get(&validator)
+                .copied()
+                .unwrap_or(0),
+            MIN_SELF_STAKE
+        );
     }
 
     #[test]
@@ -923,8 +1034,24 @@ mod tests {
         state.staking.queue_bond(delegator, validator, 5000, 0);
         state.process_epoch_transition(0);
 
-        assert_eq!(state.staking.self_bonds.get(&validator).copied().unwrap_or(0), 0);
-        assert_eq!(state.staking.delegations.get(&validator).copied().unwrap_or(0), 5000);
+        assert_eq!(
+            state
+                .staking
+                .self_bonds
+                .get(&validator)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            state
+                .staking
+                .delegations
+                .get(&validator)
+                .copied()
+                .unwrap_or(0),
+            5000
+        );
     }
 
     #[test]
@@ -954,12 +1081,20 @@ mod tests {
         assert!(state.staking.commission_rates.get(&validator).is_none());
 
         state.process_epoch_transition(0);
-        assert_eq!(state.staking.commission_rates.get(&validator).copied().unwrap(), 500);
+        assert_eq!(
+            state
+                .staking
+                .commission_rates
+                .get(&validator)
+                .copied()
+                .unwrap(),
+            500
+        );
     }
 
     #[test]
     fn slash_reduces_self_bonds_proportionally() {
-        use crate::staking::{SlashingEvent, SlashOffenceKind};
+        use crate::staking::{SlashOffenceKind, SlashingEvent};
 
         let mut ledger = StakingLedger::new();
         let validator: PublicKey = [1u8; 32];
@@ -1011,7 +1146,9 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::SetCommission { rate: MAX_COMMISSION_BPS + 1 },
+            body: TransactionBody::SetCommission {
+                rate: MAX_COMMISSION_BPS + 1,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1038,7 +1175,13 @@ mod tests {
         // v2 share = 999 * 1 / 1000 = 0 (< DUST_THRESHOLD, skipped)
         assert_eq!(result.fees_distributed, 998);
         assert_eq!(state.get_account(&v1).unwrap().native_balance, 998);
-        assert_eq!(state.get_account(&v2).map(|a| a.native_balance).unwrap_or(0), 0);
+        assert_eq!(
+            state
+                .get_account(&v2)
+                .map(|a| a.native_balance)
+                .unwrap_or(0),
+            0
+        );
     }
 
     #[test]
@@ -1073,7 +1216,10 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::Retire { validator, amount: 500 },
+            body: TransactionBody::Retire {
+                validator,
+                amount: 500,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1091,7 +1237,10 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::Retire { validator, amount: 0 },
+            body: TransactionBody::Retire {
+                validator,
+                amount: 0,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1109,7 +1258,10 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::Bond { validator, amount: 0 },
+            body: TransactionBody::Bond {
+                validator,
+                amount: 0,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1127,7 +1279,10 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 10,
-            body: TransactionBody::Bond { validator, amount: 100 },
+            body: TransactionBody::Bond {
+                validator,
+                amount: 100,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1159,12 +1314,15 @@ mod tests {
         let (_, validator) = make_keypair();
         let mut state = funded_state(&pk, 10_000);
 
-        state.staking.completed_retires.push(crate::staking::CompletedRetire {
-            delegator: pk,
-            validator,
-            amount: 500,
-            epoch_completed: 0,
-        });
+        state
+            .staking
+            .completed_retires
+            .push(crate::staking::CompletedRetire {
+                delegator: pk,
+                validator,
+                amount: 500,
+                epoch_completed: 0,
+            });
 
         let mut tx = Transaction {
             sender: pk,
@@ -1188,7 +1346,11 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::Mint { ticker: "AB".into(), max_supply: 100, metadata_hash: [0; 32] },
+            body: TransactionBody::Mint {
+                ticker: "AB".into(),
+                max_supply: 100,
+                metadata_hash: [0; 32],
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1205,7 +1367,11 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::Mint { ticker: "TOOLONGTK".into(), max_supply: 100, metadata_hash: [0; 32] },
+            body: TransactionBody::Mint {
+                ticker: "TOOLONGTK".into(),
+                max_supply: 100,
+                metadata_hash: [0; 32],
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1222,7 +1388,11 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::Mint { ticker: "BNK".into(), max_supply: 100, metadata_hash: [0; 32] },
+            body: TransactionBody::Mint {
+                ticker: "BNK".into(),
+                max_supply: 100,
+                metadata_hash: [0; 32],
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx1);
@@ -1232,7 +1402,11 @@ mod tests {
             sender: pk,
             nonce: 1,
             fee: 1,
-            body: TransactionBody::Mint { ticker: "BNK".into(), max_supply: 200, metadata_hash: [1; 32] },
+            body: TransactionBody::Mint {
+                ticker: "BNK".into(),
+                max_supply: 200,
+                metadata_hash: [1; 32],
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx2);
@@ -1250,7 +1424,11 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::TokenTransfer { to: pk_b, token_id: [0, 0, 0, 99], amount: 50 },
+            body: TransactionBody::TokenTransfer {
+                to: pk_b,
+                token_id: [0, 0, 0, 99],
+                amount: 50,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1269,7 +1447,11 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::Mint { ticker: "TKN".into(), max_supply: 100, metadata_hash: [0; 32] },
+            body: TransactionBody::Mint {
+                ticker: "TKN".into(),
+                max_supply: 100,
+                metadata_hash: [0; 32],
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut mint_tx);
@@ -1280,12 +1462,19 @@ mod tests {
             sender: pk,
             nonce: 1,
             fee: 1,
-            body: TransactionBody::TokenTransfer { to: pk_b, token_id, amount: 200 },
+            body: TransactionBody::TokenTransfer {
+                to: pk_b,
+                token_id,
+                amount: 200,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
         let err = state.execute_tx(&tx).unwrap_err();
-        assert!(matches!(err, ExecutionError::InsufficientTokenBalance { .. }));
+        assert!(matches!(
+            err,
+            ExecutionError::InsufficientTokenBalance { .. }
+        ));
     }
 
     #[test]
@@ -1297,7 +1486,11 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::Mint { ticker: "TKN".into(), max_supply: 100, metadata_hash: [0; 32] },
+            body: TransactionBody::Mint {
+                ticker: "TKN".into(),
+                max_supply: 100,
+                metadata_hash: [0; 32],
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut mint_tx);
@@ -1308,7 +1501,11 @@ mod tests {
             sender: pk,
             nonce: 1,
             fee: 1,
-            body: TransactionBody::TokenTransfer { to: pk, token_id, amount: 50 },
+            body: TransactionBody::TokenTransfer {
+                to: pk,
+                token_id,
+                amount: 50,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1326,7 +1523,11 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::Mint { ticker: "TKN".into(), max_supply: 100, metadata_hash: [0; 32] },
+            body: TransactionBody::Mint {
+                ticker: "TKN".into(),
+                max_supply: 100,
+                metadata_hash: [0; 32],
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut mint_tx);
@@ -1337,7 +1538,11 @@ mod tests {
             sender: pk,
             nonce: 1,
             fee: 1,
-            body: TransactionBody::TokenTransfer { to: pk_b, token_id, amount: 0 },
+            body: TransactionBody::TokenTransfer {
+                to: pk_b,
+                token_id,
+                amount: 0,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1373,12 +1578,17 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 1,
-            body: TransactionBody::SetCommission { rate: MAX_COMMISSION_BPS },
+            body: TransactionBody::SetCommission {
+                rate: MAX_COMMISSION_BPS,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
         state.execute_tx(&tx).unwrap();
-        assert_eq!(state.staking.pending_commission_changes[0], (pk, MAX_COMMISSION_BPS));
+        assert_eq!(
+            state.staking.pending_commission_changes[0],
+            (pk, MAX_COMMISSION_BPS)
+        );
     }
 
     #[test]
@@ -1392,7 +1602,10 @@ mod tests {
                 sender: pk,
                 nonce: i,
                 fee: 1,
-                body: TransactionBody::Transfer { to: pk_b, amount: 10 },
+                body: TransactionBody::Transfer {
+                    to: pk_b,
+                    amount: 10,
+                },
                 signature: [0u8; 64],
             };
             sign_tx(&sk, &mut tx);
@@ -1413,7 +1626,10 @@ mod tests {
             sender: pk,
             nonce: 0,
             fee: 10,
-            body: TransactionBody::Transfer { to: pk_b, amount: 1 },
+            body: TransactionBody::Transfer {
+                to: pk_b,
+                amount: 1,
+            },
             signature: [0u8; 64],
         };
         sign_tx(&sk, &mut tx);
@@ -1505,7 +1721,10 @@ mod tests {
         // epoch 1->2: should complete
         let r2 = state.process_epoch_transition(1);
         assert_eq!(r2.retires_completed.len(), 1);
-        assert_eq!(state.staking.delegations.get(&validator).copied().unwrap(), 500);
+        assert_eq!(
+            state.staking.delegations.get(&validator).copied().unwrap(),
+            500
+        );
     }
 
     #[test]

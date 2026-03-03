@@ -17,12 +17,11 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::consensus::{Blockstore, EpochInfo, Pool};
-use crate::types::SLOTS_PER_EPOCH;
 use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH, MerkleRoot};
 use crate::crypto::signature;
 use crate::network::{Network, TransactionNetwork};
 use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder};
-use crate::types::{Slice, SliceHeader, SliceIndex, SlicePayload, Slot};
+use crate::types::{SLOTS_PER_EPOCH, Slice, SliceHeader, SliceIndex, SlicePayload, Slot};
 use crate::{BlockId, Disseminator, MAX_TRANSACTION_SIZE};
 
 /// Produces blocks from transactions and dissminates them.
@@ -121,7 +120,10 @@ where
                     }
                 }
                 current_epoch = window_epoch;
-                info!("[val {}] epoch {} ready, resuming block production", self.epoch_info.own_id, current_epoch);
+                info!(
+                    "[val {}] epoch {} ready, resuming block production",
+                    self.epoch_info.own_id, current_epoch
+                );
             }
 
             let last_slot_in_window = first_slot_in_window.last_slot_in_window();

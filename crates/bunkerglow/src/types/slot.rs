@@ -20,7 +20,17 @@ pub const SLOTS_PER_EPOCH: u64 = 18_000;
 /// Slot number type.
 #[repr(transparent)]
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, SchemaRead,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    SchemaRead,
     SchemaWrite,
 )]
 pub struct Slot(u64);
@@ -184,6 +194,9 @@ mod tests {
 
         let slot = Slot::new(SLOTS_PER_EPOCH + 42);
         assert_eq!(slot.first_slot_in_epoch(), Slot::new(SLOTS_PER_EPOCH));
-        assert_eq!(slot.last_slot_in_epoch(), Slot::new(2 * SLOTS_PER_EPOCH - 1));
+        assert_eq!(
+            slot.last_slot_in_epoch(),
+            Slot::new(2 * SLOTS_PER_EPOCH - 1)
+        );
     }
 }

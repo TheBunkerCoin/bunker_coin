@@ -1,17 +1,25 @@
-use axum::{routing::{get, post}, Router, Json, extract::{Path, Query, WebSocketUpgrade, ws::{Message, WebSocket}}, response::IntoResponse};
-use serde::{Serialize, Deserialize};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{RwLock, broadcast, mpsc};
-use tower_http::cors::{CorsLayer, Any, AllowOrigin};
-use axum::http::{Method, HeaderValue};
-use futures::{sink::SinkExt, stream::StreamExt};
-use bunkerglow::consensus::Blockstore;
-use bunkerglow::crypto::Hash;
+use axum::http::{HeaderValue, Method};
+use axum::{
+    extract::{
+        ws::{Message, WebSocket},
+        Path, Query, WebSocketUpgrade,
+    },
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::{Transaction as CoreTransaction, TransactionBody};
 use bunker_coin_core::types::MAX_TICKER_LEN;
+use bunkerglow::consensus::Blockstore;
+use bunkerglow::crypto::Hash;
+use futures::{sink::SinkExt, stream::StreamExt};
 use hex;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{broadcast, mpsc, RwLock};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 const MAX_MEMPOOL_SIZE: usize = 10_000;
 
@@ -47,7 +55,7 @@ pub enum Block {
         proposed_timestamp: u64,
         finalized_timestamp: Option<u64>,
         status: SlotStatus,
-    }
+    },
 }
 
 impl Block {
@@ -74,30 +82,48 @@ impl Block {
 
     pub fn set_status(&mut self, new_status: SlotStatus, finalized_timestamp: Option<u64>) {
         match self {
-            Block::Block { status, finalized_timestamp: ft, .. } => {
+            Block::Block {
+                status,
+                finalized_timestamp: ft,
+                ..
+            } => {
                 *status = new_status;
                 if new_status == SlotStatus::Finalized {
                     *ft = finalized_timestamp;
                 }
-            },
-            Block::Skip { status, finalized_timestamp: ft, .. } => {
+            }
+            Block::Skip {
+                status,
+                finalized_timestamp: ft,
+                ..
+            } => {
                 *status = new_status;
                 if new_status == SlotStatus::Finalized {
                     *ft = finalized_timestamp;
                 }
-            },
+            }
         }
     }
     pub fn proposed_timestamp(&self) -> u64 {
         match self {
-            Block::Block { proposed_timestamp, .. } => *proposed_timestamp,
-            Block::Skip { proposed_timestamp, .. } => *proposed_timestamp,
+            Block::Block {
+                proposed_timestamp, ..
+            } => *proposed_timestamp,
+            Block::Skip {
+                proposed_timestamp, ..
+            } => *proposed_timestamp,
         }
     }
     pub fn finalized_timestamp(&self) -> Option<u64> {
         match self {
-            Block::Block { finalized_timestamp, .. } => *finalized_timestamp,
-            Block::Skip { finalized_timestamp, .. } => *finalized_timestamp,
+            Block::Block {
+                finalized_timestamp,
+                ..
+            } => *finalized_timestamp,
+            Block::Skip {
+                finalized_timestamp,
+                ..
+            } => *finalized_timestamp,
         }
     }
 }
@@ -184,14 +210,35 @@ struct SubmitTransactionRequest {
 
 #[derive(Deserialize)]
 enum TransactionBodyRequest {
-    Transfer { to: String, amount: u64 },
-    TokenTransfer { to: String, token_id: String, amount: u64 },
-    Mint { ticker: String, max_supply: u64, metadata_hash: String },
-    Bond { validator: String, amount: u64 },
-    Retire { validator: String, amount: u64 },
-    Withdraw { validator: String },
+    Transfer {
+        to: String,
+        amount: u64,
+    },
+    TokenTransfer {
+        to: String,
+        token_id: String,
+        amount: u64,
+    },
+    Mint {
+        ticker: String,
+        max_supply: u64,
+        metadata_hash: String,
+    },
+    Bond {
+        validator: String,
+        amount: u64,
+    },
+    Retire {
+        validator: String,
+        amount: u64,
+    },
+    Withdraw {
+        validator: String,
+    },
     UnJail,
-    SetCommission { rate: u16 },
+    SetCommission {
+        rate: u16,
+    },
 }
 
 // -- shared state --
@@ -236,17 +283,24 @@ fn decode_hash32(hex_str: &str) -> Result<[u8; 32], String> {
 
 fn convert_body(body: TransactionBodyRequest) -> Result<TransactionBody, String> {
     match body {
-        TransactionBodyRequest::Transfer { to, amount } => {
-            Ok(TransactionBody::Transfer { to: decode_pubkey(&to)?, amount })
-        }
-        TransactionBodyRequest::TokenTransfer { to, token_id, amount } => {
-            Ok(TransactionBody::TokenTransfer {
-                to: decode_pubkey(&to)?,
-                token_id: decode_token_id(&token_id)?,
-                amount,
-            })
-        }
-        TransactionBodyRequest::Mint { ticker, max_supply, metadata_hash } => {
+        TransactionBodyRequest::Transfer { to, amount } => Ok(TransactionBody::Transfer {
+            to: decode_pubkey(&to)?,
+            amount,
+        }),
+        TransactionBodyRequest::TokenTransfer {
+            to,
+            token_id,
+            amount,
+        } => Ok(TransactionBody::TokenTransfer {
+            to: decode_pubkey(&to)?,
+            token_id: decode_token_id(&token_id)?,
+            amount,
+        }),
+        TransactionBodyRequest::Mint {
+            ticker,
+            max_supply,
+            metadata_hash,
+        } => {
             if ticker.len() < 3 || ticker.len() > MAX_TICKER_LEN {
                 return Err(format!("ticker must be 3-{MAX_TICKER_LEN} characters"));
             }
@@ -256,15 +310,17 @@ fn convert_body(body: TransactionBodyRequest) -> Result<TransactionBody, String>
                 metadata_hash: decode_hash32(&metadata_hash)?,
             })
         }
-        TransactionBodyRequest::Bond { validator, amount } => {
-            Ok(TransactionBody::Bond { validator: decode_pubkey(&validator)?, amount })
-        }
-        TransactionBodyRequest::Retire { validator, amount } => {
-            Ok(TransactionBody::Retire { validator: decode_pubkey(&validator)?, amount })
-        }
-        TransactionBodyRequest::Withdraw { validator } => {
-            Ok(TransactionBody::Withdraw { validator: decode_pubkey(&validator)? })
-        }
+        TransactionBodyRequest::Bond { validator, amount } => Ok(TransactionBody::Bond {
+            validator: decode_pubkey(&validator)?,
+            amount,
+        }),
+        TransactionBodyRequest::Retire { validator, amount } => Ok(TransactionBody::Retire {
+            validator: decode_pubkey(&validator)?,
+            amount,
+        }),
+        TransactionBodyRequest::Withdraw { validator } => Ok(TransactionBody::Withdraw {
+            validator: decode_pubkey(&validator)?,
+        }),
         TransactionBodyRequest::UnJail => Ok(TransactionBody::UnJail),
         TransactionBodyRequest::SetCommission { rate } => {
             Ok(TransactionBody::SetCommission { rate })
@@ -301,26 +357,35 @@ async fn submit_transaction(
 ) -> impl IntoResponse {
     let sender = match decode_pubkey(&req.sender) {
         Ok(k) => k,
-        Err(e) => return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("invalid sender: {e}") })),
-        ).into_response(),
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid sender: {e}") })),
+            )
+                .into_response()
+        }
     };
 
     let signature = match decode_signature(&req.signature) {
         Ok(s) => s,
-        Err(e) => return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("invalid signature: {e}") })),
-        ).into_response(),
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid signature: {e}") })),
+            )
+                .into_response()
+        }
     };
 
     let body = match convert_body(req.body) {
         Ok(b) => b,
-        Err(e) => return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
-        ).into_response(),
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response()
+        }
     };
 
     let tx = CoreTransaction {
@@ -340,14 +405,18 @@ async fn submit_transaction(
         if mempool.iter().any(|e| e.hash == hash) {
             return (
                 axum::http::StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "transaction already in mempool", "hash": hash })),
-            ).into_response();
+                Json(
+                    serde_json::json!({ "error": "transaction already in mempool", "hash": hash }),
+                ),
+            )
+                .into_response();
         }
         if mempool.len() >= MAX_MEMPOOL_SIZE {
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "error": "mempool full" })),
-            ).into_response();
+            )
+                .into_response();
         }
     }
 
@@ -392,7 +461,9 @@ async fn mempool(
     let total = pool.len();
 
     if offset >= total {
-        return Json(serde_json::json!({ "transactions": [], "total": total, "limit": limit, "offset": offset }));
+        return Json(
+            serde_json::json!({ "transactions": [], "total": total, "limit": limit, "offset": offset }),
+        );
     }
 
     let end = (offset + limit).min(total);
@@ -420,7 +491,10 @@ async fn mempool_transaction(
 // -- block handlers --
 
 // this probably qualifies for a rewrite soon:tm:
-async fn blocks(Query(p): Query<Pagination>, state: axum::extract::State<SharedState>) -> Json<Vec<Block>> {
+async fn blocks(
+    Query(p): Query<Pagination>,
+    state: axum::extract::State<SharedState>,
+) -> Json<Vec<Block>> {
     let limit = p.limit.unwrap_or(100).min(100);
     let offset = p.offset.unwrap_or(0);
 
@@ -435,7 +509,6 @@ async fn blocks(Query(p): Query<Pagination>, state: axum::extract::State<SharedS
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
 
         for slot in 0..=highest_mem_slot + 200 {
-
             if all_blocks.iter().any(|b| b.slot() == slot) {
                 continue;
             }
@@ -444,7 +517,11 @@ async fn blocks(Query(p): Query<Pagination>, state: axum::extract::State<SharedS
                 if let Some(block) = bs.get_block(slot, hash) {
                     let (producer, proposed_timestamp, finalized_timestamp) =
                         if let Some(metadata) = bs.load_block_metadata(slot, hash) {
-                            (metadata.producer, metadata.proposed_timestamp, metadata.finalized_timestamp)
+                            (
+                                metadata.producer,
+                                metadata.proposed_timestamp,
+                                metadata.finalized_timestamp,
+                            )
                         } else {
                             (0, 0, Some(0))
                         };
@@ -496,7 +573,10 @@ async fn radio(state: axum::extract::State<SharedState>) -> Json<RadioStats> {
     Json(stats.clone())
 }
 
-async fn block(Path(hash): Path<String>, state: axum::extract::State<SharedState>) -> impl IntoResponse {
+async fn block(
+    Path(hash): Path<String>,
+    state: axum::extract::State<SharedState>,
+) -> impl IntoResponse {
     let blocks = state.blocks.read().await;
     if let Some(block) = blocks.iter().find(|b| b.hash() == hash) {
         return Json(block.clone()).into_response();
@@ -505,7 +585,7 @@ async fn block(Path(hash): Path<String>, state: axum::extract::State<SharedState
     if let Some(bs_arc) = &state.blockstore {
         if let Ok(hash_bytes) = hex::decode(&hash) {
             if hash_bytes.len() == 32 {
-                let mut hash_arr = [0u8;32];
+                let mut hash_arr = [0u8; 32];
                 hash_arr.copy_from_slice(&hash_bytes);
                 let bs = bs_arc.read().await;
                 if let Some((_slot, blk)) = bs.load_block_by_hash(hash_arr) {
@@ -513,7 +593,11 @@ async fn block(Path(hash): Path<String>, state: axum::extract::State<SharedState
 
                     let (producer, proposed_timestamp, finalized_timestamp) =
                         if let Some(metadata) = bs.load_block_metadata(slot, hash_arr) {
-                            (metadata.producer, metadata.proposed_timestamp, metadata.finalized_timestamp)
+                            (
+                                metadata.producer,
+                                metadata.proposed_timestamp,
+                                metadata.finalized_timestamp,
+                            )
                         } else {
                             (0, 0, Some(0))
                         };
@@ -555,7 +639,6 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = state.updates.subscribe();
 
-
     let mut send_task = tokio::spawn(async move {
         while let Ok(update) = rx.recv().await {
             if let Ok(msg) = serde_json::to_string(&update) {
@@ -588,10 +671,13 @@ async fn get_account(
 ) -> impl IntoResponse {
     let pubkey = match decode_pubkey(&pubkey_hex) {
         Ok(pk) => pk,
-        Err(e) => return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("invalid pubkey: {e}") })),
-        ).into_response(),
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid pubkey: {e}") })),
+            )
+                .into_response()
+        }
     };
 
     let exec = state.execution_state.read().await;
@@ -607,31 +693,35 @@ async fn get_account(
             "native_balance": account.native_balance,
             "token_balances": token_balances,
             "nonce": account.nonce,
-        })).into_response()
+        }))
+        .into_response()
     } else {
         Json(serde_json::json!({
             "pubkey": pubkey_hex,
             "native_balance": 0,
             "token_balances": {},
             "nonce": 0,
-        })).into_response()
+        }))
+        .into_response()
     }
 }
 
-async fn get_tokens(
-    state: axum::extract::State<SharedState>,
-) -> Json<serde_json::Value> {
+async fn get_tokens(state: axum::extract::State<SharedState>) -> Json<serde_json::Value> {
     let exec = state.execution_state.read().await;
-    let tokens: Vec<serde_json::Value> = exec.tokens.values().map(|t| {
-        serde_json::json!({
-            "id": hex::encode(t.id),
-            "ticker": t.ticker,
-            "current_supply": t.current_supply,
-            "max_supply": t.max_supply,
-            "metadata_hash": hex::encode(t.metadata_hash),
-            "creator": hex::encode(t.creator),
+    let tokens: Vec<serde_json::Value> = exec
+        .tokens
+        .values()
+        .map(|t| {
+            serde_json::json!({
+                "id": hex::encode(t.id),
+                "ticker": t.ticker,
+                "current_supply": t.current_supply,
+                "max_supply": t.max_supply,
+                "metadata_hash": hex::encode(t.metadata_hash),
+                "creator": hex::encode(t.creator),
+            })
         })
-    }).collect();
+        .collect();
     Json(serde_json::json!({ "tokens": tokens }))
 }
 

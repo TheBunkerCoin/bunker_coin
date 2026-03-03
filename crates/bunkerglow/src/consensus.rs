@@ -29,13 +29,19 @@ use std::marker::{Send, Sync};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use block_producer::BlockProducer;
+pub use blockstore::{BlockInfo, BlockMetadata, Blockstore, BlockstoreImpl};
+pub use cert::Cert;
 use color_eyre::Result;
+pub use epoch_info::EpochInfo;
 use fastrace::Span;
 use fastrace::future::FutureExt;
-use log::{trace, warn};
-use log::info;
+use log::{info, trace, warn};
+pub use pool::{AddVoteError, EpochBoundaryEvent, Pool, PoolError, PoolImpl, SlashingReport};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
+pub use vote::Vote;
+use votor::Votor;
 use wincode::{SchemaRead, SchemaWrite};
 
 use crate::crypto::{aggsig, signature};
@@ -44,14 +50,6 @@ use crate::repair::{Repair, RepairRequestHandler};
 use crate::shredder::Shred;
 use crate::snapshot::SnapshotStore;
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
-
-pub use blockstore::{BlockInfo, BlockMetadata, Blockstore, BlockstoreImpl};
-pub use cert::Cert;
-pub use epoch_info::EpochInfo;
-pub use pool::{AddVoteError, EpochBoundaryEvent, Pool, PoolError, PoolImpl, SlashingReport};
-pub use vote::Vote;
-use block_producer::BlockProducer;
-use votor::Votor;
 
 /// Time bound assumed on network transmission delays during periods of synchrony.
 pub(crate) const DELTA: Duration = Duration::from_millis(8_000);
@@ -257,14 +255,8 @@ where
         }
 
         // take the epoch boundary receiver out so we can move it into the task
-        let epoch_boundary_rx = std::mem::replace(
-            &mut self.epoch_boundary_rx,
-            mpsc::channel(1).1,
-        );
-        let slashing_rx = std::mem::replace(
-            &mut self.slashing_rx,
-            mpsc::channel(1).1,
-        );
+        let epoch_boundary_rx = std::mem::replace(&mut self.epoch_boundary_rx, mpsc::channel(1).1);
+        let slashing_rx = std::mem::replace(&mut self.slashing_rx, mpsc::channel(1).1);
         let snapshot_store = self.snapshot_store.take();
         let epoch_info_tx = self.epoch_info_tx.clone();
         let execution_state = self.execution_state.clone();
@@ -279,7 +271,8 @@ where
                     slashing_rx,
                     snapshot_store,
                     epoch_info_clone,
-                ).await;
+                )
+                .await;
             }
             .in_span(epoch_transition_span),
         );
@@ -431,7 +424,10 @@ async fn epoch_transition_loop(
     while let Some(event) = epoch_boundary_rx.recv().await {
         let completed_epoch = event.epoch;
         let new_epoch = completed_epoch + 1;
-        info!("epoch boundary reached: epoch {} completed at slot {}", completed_epoch, event.finalized_slot);
+        info!(
+            "epoch boundary reached: epoch {} completed at slot {}",
+            completed_epoch, event.finalized_slot
+        );
 
         // run state transition if execution state is available
         if let Some(ref state) = execution_state {
@@ -441,20 +437,22 @@ async fn epoch_transition_loop(
             while let Ok(report) = slashing_rx.try_recv() {
                 let validator_pk = *epoch_info.validator(report.validator_id).pubkey.as_bytes();
                 let offence_kind = match report.offence {
-                    pool::SlashableOffence::NotarDifferentHash(_, _) |
-                    pool::SlashableOffence::SkipAndNotarize(_, _) => {
+                    pool::SlashableOffence::NotarDifferentHash(_, _)
+                    | pool::SlashableOffence::SkipAndNotarize(_, _) => {
                         bunker_coin_core::staking::SlashOffenceKind::ConflictingVote
                     }
-                    pool::SlashableOffence::SkipAndFinalize(_, _) |
-                    pool::SlashableOffence::NotarFallbackAndFinalize(_, _) => {
+                    pool::SlashableOffence::SkipAndFinalize(_, _)
+                    | pool::SlashableOffence::NotarFallbackAndFinalize(_, _) => {
                         bunker_coin_core::staking::SlashOffenceKind::DoubleVote
                     }
                 };
-                state_guard.staking.report_offence(bunker_coin_core::staking::SlashingEvent {
-                    validator: validator_pk,
-                    offence: offence_kind,
-                    epoch: completed_epoch,
-                });
+                state_guard
+                    .staking
+                    .report_offence(bunker_coin_core::staking::SlashingEvent {
+                        validator: validator_pk,
+                        offence: offence_kind,
+                        epoch: completed_epoch,
+                    });
             }
 
             let result = state_guard.process_epoch_transition(completed_epoch);

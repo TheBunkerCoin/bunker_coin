@@ -93,7 +93,9 @@ impl VaraClient {
     pub async fn read_status_line(&self) -> Result<String, VaraError> {
         let mut reader = self.cmd_reader.lock().await;
         let next = if let Some(d) = self.read_timeout {
-            timeout(d, reader.next()).await.map_err(|_| VaraError::Timeout)?
+            timeout(d, reader.next())
+                .await
+                .map_err(|_| VaraError::Timeout)?
         } else {
             reader.next().await
         };
@@ -111,7 +113,8 @@ impl VaraClient {
     }
 
     pub async fn connect_peer(&self, remote_call: &str) -> Result<(), VaraError> {
-        self.send_command(&format!("CONNECT {}", remote_call)).await?;
+        self.send_command(&format!("CONNECT {}", remote_call))
+            .await?;
         for _ in 0..60 {
             let line = self.read_status_line().await?;
             if line.starts_with("DISCONNECTED") || line.starts_with("WRONG") {
@@ -125,7 +128,8 @@ impl VaraClient {
     }
 
     pub async fn listen_on(&self, on: bool) -> Result<(), VaraError> {
-        self.send_command(if on { "LISTEN ON" } else { "LISTEN OFF" }).await
+        self.send_command(if on { "LISTEN ON" } else { "LISTEN OFF" })
+            .await
     }
 
     pub async fn write_data(&self, data: &[u8]) -> Result<(), VaraError> {
@@ -148,7 +152,9 @@ impl VaraClient {
         } else {
             reader.read(&mut buf).await?
         };
-        if n == 0 { return Err(VaraError::Disconnected); }
+        if n == 0 {
+            return Err(VaraError::Disconnected);
+        }
         buf.truncate(n);
         Ok(buf)
     }
