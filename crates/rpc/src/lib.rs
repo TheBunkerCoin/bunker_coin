@@ -12,7 +12,9 @@ use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::{Transaction as CoreTransaction, TransactionBody};
 use bunker_coin_core::types::MAX_TICKER_LEN;
 use bunkerglow::consensus::Blockstore;
+use bunkerglow::crypto::merkle::{DoubleMerkleRoot, MerkleRoot};
 use bunkerglow::crypto::Hash;
+use bunkerglow::Slot;
 use futures::{sink::SinkExt, stream::StreamExt};
 use hex;
 use serde::{Deserialize, Serialize};
@@ -249,7 +251,7 @@ pub struct SharedState {
     pub nodes: Arc<RwLock<Vec<NodeStatus>>>,
     pub radio_stats: Arc<RwLock<RadioStats>>,
     pub updates: broadcast::Sender<WebSocketUpdate>,
-    pub blockstore: Option<Arc<RwLock<Blockstore>>>,
+    pub blockstore: Option<Arc<RwLock<dyn Blockstore + Send + Sync>>>,
     pub mempool: Arc<RwLock<Vec<MempoolEntry>>>,
     pub tx_sender: Option<mpsc::UnboundedSender<CoreTransaction>>,
     pub execution_state: Arc<RwLock<ExecutionState>>,
@@ -508,15 +510,18 @@ async fn blocks(
 
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
 
-        for slot in 0..=highest_mem_slot + 200 {
-            if all_blocks.iter().any(|b| b.slot() == slot) {
+        for slot_u64 in 0..=highest_mem_slot + 200 {
+            if all_blocks.iter().any(|b| b.slot() == slot_u64) {
                 continue;
             }
 
+            let slot = Slot::new(slot_u64);
             if let Some(hash) = bs.canonical_block_hash(slot) {
-                if let Some(block) = bs.get_block(slot, hash) {
+                let block_hash: DoubleMerkleRoot = hash.clone().into();
+                let block_id = (slot, block_hash);
+                if let Some(block) = bs.get_block(&block_id) {
                     let (producer, proposed_timestamp, finalized_timestamp) =
-                        if let Some(metadata) = bs.load_block_metadata(slot, hash) {
+                        if let Some(metadata) = bs.load_block_metadata(slot, hash.clone()) {
                             (
                                 metadata.producer,
                                 metadata.proposed_timestamp,
@@ -533,10 +538,10 @@ async fn blocks(
                     };
 
                     let api_block = Block::Block {
-                        slot,
+                        slot: slot_u64,
                         hash: hex::encode(hash),
-                        parent_slot: block.parent(),
-                        parent_hash: hex::encode(block.parent_hash()),
+                        parent_slot: block.parent().inner(),
+                        parent_hash: hex::encode(block.parent_hash().as_hash()),
                         producer,
                         proposed_timestamp,
                         finalized_timestamp,
@@ -587,12 +592,11 @@ async fn block(
             if hash_bytes.len() == 32 {
                 let mut hash_arr = [0u8; 32];
                 hash_arr.copy_from_slice(&hash_bytes);
+                let h = Hash::from(hash_arr);
                 let bs = bs_arc.read().await;
-                if let Some((_slot, blk)) = bs.load_block_by_hash(hash_arr) {
-                    let slot = blk.slot();
-
+                if let Some((slot, blk)) = bs.load_block_by_hash(h.clone()) {
                     let (producer, proposed_timestamp, finalized_timestamp) =
-                        if let Some(metadata) = bs.load_block_metadata(slot, hash_arr) {
+                        if let Some(metadata) = bs.load_block_metadata(slot, h) {
                             (
                                 metadata.producer,
                                 metadata.proposed_timestamp,
@@ -609,10 +613,10 @@ async fn block(
                     };
 
                     let api_block = Block::Block {
-                        slot,
+                        slot: slot.inner(),
                         hash: hash.clone(),
-                        parent_slot: blk.parent(),
-                        parent_hash: hex::encode(blk.parent_hash()),
+                        parent_slot: blk.parent().inner(),
+                        parent_hash: hex::encode(blk.parent_hash().as_hash()),
                         producer,
                         proposed_timestamp,
                         finalized_timestamp,
@@ -726,6 +730,451 @@ async fn get_tokens(state: axum::extract::State<SharedState>) -> Json<serde_json
 }
 
 // -- server --
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_pubkey_valid() {
+        let hex_str = "00".repeat(32);
+        let result = decode_pubkey(&hex_str);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), [0u8; 32]);
+    }
+
+    #[test]
+    fn decode_pubkey_nonzero() {
+        let mut key = [0u8; 32];
+        key[0] = 0xAB;
+        key[31] = 0xCD;
+        let hex_str = hex::encode(key);
+        let result = decode_pubkey(&hex_str).unwrap();
+        assert_eq!(result, key);
+    }
+
+    #[test]
+    fn decode_pubkey_invalid_hex() {
+        let result = decode_pubkey("not_valid_hex");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid hex"));
+    }
+
+    #[test]
+    fn decode_pubkey_wrong_length() {
+        let hex_str = "00".repeat(16);
+        let result = decode_pubkey(&hex_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected 32 bytes"));
+    }
+
+    #[test]
+    fn decode_pubkey_empty() {
+        let result = decode_pubkey("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_signature_valid() {
+        let hex_str = "FF".repeat(64);
+        let result = decode_signature(&hex_str);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), [0xFF; 64]);
+    }
+
+    #[test]
+    fn decode_signature_wrong_length() {
+        let hex_str = "00".repeat(32);
+        let result = decode_signature(&hex_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected 64 bytes"));
+    }
+
+    #[test]
+    fn decode_signature_invalid_hex() {
+        let result = decode_signature("xyz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_token_id_valid() {
+        let result = decode_token_id("01020304");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn decode_token_id_wrong_length() {
+        let result = decode_token_id("0102");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected 4 bytes"));
+    }
+
+    #[test]
+    fn decode_hash32_valid() {
+        let hex_str = "AB".repeat(32);
+        let result = decode_hash32(&hex_str);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), [0xAB; 32]);
+    }
+
+    #[test]
+    fn decode_hash32_wrong_length() {
+        let hex_str = "AB".repeat(16);
+        let result = decode_hash32(&hex_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn convert_body_transfer() {
+        let sender = "00".repeat(32);
+        let body = TransactionBodyRequest::Transfer {
+            to: sender.clone(),
+            amount: 100,
+        };
+        let result = convert_body(body).unwrap();
+        match result {
+            TransactionBody::Transfer { to, amount } => {
+                assert_eq!(to, [0u8; 32]);
+                assert_eq!(amount, 100);
+            }
+            _ => panic!("expected Transfer"),
+        }
+    }
+
+    #[test]
+    fn convert_body_token_transfer() {
+        let pk = "00".repeat(32);
+        let token = "01020304";
+        let body = TransactionBodyRequest::TokenTransfer {
+            to: pk,
+            token_id: token.to_string(),
+            amount: 50,
+        };
+        let result = convert_body(body).unwrap();
+        match result {
+            TransactionBody::TokenTransfer {
+                to,
+                token_id,
+                amount,
+            } => {
+                assert_eq!(to, [0u8; 32]);
+                assert_eq!(token_id, [1, 2, 3, 4]);
+                assert_eq!(amount, 50);
+            }
+            _ => panic!("expected TokenTransfer"),
+        }
+    }
+
+    #[test]
+    fn convert_body_mint_valid() {
+        let hash = "00".repeat(32);
+        let body = TransactionBodyRequest::Mint {
+            ticker: "BNK".to_string(),
+            max_supply: 1_000_000,
+            metadata_hash: hash,
+        };
+        let result = convert_body(body).unwrap();
+        match result {
+            TransactionBody::Mint {
+                ticker, max_supply, ..
+            } => {
+                assert_eq!(ticker, "BNK");
+                assert_eq!(max_supply, 1_000_000);
+            }
+            _ => panic!("expected Mint"),
+        }
+    }
+
+    #[test]
+    fn convert_body_mint_ticker_too_short() {
+        let hash = "00".repeat(32);
+        let body = TransactionBodyRequest::Mint {
+            ticker: "AB".to_string(),
+            max_supply: 100,
+            metadata_hash: hash,
+        };
+        let result = convert_body(body);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("ticker"));
+    }
+
+    #[test]
+    fn convert_body_mint_ticker_too_long() {
+        let hash = "00".repeat(32);
+        let body = TransactionBodyRequest::Mint {
+            ticker: "TOOLONGTICKERX".to_string(),
+            max_supply: 100,
+            metadata_hash: hash,
+        };
+        let result = convert_body(body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn convert_body_mint_ticker_at_bounds() {
+        let hash = "00".repeat(32);
+        // exactly 3 chars (min)
+        let body = TransactionBodyRequest::Mint {
+            ticker: "ABC".to_string(),
+            max_supply: 100,
+            metadata_hash: hash.clone(),
+        };
+        assert!(convert_body(body).is_ok());
+
+        // exactly MAX_TICKER_LEN chars (max)
+        let body = TransactionBodyRequest::Mint {
+            ticker: "A".repeat(MAX_TICKER_LEN),
+            max_supply: 100,
+            metadata_hash: hash,
+        };
+        assert!(convert_body(body).is_ok());
+    }
+
+    #[test]
+    fn convert_body_bond() {
+        let pk = "00".repeat(32);
+        let body = TransactionBodyRequest::Bond {
+            validator: pk,
+            amount: 500,
+        };
+        let result = convert_body(body).unwrap();
+        assert!(matches!(result, TransactionBody::Bond { amount: 500, .. }));
+    }
+
+    #[test]
+    fn convert_body_retire() {
+        let pk = "00".repeat(32);
+        let body = TransactionBodyRequest::Retire {
+            validator: pk,
+            amount: 200,
+        };
+        let result = convert_body(body).unwrap();
+        assert!(matches!(
+            result,
+            TransactionBody::Retire { amount: 200, .. }
+        ));
+    }
+
+    #[test]
+    fn convert_body_withdraw() {
+        let pk = "00".repeat(32);
+        let body = TransactionBodyRequest::Withdraw { validator: pk };
+        let result = convert_body(body).unwrap();
+        assert!(matches!(result, TransactionBody::Withdraw { .. }));
+    }
+
+    #[test]
+    fn convert_body_unjail() {
+        let body = TransactionBodyRequest::UnJail;
+        let result = convert_body(body).unwrap();
+        assert!(matches!(result, TransactionBody::UnJail));
+    }
+
+    #[test]
+    fn convert_body_set_commission() {
+        let body = TransactionBodyRequest::SetCommission { rate: 1500 };
+        let result = convert_body(body).unwrap();
+        match result {
+            TransactionBody::SetCommission { rate } => assert_eq!(rate, 1500),
+            _ => panic!("expected SetCommission"),
+        }
+    }
+
+    #[test]
+    fn convert_body_invalid_pubkey_propagates() {
+        let body = TransactionBodyRequest::Transfer {
+            to: "bad_hex".to_string(),
+            amount: 100,
+        };
+        assert!(convert_body(body).is_err());
+    }
+
+    #[test]
+    fn body_type_name_all_variants() {
+        assert_eq!(
+            body_type_name(&TransactionBody::Transfer {
+                to: [0; 32],
+                amount: 0,
+            }),
+            "Transfer"
+        );
+        assert_eq!(
+            body_type_name(&TransactionBody::TokenTransfer {
+                to: [0; 32],
+                token_id: [0; 4],
+                amount: 0,
+            }),
+            "TokenTransfer"
+        );
+        assert_eq!(
+            body_type_name(&TransactionBody::Mint {
+                ticker: "X".into(),
+                max_supply: 0,
+                metadata_hash: [0; 32],
+            }),
+            "Mint"
+        );
+        assert_eq!(
+            body_type_name(&TransactionBody::Bond {
+                validator: [0; 32],
+                amount: 0,
+            }),
+            "Bond"
+        );
+        assert_eq!(
+            body_type_name(&TransactionBody::Retire {
+                validator: [0; 32],
+                amount: 0,
+            }),
+            "Retire"
+        );
+        assert_eq!(
+            body_type_name(&TransactionBody::Withdraw { validator: [0; 32] }),
+            "Withdraw"
+        );
+        assert_eq!(body_type_name(&TransactionBody::UnJail), "UnJail");
+        assert_eq!(
+            body_type_name(&TransactionBody::SetCommission { rate: 0 }),
+            "SetCommission"
+        );
+    }
+
+    #[test]
+    fn block_slot_accessors() {
+        let block = Block::Block {
+            slot: 42,
+            hash: "abc".to_string(),
+            parent_slot: 41,
+            parent_hash: "def".to_string(),
+            producer: 1,
+            proposed_timestamp: 1000,
+            finalized_timestamp: None,
+            status: SlotStatus::Proposed,
+        };
+        assert_eq!(block.slot(), 42);
+        assert_eq!(block.hash(), "abc");
+        assert_eq!(block.status(), SlotStatus::Proposed);
+        assert_eq!(block.proposed_timestamp(), 1000);
+        assert_eq!(block.finalized_timestamp(), None);
+    }
+
+    #[test]
+    fn skip_slot_accessors() {
+        let skip = Block::Skip {
+            slot: 10,
+            hash: "skip_hash".to_string(),
+            proposed_timestamp: 500,
+            finalized_timestamp: Some(600),
+            status: SlotStatus::Finalized,
+        };
+        assert_eq!(skip.slot(), 10);
+        assert_eq!(skip.hash(), "skip_hash");
+        assert_eq!(skip.status(), SlotStatus::Finalized);
+        assert_eq!(skip.finalized_timestamp(), Some(600));
+    }
+
+    #[test]
+    fn block_set_status_to_finalized() {
+        let mut block = Block::Block {
+            slot: 1,
+            hash: "h".to_string(),
+            parent_slot: 0,
+            parent_hash: "p".to_string(),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: None,
+            status: SlotStatus::Proposed,
+        };
+        block.set_status(SlotStatus::Finalized, Some(200));
+        assert_eq!(block.status(), SlotStatus::Finalized);
+        assert_eq!(block.finalized_timestamp(), Some(200));
+    }
+
+    #[test]
+    fn block_set_status_non_finalized_keeps_timestamp() {
+        let mut block = Block::Block {
+            slot: 1,
+            hash: "h".to_string(),
+            parent_slot: 0,
+            parent_hash: "p".to_string(),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: None,
+            status: SlotStatus::Proposed,
+        };
+        block.set_status(SlotStatus::Notarized, Some(200));
+        assert_eq!(block.status(), SlotStatus::Notarized);
+        assert_eq!(block.finalized_timestamp(), None);
+    }
+
+    #[test]
+    fn skip_set_status_to_finalized() {
+        let mut skip = Block::Skip {
+            slot: 5,
+            hash: "s".to_string(),
+            proposed_timestamp: 100,
+            finalized_timestamp: None,
+            status: SlotStatus::Pending,
+        };
+        skip.set_status(SlotStatus::Finalized, Some(300));
+        assert_eq!(skip.status(), SlotStatus::Finalized);
+        assert_eq!(skip.finalized_timestamp(), Some(300));
+    }
+
+    #[test]
+    fn slot_status_json_roundtrip() {
+        let statuses = [
+            SlotStatus::Pending,
+            SlotStatus::Proposed,
+            SlotStatus::Notarized,
+            SlotStatus::Finalized,
+        ];
+        for status in statuses {
+            let json = serde_json::to_string(&status).unwrap();
+            let decoded: SlotStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn slot_status_json_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&SlotStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SlotStatus::Finalized).unwrap(),
+            "\"finalized\""
+        );
+    }
+
+    #[test]
+    fn block_json_has_type_tag() {
+        let block = Block::Block {
+            slot: 1,
+            hash: "h".into(),
+            parent_slot: 0,
+            parent_hash: "p".into(),
+            producer: 0,
+            proposed_timestamp: 0,
+            finalized_timestamp: None,
+            status: SlotStatus::Proposed,
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        assert!(json.contains("\"type\":\"block\""));
+
+        let skip = Block::Skip {
+            slot: 2,
+            hash: "s".into(),
+            proposed_timestamp: 0,
+            finalized_timestamp: None,
+            status: SlotStatus::Pending,
+        };
+        let json = serde_json::to_string(&skip).unwrap();
+        assert!(json.contains("\"type\":\"skip\""));
+    }
+}
 
 pub async fn run_api(state: SharedState) {
     let cors = CorsLayer::new()

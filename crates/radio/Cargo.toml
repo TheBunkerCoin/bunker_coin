@@ -20,6 +20,7 @@ rand_distr = { workspace = true }
 async-trait = "0.1"
 
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
+wincode = { version = "0.2", features = ["derive"] }
 bytes = "1"
 
 [dev-dependencies]

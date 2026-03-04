@@ -112,32 +112,50 @@ impl RadioScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bunkerglow::Slot;
+
+    fn frame(slot: u64, frame_index: usize, data: Vec<u8>) -> RadioFrame {
+        RadioFrame {
+            slot: Slot::new(slot),
+            shred_index: 0,
+            frame_index,
+            total_frames: 2,
+            data,
+        }
+    }
 
     #[tokio::test]
-    async fn test_scheduler_queuing() {
+    async fn scheduler_queuing() {
         let config = RadioConfig::default();
         let scheduler = RadioScheduler::new(config);
 
-        let frames = vec![
-            RadioFrame {
-                slot: 1,
-                shred_index: 0,
-                frame_index: 0,
-                total_frames: 1,
-                data: vec![0u8; 100],
-            },
-            RadioFrame {
-                slot: 1,
-                shred_index: 0,
-                frame_index: 1,
-                total_frames: 1,
-                data: vec![1u8; 100],
-            },
-        ];
+        let frames = vec![frame(1, 0, vec![0u8; 100]), frame(1, 1, vec![1u8; 100])];
 
         scheduler.queue_frames(frames).await;
 
         let (_, _, queued) = scheduler.get_stats().await;
         assert_eq!(queued, 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_stats_start_at_zero() {
+        let scheduler = RadioScheduler::new(RadioConfig::default());
+        let (windows, transmitted, queued) = scheduler.get_stats().await;
+        assert_eq!(windows, 0);
+        assert_eq!(transmitted, 0);
+        assert_eq!(queued, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_queue_multiple_batches() {
+        let scheduler = RadioScheduler::new(RadioConfig::default());
+
+        scheduler.queue_frames(vec![frame(1, 0, vec![0; 50])]).await;
+        scheduler
+            .queue_frames(vec![frame(2, 0, vec![1; 50]), frame(2, 1, vec![2; 50])])
+            .await;
+
+        let (_, _, queued) = scheduler.get_stats().await;
+        assert_eq!(queued, 3);
     }
 }

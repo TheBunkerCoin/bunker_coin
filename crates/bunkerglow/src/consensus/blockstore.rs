@@ -231,6 +231,8 @@ pub trait Blockstore {
         slice_index: SliceIndex,
     ) -> Option<DoubleMerkleProof>;
 
+    fn canonical_block_hash(&self, slot: Slot) -> Option<Hash>;
+
     fn load_block_from_db(&self, slot: Slot, hash: Hash) -> Option<Block>;
 
     fn load_block_by_hash(&self, hash: Hash) -> Option<(Slot, Block)>;
@@ -384,6 +386,11 @@ impl Blockstore for BlockstoreImpl {
             }
         }
         None
+    }
+
+    fn canonical_block_hash(&self, slot: Slot) -> Option<Hash> {
+        self.disseminated_block_hash(slot)
+            .map(|bh| bh.as_hash().clone())
     }
 
     fn load_block_by_hash(&self, hash: Hash) -> Option<(Slot, Block)> {

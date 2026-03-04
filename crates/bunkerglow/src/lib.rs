@@ -33,7 +33,7 @@ pub use self::consensus::Alpenglow;
 pub use self::consensus::votor::VotorEvent;
 use self::crypto::{aggsig, signature};
 pub use self::disseminator::Disseminator;
-use self::types::Slot;
+pub use self::types::Slot;
 pub use self::validator::Validator;
 use crate::all2all::TrivialAll2All;
 use crate::consensus::{ConsensusMessage, EpochInfo};

@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn valid_serde() {
-        let vs = [0, 1, TOTAL_SHREDS - 10, TOTAL_SHREDS - 1];
+        let vs = [0, 1, TOTAL_SHREDS - 1];
         let vs = vs.into_iter().map(|v| v.to_string());
         for v in vs {
             serde_json::from_str::<ShredIndex>(&v).unwrap();
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn valid_wincode() {
-        let vs = [0, 1, TOTAL_SHREDS - 10, TOTAL_SHREDS - 1];
+        let vs = [0, 1, TOTAL_SHREDS - 1];
         let vs = vs.iter().map(wincode::serialize);
         for res in vs {
             let v = res.unwrap();

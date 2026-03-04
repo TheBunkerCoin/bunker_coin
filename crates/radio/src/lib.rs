@@ -95,3 +95,96 @@ impl Default for RadioConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radio_config_defaults() {
+        let config = RadioConfig::default();
+        assert_eq!(config.mtu, 300);
+        assert_eq!(config.bandwidth_bps, 1200);
+        assert!((config.packet_loss - 0.15).abs() < f32::EPSILON);
+        assert_eq!(config.latency, Duration::from_millis(200));
+        assert_eq!(config.latency_jitter, Duration::from_millis(50));
+        assert_eq!(config.transmission_window, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn network_message_ping_roundtrip() {
+        let msg = NetworkMessage::Ping;
+        let bytes = msg.to_bytes();
+        let decoded = NetworkMessage::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, NetworkMessage::Ping));
+    }
+
+    #[test]
+    fn network_message_pong_roundtrip() {
+        let msg = NetworkMessage::Pong;
+        let bytes = msg.to_bytes();
+        let decoded = NetworkMessage::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, NetworkMessage::Pong));
+    }
+
+    #[test]
+    fn network_message_shred_roundtrip() {
+        let payload = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let msg = NetworkMessage::Shred(payload.clone());
+        let bytes = msg.to_bytes();
+        let decoded = NetworkMessage::from_bytes(&bytes).unwrap();
+        match decoded {
+            NetworkMessage::Shred(data) => assert_eq!(data, payload),
+            _ => panic!("expected Shred variant"),
+        }
+    }
+
+    #[test]
+    fn network_message_variants_distinct() {
+        let ping = NetworkMessage::Ping.to_bytes();
+        let pong = NetworkMessage::Pong.to_bytes();
+        let shred = NetworkMessage::Shred(vec![0]).to_bytes();
+        assert_ne!(ping, pong);
+        assert_ne!(ping, shred);
+        assert_ne!(pong, shred);
+    }
+
+    #[test]
+    fn network_message_empty_shred() {
+        let msg = NetworkMessage::Shred(vec![]);
+        let bytes = msg.to_bytes();
+        let decoded = NetworkMessage::from_bytes(&bytes).unwrap();
+        match decoded {
+            NetworkMessage::Shred(data) => assert!(data.is_empty()),
+            _ => panic!("expected Shred variant"),
+        }
+    }
+
+    #[test]
+    fn network_message_large_shred() {
+        let payload = vec![0xAB; 4096];
+        let msg = NetworkMessage::Shred(payload.clone());
+        let bytes = msg.to_bytes();
+        let decoded = NetworkMessage::from_bytes(&bytes).unwrap();
+        match decoded {
+            NetworkMessage::Shred(data) => assert_eq!(data, payload),
+            _ => panic!("expected Shred variant"),
+        }
+    }
+
+    #[test]
+    fn network_message_invalid_bytes() {
+        let result = NetworkMessage::from_bytes(&[0xFF, 0xFF, 0xFF]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn radio_config_serde_roundtrip() {
+        let config = RadioConfig::default();
+        let bytes = bincode::serde::encode_to_vec(&config, bincode::config::standard()).unwrap();
+        let (decoded, _): (RadioConfig, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded.mtu, config.mtu);
+        assert_eq!(decoded.bandwidth_bps, config.bandwidth_bps);
+    }
+}

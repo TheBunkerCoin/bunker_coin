@@ -111,9 +111,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_mtu_enforcement() {
+    async fn mtu_enforcement() {
         let config = RadioConfig {
             mtu: 100,
+            packet_loss: 0.0,
+            latency: Duration::from_millis(0),
             ..Default::default()
         };
         let radio = SimulatedRadioNetwork::new(config);
@@ -125,5 +127,39 @@ mod tests {
         let small_data = vec![0u8; 50];
         let result = radio.simulate_channel(&small_data).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn packet_loss_simulation() {
+        let config = RadioConfig {
+            mtu: 300,
+            packet_loss: 1.0, // 100% loss
+            latency: Duration::from_millis(0),
+            ..Default::default()
+        };
+        let radio = SimulatedRadioNetwork::new(config);
+
+        let data = vec![0u8; 10];
+        let result = radio.simulate_channel(&data).await;
+        assert!(matches!(result, Err(RadioError::TransmissionFailed)));
+    }
+
+    #[tokio::test]
+    async fn stats_tracking() {
+        let config = RadioConfig {
+            mtu: 300,
+            packet_loss: 0.0,
+            latency: Duration::from_millis(0),
+            ..Default::default()
+        };
+        let radio = SimulatedRadioNetwork::new(config);
+
+        radio.simulate_channel(&[0u8; 10]).await.unwrap();
+        radio.simulate_channel(&[0u8; 20]).await.unwrap();
+
+        let (sent, dropped, bytes) = radio.get_stats().await;
+        assert_eq!(sent, 2);
+        assert_eq!(dropped, 0);
+        assert_eq!(bytes, 30);
     }
 }

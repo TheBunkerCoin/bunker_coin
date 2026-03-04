@@ -20,11 +20,20 @@ use wincode::{SchemaRead, SchemaWrite};
 pub struct Hash(pub(super) [u8; 32]);
 
 impl Hash {
-    /// Creates a random hash for testing.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Hash(bytes)
+    }
+
     #[cfg(test)]
     pub fn random_for_test() -> Self {
         let mut bytes = [0; 32];
         rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+        Hash(bytes)
+    }
+}
+
+impl From<[u8; 32]> for Hash {
+    fn from(bytes: [u8; 32]) -> Self {
         Hash(bytes)
     }
 }
