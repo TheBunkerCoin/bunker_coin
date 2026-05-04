@@ -263,19 +263,18 @@ pub async fn multi_node_consensus_simulation(num_nodes: usize) {
     let mut nodes_with_id = Vec::new();
     for (i, v) in validators.iter().enumerate() {
         let epoch_info = Arc::new(EpochInfo::new(0, v.id, validators.clone()));
-        let a2a_net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
-            a2a_core.join_unlimited(v.all2all_address.port() as u64).await;
+        let a2a_net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> = a2a_core
+            .join_unlimited(v.all2all_address.port() as u64)
+            .await;
         let dis_net: SimulatedNetwork<Shred, Shred> = dis_core
             .join_unlimited(v.disseminator_address.port() as u64)
             .await;
-        let rep_net: SimulatedNetwork<RepairRequest, RepairResponse> =
-            rep_core
-                .join_unlimited(v.repair_response_address.port() as u64)
-                .await;
-        let rep_req_net: SimulatedNetwork<RepairResponse, RepairRequest> =
-            rep_req_core
-                .join_unlimited(v.repair_request_address.port() as u64)
-                .await;
+        let rep_net: SimulatedNetwork<RepairRequest, RepairResponse> = rep_core
+            .join_unlimited(v.repair_response_address.port() as u64)
+            .await;
+        let rep_req_net: SimulatedNetwork<RepairResponse, RepairRequest> = rep_req_core
+            .join_unlimited(v.repair_request_address.port() as u64)
+            .await;
         let txs_net: SimulatedNetwork<Transaction, Transaction> =
             txs_core.join_unlimited(i as u64).await;
         let all2all = TrivialAll2All::new(validators.clone(), a2a_net);
@@ -393,19 +392,18 @@ pub async fn multi_node_consensus_simulation_with_api(
     let mut nodes_with_id = Vec::new();
     for (i, v) in validators.iter().enumerate() {
         let epoch_info = Arc::new(EpochInfo::new(0, v.id, validators.clone()));
-        let a2a_net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
-            a2a_core.join_unlimited(v.all2all_address.port() as u64).await;
+        let a2a_net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> = a2a_core
+            .join_unlimited(v.all2all_address.port() as u64)
+            .await;
         let dis_net: SimulatedNetwork<Shred, Shred> = dis_core
             .join_unlimited(v.disseminator_address.port() as u64)
             .await;
-        let rep_net: SimulatedNetwork<RepairRequest, RepairResponse> =
-            rep_core
-                .join_unlimited(v.repair_response_address.port() as u64)
-                .await;
-        let rep_req_net: SimulatedNetwork<RepairResponse, RepairRequest> =
-            rep_req_core
-                .join_unlimited(v.repair_request_address.port() as u64)
-                .await;
+        let rep_net: SimulatedNetwork<RepairRequest, RepairResponse> = rep_core
+            .join_unlimited(v.repair_response_address.port() as u64)
+            .await;
+        let rep_req_net: SimulatedNetwork<RepairResponse, RepairRequest> = rep_req_core
+            .join_unlimited(v.repair_request_address.port() as u64)
+            .await;
         let txs_net: SimulatedNetwork<Transaction, Transaction> =
             txs_core.join_unlimited(i as u64).await;
         let all2all = TrivialAll2All::new(validators.clone(), a2a_net);
