@@ -1,6 +1,7 @@
 pub mod hostmode;
 pub mod simulator;
 pub mod tcp;
+pub mod usb;
 
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ pub use simulator::{
     PactorSpeed, SimulatedPactorConfig, SimulatedPactorPair, SimulatedPactorTransport,
 };
 pub use tcp::{ScsPactorClient, ScsPactorConfig};
+pub use usb::{UsbPactorConfig, UsbPactorTransport};
 
 #[derive(Debug, Error)]
 pub enum ScsPactorError {
