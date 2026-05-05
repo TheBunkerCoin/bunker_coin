@@ -280,6 +280,12 @@ impl PoolImpl {
             Cert::FastFinal(_) => {
                 info!("fast finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
+                if let Some(hash) = cert.block_hash() {
+                    let finalization_event = self
+                        .finality_tracker
+                        .mark_fast_finalized(slot, hash.clone());
+                    self.handle_finalization(finalization_event).await;
+                }
 
                 if let Some(ref blockstore) = self.blockstore {
                     if let Some(hash) = cert.block_hash() {
@@ -299,6 +305,8 @@ impl PoolImpl {
             Cert::Final(_) => {
                 info!("slow finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
+                let finalization_event = self.finality_tracker.mark_finalized(slot);
+                self.handle_finalization(finalization_event).await;
 
                 if let Some(ref blockstore) = self.blockstore {
                     if let Some(state) = self.slot_states.get(&slot) {
