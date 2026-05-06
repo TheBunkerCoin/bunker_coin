@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 pub use simulator::{
-    PactorSpeed, SimulatedPactorConfig, SimulatedPactorPair, SimulatedPactorTransport,
+    FadeWindow, PactorSpeed, SimulatedPactorConfig, SimulatedPactorPair, SimulatedPactorStats,
+    SimulatedPactorTransport,
 };
 pub use tcp::{ScsPactorClient, ScsPactorConfig};
 pub use usb::{UsbPactorConfig, UsbPactorTransport};

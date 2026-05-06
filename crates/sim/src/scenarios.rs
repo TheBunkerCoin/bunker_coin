@@ -25,6 +25,128 @@ pub struct PactorRadioProtoResult {
 pub async fn pactor_radio_proto_demo(
     config: scs_pactor::SimulatedPactorConfig,
 ) -> Result<PactorRadioProtoResult, scs_pactor::ScsPactorError> {
+    use bunker_coin_radio::Network;
+
+    let (client, node) = PactorRadioNetworkPair::new(config).await?;
+
+    let outbound = vec![
+        NetworkMessage::Ping,
+        NetworkMessage::Shred(b"radio-proto-over-pactor".to_vec()),
+        NetworkMessage::Pong,
+    ];
+
+    for message in &outbound {
+        client
+            .send(message, "NODE")
+            .await
+            .map_err(|e| scs_pactor::ScsPactorError::Protocol(e.to_string()))?;
+    }
+
+    let mut received_messages = Vec::new();
+    for _ in 0..outbound.len() {
+        received_messages.push(
+            node.receive()
+                .await
+                .map_err(|e| scs_pactor::ScsPactorError::Protocol(e.to_string()))?,
+        );
+    }
+    let stats = client.stats();
+
+    Ok(PactorRadioProtoResult {
+        received_messages,
+        frames_attempted: stats.frames_attempted,
+        frames_lost: stats.frames_lost,
+        retransmissions: stats.retransmissions,
+        bytes_delivered: stats.bytes_delivered,
+    })
+}
+
+struct PactorRadioNetworkPair;
+
+impl PactorRadioNetworkPair {
+    async fn new(
+        config: scs_pactor::SimulatedPactorConfig,
+    ) -> Result<(PactorRadioNode, PactorRadioNode), scs_pactor::ScsPactorError> {
+        use scs_pactor::{PactorTransport, SimulatedPactorPair};
+
+        let (client, node) = SimulatedPactorPair::new(config);
+        client.set_mycall("CLIENT").await?;
+        node.set_mycall("NODE").await?;
+        client.connect_peer("NODE").await?;
+
+        Ok((
+            PactorRadioNode {
+                callsign: "CLIENT",
+                transport: client,
+            },
+            PactorRadioNode {
+                callsign: "NODE",
+                transport: node,
+            },
+        ))
+    }
+}
+
+struct PactorRadioNode {
+    callsign: &'static str,
+    transport: scs_pactor::SimulatedPactorTransport,
+}
+
+impl PactorRadioNode {
+    fn stats(&self) -> scs_pactor::SimulatedPactorStats {
+        self.transport.stats()
+    }
+}
+
+impl bunker_coin_radio::Network for PactorRadioNode {
+    type Address = String;
+
+    async fn send(
+        &self,
+        msg: &NetworkMessage,
+        to: impl AsRef<str> + Send,
+    ) -> Result<(), bunker_coin_radio::NetworkError> {
+        self.send_serialized(&msg.to_bytes(), to).await
+    }
+
+    async fn send_serialized(
+        &self,
+        bytes: &[u8],
+        to: impl AsRef<str> + Send,
+    ) -> Result<(), bunker_coin_radio::NetworkError> {
+        use scs_pactor::PactorTransport;
+
+        let to = to.as_ref();
+        if !to.eq_ignore_ascii_case("BROADCAST")
+            && !to.eq_ignore_ascii_case("NODE")
+            && !to.eq_ignore_ascii_case("CLIENT")
+        {
+            return Err(bunker_coin_radio::NetworkError::Unknown);
+        }
+        if to.eq_ignore_ascii_case(self.callsign) {
+            return Ok(());
+        }
+        self.transport
+            .write_data(bytes)
+            .await
+            .map_err(|_| bunker_coin_radio::NetworkError::Unknown)
+    }
+
+    async fn receive(&self) -> Result<NetworkMessage, bunker_coin_radio::NetworkError> {
+        use scs_pactor::PactorTransport;
+
+        let payload = self
+            .transport
+            .read_data(4096)
+            .await
+            .map_err(|_| bunker_coin_radio::NetworkError::Unknown)?;
+        NetworkMessage::from_bytes(&payload).map_err(|_| bunker_coin_radio::NetworkError::Unknown)
+    }
+}
+
+pub async fn pactor_radio_proto_direct_transport_demo(
+    config: scs_pactor::SimulatedPactorConfig,
+) -> Result<PactorRadioProtoResult, scs_pactor::ScsPactorError> {
     use scs_pactor::{PactorTransport, SimulatedPactorPair};
 
     let (client, node) = SimulatedPactorPair::new(config);
