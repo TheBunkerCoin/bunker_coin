@@ -13,6 +13,45 @@ use hex;
 use rpc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Debug)]
+pub struct PactorRadioProtoResult {
+    pub received_message: NetworkMessage,
+    pub frames_attempted: u64,
+    pub frames_lost: u64,
+    pub retransmissions: u64,
+    pub bytes_delivered: u64,
+}
+
+pub async fn pactor_radio_proto_demo(
+    config: scs_pactor::SimulatedPactorConfig,
+) -> Result<PactorRadioProtoResult, scs_pactor::ScsPactorError> {
+    use scs_pactor::{PactorTransport, SimulatedPactorPair};
+
+    let (client, node) = SimulatedPactorPair::new(config);
+    client.set_mycall("CLIENT").await?;
+    node.set_mycall("NODE").await?;
+    client.connect_peer("NODE").await?;
+
+    let outbound = NetworkMessage::Shred(b"radio-proto-over-pactor".to_vec());
+    client.write_data(&outbound.to_bytes()).await?;
+
+    let payload = node.read_data(4096).await?;
+    let received_message = NetworkMessage::from_bytes(&payload).map_err(|_| {
+        scs_pactor::ScsPactorError::Protocol(
+            "failed to decode radio protocol message from PACTOR payload".to_owned(),
+        )
+    })?;
+    let stats = client.stats();
+
+    Ok(PactorRadioProtoResult {
+        received_message,
+        frames_attempted: stats.frames_attempted,
+        frames_lost: stats.frames_lost,
+        retransmissions: stats.retransmissions,
+        bytes_delivered: stats.bytes_delivered,
+    })
+}
+
 pub async fn basic_consensus_test(config: RadioConfig, num_validators: u64) {
     println!(
         "Starting basic consensus test with {} validators",
@@ -839,5 +878,35 @@ pub async fn multi_node_consensus_simulation_with_api(
     println!("simulation stopped");
     for handle in node_handles {
         let _ = handle.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scs_pactor::SimulatedPactorConfig;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn pactor_radio_proto_demo_round_trips_network_message() {
+        let config = SimulatedPactorConfig {
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let result = pactor_radio_proto_demo(config).await.unwrap();
+        match result.received_message {
+            NetworkMessage::Shred(payload) => {
+                assert_eq!(payload, b"radio-proto-over-pactor".to_vec());
+            }
+            other => panic!("expected Shred message, got {other:?}"),
+        }
+        assert_eq!(result.frames_attempted, 1);
+        assert_eq!(result.frames_lost, 0);
+        assert_eq!(result.retransmissions, 0);
+        assert!(result.bytes_delivered > 0);
     }
 }

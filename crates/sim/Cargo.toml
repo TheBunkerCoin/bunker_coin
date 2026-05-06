@@ -13,6 +13,7 @@ path = "src/bin/radio_sim.rs"
 bunker_coin_core = { workspace = true }
 bunker_coin_radio = { workspace = true }
 bunkerglow = { workspace = true }
+scs_pactor = { path = "../scs_pactor" }
 
 tokio = { workspace = true }
 serde = { workspace = true }

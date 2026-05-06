@@ -581,6 +581,7 @@ dependencies = [
  "log",
  "rand 0.9.1",
  "rpc",
+ "scs_pactor",
  "serde",
  "tokio",
  "wincode",
