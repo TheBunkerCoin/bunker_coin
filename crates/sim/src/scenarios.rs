@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct PactorRadioProtoResult {
-    pub received_message: NetworkMessage,
+    pub received_messages: Vec<NetworkMessage>,
     pub frames_attempted: u64,
     pub frames_lost: u64,
     pub retransmissions: u64,
@@ -32,23 +32,65 @@ pub async fn pactor_radio_proto_demo(
     node.set_mycall("NODE").await?;
     client.connect_peer("NODE").await?;
 
-    let outbound = NetworkMessage::Shred(b"radio-proto-over-pactor".to_vec());
-    client.write_data(&outbound.to_bytes()).await?;
+    let outbound = vec![
+        NetworkMessage::Ping,
+        NetworkMessage::Shred(b"radio-proto-over-pactor".to_vec()),
+        NetworkMessage::Pong,
+    ];
 
-    let payload = node.read_data(4096).await?;
-    let received_message = NetworkMessage::from_bytes(&payload).map_err(|_| {
-        scs_pactor::ScsPactorError::Protocol(
-            "failed to decode radio protocol message from PACTOR payload".to_owned(),
-        )
-    })?;
+    for message in &outbound {
+        client.write_data(&message.to_bytes()).await?;
+    }
+
+    let mut received_messages = Vec::new();
+    for _ in 0..outbound.len() {
+        let payload = node.read_data(4096).await?;
+        let received_message = NetworkMessage::from_bytes(&payload).map_err(|_| {
+            scs_pactor::ScsPactorError::Protocol(
+                "failed to decode radio protocol message from PACTOR payload".to_owned(),
+            )
+        })?;
+        received_messages.push(received_message);
+    }
     let stats = client.stats();
 
     Ok(PactorRadioProtoResult {
-        received_message,
+        received_messages,
         frames_attempted: stats.frames_attempted,
         frames_lost: stats.frames_lost,
         retransmissions: stats.retransmissions,
         bytes_delivered: stats.bytes_delivered,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct PactorRadioProtoComparison {
+    pub clean: PactorRadioProtoResult,
+    pub degraded: PactorRadioProtoResult,
+}
+
+pub async fn pactor_radio_proto_degradation_demo(
+) -> Result<PactorRadioProtoComparison, scs_pactor::ScsPactorError> {
+    let clean_config = scs_pactor::SimulatedPactorConfig {
+        packet_loss: 0.0,
+        latency: std::time::Duration::ZERO,
+        latency_jitter: std::time::Duration::ZERO,
+        setup_delay: std::time::Duration::ZERO,
+        ..Default::default()
+    };
+    let degraded_config = scs_pactor::SimulatedPactorConfig {
+        packet_loss: 0.0,
+        latency: std::time::Duration::ZERO,
+        latency_jitter: std::time::Duration::ZERO,
+        setup_delay: std::time::Duration::ZERO,
+        forced_initial_losses: 2,
+        max_retries: 4,
+        ..Default::default()
+    };
+
+    Ok(PactorRadioProtoComparison {
+        clean: pactor_radio_proto_demo(clean_config).await?,
+        degraded: pactor_radio_proto_demo(degraded_config).await?,
     })
 }
 
@@ -898,15 +940,35 @@ mod tests {
         };
 
         let result = pactor_radio_proto_demo(config).await.unwrap();
-        match result.received_message {
+        assert_eq!(result.received_messages.len(), 3);
+        assert!(matches!(result.received_messages[0], NetworkMessage::Ping));
+        match &result.received_messages[1] {
             NetworkMessage::Shred(payload) => {
-                assert_eq!(payload, b"radio-proto-over-pactor".to_vec());
+                assert_eq!(payload, &b"radio-proto-over-pactor".to_vec());
             }
             other => panic!("expected Shred message, got {other:?}"),
         }
-        assert_eq!(result.frames_attempted, 1);
+        assert!(matches!(result.received_messages[2], NetworkMessage::Pong));
+        assert_eq!(result.frames_attempted, 3);
         assert_eq!(result.frames_lost, 0);
         assert_eq!(result.retransmissions, 0);
         assert!(result.bytes_delivered > 0);
+    }
+
+    #[tokio::test]
+    async fn pactor_radio_proto_degradation_demo_shows_arq_overhead() {
+        let result = pactor_radio_proto_degradation_demo().await.unwrap();
+
+        assert_eq!(result.clean.received_messages.len(), 3);
+        assert_eq!(result.degraded.received_messages.len(), 3);
+        assert_eq!(result.clean.frames_lost, 0);
+        assert_eq!(result.clean.retransmissions, 0);
+        assert!(result.degraded.frames_lost > result.clean.frames_lost);
+        assert!(result.degraded.retransmissions > result.clean.retransmissions);
+        assert!(result.degraded.frames_attempted > result.clean.frames_attempted);
+        assert_eq!(
+            result.degraded.bytes_delivered,
+            result.clean.bytes_delivered
+        );
     }
 }
