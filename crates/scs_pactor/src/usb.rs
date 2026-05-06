@@ -6,11 +6,14 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::hostmode::{encode_frame, HostmodeDecoder, HostmodeFrame};
+use crate::hostmode::{encode_frame, HostmodeDecoder, HostmodeFrame, HostmodePacket};
 use crate::{PactorLinkEvent, PactorLinkStatus, PactorTransport, ScsPactorError};
 
 const COMMAND_CHANNEL: u8 = 0;
 const DATA_CHANNEL: u8 = 1;
+const STATUS_CHANNEL: u8 = 254;
+const EXTENDED_POLL_CHANNEL: u8 = 255;
+const MAX_HOSTMODE_RETRIES: u8 = 3;
 
 #[derive(Clone, Debug)]
 pub struct UsbPactorConfig {
@@ -38,6 +41,8 @@ pub struct UsbPactorTransport {
     command_rx: Mutex<mpsc::Receiver<String>>,
     data_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     event_rx: Mutex<mpsc::Receiver<PactorLinkEvent>>,
+    packet_rx: Mutex<mpsc::Receiver<HostmodePacket>>,
+    transaction_lock: Mutex<()>,
     read_task: JoinHandle<()>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
@@ -61,6 +66,7 @@ impl UsbPactorTransport {
         let (command_tx, command_rx) = mpsc::channel(1024);
         let (data_tx, data_rx) = mpsc::channel(1024);
         let (event_tx, event_rx) = mpsc::channel(1024);
+        let (packet_tx, packet_rx) = mpsc::channel(1024);
 
         let read_task = tokio::spawn(async move {
             let mut decoder = HostmodeDecoder::new();
@@ -85,14 +91,18 @@ impl UsbPactorTransport {
 
                 decoder.push(&buf[..n]);
                 loop {
-                    match decoder.next_frame() {
-                        Ok(Some(frame)) => {
+                    match decoder.next_packet() {
+                        Ok(Some(HostmodePacket::Frame(frame))) => {
+                            let _ = packet_tx.send(HostmodePacket::Frame(frame.clone())).await;
                             if route_frame(frame, &command_tx, &data_tx, &event_tx)
                                 .await
                                 .is_err()
                             {
                                 break;
                             }
+                        }
+                        Ok(Some(HostmodePacket::RepeatRequest)) => {
+                            let _ = packet_tx.send(HostmodePacket::RepeatRequest).await;
                         }
                         Ok(None) => break,
                         Err(_) => {
@@ -111,6 +121,8 @@ impl UsbPactorTransport {
             command_rx: Mutex::new(command_rx),
             data_rx: Mutex::new(data_rx),
             event_rx: Mutex::new(event_rx),
+            packet_rx: Mutex::new(packet_rx),
+            transaction_lock: Mutex::new(()),
             read_task,
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
@@ -120,8 +132,12 @@ impl UsbPactorTransport {
 
     async fn send_hostmode_frame(&self, frame: HostmodeFrame) -> Result<(), ScsPactorError> {
         let encoded = encode_frame(&frame)?;
+        self.write_encoded_frame(&encoded).await
+    }
+
+    async fn write_encoded_frame(&self, encoded: &[u8]) -> Result<(), ScsPactorError> {
         let mut writer = self.writer.lock().await;
-        let write = writer.write_all(&encoded);
+        let write = writer.write_all(encoded);
         if let Some(d) = self.write_timeout {
             timeout(d, write)
                 .await
@@ -131,6 +147,75 @@ impl UsbPactorTransport {
         }
         writer.flush().await?;
         Ok(())
+    }
+
+    pub async fn hostmode_transaction(
+        &self,
+        frame: HostmodeFrame,
+    ) -> Result<HostmodeFrame, ScsPactorError> {
+        let _transaction = self.transaction_lock.lock().await;
+        let encoded = encode_frame(&frame)?;
+        let mut retries = 0;
+
+        loop {
+            self.write_encoded_frame(&encoded).await?;
+            match self.recv_hostmode_packet(self.command_timeout).await? {
+                HostmodePacket::Frame(response) => return Ok(response),
+                HostmodePacket::RepeatRequest => {
+                    retries += 1;
+                    if retries > MAX_HOSTMODE_RETRIES {
+                        return Err(ScsPactorError::Protocol(
+                            "hostmode repeat request limit exceeded".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn recv_hostmode_packet(
+        &self,
+        timeout_after: Duration,
+    ) -> Result<HostmodePacket, ScsPactorError> {
+        let mut rx = self.packet_rx.lock().await;
+        timeout(timeout_after, rx.recv())
+            .await
+            .map_err(|_| ScsPactorError::Timeout)?
+            .ok_or(ScsPactorError::Disconnected)
+    }
+
+    pub async fn poll_channel(&self, channel: u8) -> Result<HostmodeFrame, ScsPactorError> {
+        self.hostmode_transaction(HostmodeFrame::with_code(channel, b'G', vec![0]))
+            .await
+    }
+
+    pub async fn poll_pending_channels(&self) -> Result<Vec<u8>, ScsPactorError> {
+        let response = self.poll_channel(EXTENDED_POLL_CHANNEL).await?;
+        if response.channel != EXTENDED_POLL_CHANNEL {
+            return Err(ScsPactorError::Protocol(format!(
+                "expected channel {EXTENDED_POLL_CHANNEL} poll response, got {}",
+                response.channel
+            )));
+        }
+
+        Ok(response
+            .payload
+            .iter()
+            .copied()
+            .take_while(|byte| *byte != 0)
+            .filter_map(|byte| byte.checked_sub(1))
+            .collect())
+    }
+
+    pub async fn poll_status(&self) -> Result<Vec<u8>, ScsPactorError> {
+        let response = self.poll_channel(STATUS_CHANNEL).await?;
+        if response.channel != STATUS_CHANNEL {
+            return Err(ScsPactorError::Protocol(format!(
+                "expected channel {STATUS_CHANNEL} status response, got {}",
+                response.channel
+            )));
+        }
+        Ok(response.payload)
     }
 
     async fn send_frame(&self, channel: u8, payload: &[u8]) -> Result<(), ScsPactorError> {
@@ -249,6 +334,17 @@ async fn route_frame(
                 .await
                 .map_err(|_| ScsPactorError::Disconnected)?;
         }
+        STATUS_CHANNEL => {
+            if frame.payload.len() >= 3 {
+                let _ = event_tx
+                    .send(PactorLinkEvent::LinkQuality {
+                        speed_level: frame.payload[2],
+                        retries: 0,
+                    })
+                    .await;
+            }
+        }
+        EXTENDED_POLL_CHANNEL => {}
         other => {
             return Err(ScsPactorError::Protocol(format!(
                 "unknown hostmode channel {other}"
@@ -328,7 +424,7 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt};
 
     use super::*;
-    use crate::hostmode::decode_frame;
+    use crate::hostmode::{decode_frame, encode_repeat_request};
 
     fn test_config() -> UsbPactorConfig {
         UsbPactorConfig {
@@ -425,5 +521,98 @@ mod tests {
         assert_eq!(frame.channel, COMMAND_CHANNEL);
         assert_eq!(frame.code, b'D');
         assert_eq!(frame.payload, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn usb_hostmode_transaction_retransmits_after_repeat_request() {
+        let (transport_side, mut modem_side) = duplex(4096);
+        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+
+        let modem = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = modem_side.read(&mut buf).await.unwrap();
+            let first = buf[..n].to_vec();
+            let frame = decode_frame(&first).unwrap();
+            assert_eq!(frame.channel, COMMAND_CHANNEL);
+            assert_eq!(frame.code, b'V');
+
+            modem_side
+                .write_all(&encode_repeat_request())
+                .await
+                .unwrap();
+
+            let n = modem_side.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], first.as_slice());
+
+            let response =
+                encode_frame(&HostmodeFrame::new(COMMAND_CHANNEL, b"OK".to_vec())).unwrap();
+            modem_side.write_all(&response).await.unwrap();
+        });
+
+        let response = transport
+            .hostmode_transaction(HostmodeFrame::with_code(COMMAND_CHANNEL, b'V', vec![0]))
+            .await
+            .unwrap();
+        assert_eq!(response.channel, COMMAND_CHANNEL);
+        assert_eq!(response.payload, b"OK");
+        modem.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_poll_pending_channels_uses_extended_hostmode_channel() {
+        let (transport_side, mut modem_side) = duplex(4096);
+        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+
+        let modem = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = modem_side.read(&mut buf).await.unwrap();
+            let frame = decode_frame(&buf[..n]).unwrap();
+            assert_eq!(frame.channel, EXTENDED_POLL_CHANNEL);
+            assert_eq!(frame.code, b'G');
+            assert_eq!(frame.payload, vec![0]);
+
+            let response = encode_frame(&HostmodeFrame::with_code(
+                EXTENDED_POLL_CHANNEL,
+                1,
+                vec![3, 4, 0],
+            ))
+            .unwrap();
+            modem_side.write_all(&response).await.unwrap();
+        });
+
+        let channels = transport.poll_pending_channels().await.unwrap();
+        assert_eq!(channels, vec![2, 3]);
+        modem.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_poll_status_returns_status_payload() {
+        let (transport_side, mut modem_side) = duplex(4096);
+        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+
+        let modem = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = modem_side.read(&mut buf).await.unwrap();
+            let frame = decode_frame(&buf[..n]).unwrap();
+            assert_eq!(frame.channel, STATUS_CHANNEL);
+            assert_eq!(frame.code, b'G');
+
+            let response =
+                encode_frame(&HostmodeFrame::with_code(STATUS_CHANNEL, 7, vec![1, 3, 5])).unwrap();
+            modem_side.write_all(&response).await.unwrap();
+        });
+
+        assert_eq!(transport.poll_status().await.unwrap(), vec![1, 3, 5]);
+        assert_eq!(
+            transport
+                .next_event(Some(Duration::from_millis(100)))
+                .await
+                .unwrap(),
+            PactorLinkEvent::LinkQuality {
+                speed_level: 5,
+                retries: 0
+            }
+        );
+        modem.await.unwrap();
     }
 }
