@@ -15,4 +15,4 @@ bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
 async-trait = "0.1"
-
+tokio-serial = "5"

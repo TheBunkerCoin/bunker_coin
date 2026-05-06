@@ -5,6 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
 
 use crate::hostmode::{encode_frame, HostmodeDecoder, HostmodeFrame};
 use crate::{PactorLinkEvent, PactorLinkStatus, PactorTransport, ScsPactorError};
@@ -45,6 +46,18 @@ pub struct UsbPactorTransport {
 }
 
 impl UsbPactorTransport {
+    pub async fn connect(config: UsbPactorConfig) -> Result<Self, ScsPactorError> {
+        let serial = tokio_serial::new(&config.port, config.baud_rate)
+            .data_bits(DataBits::Eight)
+            .parity(Parity::None)
+            .stop_bits(StopBits::One)
+            .flow_control(FlowControl::None)
+            .open_native_async()
+            .map_err(|e| ScsPactorError::Io(std::io::Error::other(e.to_string())))?;
+
+        Ok(Self::from_stream(serial, config))
+    }
+
     pub fn from_stream<S>(stream: S, config: UsbPactorConfig) -> Self
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
