@@ -6,11 +6,13 @@ use thiserror::Error;
 
 pub mod framing;
 pub mod network_core;
+pub mod pactor;
 pub mod scheduler;
 pub mod simulated;
 
 pub use framing::{RadioFrame, RadioFramer};
 pub use network_core::RadioNetworkCore;
+pub use pactor::PactorRadioNode;
 pub use scheduler::RadioScheduler;
 pub use simulated::SimulatedRadioNetwork;
 

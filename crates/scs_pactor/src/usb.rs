@@ -295,6 +295,9 @@ impl UsbPactorTransport {
         if line.starts_with("BUSY") {
             return Ok(PactorLinkEvent::Status(PactorLinkStatus::Busy));
         }
+        if line.starts_with("QUEUED") {
+            return Ok(PactorLinkEvent::Status(PactorLinkStatus::Queued));
+        }
         if line.starts_with("LINK FAILURE") || line.starts_with("FAIL") || line.starts_with("NO ") {
             return Ok(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure));
         }
@@ -384,6 +387,7 @@ impl PactorTransport for UsbPactorTransport {
                 PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
                     return Err(ScsPactorError::Busy)
                 }
+                PactorLinkEvent::Status(PactorLinkStatus::Queued) => {}
                 PactorLinkEvent::Status(
                     PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
                 ) => return Err(ScsPactorError::Io(std::io::Error::other(line))),
@@ -519,6 +523,72 @@ mod tests {
 
         transport.connect_peer("NODE").await.unwrap();
         modem.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_transport_connect_peer_reports_busy_status() {
+        let (transport_side, mut modem_side) = duplex(2048);
+        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+
+        let modem = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = modem_side.read(&mut buf).await.unwrap();
+            let frame = decode_frame(&buf[..n]).unwrap();
+            assert_eq!(frame.channel, COMMAND_CHANNEL);
+            assert_eq!(frame.code, b'C');
+            assert_eq!(frame.payload, b"NODE");
+
+            let busy =
+                encode_frame(&HostmodeFrame::new(COMMAND_CHANNEL, b"BUSY".to_vec())).unwrap();
+            modem_side.write_all(&busy).await.unwrap();
+        });
+
+        let err = transport.connect_peer("NODE").await.unwrap_err();
+        assert!(matches!(err, ScsPactorError::Busy));
+        modem.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_transport_connect_peer_waits_through_queued_status() {
+        let (transport_side, mut modem_side) = duplex(4096);
+        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+
+        let modem = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = modem_side.read(&mut buf).await.unwrap();
+            let frame = decode_frame(&buf[..n]).unwrap();
+            assert_eq!(frame.channel, COMMAND_CHANNEL);
+            assert_eq!(frame.code, b'C');
+            assert_eq!(frame.payload, b"NODE");
+
+            let queued =
+                encode_frame(&HostmodeFrame::new(COMMAND_CHANNEL, b"QUEUED".to_vec())).unwrap();
+            let connected = encode_frame(&HostmodeFrame::new(
+                COMMAND_CHANNEL,
+                b"CONNECTED NODE".to_vec(),
+            ))
+            .unwrap();
+            modem_side.write_all(&queued).await.unwrap();
+            modem_side.write_all(&connected).await.unwrap();
+        });
+
+        transport.connect_peer("NODE").await.unwrap();
+        modem.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_transport_reports_disconnect_when_device_unplugs() {
+        let (transport_side, modem_side) = duplex(1024);
+        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+        drop(modem_side);
+
+        assert_eq!(
+            transport
+                .next_event(Some(Duration::from_millis(100)))
+                .await
+                .unwrap(),
+            PactorLinkEvent::Status(PactorLinkStatus::Disconnected)
+        );
     }
 
     #[tokio::test]

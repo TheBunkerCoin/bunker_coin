@@ -113,6 +113,9 @@ impl ScsPactorClient {
         if line.starts_with("BUSY") {
             return Ok(PactorLinkEvent::Status(PactorLinkStatus::Busy));
         }
+        if line.starts_with("QUEUED") {
+            return Ok(PactorLinkEvent::Status(PactorLinkStatus::Queued));
+        }
         if line.starts_with("LINK FAILURE") || line.starts_with("FAIL") || line.starts_with("NO ") {
             return Ok(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure));
         }
@@ -148,6 +151,7 @@ impl ScsPactorClient {
                 PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
                     return Err(ScsPactorError::Busy)
                 }
+                PactorLinkEvent::Status(PactorLinkStatus::Queued) => {}
                 PactorLinkEvent::Status(
                     PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
                 ) => {
@@ -263,5 +267,11 @@ mod tests {
                 retries: 2
             }
         );
+    }
+
+    #[test]
+    fn parse_queued_status() {
+        let event = ScsPactorClient::parse_status_line("QUEUED").unwrap();
+        assert_eq!(event, PactorLinkEvent::Status(PactorLinkStatus::Queued));
     }
 }

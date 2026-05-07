@@ -16,6 +16,13 @@ cargo run --bin node-api-radio-proto
 - The explorer API will be available at http://localhost:3001
 - See [Explorer API Spec](docs/rpc_spec.md) for endpoints
 
+To run the same radio-proto message path through the PACTOR simulator instead
+of the raw simulated radio transport:
+
+```bash
+cargo run --bin node-api-radio-proto -- --pactor
+```
+
 ### Repo Overview
 
 - `bunker_coin_core`: Shared types (hashes, blocks, transactions)
@@ -64,4 +71,4 @@ rustup update stable
 cargo check
 ```
 
-Nothing is stabilised yet, expect rapid iteration. 
+Nothing is stabilised yet, expect rapid iteration.

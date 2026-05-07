@@ -302,6 +302,9 @@ impl SimulatedPactorTransport {
                     return Ok("LINK FAILURE".to_owned());
                 }
                 PactorLinkEvent::Status(PactorLinkStatus::Busy) => return Ok("BUSY".to_owned()),
+                PactorLinkEvent::Status(PactorLinkStatus::Queued) => {
+                    return Ok("QUEUED".to_owned());
+                }
                 PactorLinkEvent::Status(PactorLinkStatus::Idle) => return Ok("IDLE".to_owned()),
                 PactorLinkEvent::LinkQuality {
                     speed_level,
@@ -321,6 +324,7 @@ impl SimulatedPactorTransport {
             "DISCONNECTED" => PactorLinkEvent::Status(PactorLinkStatus::Disconnected),
             "LINK FAILURE" => PactorLinkEvent::Status(PactorLinkStatus::LinkFailure),
             "BUSY" => PactorLinkEvent::Status(PactorLinkStatus::Busy),
+            "QUEUED" => PactorLinkEvent::Status(PactorLinkStatus::Queued),
             line if line.starts_with("CONNECTED ") => {
                 PactorLinkEvent::Status(PactorLinkStatus::Connected {
                     remote_call: line["CONNECTED ".len()..].trim().to_owned(),
@@ -657,6 +661,9 @@ mod tests {
         assert_eq!(client.read_status_line().await.unwrap(), "IDLE");
         assert_eq!(client.read_status_line().await.unwrap(), "CONNECTING NODE");
         assert_eq!(client.read_status_line().await.unwrap(), "CONNECTED NODE");
+
+        client.emit_status_line("QUEUED").await;
+        assert_eq!(client.read_status_line().await.unwrap(), "QUEUED");
 
         client.send_command("D").await.unwrap();
         assert_eq!(client.read_status_line().await.unwrap(), "DISCONNECTED");

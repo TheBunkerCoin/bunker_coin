@@ -47,6 +47,7 @@ pub enum PactorLinkStatus {
     Disconnected,
     LinkFailure,
     Busy,
+    Queued,
 }
 
 #[derive(Clone, Debug, PartialEq)]

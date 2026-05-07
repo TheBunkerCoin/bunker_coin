@@ -38,6 +38,32 @@ async fn main() -> Result<(), scs_pactor::ScsPactorError> {
         comparison.degraded.retransmissions,
         comparison.degraded.bytes_delivered
     );
+    println!();
+    println!("PACTOR speed report:");
+    for sample in scenarios::pactor_throughput_report() {
+        println!(
+            "PT-{}: raw={} bps, clean={:.0} bps ({:.1}% error), degraded ARQ={:.0} bps",
+            sample.speed_level,
+            sample.raw_bps,
+            sample.clean_effective_bps,
+            sample.clean_error_pct,
+            sample.degraded_effective_bps
+        );
+    }
+    println!();
+    println!("Measured PACTOR simulator throughput:");
+    for sample in scenarios::pactor_measured_throughput_report().await? {
+        println!(
+            "PT-{}: payload={} bytes, raw={} bps, clean={:.0} bps ({:.1}% error), degraded={:.0} bps ({} retransmissions)",
+            sample.speed_level,
+            sample.payload_bytes,
+            sample.raw_bps,
+            sample.clean_effective_bps,
+            sample.clean_error_pct,
+            sample.degraded_effective_bps,
+            sample.degraded_retransmissions
+        );
+    }
 
     Ok(())
 }

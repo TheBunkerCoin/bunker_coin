@@ -558,6 +558,7 @@ dependencies = [
  "rand 0.9.1",
  "rand_distr",
  "reed-solomon-erasure",
+ "scs_pactor",
  "serde",
  "thiserror 2.0.18",
  "tokio",
