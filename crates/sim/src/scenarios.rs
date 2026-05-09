@@ -2,7 +2,7 @@
 
 use bincode;
 use bunker_coin_radio::{
-    Network as RadioNetwork, NetworkMessage, RadioConfig, SimulatedRadioNetwork,
+    Network as RadioNetwork, NetworkMessage, PactorRadioNode, RadioConfig, SimulatedRadioNetwork,
 };
 use bunkerglow::crypto::merkle::{DoubleMerkleRoot, MerkleRoot};
 use bunkerglow::crypto::signature::SecretKey;
@@ -12,6 +12,264 @@ use bunkerglow::Slot;
 use hex;
 use rpc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Debug)]
+pub struct PactorRadioProtoResult {
+    pub received_messages: Vec<NetworkMessage>,
+    pub frames_attempted: u64,
+    pub frames_lost: u64,
+    pub retransmissions: u64,
+    pub bytes_delivered: u64,
+}
+
+pub async fn pactor_radio_proto_demo(
+    config: scs_pactor::SimulatedPactorConfig,
+) -> Result<PactorRadioProtoResult, scs_pactor::ScsPactorError> {
+    use bunker_coin_radio::Network;
+
+    let (client, node, stats_source) = PactorRadioNetworkPair::new(config).await?;
+
+    let outbound = vec![
+        NetworkMessage::Ping,
+        NetworkMessage::Shred(b"radio-proto-over-pactor".to_vec()),
+        NetworkMessage::Pong,
+    ];
+
+    for message in &outbound {
+        client
+            .send(message, "NODE")
+            .await
+            .map_err(|e| scs_pactor::ScsPactorError::Protocol(e.to_string()))?;
+    }
+
+    let mut received_messages = Vec::new();
+    for _ in 0..outbound.len() {
+        received_messages.push(
+            node.receive()
+                .await
+                .map_err(|e| scs_pactor::ScsPactorError::Protocol(e.to_string()))?,
+        );
+    }
+    let stats = stats_source.stats();
+
+    Ok(PactorRadioProtoResult {
+        received_messages,
+        frames_attempted: stats.frames_attempted,
+        frames_lost: stats.frames_lost,
+        retransmissions: stats.retransmissions,
+        bytes_delivered: stats.bytes_delivered,
+    })
+}
+
+struct PactorRadioNetworkPair;
+
+impl PactorRadioNetworkPair {
+    async fn new(
+        config: scs_pactor::SimulatedPactorConfig,
+    ) -> Result<
+        (
+            PactorRadioNode,
+            PactorRadioNode,
+            scs_pactor::SimulatedPactorTransport,
+        ),
+        scs_pactor::ScsPactorError,
+    > {
+        use scs_pactor::{PactorTransport, SimulatedPactorPair};
+
+        let (client_transport, node_transport) = SimulatedPactorPair::new(config);
+        client_transport.set_mycall("CLIENT").await?;
+        node_transport.set_mycall("NODE").await?;
+        client_transport.connect_peer("NODE").await?;
+
+        Ok((
+            PactorRadioNode::new("CLIENT", client_transport.clone()),
+            PactorRadioNode::new("NODE", node_transport),
+            client_transport,
+        ))
+    }
+}
+
+pub async fn pactor_radio_proto_direct_transport_demo(
+    config: scs_pactor::SimulatedPactorConfig,
+) -> Result<PactorRadioProtoResult, scs_pactor::ScsPactorError> {
+    use scs_pactor::{PactorTransport, SimulatedPactorPair};
+
+    let (client, node) = SimulatedPactorPair::new(config);
+    client.set_mycall("CLIENT").await?;
+    node.set_mycall("NODE").await?;
+    client.connect_peer("NODE").await?;
+
+    let outbound = vec![
+        NetworkMessage::Ping,
+        NetworkMessage::Shred(b"radio-proto-over-pactor".to_vec()),
+        NetworkMessage::Pong,
+    ];
+
+    for message in &outbound {
+        client.write_data(&message.to_bytes()).await?;
+    }
+
+    let mut received_messages = Vec::new();
+    for _ in 0..outbound.len() {
+        let payload = node.read_data(4096).await?;
+        let received_message = NetworkMessage::from_bytes(&payload).map_err(|_| {
+            scs_pactor::ScsPactorError::Protocol(
+                "failed to decode radio protocol message from PACTOR payload".to_owned(),
+            )
+        })?;
+        received_messages.push(received_message);
+    }
+    let stats = client.stats();
+
+    Ok(PactorRadioProtoResult {
+        received_messages,
+        frames_attempted: stats.frames_attempted,
+        frames_lost: stats.frames_lost,
+        retransmissions: stats.retransmissions,
+        bytes_delivered: stats.bytes_delivered,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct PactorRadioProtoComparison {
+    pub clean: PactorRadioProtoResult,
+    pub degraded: PactorRadioProtoResult,
+}
+
+#[derive(Clone, Debug)]
+pub struct PactorThroughputSample {
+    pub speed_level: u8,
+    pub raw_bps: u32,
+    pub clean_effective_bps: f64,
+    pub clean_error_pct: f64,
+    pub degraded_effective_bps: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PactorMeasuredThroughputSample {
+    pub speed_level: u8,
+    pub raw_bps: u32,
+    pub payload_bytes: usize,
+    pub clean_effective_bps: f64,
+    pub clean_error_pct: f64,
+    pub degraded_effective_bps: f64,
+    pub degraded_retransmissions: u64,
+}
+
+pub async fn pactor_radio_proto_degradation_demo(
+) -> Result<PactorRadioProtoComparison, scs_pactor::ScsPactorError> {
+    let clean_config = scs_pactor::SimulatedPactorConfig {
+        packet_loss: 0.0,
+        latency: std::time::Duration::ZERO,
+        latency_jitter: std::time::Duration::ZERO,
+        setup_delay: std::time::Duration::ZERO,
+        ..Default::default()
+    };
+    let degraded_config = scs_pactor::SimulatedPactorConfig {
+        packet_loss: 0.0,
+        latency: std::time::Duration::ZERO,
+        latency_jitter: std::time::Duration::ZERO,
+        setup_delay: std::time::Duration::ZERO,
+        forced_initial_losses: 2,
+        max_retries: 4,
+        ..Default::default()
+    };
+
+    Ok(PactorRadioProtoComparison {
+        clean: pactor_radio_proto_demo(clean_config).await?,
+        degraded: pactor_radio_proto_demo(degraded_config).await?,
+    })
+}
+
+pub fn pactor_throughput_report() -> Vec<PactorThroughputSample> {
+    [
+        scs_pactor::PactorSpeed::P1,
+        scs_pactor::PactorSpeed::P2,
+        scs_pactor::PactorSpeed::P3,
+        scs_pactor::PactorSpeed::P4,
+    ]
+    .into_iter()
+    .map(|speed| {
+        let raw_bps = speed.raw_bps();
+        let clean_effective_bps = raw_bps as f64;
+        let degraded_effective_bps = raw_bps as f64 / 3.0;
+        PactorThroughputSample {
+            speed_level: speed.level(),
+            raw_bps,
+            clean_effective_bps,
+            clean_error_pct: ((clean_effective_bps - raw_bps as f64).abs() / raw_bps as f64)
+                * 100.0,
+            degraded_effective_bps,
+        }
+    })
+    .collect()
+}
+
+pub async fn pactor_measured_throughput_report(
+) -> Result<Vec<PactorMeasuredThroughputSample>, scs_pactor::ScsPactorError> {
+    let mut samples = Vec::new();
+    for speed in [
+        scs_pactor::PactorSpeed::P1,
+        scs_pactor::PactorSpeed::P2,
+        scs_pactor::PactorSpeed::P3,
+        scs_pactor::PactorSpeed::P4,
+    ] {
+        let raw_bps = speed.raw_bps();
+        let payload_bytes = (raw_bps as usize / 32).max(8);
+        let clean = measure_pactor_transfer(speed, payload_bytes, 0).await?;
+        let degraded = measure_pactor_transfer(speed, payload_bytes, 2).await?;
+
+        samples.push(PactorMeasuredThroughputSample {
+            speed_level: speed.level(),
+            raw_bps,
+            payload_bytes,
+            clean_effective_bps: clean.0,
+            clean_error_pct: ((clean.0 - raw_bps as f64).abs() / raw_bps as f64) * 100.0,
+            degraded_effective_bps: degraded.0,
+            degraded_retransmissions: degraded.1.retransmissions,
+        });
+    }
+    Ok(samples)
+}
+
+async fn measure_pactor_transfer(
+    speed: scs_pactor::PactorSpeed,
+    payload_bytes: usize,
+    forced_initial_losses: u32,
+) -> Result<(f64, scs_pactor::SimulatedPactorStats), scs_pactor::ScsPactorError> {
+    use scs_pactor::{PactorTransport, SimulatedPactorPair};
+
+    let config = scs_pactor::SimulatedPactorConfig {
+        speed,
+        packet_loss: 0.0,
+        latency: std::time::Duration::ZERO,
+        latency_jitter: std::time::Duration::ZERO,
+        setup_delay: std::time::Duration::ZERO,
+        forced_initial_losses,
+        max_retries: 4,
+        read_timeout: Some(std::time::Duration::from_secs(10)),
+        ..Default::default()
+    };
+    let payload = vec![0xA5; payload_bytes];
+    let (client, node) = SimulatedPactorPair::new(config);
+    client.set_mycall("CLIENT").await?;
+    node.set_mycall("NODE").await?;
+    client.connect_peer("NODE").await?;
+
+    let start = tokio::time::Instant::now();
+    client.write_data(&payload).await?;
+    let received = node.read_data(payload_bytes + 1).await?;
+    let elapsed = start.elapsed();
+
+    if received != payload {
+        return Err(scs_pactor::ScsPactorError::Protocol(
+            "measured PACTOR transfer payload mismatch".to_owned(),
+        ));
+    }
+
+    let effective_bps = (payload_bytes * 8) as f64 / elapsed.as_secs_f64();
+    Ok((effective_bps, client.stats()))
+}
 
 pub async fn basic_consensus_test(config: RadioConfig, num_validators: u64) {
     println!(
@@ -839,5 +1097,83 @@ pub async fn multi_node_consensus_simulation_with_api(
     println!("simulation stopped");
     for handle in node_handles {
         let _ = handle.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scs_pactor::SimulatedPactorConfig;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn pactor_radio_proto_demo_round_trips_network_message() {
+        let config = SimulatedPactorConfig {
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let result = pactor_radio_proto_demo(config).await.unwrap();
+        assert_eq!(result.received_messages.len(), 3);
+        assert!(matches!(result.received_messages[0], NetworkMessage::Ping));
+        match &result.received_messages[1] {
+            NetworkMessage::Shred(payload) => {
+                assert_eq!(payload, &b"radio-proto-over-pactor".to_vec());
+            }
+            other => panic!("expected Shred message, got {other:?}"),
+        }
+        assert!(matches!(result.received_messages[2], NetworkMessage::Pong));
+        assert_eq!(result.frames_attempted, 3);
+        assert_eq!(result.frames_lost, 0);
+        assert_eq!(result.retransmissions, 0);
+        assert!(result.bytes_delivered > 0);
+    }
+
+    #[tokio::test]
+    async fn pactor_radio_proto_degradation_demo_shows_arq_overhead() {
+        let result = pactor_radio_proto_degradation_demo().await.unwrap();
+
+        assert_eq!(result.clean.received_messages.len(), 3);
+        assert_eq!(result.degraded.received_messages.len(), 3);
+        assert_eq!(result.clean.frames_lost, 0);
+        assert_eq!(result.clean.retransmissions, 0);
+        assert!(result.degraded.frames_lost > result.clean.frames_lost);
+        assert!(result.degraded.retransmissions > result.clean.retransmissions);
+        assert!(result.degraded.frames_attempted > result.clean.frames_attempted);
+        assert_eq!(
+            result.degraded.bytes_delivered,
+            result.clean.bytes_delivered
+        );
+    }
+
+    #[test]
+    fn pactor_throughput_report_tracks_speed_levels_and_degradation() {
+        let report = pactor_throughput_report();
+
+        assert_eq!(report.len(), 4);
+        for sample in report {
+            assert!(sample.clean_error_pct <= 10.0);
+            assert!(sample.degraded_effective_bps < sample.clean_effective_bps);
+        }
+    }
+
+    #[tokio::test]
+    async fn pactor_measured_throughput_report_tracks_clean_rates_and_degradation() {
+        let report = pactor_measured_throughput_report().await.unwrap();
+
+        assert_eq!(report.len(), 4);
+        for sample in report {
+            assert!(
+                sample.clean_error_pct <= 10.0,
+                "PT-{} clean throughput error was {:.1}%",
+                sample.speed_level,
+                sample.clean_error_pct
+            );
+            assert!(sample.degraded_effective_bps < sample.clean_effective_bps);
+            assert!(sample.degraded_retransmissions > 0);
+        }
     }
 }

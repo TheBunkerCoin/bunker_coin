@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 bunker_coin_core = { workspace = true }
 bunkerglow = { workspace = true }
+scs_pactor = { path = "../scs_pactor" }
 
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -24,4 +25,4 @@ wincode = { version = "0.2", features = ["derive"] }
 bytes = "1"
 
 [dev-dependencies]
-tokio-test = "0.4" 
+tokio-test = "0.4"

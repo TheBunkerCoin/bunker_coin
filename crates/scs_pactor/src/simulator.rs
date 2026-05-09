@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +37,36 @@ impl PactorSpeed {
     }
 }
 
+impl PactorSpeed {
+    fn downshift(self) -> Self {
+        match self {
+            Self::P4 => Self::P3,
+            Self::P3 => Self::P2,
+            Self::P2 => Self::P1,
+            Self::P1 => Self::P1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FadeWindow {
+    pub starts_after: Duration,
+    pub duration: Duration,
+}
+
+impl FadeWindow {
+    pub fn new(starts_after: Duration, duration: Duration) -> Self {
+        Self {
+            starts_after,
+            duration,
+        }
+    }
+
+    fn contains(self, elapsed: Duration) -> bool {
+        elapsed >= self.starts_after && elapsed < self.starts_after + self.duration
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SimulatedPactorConfig {
     pub speed: PactorSpeed,
@@ -44,6 +75,9 @@ pub struct SimulatedPactorConfig {
     pub latency_jitter: Duration,
     pub setup_delay: Duration,
     pub max_retries: u32,
+    pub downshift_after_retries: u32,
+    pub forced_initial_losses: u32,
+    pub fade_windows: Vec<FadeWindow>,
     pub read_timeout: Option<Duration>,
 }
 
@@ -56,7 +90,49 @@ impl Default for SimulatedPactorConfig {
             latency_jitter: Duration::from_millis(50),
             setup_delay: Duration::from_secs(2),
             max_retries: 8,
+            downshift_after_retries: 2,
+            forced_initial_losses: 0,
+            fade_windows: Vec::new(),
             read_timeout: Some(Duration::from_secs(10)),
+        }
+    }
+}
+
+impl SimulatedPactorConfig {
+    pub fn good_link() -> Self {
+        Self {
+            speed: PactorSpeed::P4,
+            packet_loss: 0.02,
+            latency: Duration::from_millis(150),
+            latency_jitter: Duration::from_millis(25),
+            setup_delay: Duration::from_secs(2),
+            max_retries: 8,
+            downshift_after_retries: 2,
+            forced_initial_losses: 0,
+            fade_windows: Vec::new(),
+            read_timeout: Some(Duration::from_secs(10)),
+        }
+    }
+
+    pub fn marginal_link() -> Self {
+        Self {
+            speed: PactorSpeed::P3,
+            packet_loss: 0.30,
+            latency: Duration::from_millis(600),
+            latency_jitter: Duration::from_millis(250),
+            setup_delay: Duration::from_secs(4),
+            max_retries: 12,
+            downshift_after_retries: 1,
+            forced_initial_losses: 0,
+            fade_windows: Vec::new(),
+            read_timeout: Some(Duration::from_secs(20)),
+        }
+    }
+
+    pub fn fading_link(fade_windows: Vec<FadeWindow>) -> Self {
+        Self {
+            fade_windows,
+            ..Self::marginal_link()
         }
     }
 }
@@ -95,11 +171,43 @@ impl Endpoint {
     }
 }
 
+#[derive(Debug, Default)]
+struct SharedStats {
+    frames_attempted: AtomicU64,
+    frames_delivered: AtomicU64,
+    frames_lost: AtomicU64,
+    retransmissions: AtomicU64,
+    bytes_delivered: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SimulatedPactorStats {
+    pub frames_attempted: u64,
+    pub frames_delivered: u64,
+    pub frames_lost: u64,
+    pub retransmissions: u64,
+    pub bytes_delivered: u64,
+}
+
+impl SharedStats {
+    fn snapshot(&self) -> SimulatedPactorStats {
+        SimulatedPactorStats {
+            frames_attempted: self.frames_attempted.load(Ordering::Relaxed),
+            frames_delivered: self.frames_delivered.load(Ordering::Relaxed),
+            frames_lost: self.frames_lost.load(Ordering::Relaxed),
+            retransmissions: self.retransmissions.load(Ordering::Relaxed),
+            bytes_delivered: self.bytes_delivered.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SimulatedPactorTransport {
     local: Arc<Endpoint>,
     remote: Arc<Endpoint>,
     config: SimulatedPactorConfig,
+    stats: Arc<SharedStats>,
+    started_at: tokio::time::Instant,
 }
 
 pub struct SimulatedPactorPair;
@@ -110,18 +218,121 @@ impl SimulatedPactorPair {
     ) -> (SimulatedPactorTransport, SimulatedPactorTransport) {
         let a = Endpoint::new();
         let b = Endpoint::new();
+        let stats = Arc::new(SharedStats::default());
+        let started_at = tokio::time::Instant::now();
         (
             SimulatedPactorTransport {
                 local: a.clone(),
                 remote: b.clone(),
                 config: config.clone(),
+                stats: stats.clone(),
+                started_at,
             },
             SimulatedPactorTransport {
                 local: b,
                 remote: a,
                 config,
+                stats,
+                started_at,
             },
         )
+    }
+}
+
+impl SimulatedPactorTransport {
+    pub fn stats(&self) -> SimulatedPactorStats {
+        self.stats.snapshot()
+    }
+
+    fn in_fade(&self) -> bool {
+        let elapsed = self.started_at.elapsed();
+        self.config
+            .fade_windows
+            .iter()
+            .any(|window| window.contains(elapsed))
+    }
+
+    pub async fn send_command(&self, line: &str) -> Result<(), ScsPactorError> {
+        let trimmed = line.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let command = parts.next().unwrap_or_default();
+        let payload = parts.next().unwrap_or_default().trim();
+
+        match command {
+            "I" | "MYCALL" => {
+                self.set_mycall(payload).await?;
+                self.emit_status_line("OK").await;
+                Ok(())
+            }
+            "C" | "CONNECT" => match self.connect_peer(payload).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    self.emit_status_line("LINK FAILURE").await;
+                    Err(err)
+                }
+            },
+            "D" | "DISCONNECT" => {
+                self.disconnect().await?;
+                self.emit_status_line("DISCONNECTED").await;
+                Ok(())
+            }
+            "G" => {
+                self.emit_status_line("255,0").await;
+                Ok(())
+            }
+            _ => Err(ScsPactorError::Protocol(format!(
+                "unsupported simulator command {command}"
+            ))),
+        }
+    }
+
+    pub async fn read_status_line(&self) -> Result<String, ScsPactorError> {
+        loop {
+            match self.next_event(self.config.read_timeout).await? {
+                PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
+                    return Ok(format!("CONNECTED {remote_call}"));
+                }
+                PactorLinkEvent::Status(PactorLinkStatus::Connecting { remote_call }) => {
+                    return Ok(format!("CONNECTING {remote_call}"));
+                }
+                PactorLinkEvent::Status(PactorLinkStatus::Disconnected) => {
+                    return Ok("DISCONNECTED".to_owned());
+                }
+                PactorLinkEvent::Status(PactorLinkStatus::LinkFailure) => {
+                    return Ok("LINK FAILURE".to_owned());
+                }
+                PactorLinkEvent::Status(PactorLinkStatus::Busy) => return Ok("BUSY".to_owned()),
+                PactorLinkEvent::Status(PactorLinkStatus::Queued) => {
+                    return Ok("QUEUED".to_owned());
+                }
+                PactorLinkEvent::Status(PactorLinkStatus::Idle) => return Ok("IDLE".to_owned()),
+                PactorLinkEvent::LinkQuality {
+                    speed_level,
+                    retries,
+                } => {
+                    return Ok(format!(
+                        "LINK QUALITY SPEED={speed_level} RETRIES={retries}"
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn emit_status_line(&self, line: &str) {
+        let event = match line {
+            "OK" => PactorLinkEvent::Status(PactorLinkStatus::Idle),
+            "DISCONNECTED" => PactorLinkEvent::Status(PactorLinkStatus::Disconnected),
+            "LINK FAILURE" => PactorLinkEvent::Status(PactorLinkStatus::LinkFailure),
+            "BUSY" => PactorLinkEvent::Status(PactorLinkStatus::Busy),
+            "QUEUED" => PactorLinkEvent::Status(PactorLinkStatus::Queued),
+            line if line.starts_with("CONNECTED ") => {
+                PactorLinkEvent::Status(PactorLinkStatus::Connected {
+                    remote_call: line["CONNECTED ".len()..].trim().to_owned(),
+                })
+            }
+            _ => PactorLinkEvent::Status(PactorLinkStatus::Idle),
+        };
+        let _ = self.local.event_tx.send(event).await;
     }
 }
 
@@ -178,10 +389,11 @@ impl PactorTransport for SimulatedPactorTransport {
         }
 
         let mut retries = 0;
+        let mut speed = self.config.speed;
         loop {
-            let transmit_time = Duration::from_secs_f64(
-                (data.len() * 8) as f64 / self.config.speed.raw_bps() as f64,
-            );
+            self.stats.frames_attempted.fetch_add(1, Ordering::Relaxed);
+            let transmit_time =
+                Duration::from_secs_f64((data.len() * 8) as f64 / speed.raw_bps() as f64);
             let jitter = if self.config.latency_jitter.is_zero() {
                 Duration::ZERO
             } else {
@@ -190,17 +402,25 @@ impl PactorTransport for SimulatedPactorTransport {
             };
             sleep(transmit_time + self.config.latency + jitter).await;
 
-            if rand::rng().random::<f32>() >= self.config.packet_loss {
+            let forced_loss = retries < self.config.forced_initial_losses;
+            if !forced_loss
+                && !self.in_fade()
+                && rand::rng().random::<f32>() >= self.config.packet_loss
+            {
                 self.remote
                     .data_tx
                     .send(data.to_vec())
                     .await
                     .map_err(|_| ScsPactorError::Disconnected)?;
+                self.stats.frames_delivered.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .bytes_delivered
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
                 let _ = self
                     .local
                     .event_tx
                     .send(PactorLinkEvent::LinkQuality {
-                        speed_level: self.config.speed.level(),
+                        speed_level: speed.level(),
                         retries,
                     })
                     .await;
@@ -208,6 +428,11 @@ impl PactorTransport for SimulatedPactorTransport {
             }
 
             retries += 1;
+            self.stats.frames_lost.fetch_add(1, Ordering::Relaxed);
+            self.stats.retransmissions.fetch_add(1, Ordering::Relaxed);
+            if retries >= self.config.downshift_after_retries {
+                speed = speed.downshift();
+            }
             if retries > self.config.max_retries {
                 let _ = self
                     .local
@@ -319,5 +544,193 @@ mod tests {
 
         let err = client.write_data(b"lost").await.unwrap_err();
         assert!(matches!(err, ScsPactorError::Disconnected));
+        let stats = client.stats();
+        assert_eq!(stats.frames_delivered, 0);
+        assert_eq!(stats.frames_lost, 3);
+        assert_eq!(stats.retransmissions, 3);
+    }
+
+    #[tokio::test]
+    async fn simulator_profiles_expose_expected_link_shapes() {
+        let good = SimulatedPactorConfig::good_link();
+        assert_eq!(good.speed, PactorSpeed::P4);
+        assert!(good.packet_loss < 0.05);
+
+        let marginal = SimulatedPactorConfig::marginal_link();
+        assert_eq!(marginal.speed, PactorSpeed::P3);
+        assert!(marginal.packet_loss > good.packet_loss);
+
+        let fading = SimulatedPactorConfig::fading_link(vec![FadeWindow::new(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )]);
+        assert_eq!(fading.fade_windows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn simulator_fade_window_drops_until_retry_budget_exhausts() {
+        let config = SimulatedPactorConfig {
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            max_retries: 1,
+            fade_windows: vec![FadeWindow::new(Duration::ZERO, Duration::from_secs(10))],
+            ..Default::default()
+        };
+        let (client, node) = SimulatedPactorPair::new(config);
+        client.set_mycall("CLIENT").await.unwrap();
+        node.set_mycall("NODE").await.unwrap();
+        client.connect_peer("NODE").await.unwrap();
+
+        let err = client.write_data(b"fade").await.unwrap_err();
+        assert!(matches!(err, ScsPactorError::Disconnected));
+        let stats = client.stats();
+        assert_eq!(stats.frames_delivered, 0);
+        assert_eq!(stats.frames_lost, 2);
+    }
+
+    #[tokio::test]
+    async fn simulator_reports_downshifted_speed_after_retries() {
+        let config = SimulatedPactorConfig {
+            speed: PactorSpeed::P4,
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            max_retries: 4,
+            downshift_after_retries: 1,
+            forced_initial_losses: 1,
+            ..Default::default()
+        };
+        let (client, node) = SimulatedPactorPair::new(config);
+        client.set_mycall("CLIENT").await.unwrap();
+        node.set_mycall("NODE").await.unwrap();
+        client.connect_peer("NODE").await.unwrap();
+
+        client.write_data(b"hello").await.unwrap();
+        let event = client
+            .next_event(Some(Duration::from_millis(50)))
+            .await
+            .unwrap();
+        assert_eq!(
+            event,
+            PactorLinkEvent::Status(PactorLinkStatus::Connecting {
+                remote_call: "NODE".to_owned()
+            })
+        );
+        let event = client
+            .next_event(Some(Duration::from_millis(50)))
+            .await
+            .unwrap();
+        assert_eq!(
+            event,
+            PactorLinkEvent::Status(PactorLinkStatus::Connected {
+                remote_call: "NODE".to_owned()
+            })
+        );
+        let event = client
+            .next_event(Some(Duration::from_millis(50)))
+            .await
+            .unwrap();
+        assert_eq!(
+            event,
+            PactorLinkEvent::LinkQuality {
+                speed_level: PactorSpeed::P3.level(),
+                retries: 1
+            }
+        );
+        assert_eq!(node.read_data(1024).await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn simulator_command_surface_matches_hostmode_commands() {
+        let config = SimulatedPactorConfig {
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            ..Default::default()
+        };
+        let (client, node) = SimulatedPactorPair::new(config);
+
+        client.send_command("I CLIENT").await.unwrap();
+        node.send_command("I NODE").await.unwrap();
+
+        client.send_command("C NODE").await.unwrap();
+        assert_eq!(client.read_status_line().await.unwrap(), "IDLE");
+        assert_eq!(client.read_status_line().await.unwrap(), "CONNECTING NODE");
+        assert_eq!(client.read_status_line().await.unwrap(), "CONNECTED NODE");
+
+        client.emit_status_line("QUEUED").await;
+        assert_eq!(client.read_status_line().await.unwrap(), "QUEUED");
+
+        client.send_command("D").await.unwrap();
+        assert_eq!(client.read_status_line().await.unwrap(), "DISCONNECTED");
+    }
+
+    #[tokio::test]
+    async fn simulator_clean_link_has_no_retransmission_overhead() {
+        let config = SimulatedPactorConfig {
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            ..Default::default()
+        };
+        let (client, node) = SimulatedPactorPair::new(config);
+        client.set_mycall("CLIENT").await.unwrap();
+        node.set_mycall("NODE").await.unwrap();
+        client.connect_peer("NODE").await.unwrap();
+
+        client.write_data(&[0xAB; 128]).await.unwrap();
+        assert_eq!(node.read_data(1024).await.unwrap(), vec![0xAB; 128]);
+
+        let stats = client.stats();
+        assert_eq!(stats.frames_attempted, 1);
+        assert_eq!(stats.frames_delivered, 1);
+        assert_eq!(stats.frames_lost, 0);
+        assert_eq!(stats.retransmissions, 0);
+        assert_eq!(stats.bytes_delivered, 128);
+    }
+
+    #[tokio::test]
+    async fn simulator_loss_degrades_effective_delivery_efficiency() {
+        let clean = SimulatedPactorConfig {
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            ..Default::default()
+        };
+        let lossy = SimulatedPactorConfig {
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            forced_initial_losses: 2,
+            max_retries: 4,
+            ..Default::default()
+        };
+
+        let (clean_client, clean_node) = SimulatedPactorPair::new(clean);
+        clean_client.set_mycall("CLIENT").await.unwrap();
+        clean_node.set_mycall("NODE").await.unwrap();
+        clean_client.connect_peer("NODE").await.unwrap();
+        clean_client.write_data(&[0xCD; 64]).await.unwrap();
+
+        let (lossy_client, lossy_node) = SimulatedPactorPair::new(lossy);
+        lossy_client.set_mycall("CLIENT").await.unwrap();
+        lossy_node.set_mycall("NODE").await.unwrap();
+        lossy_client.connect_peer("NODE").await.unwrap();
+        lossy_client.write_data(&[0xCD; 64]).await.unwrap();
+
+        let clean_stats = clean_client.stats();
+        let lossy_stats = lossy_client.stats();
+        assert_eq!(clean_stats.frames_attempted, 1);
+        assert_eq!(lossy_stats.frames_attempted, 3);
+        assert_eq!(lossy_stats.frames_lost, 2);
+        assert_eq!(lossy_stats.retransmissions, 2);
+        assert_eq!(lossy_stats.bytes_delivered, clean_stats.bytes_delivered);
     }
 }
