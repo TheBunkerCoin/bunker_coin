@@ -586,6 +586,7 @@ dependencies = [
  "scs_pactor",
  "serde",
  "tokio",
+ "tokio-serial",
  "wincode",
 ]
 

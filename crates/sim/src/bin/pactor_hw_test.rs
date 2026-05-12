@@ -5,15 +5,17 @@
 //!
 //! ```text
 //! cargo run --bin pactor_hw_test -- \
-//!   --port-a /dev/cu.usbserial-A --port-b /dev/cu.usbserial-B
+//!   --port-a /dev/ttyUSB0 --port-b /dev/ttyUSB1
 //! ```
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bunker_coin_radio::{Network, NetworkMessage, PactorRadioNode};
 use clap::Parser;
 use scs_pactor::{PactorTransport, UsbPactorConfig, UsbPactorTransport};
+use tokio::io::AsyncWriteExt;
+use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
 
 #[derive(Parser)]
 #[command(name = "pactor_hw_test")]
@@ -40,20 +42,48 @@ struct Args {
     baud: u32,
 }
 
+/// Switch an SCS modem from terminal mode into WA8DED hostmode.
+///
+/// Sends ESC to break out of any current state, waits for the modem to
+/// settle, then sends `JHOST1\r` to enter hostmode. The serial port is
+/// consumed and returned as a `UsbPactorTransport` ready for hostmode
+/// framing.
+async fn init_hostmode(port: &str, baud: u32) -> anyhow::Result<UsbPactorTransport> {
+    let mut serial = tokio_serial::new(port, baud)
+        .data_bits(DataBits::Eight)
+        .parity(Parity::None)
+        .stop_bits(StopBits::One)
+        .flow_control(FlowControl::None)
+        .open_native_async()
+        .map_err(|e| anyhow::anyhow!("failed to open {port}: {e}"))?;
+
+    // ESC to ensure we're at the terminal prompt
+    serial.write_all(b"\x1b").await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Drain any pending response from the modem
+    serial.flush().await?;
+
+    // Enter WA8DED hostmode
+    serial.write_all(b"JHOST1\r").await?;
+    serial.flush().await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Now wrap the already-open serial stream in the hostmode transport
+    let config = UsbPactorConfig::new(port);
+    Ok(UsbPactorTransport::from_stream(serial, config))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    println!("Connecting to modem A on {} ...", args.port_a);
-    let mut config_a = UsbPactorConfig::new(&args.port_a);
-    config_a.baud_rate = args.baud;
-    let modem_a = UsbPactorTransport::connect(config_a).await?;
+    println!("Initializing modem A on {} ...", args.port_a);
+    let modem_a = init_hostmode(&args.port_a, args.baud).await?;
 
-    println!("Connecting to modem B on {} ...", args.port_b);
-    let mut config_b = UsbPactorConfig::new(&args.port_b);
-    config_b.baud_rate = args.baud;
-    let modem_b = UsbPactorTransport::connect(config_b).await?;
+    println!("Initializing modem B on {} ...", args.port_b);
+    let modem_b = init_hostmode(&args.port_b, args.baud).await?;
 
     println!("Setting callsigns: A={}, B={}", args.call_a, args.call_b);
     modem_a.set_mycall(&args.call_a).await?;
