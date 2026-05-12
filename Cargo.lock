@@ -575,6 +575,7 @@ dependencies = [
  "bunker_coin_core",
  "bunker_coin_radio",
  "bunkerglow",
+ "clap",
  "colored 2.2.0",
  "env_logger",
  "hex",

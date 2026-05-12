@@ -25,6 +25,7 @@ rand = { workspace = true }
 indicatif = "0.17"
 colored = "2" 
 
+clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 bincode = "2"
 wincode = { version = "0.2", features = ["derive"] }
