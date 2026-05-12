@@ -40,12 +40,20 @@ struct Args {
     /// Baud rate for serial ports
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
+
+    /// SCS JHOST mode to enter before speaking hostmode.
+    ///
+    /// 1 is plain hostmode, 4 is CRC hostmode, and 5 is extended CRC hostmode.
+    /// The scs_pactor transport uses CRC-framed hostmode packets, so 5 is the
+    /// safest default for DRAGON modems.
+    #[arg(long, default_value_t = 5)]
+    jhost: u8,
 }
 
 /// Switch an SCS modem from terminal mode into WA8DED hostmode.
 ///
 /// Sends ESC to break out of any current state, waits for the modem to
-/// settle, then sends `JHOST1\r` to enter hostmode. The serial port is
+/// settle, then sends `JHOST{jhost}\r` to enter hostmode. The serial port is
 /// consumed and returned as a `UsbPactorTransport` ready for hostmode
 /// framing.
 /// Drain any pending bytes from the serial port (non-blocking read until empty).
@@ -66,10 +74,15 @@ async fn drain_serial(serial: &mut tokio_serial::SerialStream) {
 /// The SCS DRAGON boots in terminal/command mode. We must:
 /// 1. Send ESC to abort any in-progress command
 /// 2. Drain stale data
-/// 3. Send `JHOST1\r` to enter WA8DED hostmode
+/// 3. Send `JHOST{jhost}\r` to enter WA8DED hostmode
 /// 4. Drain the hostmode-entry response
 /// 5. Verify hostmode is active via a `G` (poll) transaction
-async fn init_hostmode(port: &str, baud: u32) -> anyhow::Result<UsbPactorTransport> {
+async fn init_hostmode(port: &str, baud: u32, jhost: u8) -> anyhow::Result<UsbPactorTransport> {
+    anyhow::ensure!(
+        matches!(jhost, 1 | 4 | 5),
+        "unsupported JHOST mode {jhost}; expected 1, 4, or 5"
+    );
+
     let mut serial = tokio_serial::new(port, baud)
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
@@ -90,9 +103,11 @@ async fn init_hostmode(port: &str, baud: u32) -> anyhow::Result<UsbPactorTranspo
     tokio::time::sleep(Duration::from_millis(300)).await;
     drain_serial(&mut serial).await;
 
-    // Enter WA8DED hostmode
-    println!("  sending JHOST1 ...");
-    serial.write_all(b"JHOST1\r").await?;
+    // Enter WA8DED hostmode.
+    println!("  sending JHOST{jhost} ...");
+    serial
+        .write_all(format!("JHOST{jhost}\r").as_bytes())
+        .await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(1000)).await;
     drain_serial(&mut serial).await;
@@ -134,10 +149,10 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     println!("Initializing modem A on {} ...", args.port_a);
-    let modem_a = init_hostmode(&args.port_a, args.baud).await?;
+    let modem_a = init_hostmode(&args.port_a, args.baud, args.jhost).await?;
 
     println!("Initializing modem B on {} ...", args.port_b);
-    let modem_b = init_hostmode(&args.port_b, args.baud).await?;
+    let modem_b = init_hostmode(&args.port_b, args.baud, args.jhost).await?;
 
     println!("Setting callsigns: A={}, B={}", args.call_a, args.call_b);
     modem_a.set_mycall(&args.call_a).await?;
