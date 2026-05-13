@@ -16,7 +16,7 @@ use clap::Parser;
 use scs_pactor::hostmode::{encode_frame, HostmodeFrame, PACTOR_CHANNEL};
 use scs_pactor::{PactorTransport, UsbPactorConfig, UsbPactorTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
+use tokio_serial::{DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderExt, StopBits};
 
 #[derive(Parser)]
 #[command(name = "pactor_hw_test")]
@@ -58,13 +58,20 @@ async fn drain_serial(serial: &mut tokio_serial::SerialStream) {
 
 /// Open a serial port.
 fn open_serial(port: &str, baud: u32) -> anyhow::Result<tokio_serial::SerialStream> {
-    tokio_serial::new(port, baud)
+    let mut serial = tokio_serial::new(port, baud)
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
         .stop_bits(StopBits::One)
         .flow_control(FlowControl::None)
         .open_native_async()
-        .map_err(|e| anyhow::anyhow!("failed to open {port}: {e}"))
+        .map_err(|e| anyhow::anyhow!("failed to open {port}: {e}"))?;
+
+    // Keep control lines asserted. Some USB serial stacks/firmware gate the
+    // command interface when DTR/RTS are low; ptc-go's serial backend leaves
+    // these in the normal active terminal state.
+    let _ = serial.write_data_terminal_ready(true);
+    let _ = serial.write_request_to_send(true);
+    Ok(serial)
 }
 
 /// Send an ASCII command and wait for the modem to process it.
@@ -109,6 +116,7 @@ async fn send_hostmode_quit(serial: &mut tokio_serial::SerialStream) -> anyhow::
     println!("  >> hostmode JHOST0 on channel 0");
     let frame = HostmodeFrame::command(0, b"JHOST0".to_vec());
     let encoded = encode_frame(&frame)?;
+    println!("  hostmode quit bytes: {:02x?}", encoded);
     serial.write_all(&encoded).await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
