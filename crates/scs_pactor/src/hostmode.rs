@@ -337,9 +337,10 @@ fn destuffed_prefix(raw_body: &[u8], len: usize) -> Result<Option<Vec<u8>>, ScsP
 /// CRC16-CCITT as implemented by `github.com/howeyc/crc16.ChecksumCCITT`.
 ///
 /// ptc-go depends on `github.com/howeyc/crc16`, whose `ChecksumCCITT`
-/// uses the reflected CCITT polynomial `0x8408` with init `0x0000`.
+/// matches the reflected CCITT polynomial `0x8408`, init `0xffff`,
+/// xorout `0xffff`.
 fn crc16_ccitt(bytes: &[u8]) -> u16 {
-    let mut crc = 0x0000u16;
+    let mut crc = 0xffffu16;
     for byte in bytes {
         crc ^= *byte as u16;
         for _ in 0..8 {
@@ -350,13 +351,13 @@ fn crc16_ccitt(bytes: &[u8]) -> u16 {
             }
         }
     }
-    crc
+    crc ^ 0xffff
 }
 
 /// Compute the 2-byte CRC checksum for a hostmode frame body.
 ///
 /// Matches ptc-go: howeyc CRC16-CCITT, then `bits.ReverseBytes16`,
-/// then big-endian.
+/// then big-endian. This is equivalent to writing the checksum little-endian.
 fn checksum(body: &[u8]) -> [u8; 2] {
     let crc = crc16_ccitt(body);
     let reversed = crc.swap_bytes();
@@ -369,8 +370,7 @@ mod tests {
 
     #[test]
     fn crc_known_vector() {
-        // github.com/howeyc/crc16.ChecksumCCITT("123456789") = 0x2189.
-        assert_eq!(crc16_ccitt(b"123456789"), 0x2189);
+        assert_eq!(crc16_ccitt(b"123456789"), 0x906e);
     }
 
     #[test]
@@ -471,8 +471,18 @@ mod tests {
         assert_eq!(
             encoded,
             vec![
-                0xaa, 0xaa, 0x00, 0x01, 0x05, 0x4a, 0x48, 0x4f, 0x53, 0x54, 0x30, 0x1c, 0x8c,
+                0xaa, 0xaa, 0x00, 0x01, 0x05, 0x4a, 0x48, 0x4f, 0x53, 0x54, 0x30, 0xfb, 0x3d,
             ]
+        );
+    }
+
+    #[test]
+    fn status_poll_matches_ptc_go_debug_dump() {
+        let frame = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
+        let encoded = encode_frame(&frame).unwrap();
+        assert_eq!(
+            encoded,
+            vec![0xaa, 0xaa, 0x1f, 0x01, 0x00, 0x4c, 0x32, 0x5f]
         );
     }
 }
