@@ -334,20 +334,19 @@ fn destuffed_prefix(raw_body: &[u8], len: usize) -> Result<Option<Vec<u8>>, ScsP
     }
 }
 
-/// CRC16-CCITT (init 0x0000, polynomial 0x1021).
+/// CRC16-CCITT as implemented by `github.com/howeyc/crc16.ChecksumCCITT`.
 ///
-/// This matches Go's `crc16.ChecksumCCITT` from the `sigurn/crc16` package
-/// used by ptc-go. Note: init is 0x0000, NOT 0xFFFF (that would be
-/// CRC16-CCITT-FALSE, a different variant).
+/// ptc-go depends on `github.com/howeyc/crc16`, whose `ChecksumCCITT`
+/// uses the reflected CCITT polynomial `0x8408` with init `0x0000`.
 fn crc16_ccitt(bytes: &[u8]) -> u16 {
     let mut crc = 0x0000u16;
     for byte in bytes {
-        crc ^= (*byte as u16) << 8;
+        crc ^= *byte as u16;
         for _ in 0..8 {
-            if crc & 0x8000 != 0 {
-                crc = (crc << 1) ^ 0x1021;
+            if crc & 0x0001 != 0 {
+                crc = (crc >> 1) ^ 0x8408;
             } else {
-                crc <<= 1;
+                crc >>= 1;
             }
         }
     }
@@ -356,7 +355,8 @@ fn crc16_ccitt(bytes: &[u8]) -> u16 {
 
 /// Compute the 2-byte CRC checksum for a hostmode frame body.
 ///
-/// Matches ptc-go: CRC16-CCITT, then `bits.ReverseBytes16`, then big-endian.
+/// Matches ptc-go: howeyc CRC16-CCITT, then `bits.ReverseBytes16`,
+/// then big-endian.
 fn checksum(body: &[u8]) -> [u8; 2] {
     let crc = crc16_ccitt(body);
     let reversed = crc.swap_bytes();
@@ -369,8 +369,8 @@ mod tests {
 
     #[test]
     fn crc_known_vector() {
-        // CRC16-CCITT with init 0x0000 for "123456789" = 0x31C3
-        assert_eq!(crc16_ccitt(b"123456789"), 0x31C3);
+        // github.com/howeyc/crc16.ChecksumCCITT("123456789") = 0x2189.
+        assert_eq!(crc16_ccitt(b"123456789"), 0x2189);
     }
 
     #[test]
@@ -462,5 +462,17 @@ mod tests {
         assert_eq!(decoded.channel, PACTOR_CHANNEL);
         assert_eq!(decoded.code, TYPE_COMMAND);
         assert_eq!(decoded.payload, b"G");
+    }
+
+    #[test]
+    fn hostmode_quit_matches_ptc_go_crc() {
+        let frame = HostmodeFrame::command(0, b"JHOST0".to_vec());
+        let encoded = encode_frame(&frame).unwrap();
+        assert_eq!(
+            encoded,
+            vec![
+                0xaa, 0xaa, 0x00, 0x01, 0x05, 0x4a, 0x48, 0x4f, 0x53, 0x54, 0x30, 0x1c, 0x8c,
+            ]
+        );
     }
 }
