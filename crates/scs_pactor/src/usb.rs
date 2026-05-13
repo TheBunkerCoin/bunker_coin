@@ -7,11 +7,11 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
 
-use crate::hostmode::{encode_frame, HostmodeDecoder, HostmodeFrame, HostmodePacket};
+use crate::hostmode::{
+    encode_frame, HostmodeDecoder, HostmodeFrame, HostmodePacket, PACTOR_CHANNEL,
+};
 use crate::{PactorLinkEvent, PactorLinkStatus, PactorTransport, ScsPactorError};
 
-const COMMAND_CHANNEL: u8 = 0;
-const DATA_CHANNEL: u8 = 1;
 const STATUS_CHANNEL: u8 = 254;
 const EXTENDED_POLL_CHANNEL: u8 = 255;
 const MAX_HOSTMODE_RETRIES: u8 = 3;
@@ -44,6 +44,7 @@ pub struct UsbPactorTransport {
     event_rx: Mutex<mpsc::Receiver<PactorLinkEvent>>,
     packet_rx: Mutex<mpsc::Receiver<HostmodePacket>>,
     transaction_lock: Mutex<()>,
+    tx_counter: Mutex<bool>,
     read_task: JoinHandle<()>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
@@ -136,6 +137,7 @@ impl UsbPactorTransport {
             event_rx: Mutex::new(event_rx),
             packet_rx: Mutex::new(packet_rx),
             transaction_lock: Mutex::new(()),
+            tx_counter: Mutex::new(false),
             read_task,
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
@@ -144,8 +146,22 @@ impl UsbPactorTransport {
     }
 
     async fn send_hostmode_frame(&self, frame: HostmodeFrame) -> Result<(), ScsPactorError> {
-        let encoded = encode_frame(&frame)?;
+        let encoded = self.encode_outbound_frame(frame).await?;
         self.write_encoded_frame(&encoded).await
+    }
+
+    async fn encode_outbound_frame(
+        &self,
+        mut frame: HostmodeFrame,
+    ) -> Result<Vec<u8>, ScsPactorError> {
+        let mut counter = self.tx_counter.lock().await;
+        if *counter {
+            frame.code |= 0x80;
+        } else {
+            frame.code &= 0x7f;
+        }
+        *counter = !*counter;
+        encode_frame(&frame)
     }
 
     async fn write_encoded_frame(&self, encoded: &[u8]) -> Result<(), ScsPactorError> {
@@ -167,7 +183,7 @@ impl UsbPactorTransport {
         frame: HostmodeFrame,
     ) -> Result<HostmodeFrame, ScsPactorError> {
         let _transaction = self.transaction_lock.lock().await;
-        let encoded = encode_frame(&frame)?;
+        let encoded = self.encode_outbound_frame(frame).await?;
         let mut retries = 0;
 
         loop {
@@ -197,8 +213,9 @@ impl UsbPactorTransport {
             .ok_or(ScsPactorError::Disconnected)
     }
 
+    /// Poll a channel by sending a command frame with payload "G".
     pub async fn poll_channel(&self, channel: u8) -> Result<HostmodeFrame, ScsPactorError> {
-        self.hostmode_transaction(HostmodeFrame::with_code(channel, b'G', vec![0]))
+        self.hostmode_transaction(HostmodeFrame::command(channel, b"G".to_vec()))
             .await
     }
 
@@ -231,18 +248,24 @@ impl UsbPactorTransport {
         Ok(response.payload)
     }
 
-    async fn send_frame(&self, channel: u8, payload: &[u8]) -> Result<(), ScsPactorError> {
+    /// Send a data frame on the given channel.
+    async fn send_data_frame(&self, channel: u8, payload: &[u8]) -> Result<(), ScsPactorError> {
         self.send_hostmode_frame(HostmodeFrame::new(channel, payload.to_vec()))
             .await
     }
 
-    async fn send_host_command(&self, code: u8, payload: &[u8]) -> Result<(), ScsPactorError> {
-        let payload = if payload.is_empty() {
-            vec![0]
-        } else {
-            payload.to_vec()
-        };
-        self.send_hostmode_frame(HostmodeFrame::with_code(COMMAND_CHANNEL, code, payload))
+    /// Send a command on the PACTOR channel.
+    ///
+    /// In ptc-go hostmode, the command letter (e.g. `I`, `C`, `D`) is part
+    /// of the payload with type byte = 0x01. So `set_mycall("N0CALL")`
+    /// sends: channel=31, type=0x01, payload=`"I N0CALL"`.
+    async fn send_host_command(&self, cmd_letter: u8, args: &[u8]) -> Result<(), ScsPactorError> {
+        let mut payload = vec![cmd_letter];
+        if !args.is_empty() {
+            payload.push(b' ');
+            payload.extend_from_slice(args);
+        }
+        self.send_hostmode_frame(HostmodeFrame::command(PACTOR_CHANNEL, payload))
             .await
     }
 
@@ -250,8 +273,8 @@ impl UsbPactorTransport {
         let trimmed = line.trim();
         let mut parts = trimmed.splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or_default();
-        let payload = parts.next().unwrap_or_default().trim_start();
-        let code = match command {
+        let args = parts.next().unwrap_or_default().trim_start();
+        let cmd_letter = match command {
             "MYCALL" => b'I',
             "CONNECT" => b'C',
             "DISCONNECT" => b'D',
@@ -262,7 +285,7 @@ impl UsbPactorTransport {
                 )))
             }
         };
-        self.send_host_command(code, payload.as_bytes()).await
+        self.send_host_command(cmd_letter, args.as_bytes()).await
     }
 
     pub async fn read_status_line(&self) -> Result<String, ScsPactorError> {
@@ -333,22 +356,27 @@ async fn route_frame(
     event_tx: &mpsc::Sender<PactorLinkEvent>,
 ) -> Result<(), ScsPactorError> {
     match frame.channel {
-        COMMAND_CHANNEL => {
-            let line = String::from_utf8(frame.payload)
-                .map_err(|e| ScsPactorError::Protocol(e.to_string()))?;
-            if let Ok(event) = UsbPactorTransport::parse_status_line(&line) {
-                let _ = event_tx.send(event).await;
+        PACTOR_CHANNEL => {
+            // On the PACTOR channel, type byte distinguishes command responses
+            // (TYPE_COMMAND / TYPE_COMMAND_COUNTER) from data.
+            if frame.code & 0x01 != 0 {
+                // Command response — payload is ASCII status text
+                let line = String::from_utf8(frame.payload)
+                    .map_err(|e| ScsPactorError::Protocol(e.to_string()))?;
+                if let Ok(event) = UsbPactorTransport::parse_status_line(&line) {
+                    let _ = event_tx.send(event).await;
+                }
+                command_tx
+                    .send(line)
+                    .await
+                    .map_err(|_| ScsPactorError::Disconnected)?;
+            } else {
+                // Data frame
+                data_tx
+                    .send(frame.payload)
+                    .await
+                    .map_err(|_| ScsPactorError::Disconnected)?;
             }
-            command_tx
-                .send(line)
-                .await
-                .map_err(|_| ScsPactorError::Disconnected)?;
-        }
-        DATA_CHANNEL => {
-            data_tx
-                .send(frame.payload)
-                .await
-                .map_err(|_| ScsPactorError::Disconnected)?;
         }
         STATUS_CHANNEL => {
             if frame.payload.len() >= 3 {
@@ -361,10 +389,18 @@ async fn route_frame(
             }
         }
         EXTENDED_POLL_CHANNEL => {}
-        other => {
-            return Err(ScsPactorError::Protocol(format!(
-                "unknown hostmode channel {other}"
-            )));
+        _ => {
+            // Other channels: try to route as command if type says so, else data
+            if frame.code & 0x01 != 0 {
+                let line = String::from_utf8(frame.payload)
+                    .map_err(|e| ScsPactorError::Protocol(e.to_string()))?;
+                if let Ok(event) = UsbPactorTransport::parse_status_line(&line) {
+                    let _ = event_tx.send(event).await;
+                }
+                let _ = command_tx.send(line).await;
+            } else {
+                let _ = data_tx.send(frame.payload).await;
+            }
         }
     }
     Ok(())
@@ -397,7 +433,7 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
-        self.send_frame(DATA_CHANNEL, data).await
+        self.send_data_frame(PACTOR_CHANNEL, data).await
     }
 
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, ScsPactorError> {
@@ -441,7 +477,7 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt};
 
     use super::*;
-    use crate::hostmode::{decode_frame, encode_repeat_request};
+    use crate::hostmode::{decode_frame, encode_repeat_request, TYPE_COMMAND, TYPE_DATA};
 
     fn test_config() -> UsbPactorConfig {
         UsbPactorConfig {
@@ -463,9 +499,9 @@ mod tests {
         let mut buf = [0u8; 1024];
         let n = modem_side.read(&mut buf).await.unwrap();
         let frame = decode_frame(&buf[..n]).unwrap();
-        assert_eq!(frame.channel, COMMAND_CHANNEL);
-        assert_eq!(frame.code, b'I');
-        assert_eq!(frame.payload, b"N0CALL");
+        assert_eq!(frame.channel, PACTOR_CHANNEL);
+        assert_eq!(frame.code, TYPE_COMMAND);
+        assert_eq!(frame.payload, b"I N0CALL");
     }
 
     #[tokio::test]
@@ -473,12 +509,14 @@ mod tests {
         let (transport_side, mut modem_side) = duplex(2048);
         let transport = UsbPactorTransport::from_stream(transport_side, test_config());
 
-        let status = encode_frame(&HostmodeFrame::new(
-            COMMAND_CHANNEL,
+        // Command response on PACTOR channel (type=COMMAND)
+        let status = encode_frame(&HostmodeFrame::command(
+            PACTOR_CHANNEL,
             b"CONNECTED NODE".to_vec(),
         ))
         .unwrap();
-        let data = encode_frame(&HostmodeFrame::new(DATA_CHANNEL, b"payload".to_vec())).unwrap();
+        // Data on PACTOR channel (type=DATA)
+        let data = encode_frame(&HostmodeFrame::new(PACTOR_CHANNEL, b"payload".to_vec())).unwrap();
 
         modem_side.write_all(&[0x00, 0x01, 0x02]).await.unwrap();
         modem_side.write_all(&status).await.unwrap();
@@ -509,12 +547,12 @@ mod tests {
             let mut buf = [0u8; 1024];
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
-            assert_eq!(frame.channel, COMMAND_CHANNEL);
-            assert_eq!(frame.code, b'C');
-            assert_eq!(frame.payload, b"NODE");
+            assert_eq!(frame.channel, PACTOR_CHANNEL);
+            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(frame.payload, b"C NODE");
 
-            let connected = encode_frame(&HostmodeFrame::new(
-                COMMAND_CHANNEL,
+            let connected = encode_frame(&HostmodeFrame::command(
+                PACTOR_CHANNEL,
                 b"CONNECTED NODE".to_vec(),
             ))
             .unwrap();
@@ -534,12 +572,12 @@ mod tests {
             let mut buf = [0u8; 1024];
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
-            assert_eq!(frame.channel, COMMAND_CHANNEL);
-            assert_eq!(frame.code, b'C');
-            assert_eq!(frame.payload, b"NODE");
+            assert_eq!(frame.channel, PACTOR_CHANNEL);
+            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(frame.payload, b"C NODE");
 
             let busy =
-                encode_frame(&HostmodeFrame::new(COMMAND_CHANNEL, b"BUSY".to_vec())).unwrap();
+                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"BUSY".to_vec())).unwrap();
             modem_side.write_all(&busy).await.unwrap();
         });
 
@@ -557,14 +595,14 @@ mod tests {
             let mut buf = [0u8; 1024];
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
-            assert_eq!(frame.channel, COMMAND_CHANNEL);
-            assert_eq!(frame.code, b'C');
-            assert_eq!(frame.payload, b"NODE");
+            assert_eq!(frame.channel, PACTOR_CHANNEL);
+            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(frame.payload, b"C NODE");
 
             let queued =
-                encode_frame(&HostmodeFrame::new(COMMAND_CHANNEL, b"QUEUED".to_vec())).unwrap();
-            let connected = encode_frame(&HostmodeFrame::new(
-                COMMAND_CHANNEL,
+                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"QUEUED".to_vec())).unwrap();
+            let connected = encode_frame(&HostmodeFrame::command(
+                PACTOR_CHANNEL,
                 b"CONNECTED NODE".to_vec(),
             ))
             .unwrap();
@@ -601,9 +639,9 @@ mod tests {
         let mut buf = [0u8; 1024];
         let n = modem_side.read(&mut buf).await.unwrap();
         let frame = decode_frame(&buf[..n]).unwrap();
-        assert_eq!(frame.channel, COMMAND_CHANNEL);
-        assert_eq!(frame.code, b'D');
-        assert_eq!(frame.payload, vec![0]);
+        assert_eq!(frame.channel, PACTOR_CHANNEL);
+        assert_eq!(frame.code, TYPE_COMMAND);
+        assert_eq!(frame.payload, b"D");
     }
 
     #[tokio::test]
@@ -616,8 +654,9 @@ mod tests {
             let n = modem_side.read(&mut buf).await.unwrap();
             let first = buf[..n].to_vec();
             let frame = decode_frame(&first).unwrap();
-            assert_eq!(frame.channel, COMMAND_CHANNEL);
-            assert_eq!(frame.code, b'V');
+            assert_eq!(frame.channel, PACTOR_CHANNEL);
+            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(frame.payload, b"V");
 
             modem_side
                 .write_all(&encode_repeat_request())
@@ -628,15 +667,15 @@ mod tests {
             assert_eq!(&buf[..n], first.as_slice());
 
             let response =
-                encode_frame(&HostmodeFrame::new(COMMAND_CHANNEL, b"OK".to_vec())).unwrap();
+                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
             modem_side.write_all(&response).await.unwrap();
         });
 
         let response = transport
-            .hostmode_transaction(HostmodeFrame::with_code(COMMAND_CHANNEL, b'V', vec![0]))
+            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, b"V".to_vec()))
             .await
             .unwrap();
-        assert_eq!(response.channel, COMMAND_CHANNEL);
+        assert_eq!(response.channel, PACTOR_CHANNEL);
         assert_eq!(response.payload, b"OK");
         modem.await.unwrap();
     }
@@ -651,12 +690,12 @@ mod tests {
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
             assert_eq!(frame.channel, EXTENDED_POLL_CHANNEL);
-            assert_eq!(frame.code, b'G');
-            assert_eq!(frame.payload, vec![0]);
+            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(frame.payload, b"G");
 
             let response = encode_frame(&HostmodeFrame::with_code(
                 EXTENDED_POLL_CHANNEL,
-                1,
+                TYPE_COMMAND,
                 vec![3, 4, 0],
             ))
             .unwrap();
@@ -678,10 +717,14 @@ mod tests {
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
             assert_eq!(frame.channel, STATUS_CHANNEL);
-            assert_eq!(frame.code, b'G');
+            assert_eq!(frame.code, TYPE_COMMAND);
 
-            let response =
-                encode_frame(&HostmodeFrame::with_code(STATUS_CHANNEL, 7, vec![1, 3, 5])).unwrap();
+            let response = encode_frame(&HostmodeFrame::with_code(
+                STATUS_CHANNEL,
+                TYPE_DATA,
+                vec![1, 3, 5],
+            ))
+            .unwrap();
             modem_side.write_all(&response).await.unwrap();
         });
 
@@ -697,5 +740,48 @@ mod tests {
             }
         );
         modem.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_transport_writes_data_on_pactor_channel() {
+        let (transport_side, mut modem_side) = duplex(1024);
+        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+
+        transport.write_data(b"hello").await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let n = modem_side.read(&mut buf).await.unwrap();
+        let frame = decode_frame(&buf[..n]).unwrap();
+        assert_eq!(frame.channel, PACTOR_CHANNEL);
+        assert_eq!(frame.code, TYPE_DATA);
+        assert_eq!(frame.payload, b"hello");
+    }
+
+    #[tokio::test]
+    async fn usb_transport_toggles_outbound_packet_counter() {
+        let (transport_side, mut modem_side) = duplex(2048);
+        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+
+        transport.send_command("MYCALL A").await.unwrap();
+        transport.send_command("MYCALL B").await.unwrap();
+
+        let mut decoder = HostmodeDecoder::new();
+        let mut frames = Vec::new();
+        let mut buf = [0u8; 1024];
+        while frames.len() < 2 {
+            let n = modem_side.read(&mut buf).await.unwrap();
+            decoder.push(&buf[..n]);
+            while let Some(frame) = decoder.next_frame().unwrap() {
+                frames.push(frame);
+            }
+        }
+
+        let first = &frames[0];
+        let second = &frames[1];
+
+        assert_eq!(first.code, TYPE_COMMAND);
+        assert_eq!(first.payload, b"I A");
+        assert_eq!(second.code, TYPE_COMMAND | 0x80);
+        assert_eq!(second.payload, b"I B");
     }
 }

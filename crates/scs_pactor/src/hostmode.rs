@@ -5,26 +5,56 @@ const STUFF_BYTE: u8 = 0x00;
 const REQUEST_PACKET: [u8; 4] = [0xAA, 0xAA, 0xAA, 0x55];
 const MAX_STANDARD_PAYLOAD_LEN: usize = 256;
 
+/// PACTOR channel used by ptc-go for the main data/command stream.
+pub const PACTOR_CHANNEL: u8 = 31;
+
+/// Type byte values for JHOST4 CRC hostmode (matches ptc-go).
+///
+/// The type byte sits in the second position of the frame body
+/// (after channel, before length). In the original code this was called
+/// `code` and held arbitrary command letters like `b'G'` or `b'I'`.
+/// The real SCS protocol uses it to distinguish data vs command frames.
+pub const TYPE_DATA: u8 = 0x00;
+pub const TYPE_COMMAND: u8 = 0x01;
+pub const TYPE_DATA_COUNTER: u8 = 0x80;
+pub const TYPE_COMMAND_COUNTER: u8 = 0x81;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostmodeFrame {
     pub channel: u8,
+    /// Type byte: TYPE_DATA (0x00), TYPE_COMMAND (0x01), or counter variants.
     pub code: u8,
     pub payload: Vec<u8>,
 }
 
 impl HostmodeFrame {
+    /// Data frame (type = 0x00).
     pub fn new(channel: u8, payload: impl Into<Vec<u8>>) -> Self {
         Self {
             channel,
-            code: 0,
+            code: TYPE_DATA,
             payload: payload.into(),
         }
     }
 
+    /// Frame with an explicit type byte.
     pub fn with_code(channel: u8, code: u8, payload: impl Into<Vec<u8>>) -> Self {
         Self {
             channel,
             code,
+            payload: payload.into(),
+        }
+    }
+
+    /// Command frame (type = 0x01) with the command string as payload.
+    ///
+    /// In ptc-go hostmode, the command letter (e.g. `I`, `C`, `D`, `G`)
+    /// is part of the payload, not the type byte. So `MYCALL N0CALL` is:
+    /// `HostmodeFrame::command(31, b"I N0CALL")`.
+    pub fn command(channel: u8, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            channel,
+            code: TYPE_COMMAND,
             payload: payload.into(),
         }
     }
@@ -36,6 +66,12 @@ pub enum HostmodePacket {
     RepeatRequest,
 }
 
+/// Encode a hostmode frame using JHOST4 CRC framing (matching ptc-go).
+///
+/// Wire format: `[0xAA, 0xAA] + stuffed(channel + type + len-1 + payload + crc)`
+///
+/// CRC is CRC16-CCITT (init 0x0000, poly 0x1021), then byte-reversed,
+/// then encoded big-endian.
 pub fn encode_frame(frame: &HostmodeFrame) -> Result<Vec<u8>, ScsPactorError> {
     if frame.payload.len() > MAX_STANDARD_PAYLOAD_LEN {
         return Err(ScsPactorError::ExceedsMtu(frame.payload.len()));
@@ -47,8 +83,8 @@ pub fn encode_frame(frame: &HostmodeFrame) -> Result<Vec<u8>, ScsPactorError> {
     body.push(length_minus_one(frame.payload.len())?);
     body.extend_from_slice(&frame.payload);
 
-    let crc = crc16_ccitt_false(&body);
-    body.extend_from_slice(&crc.to_le_bytes());
+    let crc = checksum(&body);
+    body.extend_from_slice(&crc);
 
     let mut encoded = Vec::with_capacity(body.len() + 2);
     encoded.extend_from_slice(&FRAME_SYNC);
@@ -92,8 +128,8 @@ pub fn decode_packet(bytes: &[u8]) -> Result<HostmodePacket, ScsPactorError> {
     }
 
     let crc_offset = body.len() - 2;
-    let expected_crc = u16::from_le_bytes([body[crc_offset], body[crc_offset + 1]]);
-    let actual_crc = crc16_ccitt_false(&body[..crc_offset]);
+    let expected_crc = [body[crc_offset], body[crc_offset + 1]];
+    let actual_crc = checksum(&body[..crc_offset]);
     if actual_crc != expected_crc {
         return Err(ScsPactorError::Protocol(
             "hostmode frame crc mismatch".to_owned(),
@@ -298,8 +334,13 @@ fn destuffed_prefix(raw_body: &[u8], len: usize) -> Result<Option<Vec<u8>>, ScsP
     }
 }
 
-fn crc16_ccitt_false(bytes: &[u8]) -> u16 {
-    let mut crc = 0xFFFFu16;
+/// CRC16-CCITT (init 0x0000, polynomial 0x1021).
+///
+/// This matches Go's `crc16.ChecksumCCITT` from the `sigurn/crc16` package
+/// used by ptc-go. Note: init is 0x0000, NOT 0xFFFF (that would be
+/// CRC16-CCITT-FALSE, a different variant).
+fn crc16_ccitt(bytes: &[u8]) -> u16 {
+    let mut crc = 0x0000u16;
     for byte in bytes {
         crc ^= (*byte as u16) << 8;
         for _ in 0..8 {
@@ -313,13 +354,38 @@ fn crc16_ccitt_false(bytes: &[u8]) -> u16 {
     crc
 }
 
+/// Compute the 2-byte CRC checksum for a hostmode frame body.
+///
+/// Matches ptc-go: CRC16-CCITT, then `bits.ReverseBytes16`, then big-endian.
+fn checksum(body: &[u8]) -> [u8; 2] {
+    let crc = crc16_ccitt(body);
+    let reversed = crc.swap_bytes();
+    reversed.to_be_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn crc_known_vector() {
+        // CRC16-CCITT with init 0x0000 for "123456789" = 0x31C3
+        assert_eq!(crc16_ccitt(b"123456789"), 0x31C3);
+    }
+
+    #[test]
+    fn checksum_applies_reverse_and_big_endian() {
+        let body = [0x1F, 0x01, 0x00, 0x47];
+        let crc = crc16_ccitt(&body);
+        let reversed = crc.swap_bytes();
+        let expected = reversed.to_be_bytes();
+        assert_eq!(checksum(&body), expected);
+    }
+
+    #[test]
     fn hostmode_frame_round_trip() {
-        let frame = HostmodeFrame::with_code(1, b'C', b"DL1ZAM".to_vec());
+        // Command frame: channel 31, type COMMAND, payload "C DL1ZAM"
+        let frame = HostmodeFrame::command(PACTOR_CHANNEL, b"C DL1ZAM".to_vec());
         let encoded = encode_frame(&frame).unwrap();
         assert!(encoded.starts_with(&FRAME_SYNC));
         let decoded = decode_frame(&encoded).unwrap();
@@ -327,8 +393,17 @@ mod tests {
     }
 
     #[test]
+    fn hostmode_data_frame_round_trip() {
+        let frame = HostmodeFrame::new(PACTOR_CHANNEL, b"hello".to_vec());
+        let encoded = encode_frame(&frame).unwrap();
+        let decoded = decode_frame(&encoded).unwrap();
+        assert_eq!(decoded, frame);
+        assert_eq!(decoded.code, TYPE_DATA);
+    }
+
+    #[test]
     fn hostmode_frame_stuffs_0xaa_bytes() {
-        let frame = HostmodeFrame::with_code(2, 0, vec![0x01, 0xAA, 0x02]);
+        let frame = HostmodeFrame::with_code(2, TYPE_DATA, vec![0x01, 0xAA, 0x02]);
         let encoded = encode_frame(&frame).unwrap();
         assert!(encoded.windows(2).any(|window| window == [0xAA, 0x00]));
         let decoded = decode_frame(&encoded).unwrap();
@@ -337,7 +412,7 @@ mod tests {
 
     #[test]
     fn hostmode_frame_rejects_bad_crc() {
-        let frame = HostmodeFrame::with_code(2, 0, b"payload".to_vec());
+        let frame = HostmodeFrame::with_code(2, TYPE_DATA, b"payload".to_vec());
         let mut encoded = encode_frame(&frame).unwrap();
         let last = encoded.len() - 1;
         encoded[last] ^= 0x01;
@@ -347,14 +422,14 @@ mod tests {
 
     #[test]
     fn hostmode_frame_rejects_empty_payload() {
-        let frame = HostmodeFrame::with_code(2, b'D', Vec::new());
+        let frame = HostmodeFrame::command(2, Vec::new());
         let err = encode_frame(&frame).unwrap_err();
         assert!(matches!(err, ScsPactorError::Protocol(_)));
     }
 
     #[test]
     fn decoder_resyncs_after_garbage() {
-        let frame = HostmodeFrame::with_code(7, b'D', b"X".to_vec());
+        let frame = HostmodeFrame::command(7, b"D".to_vec());
         let encoded = encode_frame(&frame).unwrap();
 
         let mut decoder = HostmodeDecoder::new();
@@ -379,7 +454,13 @@ mod tests {
     }
 
     #[test]
-    fn crc_known_vector() {
-        assert_eq!(crc16_ccitt_false(b"123456789"), 0x29B1);
+    fn poll_command_encodes_correctly() {
+        // A poll on channel 31: type=COMMAND, payload="G" (the poll command)
+        let frame = HostmodeFrame::command(PACTOR_CHANNEL, b"G".to_vec());
+        let encoded = encode_frame(&frame).unwrap();
+        let decoded = decode_frame(&encoded).unwrap();
+        assert_eq!(decoded.channel, PACTOR_CHANNEL);
+        assert_eq!(decoded.code, TYPE_COMMAND);
+        assert_eq!(decoded.payload, b"G");
     }
 }
