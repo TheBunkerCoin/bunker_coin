@@ -38,7 +38,7 @@ struct Args {
     call_b: String,
 
     /// Baud rate for serial ports
-    #[arg(long, default_value_t = 115_200)]
+    #[arg(long, default_value_t = 230_400)]
     baud: u32,
 
     /// SCS JHOST mode to enter before speaking hostmode.
@@ -50,60 +50,117 @@ struct Args {
     jhost: u8,
 }
 
-/// Switch an SCS modem from terminal mode into WA8DED hostmode.
-///
-/// Sends ESC to break out of any current state, waits for the modem to
-/// settle, then sends `JHOST{jhost}\r` to enter hostmode. The serial port is
-/// consumed and returned as a `UsbPactorTransport` ready for hostmode
-/// framing.
 /// Drain any pending bytes from the serial port (non-blocking read until empty).
 async fn drain_serial(serial: &mut tokio_serial::SerialStream) {
     let mut buf = [0u8; 1024];
     loop {
-        match tokio::time::timeout(Duration::from_millis(100), serial.read(&mut buf)).await {
+        match tokio::time::timeout(Duration::from_millis(200), serial.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
-                println!("  drained {} bytes: {:?}", n, String::from_utf8_lossy(&buf[..n]));
+                println!("  drained {} bytes hex: {:02x?}", n, &buf[..n]);
+                println!(
+                    "  drained {} bytes utf8: {:?}",
+                    n,
+                    String::from_utf8_lossy(&buf[..n])
+                );
             }
             _ => break,
         }
     }
 }
 
-/// Switch an SCS modem from terminal mode into WA8DED hostmode.
+/// Open a serial port for the modem.
+fn open_serial(port: &str, baud: u32) -> anyhow::Result<tokio_serial::SerialStream> {
+    tokio_serial::new(port, baud)
+        .data_bits(DataBits::Eight)
+        .parity(Parity::None)
+        .stop_bits(StopBits::One)
+        .flow_control(FlowControl::None)
+        .open_native_async()
+        .map_err(|e| anyhow::anyhow!("failed to open {port}: {e}"))
+}
+
+/// Try to verify hostmode is active on an already-wrapped transport.
+async fn verify_hostmode(transport: &UsbPactorTransport) -> bool {
+    match tokio::time::timeout(Duration::from_secs(3), transport.poll_channel(0)).await {
+        Ok(Ok(frame)) => {
+            println!(
+                "  hostmode OK: ch={} code={} payload={:02x?}",
+                frame.channel, frame.code, &frame.payload
+            );
+            true
+        }
+        Ok(Err(e)) => {
+            println!("  hostmode poll error: {e}");
+            false
+        }
+        Err(_) => {
+            println!("  hostmode poll timed out");
+            false
+        }
+    }
+}
+
+/// Switch an SCS modem into WA8DED hostmode.
 ///
-/// The SCS DRAGON boots in terminal/command mode. We must:
-/// 1. Send ESC to abort any in-progress command
-/// 2. Drain stale data
-/// 3. Send `JHOST{jhost}\r` to enter WA8DED hostmode
-/// 4. Drain the hostmode-entry response
-/// 5. Verify hostmode is active via a `G` (poll) transaction
+/// Strategy:
+/// 1. First, try a direct hostmode poll — the modem may already be in
+///    hostmode from a previous session (e.g., `pat` left it there).
+/// 2. If that fails, assume terminal mode: send ESC, drain, then JHOST{n}.
+/// 3. Verify hostmode is active after either path.
 async fn init_hostmode(port: &str, baud: u32, jhost: u8) -> anyhow::Result<UsbPactorTransport> {
     anyhow::ensure!(
         matches!(jhost, 1 | 4 | 5),
         "unsupported JHOST mode {jhost}; expected 1, 4, or 5"
     );
 
-    let mut serial = tokio_serial::new(port, baud)
-        .data_bits(DataBits::Eight)
-        .parity(Parity::None)
-        .stop_bits(StopBits::One)
-        .flow_control(FlowControl::None)
-        .open_native_async()
-        .map_err(|e| anyhow::anyhow!("failed to open {port}: {e}"))?;
+    // === Attempt 1: modem may already be in hostmode ===
+    println!("  trying direct hostmode (modem may already be in hostmode) ...");
+    {
+        let serial = open_serial(port, baud)?;
+        let config = UsbPactorConfig::new(port);
+        let transport = UsbPactorTransport::from_stream(serial, config);
 
-    // ESC to break out of any current state
+        if verify_hostmode(&transport).await {
+            println!("  modem already in hostmode, skipping init");
+            return Ok(transport);
+        }
+        // Drop transport to release the serial port
+        println!("  direct hostmode failed, will try terminal-mode init");
+        drop(transport);
+    }
+
+    // Small delay to let the serial port fully close before re-opening
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // === Attempt 2: init from terminal mode ===
+    let mut serial = open_serial(port, baud)?;
+
+    // Try to exit any existing hostmode first (basic hostmode JHOST0 command).
+    // In basic WA8DED hostmode (JHOST1), channel 0 code 'C' with "JHOST0\r"
+    // would exit. But we don't know what sub-mode we're in, so send a few
+    // different escape sequences.
+    println!("  sending hostmode exit attempts ...");
+
+    // Basic hostmode exit: raw bytes for channel 0, command, JHOST0
+    // This is NOT CRC-framed, just the basic WA8DED format
+    serial.write_all(b"\x00\x01\x07JHOST0\r").await?;
+    serial.flush().await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain_serial(&mut serial).await;
+
+    // ESC to break out of any terminal-mode command
     serial.write_all(b"\x1b").await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     drain_serial(&mut serial).await;
 
-    // Send a bare CR to get a clean prompt
+    // Send a bare CR to get a clean terminal prompt
     serial.write_all(b"\r").await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
     drain_serial(&mut serial).await;
 
-    // Enter WA8DED hostmode.
+    // Enter WA8DED hostmode
     println!("  sending JHOST{jhost} ...");
     serial
         .write_all(format!("JHOST{jhost}\r").as_bytes())
@@ -112,35 +169,18 @@ async fn init_hostmode(port: &str, baud: u32, jhost: u8) -> anyhow::Result<UsbPa
     tokio::time::sleep(Duration::from_millis(1000)).await;
     drain_serial(&mut serial).await;
 
-    // Wrap in hostmode transport
+    // Wrap in hostmode transport and verify
     let config = UsbPactorConfig::new(port);
     let transport = UsbPactorTransport::from_stream(serial, config);
 
-    // Verify hostmode is active by polling the command channel.
-    // In hostmode, a poll on channel 0 should return a valid frame.
-    println!("  verifying hostmode ...");
-    match tokio::time::timeout(Duration::from_secs(3), transport.poll_channel(0)).await {
-        Ok(Ok(frame)) => {
-            println!(
-                "  hostmode OK: ch={} code={} payload={:?}",
-                frame.channel,
-                frame.code,
-                String::from_utf8_lossy(&frame.payload)
-            );
-        }
-        Ok(Err(e)) => {
-            return Err(anyhow::anyhow!(
-                "hostmode verification failed for {port}: {e}"
-            ));
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "hostmode verification timed out for {port} — modem may not be in hostmode"
-            ));
-        }
+    println!("  verifying hostmode after init ...");
+    if verify_hostmode(&transport).await {
+        return Ok(transport);
     }
 
-    Ok(transport)
+    Err(anyhow::anyhow!(
+        "failed to enter hostmode on {port} — check modem power and baud rate"
+    ))
 }
 
 #[tokio::main]
