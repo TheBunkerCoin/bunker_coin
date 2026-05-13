@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use bunker_coin_radio::{Network, NetworkMessage, PactorRadioNode};
 use clap::Parser;
+use scs_pactor::hostmode::{encode_frame, HostmodeFrame, PACTOR_CHANNEL};
 use scs_pactor::{PactorTransport, UsbPactorConfig, UsbPactorTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
@@ -79,7 +80,12 @@ async fn send_ascii(serial: &mut tokio_serial::SerialStream, cmd: &str) -> anyho
 
 /// Try to verify hostmode is active on an already-wrapped transport.
 async fn verify_hostmode(transport: &UsbPactorTransport) -> bool {
-    match tokio::time::timeout(Duration::from_secs(3), transport.poll_channel(31)).await {
+    // ptc-go uses the L command on the PACTOR channel to query channel state.
+    // This works even when the modem has no pending receive data.
+    let status = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
+    match tokio::time::timeout(Duration::from_secs(3), transport.hostmode_transaction(status))
+        .await
+    {
         Ok(Ok(frame)) => {
             println!(
                 "  hostmode OK: ch={} code={} payload={:02x?}",
@@ -96,6 +102,18 @@ async fn verify_hostmode(transport: &UsbPactorTransport) -> bool {
             false
         }
     }
+}
+
+/// Try to leave any existing CRC hostmode session.
+async fn send_hostmode_quit(serial: &mut tokio_serial::SerialStream) -> anyhow::Result<()> {
+    println!("  >> hostmode JHOST0 on channel 0");
+    let frame = HostmodeFrame::command(0, b"JHOST0".to_vec());
+    let encoded = encode_frame(&frame)?;
+    serial.write_all(&encoded).await?;
+    serial.flush().await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain_serial(serial).await;
+    Ok(())
 }
 
 /// Initialize an SCS modem into JHOST4 CRC hostmode.
@@ -130,15 +148,15 @@ async fn init_hostmode(
     // === Attempt 2: full terminal-mode init (matching ptc-go) ===
     let mut serial = open_serial(port, baud)?;
 
-    // Exit any existing hostmode
+    // Exit any existing CRC hostmode first. Plain ASCII JHOST0 is only useful
+    // after we are already back in terminal mode.
     println!("  exiting any existing hostmode ...");
-    // Send ESC to break out of any state
-    serial.write_all(b"\x1b").await?;
-    serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    drain_serial(&mut serial).await;
+    send_hostmode_quit(&mut serial).await?;
 
-    // Try JHOST0 in case we're in hostmode (raw ASCII, modem might parse it)
+    // A blank terminal command gives the modem a chance to print the prompt.
+    send_ascii(&mut serial, "").await?;
+
+    // Try ASCII JHOST0 too, in case the modem is already in terminal mode.
     send_ascii(&mut serial, "JHOST0").await?;
 
     // Quit to main menu
@@ -157,9 +175,22 @@ async fn init_hostmode(
     drain_serial(&mut serial).await;
 
     // Pre-hostmode config commands (matching ptc-go)
-    send_ascii(&mut serial, &format!("MYcall {callsign}")).await?;
-    send_ascii(&mut serial, "PTCH 31").await?;
-    send_ascii(&mut serial, "MAXE 35").await?;
+    let commands = [
+        format!("MYcall {callsign}"),
+        format!("PTCH {PACTOR_CHANNEL}"),
+        "MAXE 35".to_owned(),
+        "REM 0".to_owned(),
+        "CHOB 0".to_owned(),
+        "TONES 4".to_owned(),
+        "MARK 1600".to_owned(),
+        "SPACE 1400".to_owned(),
+        "CWID 0".to_owned(),
+        "CONType 3".to_owned(),
+        "MODE 0".to_owned(),
+    ];
+    for command in commands {
+        send_ascii(&mut serial, &command).await?;
+    }
 
     // Enter JHOST4 CRC hostmode
     println!("  entering JHOST4 ...");
