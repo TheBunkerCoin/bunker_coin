@@ -54,7 +54,6 @@ pub struct UsbPactorTransport {
     event_rx: Mutex<mpsc::Receiver<PactorLinkEvent>>,
     packet_rx: Mutex<mpsc::Receiver<HostmodePacket>>,
     transaction_lock: Mutex<()>,
-    tx_counter: Mutex<bool>,
     read_task: JoinHandle<()>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
@@ -147,7 +146,6 @@ impl UsbPactorTransport {
             event_rx: Mutex::new(event_rx),
             packet_rx: Mutex::new(packet_rx),
             transaction_lock: Mutex::new(()),
-            tx_counter: Mutex::new(false),
             read_task,
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
@@ -162,19 +160,8 @@ impl UsbPactorTransport {
 
     async fn encode_outbound_frame(
         &self,
-        mut frame: HostmodeFrame,
+        frame: HostmodeFrame,
     ) -> Result<Vec<u8>, ScsPactorError> {
-        if frame.code & 0x40 != 0 {
-            return encode_frame(&frame);
-        }
-
-        let mut counter = self.tx_counter.lock().await;
-        if *counter {
-            frame.code |= 0x80;
-        } else {
-            frame.code &= 0x7f;
-        }
-        *counter = !*counter;
         encode_frame(&frame)
     }
 
@@ -853,7 +840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usb_transport_toggles_outbound_packet_counter() {
+    async fn usb_transport_leaves_outbound_packet_counter_clear() {
         let (transport_side, mut modem_side) = duplex(2048);
         let transport = UsbPactorTransport::from_stream(transport_side, test_config());
 
@@ -876,7 +863,7 @@ mod tests {
 
         assert_eq!(first.code, TYPE_COMMAND);
         assert_eq!(first.payload, b"I A");
-        assert_eq!(second.code, TYPE_COMMAND | 0x80);
+        assert_eq!(second.code, TYPE_COMMAND);
         assert_eq!(second.payload, b"I B");
     }
 }
