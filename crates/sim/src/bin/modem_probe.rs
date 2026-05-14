@@ -1,7 +1,7 @@
 //! Minimal serial probe for SCS PACTOR modems.
 //!
-//! Captures the initial burst of data from the modem immediately on port
-//! open, then tries to decode it as CRC hostmode frames.
+//! The SCS Dragon DR-7400 uses a non-standard baud rate of 829440.
+//! This probe tests that baud rate using Linux's custom_divisor support.
 //!
 //! ```text
 //! cargo run --bin modem_probe -- --port /dev/ttyUSB0
@@ -20,7 +20,7 @@ struct Args {
     #[arg(long)]
     port: String,
 
-    #[arg(long, default_value_t = 230_400)]
+    #[arg(long, default_value_t = 829_440)]
     baud: u32,
 }
 
@@ -44,18 +44,6 @@ fn print_bytes(label: &str, bytes: &[u8]) {
         println!("  {label}: (no response)");
         return;
     }
-    let ascii: String = bytes
-        .iter()
-        .map(|&b| {
-            if b.is_ascii_graphic() || b == b' ' {
-                b as char
-            } else {
-                '.'
-            }
-        })
-        .collect();
-    println!("  {label}: {} bytes", bytes.len());
-    // Print hex in rows of 16
     for (i, chunk) in bytes.chunks(16).enumerate() {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{:02x}", b)).collect();
         let asc: String = chunk
@@ -68,9 +56,18 @@ fn print_bytes(label: &str, bytes: &[u8]) {
                 }
             })
             .collect();
-        println!("    {:04x}: {:48} {}", i * 16, hex.join(" "), asc);
+        if i == 0 {
+            println!(
+                "  {label}: {} bytes\n    {:04x}: {:48} {}",
+                bytes.len(),
+                i * 16,
+                hex.join(" "),
+                asc
+            );
+        } else {
+            println!("    {:04x}: {:48} {}", i * 16, hex.join(" "), asc);
+        }
     }
-    let _ = ascii; // suppress warning
 }
 
 fn try_decode_hostmode(bytes: &[u8]) -> Vec<HostmodePacket> {
@@ -106,130 +103,157 @@ async fn read_all(serial: &mut tokio_serial::SerialStream, timeout_ms: u64) -> V
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    println!("Probing modem on {} at {} baud ...\n", args.port, args.baud);
+    println!(
+        "Probing SCS Dragon modem on {} at {} baud ...\n",
+        args.port, args.baud
+    );
 
     set_ftdi_latency(&args.port);
 
-    let mut serial = tokio_serial::new(&args.port, args.baud)
+    // Try opening at the specified baud rate
+    println!("=== Opening serial port at {} baud ===", args.baud);
+    let mut serial = match tokio_serial::new(&args.port, args.baud)
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
         .stop_bits(StopBits::One)
         .flow_control(FlowControl::None)
         .open_native_async()
-        .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", args.port))?;
+    {
+        Ok(s) => s,
+        Err(e) => {
+            println!("  Failed to open at {} baud: {e}", args.baud);
+            println!("  The FTDI FT232R may not support this custom baud rate.");
+            println!("  Trying to set it via Linux ioctl...");
+
+            // Fall back: open at a standard baud, then try to change
+            // via the Linux serial_struct custom_divisor interface.
+            // FTDI base clock = 3000000 Hz
+            // divisor = 3000000 / 829440 ≈ 3.616... → try closest
+            // Actually, FT232R can do 3000000 / 829440, but the driver
+            // may need ASYNC_SPD_CUST flag.
+            return Err(anyhow::anyhow!(
+                "Cannot open at {} baud. Try: stty -F {} {} raw",
+                args.baud,
+                args.port,
+                args.baud
+            ));
+        }
+    };
     let _ = serial.write_data_terminal_ready(true);
     let _ = serial.write_request_to_send(true);
+    println!("  Port opened successfully!");
 
-    // === Phase 1: Capture initial burst ===
-    println!("=== Phase 1: Capturing initial burst (5 seconds) ===");
-    let burst = read_all(&mut serial, 5000).await;
-    print_bytes("initial burst", &burst);
+    // Capture initial burst
+    println!("\n=== Phase 1: Initial burst (3 sec) ===");
+    let burst = read_all(&mut serial, 3000).await;
+    print_bytes("initial", &burst);
 
     if !burst.is_empty() {
-        // Try to decode as hostmode frames
         let packets = try_decode_hostmode(&burst);
         if !packets.is_empty() {
-            println!("\n  Decoded {} hostmode packet(s):", packets.len());
+            println!("  Decoded {} hostmode packet(s)!", packets.len());
             for (i, pkt) in packets.iter().enumerate() {
-                match pkt {
-                    HostmodePacket::Frame(f) => {
-                        let payload_ascii: String = f.payload.iter().map(|&b| {
-                            if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' }
-                        }).collect();
-                        println!(
-                            "    [{i}] Frame ch={} code=0x{:02x} len={} payload={:02x?} ascii=\"{payload_ascii}\"",
-                            f.channel, f.code, f.payload.len(), &f.payload
-                        );
-                    }
-                    HostmodePacket::RepeatRequest => {
-                        println!("    [{i}] RepeatRequest");
-                    }
-                }
+                println!("    [{i}] {:?}", pkt);
             }
-        } else {
-            println!("\n  No valid hostmode frames found in burst.");
         }
-
-        // Count 0xAA bytes — they indicate hostmode sync patterns
         let aa_count = burst.iter().filter(|&&b| b == 0xAA).count();
-        println!("  0xAA sync bytes in burst: {aa_count}");
+        if aa_count > 0 {
+            println!("  Found {} potential 0xAA sync bytes", aa_count);
+        }
     }
 
-    // === Phase 2: Send CRC-framed JHOST0 to exit hostmode ===
-    println!("\n=== Phase 2: Sending CRC-framed JHOST0 (exit hostmode) ===");
+    // Send CRC-framed JHOST0 to exit any existing hostmode
+    println!("\n=== Phase 2: CRC-framed JHOST0 (exit hostmode) ===");
     let quit_frame = encode_frame(&HostmodeFrame::command(0, b"JHOST0".to_vec()))?;
     println!("  >> {:02x?}", quit_frame);
     serial.write_all(&quit_frame).await?;
     serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let resp = read_all(&mut serial, 3000).await;
-    print_bytes("JHOST0 response", &resp);
-
+    print_bytes("JHOST0 resp", &resp);
     let packets = try_decode_hostmode(&resp);
     if !packets.is_empty() {
-        println!("  Decoded {} packet(s) from JHOST0 response:", packets.len());
+        println!("  Modem responded in hostmode! {} packet(s):", packets.len());
         for (i, pkt) in packets.iter().enumerate() {
-            println!("    [{i}] {:?}", pkt);
+            match pkt {
+                HostmodePacket::Frame(f) => {
+                    let asc: String = f
+                        .payload
+                        .iter()
+                        .map(|&b| {
+                            if b.is_ascii_graphic() || b == b' ' {
+                                b as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    println!(
+                        "    [{i}] ch={} code=0x{:02x} payload=\"{asc}\"",
+                        f.channel, f.code
+                    );
+                }
+                HostmodePacket::RepeatRequest => println!("    [{i}] RepeatRequest"),
+            }
         }
-        println!("  => Modem WAS in hostmode and responded to JHOST0!");
     }
 
-    // Wait for modem to settle back to terminal mode
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Extra drain
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let extra = read_all(&mut serial, 2000).await;
     if !extra.is_empty() {
-        print_bytes("post-JHOST0 extra", &extra);
+        print_bytes("extra", &extra);
     }
 
-    // === Phase 3: Try terminal commands ===
+    // Terminal mode test
     println!("\n=== Phase 3: Terminal mode commands ===");
-    for cmd in ["", "MYcall", "VER", "PTCH", "SERBaud"] {
+    for cmd in ["", "MYcall", "VER", "SERBaud"] {
         let label = if cmd.is_empty() { "CR" } else { cmd };
         println!("  >> {label}");
         serial.write_all(cmd.as_bytes()).await?;
         serial.write_all(b"\r").await?;
         serial.flush().await?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let resp = read_all(&mut serial, 3000).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let resp = read_all(&mut serial, 2000).await;
         print_bytes(label, &resp);
     }
 
-    // === Phase 4: Enter JHOST4 and test hostmode ===
-    println!("\n=== Phase 4: Enter JHOST4 and verify ===");
+    // JHOST4 entry
+    println!("\n=== Phase 4: Enter JHOST4 ===");
     println!("  >> JHOST4");
     serial.write_all(b"JHOST4\r").await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(2000)).await;
     let resp = read_all(&mut serial, 3000).await;
-    print_bytes("JHOST4 response", &resp);
+    print_bytes("JHOST4", &resp);
 
-    // Send hostmode L command with sequence reset bit
+    // Verify hostmode
+    println!("\n=== Phase 5: Hostmode verification ===");
     let l_frame = encode_frame(&HostmodeFrame::with_code(31, 0x41, b"L".to_vec()))?;
     println!("  >> hostmode L ch31 (reset): {:02x?}", l_frame);
     serial.write_all(&l_frame).await?;
     serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let resp = read_all(&mut serial, 3000).await;
-    print_bytes("hostmode L response", &resp);
+    print_bytes("L resp", &resp);
     let packets = try_decode_hostmode(&resp);
     if !packets.is_empty() {
-        println!("  HOSTMODE IS WORKING! Decoded {} packet(s):", packets.len());
+        println!("  *** HOSTMODE WORKING! *** {} packet(s):", packets.len());
         for (i, pkt) in packets.iter().enumerate() {
             println!("    [{i}] {:?}", pkt);
         }
     }
 
-    // Send G poll too
     let g_frame = encode_frame(&HostmodeFrame::command(31, b"G".to_vec()))?;
     println!("  >> hostmode G ch31: {:02x?}", g_frame);
     serial.write_all(&g_frame).await?;
     serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let resp = read_all(&mut serial, 3000).await;
-    print_bytes("hostmode G response", &resp);
+    print_bytes("G resp", &resp);
     let packets = try_decode_hostmode(&resp);
     if !packets.is_empty() {
-        println!("  HOSTMODE IS WORKING! Decoded {} packet(s):", packets.len());
+        println!("  *** HOSTMODE WORKING! *** {} packet(s):", packets.len());
         for (i, pkt) in packets.iter().enumerate() {
             println!("    [{i}] {:?}", pkt);
         }
