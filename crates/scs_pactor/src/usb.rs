@@ -494,6 +494,15 @@ impl PactorTransport for UsbPactorTransport {
             }
 
             let state = self.poll_pactor_channel_state().await?;
+            println!(
+                "  connect state: pending_status={} pending_rx={} not_tx={} not_ack={} retries={} link_state={}",
+                state.status_messages_pending,
+                state.frames_received_pending,
+                state.frames_not_transmitted,
+                state.frames_not_acknowledged,
+                state.retries,
+                state.link_state
+            );
             match state.link_state {
                 1 => saw_link_setup = true,
                 2 | 4 | 5 | 6 => return Ok(()),
