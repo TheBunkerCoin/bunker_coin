@@ -164,6 +164,10 @@ impl UsbPactorTransport {
         &self,
         mut frame: HostmodeFrame,
     ) -> Result<Vec<u8>, ScsPactorError> {
+        if frame.code & 0x40 != 0 {
+            return encode_frame(&frame);
+        }
+
         let mut counter = self.tx_counter.lock().await;
         if *counter {
             frame.code |= 0x80;
