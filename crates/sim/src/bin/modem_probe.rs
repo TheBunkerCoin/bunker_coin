@@ -1,7 +1,6 @@
 //! Minimal serial probe for SCS PACTOR modems.
 //!
-//! Tries different framing configurations and sends simple commands to
-//! diagnose communication issues.
+//! Deep probe with FTDI latency tuning and comprehensive baud rate sweep.
 //!
 //! ```text
 //! cargo run --bin modem_probe -- --port /dev/ttyUSB0
@@ -66,35 +65,58 @@ fn print_bytes(label: &str, bytes: &[u8]) {
     );
 }
 
-async fn send_and_read(
-    serial: &mut tokio_serial::SerialStream,
-    cmd: &str,
-    label: &str,
-    wait_ms: u64,
-    read_ms: u64,
-) -> Vec<u8> {
-    let _ = serial.write_all(cmd.as_bytes()).await;
-    let _ = serial.write_all(b"\r").await;
-    let _ = serial.flush().await;
-    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-    let resp = read_all(serial, read_ms).await;
-    print_bytes(label, &resp);
-    resp
+/// Extract the ttyUSB device number from a port path for FTDI sysfs access.
+fn ftdi_device_name(port: &str) -> Option<String> {
+    // Handle both /dev/ttyUSB0 and /dev/serial/by-id/... (resolve symlink)
+    let resolved = std::fs::canonicalize(port).ok()?;
+    let name = resolved.file_name()?.to_str()?;
+    if name.starts_with("ttyUSB") {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Try to set the FTDI latency timer to 1ms (default is 16ms).
+/// This dramatically improves small-packet delivery on FTDI USB serial.
+fn set_ftdi_latency(port: &str) {
+    let Some(dev) = ftdi_device_name(port) else {
+        println!("  (could not resolve device name for FTDI tuning)");
+        return;
+    };
+    let path = format!("/sys/bus/usb-serial/devices/{dev}/latency_timer");
+    println!("  setting FTDI latency timer: {path} = 1");
+    match std::fs::write(&path, "1") {
+        Ok(()) => {
+            let current = std::fs::read_to_string(&path).unwrap_or_default();
+            println!("  latency_timer is now: {}", current.trim());
+        }
+        Err(e) => println!("  failed to set latency timer: {e} (try: sudo chmod 666 {path})"),
+    }
+}
+
+/// Read current FTDI latency timer value.
+fn read_ftdi_latency(port: &str) {
+    let Some(dev) = ftdi_device_name(port) else {
+        return;
+    };
+    let path = format!("/sys/bus/usb-serial/devices/{dev}/latency_timer");
+    match std::fs::read_to_string(&path) {
+        Ok(val) => println!("  current FTDI latency_timer: {}ms", val.trim()),
+        Err(e) => println!("  could not read latency_timer: {e}"),
+    }
 }
 
 async fn deep_probe(
     port: &str,
     baud: u32,
-    data_bits: DataBits,
-    parity: Parity,
-    stop_bits: StopBits,
     label: &str,
 ) {
     println!("\n=== DEEP PROBE: {label} (baud={baud}) ===");
     let Ok(mut serial) = tokio_serial::new(port, baud)
-        .data_bits(data_bits)
-        .parity(parity)
-        .stop_bits(stop_bits)
+        .data_bits(DataBits::Eight)
+        .parity(Parity::None)
+        .stop_bits(StopBits::One)
         .flow_control(FlowControl::None)
         .open_native_async()
     else {
@@ -111,99 +133,91 @@ async fn deep_probe(
     }
 
     // Send ESC to break out of any mode
+    println!("  >> ESC");
     let _ = serial.write_all(b"\x1b").await;
     let _ = serial.flush().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let resp = read_all(&mut serial, 1000).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let resp = read_all(&mut serial, 2000).await;
     print_bytes("ESC", &resp);
 
-    // Send CR to get a prompt
-    send_and_read(&mut serial, "", "CR (empty)", 500, 1500).await;
-
-    // Send CR again
-    send_and_read(&mut serial, "", "CR again", 500, 1500).await;
-
-    // Send Quit to get to main menu
-    send_and_read(&mut serial, "Quit", "Quit", 500, 1500).await;
-
-    // Version query
-    send_and_read(&mut serial, "VER", "VER (version)", 500, 2000).await;
-
-    // MYcall query (no argument = query current)
-    send_and_read(&mut serial, "MYcall", "MYcall (query)", 500, 2000).await;
-
-    // Status query
-    send_and_read(&mut serial, "STATUS", "STATUS", 500, 2000).await;
-
-    // PTCH query
-    send_and_read(&mut serial, "PTCH", "PTCH (query)", 500, 2000).await;
-
-    // JHOST0 to ensure we're in terminal mode
-    send_and_read(&mut serial, "JHOST0", "JHOST0", 500, 2000).await;
-
-    // Try entering JHOST4
-    println!("\n  --- Attempting JHOST4 entry ---");
-    send_and_read(&mut serial, "JHOST4", "JHOST4", 1000, 3000).await;
-
-    // After JHOST4, try sending a CRC hostmode frame and read response
-    // with this same framing config
-    println!("\n  --- Post-JHOST4: trying CRC hostmode frame ---");
-    // L command on channel 31: AA AA 1F 01 00 4C 32 5F
-    let hostmode_frame: &[u8] = &[0xaa, 0xaa, 0x1f, 0x01, 0x00, 0x4c, 0x32, 0x5f];
-    println!("  >> hostmode L ch31: {:02x?}", hostmode_frame);
-    let _ = serial.write_all(hostmode_frame).await;
+    // Send just CR — wait much longer
+    println!("  >> CR");
+    let _ = serial.write_all(b"\r").await;
     let _ = serial.flush().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let resp = read_all(&mut serial, 2000).await;
-    print_bytes("hostmode L response", &resp);
+    let resp = read_all(&mut serial, 3000).await;
+    print_bytes("CR", &resp);
 
-    // Try G command too
-    // G command on channel 31: AA AA 1F 01 00 47 E1 E1
-    let g_frame: &[u8] = &[0xaa, 0xaa, 0x1f, 0x01, 0x00, 0x47, 0xe1, 0xe1];
-    println!("  >> hostmode G ch31: {:02x?}", g_frame);
-    let _ = serial.write_all(g_frame).await;
+    // Send another CR
+    println!("  >> CR");
+    let _ = serial.write_all(b"\r").await;
     let _ = serial.flush().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let resp = read_all(&mut serial, 2000).await;
-    print_bytes("hostmode G response", &resp);
+    let resp = read_all(&mut serial, 3000).await;
+    print_bytes("CR", &resp);
 
-    // Try with sequence reset bit (0x41)
-    // L command ch31 with reset: AA AA 1F 41 00 4C 44 59
-    let reset_frame: &[u8] = &[0xaa, 0xaa, 0x1f, 0x41, 0x00, 0x4c, 0x44, 0x59];
-    println!("  >> hostmode L ch31 (reset): {:02x?}", reset_frame);
-    let _ = serial.write_all(reset_frame).await;
+    // Try MYcall with very long wait
+    println!("  >> MYcall");
+    let _ = serial.write_all(b"MYcall\r").await;
     let _ = serial.flush().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let resp = read_all(&mut serial, 2000).await;
-    print_bytes("hostmode L (reset) response", &resp);
+    let resp = read_all(&mut serial, 3000).await;
+    print_bytes("MYcall", &resp);
+
+    // Try VER
+    println!("  >> VER");
+    let _ = serial.write_all(b"VER\r").await;
+    let _ = serial.flush().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let resp = read_all(&mut serial, 3000).await;
+    print_bytes("VER", &resp);
+
+    // Try sending characters one at a time with delays between
+    // This helps with USB bulk transfer buffering
+    println!("  >> M-Y-c-a-l-l (char by char)");
+    for ch in b"MYcall\r" {
+        let _ = serial.write_all(&[*ch]).await;
+        let _ = serial.flush().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let resp = read_all(&mut serial, 3000).await;
+    print_bytes("MYcall (slow)", &resp);
+
+    // JHOST4 entry attempt
+    println!("  >> JHOST4");
+    let _ = serial.write_all(b"JHOST4\r").await;
+    let _ = serial.flush().await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let resp = read_all(&mut serial, 3000).await;
+    print_bytes("JHOST4", &resp);
+
+    // Post-JHOST4: CRC hostmode L command on ch31
+    println!("  >> hostmode L ch31 [aa aa 1f 01 00 4c 32 5f]");
+    let _ = serial.write_all(&[0xaa, 0xaa, 0x1f, 0x01, 0x00, 0x4c, 0x32, 0x5f]).await;
+    let _ = serial.flush().await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let resp = read_all(&mut serial, 3000).await;
+    print_bytes("hostmode L", &resp);
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    println!("Probing modem on {} ...", args.port);
+    println!("Probing modem on {} ...\n", args.port);
 
-    // Deep probe with 8N1 (the standard config)
-    deep_probe(
-        &args.port,
-        args.baud,
-        DataBits::Eight,
-        Parity::None,
-        StopBits::One,
-        "8N1",
-    )
-    .await;
+    // Show and tune FTDI latency timer
+    read_ftdi_latency(&args.port);
+    set_ftdi_latency(&args.port);
 
-    // Deep probe with 7E1 (showed promising results)
-    deep_probe(
-        &args.port,
-        args.baud,
-        DataBits::Seven,
-        Parity::Even,
-        StopBits::One,
-        "7E1",
-    )
-    .await;
+    // Main probe at specified baud
+    deep_probe(&args.port, args.baud, "8N1").await;
+
+    // Try 115200 (SCS Dragon default)
+    deep_probe(&args.port, 115_200, "8N1 @115200").await;
+
+    // Try 9600 (universal fallback)
+    deep_probe(&args.port, 9600, "8N1 @9600").await;
 
     println!("\nDone.");
     Ok(())
