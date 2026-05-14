@@ -50,6 +50,10 @@ struct Args {
     /// Maximum time to wait for PACTOR link establishment
     #[arg(long, default_value_t = 90)]
     connect_timeout_secs: u64,
+
+    /// Stop after sending C <CALL> and print raw L status polls.
+    #[arg(long)]
+    diagnose_connect: bool,
 }
 
 /// Read all pending bytes from the serial port, printing hex + ASCII.
@@ -202,6 +206,39 @@ async fn verify_hostmode(transport: &UsbPactorTransport) -> bool {
             false
         }
     }
+}
+
+async fn diagnose_connect(
+    modem: &UsbPactorTransport,
+    remote_call: &str,
+    duration: Duration,
+) -> anyhow::Result<()> {
+    println!("Diagnosing connect to {remote_call} ...");
+    modem.send_command(&format!("C {remote_call}")).await?;
+    let deadline = Instant::now() + duration;
+    let mut attempt = 0;
+
+    while Instant::now() < deadline {
+        attempt += 1;
+        let frame = HostmodeFrame::with_code(PACTOR_CHANNEL, TYPE_COMMAND | 0x40, b"L".to_vec());
+        match tokio::time::timeout(Duration::from_secs(3), modem.hostmode_transaction(frame)).await
+        {
+            Ok(Ok(response)) => {
+                println!(
+                    "  L poll {attempt}: ch={} code=0x{:02x} payload_hex={:02x?} payload_ascii={:?}",
+                    response.channel,
+                    response.code,
+                    response.payload,
+                    String::from_utf8_lossy(&response.payload)
+                );
+            }
+            Ok(Err(err)) => println!("  L poll {attempt}: error {err}"),
+            Err(_) => println!("  L poll {attempt}: timed out"),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    Ok(())
 }
 
 /// Try to decode any hostmode frames from raw bytes.
@@ -404,6 +441,16 @@ async fn main() -> anyhow::Result<()> {
     println!("Setting callsigns: A={}, B={}", args.call_a, args.call_b);
     modem_a.set_mycall(&args.call_a).await?;
     modem_b.set_mycall(&args.call_b).await?;
+
+    if args.diagnose_connect {
+        diagnose_connect(
+            &modem_a,
+            &args.call_b,
+            Duration::from_secs(args.connect_timeout_secs),
+        )
+        .await?;
+        return Ok(());
+    }
 
     println!("Modem A connecting to {} ...", args.call_b);
     let link_start = Instant::now();
