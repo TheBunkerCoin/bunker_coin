@@ -54,6 +54,10 @@ struct Args {
     /// Stop after sending C <CALL> and print raw L status polls.
     #[arg(long)]
     diagnose_connect: bool,
+
+    /// In diagnose-connect mode, send C <CALL> with the hostmode reset bit.
+    #[arg(long)]
+    diagnose_connect_reset: bool,
 }
 
 /// Read all pending bytes from the serial port, printing hex + ASCII.
@@ -212,14 +216,26 @@ async fn diagnose_connect(
     modem: &UsbPactorTransport,
     remote_call: &str,
     duration: Duration,
+    reset_connect: bool,
 ) -> anyhow::Result<()> {
     println!("Diagnosing connect to {remote_call} ...");
-    modem
-        .send_hostmode_frame_no_response(HostmodeFrame::command(
+    let connect_frame = if reset_connect {
+        HostmodeFrame::with_code(
             PACTOR_CHANNEL,
+            TYPE_COMMAND | 0x40,
             format!("C {remote_call}").into_bytes(),
-        ))
-        .await?;
+        )
+    } else {
+        HostmodeFrame::command(PACTOR_CHANNEL, format!("C {remote_call}").into_bytes())
+    };
+    let connect_bytes = encode_frame(&connect_frame)?;
+    println!(
+        "  >> hostmode C ch31{}: {:02x?} ({} bytes)",
+        if reset_connect { " (reset)" } else { "" },
+        connect_bytes,
+        connect_bytes.len()
+    );
+    modem.send_hostmode_frame_no_response(connect_frame).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let deadline = Instant::now() + duration;
     let mut attempt = 0;
@@ -454,6 +470,7 @@ async fn main() -> anyhow::Result<()> {
             &modem_a,
             &args.call_b,
             Duration::from_secs(args.connect_timeout_secs),
+            args.diagnose_connect_reset,
         )
         .await?;
         return Ok(());
