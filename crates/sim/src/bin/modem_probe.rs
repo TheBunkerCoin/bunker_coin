@@ -47,22 +47,42 @@ fn print_bytes(label: &str, bytes: &[u8]) {
     }
     let ascii: String = bytes
         .iter()
-        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else if b == b'\r' {
+                '↵'
+            } else if b == b'\n' {
+                '⏎'
+            } else {
+                '.'
+            }
+        })
         .collect();
     println!(
-        "  {label}: {} bytes hex={:02x?} ascii=\"{ascii}\"",
+        "  {label}: {} bytes hex={:02x?}\n         ascii=\"{ascii}\"",
         bytes.len(),
         bytes
     );
-    // Also show as binary for framing analysis
-    if bytes.len() <= 8 {
-        for &b in bytes {
-            println!("    0x{b:02x} = 0b{b:08b}");
-        }
-    }
 }
 
-async fn probe_config(
+async fn send_and_read(
+    serial: &mut tokio_serial::SerialStream,
+    cmd: &str,
+    label: &str,
+    wait_ms: u64,
+    read_ms: u64,
+) -> Vec<u8> {
+    let _ = serial.write_all(cmd.as_bytes()).await;
+    let _ = serial.write_all(b"\r").await;
+    let _ = serial.flush().await;
+    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+    let resp = read_all(serial, read_ms).await;
+    print_bytes(label, &resp);
+    resp
+}
+
+async fn deep_probe(
     port: &str,
     baud: u32,
     data_bits: DataBits,
@@ -70,7 +90,7 @@ async fn probe_config(
     stop_bits: StopBits,
     label: &str,
 ) {
-    println!("\n--- {label} (baud={baud}) ---");
+    println!("\n=== DEEP PROBE: {label} (baud={baud}) ===");
     let Ok(mut serial) = tokio_serial::new(port, baud)
         .data_bits(data_bits)
         .parity(parity)
@@ -85,52 +105,77 @@ async fn probe_config(
     let _ = serial.write_request_to_send(true);
 
     // Drain initial
-    let initial = read_all(&mut serial, 500).await;
+    let initial = read_all(&mut serial, 1000).await;
     if !initial.is_empty() {
         print_bytes("initial drain", &initial);
     }
 
-    // Test 1: Send just CR
-    let _ = serial.write_all(b"\r").await;
-    let _ = serial.flush().await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let resp = read_all(&mut serial, 1000).await;
-    print_bytes("CR only", &resp);
-
-    // Test 2: Send ESC
+    // Send ESC to break out of any mode
     let _ = serial.write_all(b"\x1b").await;
     let _ = serial.flush().await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let resp = read_all(&mut serial, 1000).await;
     print_bytes("ESC", &resp);
 
-    // Test 3: Send "MYcall\r"
-    let _ = serial.write_all(b"MYcall\r").await;
-    let _ = serial.flush().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let resp = read_all(&mut serial, 1000).await;
-    print_bytes("MYcall", &resp);
+    // Send CR to get a prompt
+    send_and_read(&mut serial, "", "CR (empty)", 500, 1500).await;
 
-    // Test 4: Send just "V\r" (version query, short command)
-    let _ = serial.write_all(b"V\r").await;
-    let _ = serial.flush().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let resp = read_all(&mut serial, 1000).await;
-    print_bytes("V (version)", &resp);
+    // Send CR again
+    send_and_read(&mut serial, "", "CR again", 500, 1500).await;
 
-    // Test 5: Send "JHOST0\r"
-    let _ = serial.write_all(b"JHOST0\r").await;
-    let _ = serial.flush().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let resp = read_all(&mut serial, 1000).await;
-    print_bytes("JHOST0", &resp);
+    // Send Quit to get to main menu
+    send_and_read(&mut serial, "Quit", "Quit", 500, 1500).await;
 
-    // Test 6: Send just a single byte 'A' + CR
-    let _ = serial.write_all(b"A\r").await;
+    // Version query
+    send_and_read(&mut serial, "VER", "VER (version)", 500, 2000).await;
+
+    // MYcall query (no argument = query current)
+    send_and_read(&mut serial, "MYcall", "MYcall (query)", 500, 2000).await;
+
+    // Status query
+    send_and_read(&mut serial, "STATUS", "STATUS", 500, 2000).await;
+
+    // PTCH query
+    send_and_read(&mut serial, "PTCH", "PTCH (query)", 500, 2000).await;
+
+    // JHOST0 to ensure we're in terminal mode
+    send_and_read(&mut serial, "JHOST0", "JHOST0", 500, 2000).await;
+
+    // Try entering JHOST4
+    println!("\n  --- Attempting JHOST4 entry ---");
+    send_and_read(&mut serial, "JHOST4", "JHOST4", 1000, 3000).await;
+
+    // After JHOST4, try sending a CRC hostmode frame and read response
+    // with this same framing config
+    println!("\n  --- Post-JHOST4: trying CRC hostmode frame ---");
+    // L command on channel 31: AA AA 1F 01 00 4C 32 5F
+    let hostmode_frame: &[u8] = &[0xaa, 0xaa, 0x1f, 0x01, 0x00, 0x4c, 0x32, 0x5f];
+    println!("  >> hostmode L ch31: {:02x?}", hostmode_frame);
+    let _ = serial.write_all(hostmode_frame).await;
     let _ = serial.flush().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let resp = read_all(&mut serial, 1000).await;
-    print_bytes("A (single char)", &resp);
+    let resp = read_all(&mut serial, 2000).await;
+    print_bytes("hostmode L response", &resp);
+
+    // Try G command too
+    // G command on channel 31: AA AA 1F 01 00 47 E1 E1
+    let g_frame: &[u8] = &[0xaa, 0xaa, 0x1f, 0x01, 0x00, 0x47, 0xe1, 0xe1];
+    println!("  >> hostmode G ch31: {:02x?}", g_frame);
+    let _ = serial.write_all(g_frame).await;
+    let _ = serial.flush().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let resp = read_all(&mut serial, 2000).await;
+    print_bytes("hostmode G response", &resp);
+
+    // Try with sequence reset bit (0x41)
+    // L command ch31 with reset: AA AA 1F 41 00 4C 44 59
+    let reset_frame: &[u8] = &[0xaa, 0xaa, 0x1f, 0x41, 0x00, 0x4c, 0x44, 0x59];
+    println!("  >> hostmode L ch31 (reset): {:02x?}", reset_frame);
+    let _ = serial.write_all(reset_frame).await;
+    let _ = serial.flush().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let resp = read_all(&mut serial, 2000).await;
+    print_bytes("hostmode L (reset) response", &resp);
 }
 
 #[tokio::main]
@@ -138,8 +183,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     println!("Probing modem on {} ...", args.port);
 
-    // Try the standard 8N1 at the specified baud
-    probe_config(
+    // Deep probe with 8N1 (the standard config)
+    deep_probe(
         &args.port,
         args.baud,
         DataBits::Eight,
@@ -149,49 +194,14 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    // Try 8N1 at 115200 (common fallback)
-    if args.baud != 115_200 {
-        probe_config(
-            &args.port,
-            115_200,
-            DataBits::Eight,
-            Parity::None,
-            StopBits::One,
-            "8N1 @115200",
-        )
-        .await;
-    }
-
-    // Try 7E1 (some older modems)
-    probe_config(
+    // Deep probe with 7E1 (showed promising results)
+    deep_probe(
         &args.port,
         args.baud,
         DataBits::Seven,
         Parity::Even,
         StopBits::One,
         "7E1",
-    )
-    .await;
-
-    // Try 8E1
-    probe_config(
-        &args.port,
-        args.baud,
-        DataBits::Eight,
-        Parity::Even,
-        StopBits::One,
-        "8E1",
-    )
-    .await;
-
-    // Try 8N2 (two stop bits)
-    probe_config(
-        &args.port,
-        args.baud,
-        DataBits::Eight,
-        Parity::None,
-        StopBits::Two,
-        "8N2",
     )
     .await;
 
