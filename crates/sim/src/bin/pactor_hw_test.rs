@@ -214,7 +214,13 @@ async fn diagnose_connect(
     duration: Duration,
 ) -> anyhow::Result<()> {
     println!("Diagnosing connect to {remote_call} ...");
-    modem.send_command(&format!("C {remote_call}")).await?;
+    modem
+        .hostmode_transaction(HostmodeFrame::with_code(
+            PACTOR_CHANNEL,
+            TYPE_COMMAND | 0x40,
+            format!("C {remote_call}").into_bytes(),
+        ))
+        .await?;
     let deadline = Instant::now() + duration;
     let mut attempt = 0;
 
@@ -438,9 +444,10 @@ async fn main() -> anyhow::Result<()> {
     println!("Initializing modem B on {} ...", args.port_b);
     let modem_b = init_hostmode(&args.port_b, args.baud, &args.call_b, command_timeout).await?;
 
-    println!("Setting callsigns: A={}, B={}", args.call_a, args.call_b);
-    modem_a.set_mycall(&args.call_a).await?;
-    modem_b.set_mycall(&args.call_b).await?;
+    println!(
+        "Callsigns configured during terminal init: A={}, B={}",
+        args.call_a, args.call_b
+    );
 
     if args.diagnose_connect {
         diagnose_connect(
