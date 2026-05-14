@@ -109,7 +109,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<HostmodePacket, ScsPactorError> {
     if bytes == REQUEST_PACKET {
         return Ok(HostmodePacket::RepeatRequest);
     }
-    if bytes.len() < 7 {
+    if bytes.len() < 6 {
         return Err(ScsPactorError::Protocol(
             "hostmode frame too short".to_owned(),
         ));
@@ -121,7 +121,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<HostmodePacket, ScsPactorError> {
     }
 
     let body = destuff_bytes(&bytes[2..])?;
-    if body.len() < 5 {
+    if body.len() < 4 {
         return Err(ScsPactorError::Protocol(
             "hostmode frame body too short".to_owned(),
         ));
@@ -136,19 +136,34 @@ pub fn decode_packet(bytes: &[u8]) -> Result<HostmodePacket, ScsPactorError> {
         ));
     }
 
-    let payload_len = payload_len_from_minus_one(body[2]);
-    let expected_body_len = 3 + payload_len + 2;
-    if body.len() != expected_body_len {
-        return Err(ScsPactorError::Protocol(format!(
-            "hostmode frame length mismatch: expected body {expected_body_len}, got {}",
-            body.len()
-        )));
+    // The PTC-IIpro sends frames WITHOUT a length byte:
+    //   [channel][type][payload...][CRC]
+    // But ptc-go/Dragon frames include a length-1 byte:
+    //   [channel][type][length-1][payload...][CRC]
+    //
+    // We detect which format by checking if body[2] as length-1 is
+    // consistent with the actual body size. If it matches, we have
+    // the length-byte format; otherwise, we treat the entire body
+    // (minus channel, type, CRC) as payload.
+    let payload_start;
+    if crc_offset >= 3 {
+        let claimed_len = payload_len_from_minus_one(body[2]);
+        let expected_body_len = 3 + claimed_len + 2;
+        if body.len() == expected_body_len {
+            // Length-byte format (ptc-go / Dragon)
+            payload_start = 3;
+        } else {
+            // No length byte (PTC-IIpro)
+            payload_start = 2;
+        }
+    } else {
+        payload_start = 2;
     }
 
     Ok(HostmodePacket::Frame(HostmodeFrame {
         channel: body[0],
         code: body[1],
-        payload: body[3..crc_offset].to_vec(),
+        payload: body[payload_start..crc_offset].to_vec(),
     }))
 }
 
@@ -190,20 +205,46 @@ impl HostmodeDecoder {
             return Ok(Some(HostmodePacket::RepeatRequest));
         }
 
-        if self.buffer.len() < 5 {
-            return Ok(None);
+        // Minimum frame: [AA AA] + channel + type + CRC(2) = 6 raw bytes
+        // (more with byte-stuffing). Try length-byte format first, then
+        // scan for CRC match at each possible boundary.
+
+        // Try length-byte format (ptc-go / Dragon)
+        if self.buffer.len() >= 7 {
+            if let Ok(Some(body_len)) = decoded_body_len(&self.buffer[2..]) {
+                if let Ok(Some(raw_len)) =
+                    raw_len_for_destuffed_body(&self.buffer[2..], body_len)
+                {
+                    let packet_len = 2 + raw_len;
+                    if self.buffer.len() >= packet_len {
+                        let candidate: Vec<u8> =
+                            self.buffer[..packet_len].to_vec();
+                        if decode_packet(&candidate).is_ok() {
+                            self.buffer.drain(..packet_len);
+                            return decode_packet(&candidate).map(Some);
+                        }
+                    }
+                }
+            }
         }
 
-        let Some(body_len) = decoded_body_len(&self.buffer[2..])? else {
-            return Ok(None);
-        };
-        let Some(raw_len) = raw_len_for_destuffed_body(&self.buffer[2..], body_len)? else {
-            return Ok(None);
-        };
+        // Scan for CRC-valid frame without length byte.
+        // Try each possible raw frame length from smallest to largest.
+        // Min destuffed body = 4 (channel + type + 2 CRC bytes).
+        for raw_end in 6..=self.buffer.len() {
+            let candidate = &self.buffer[..raw_end];
+            if let Ok(pkt) = decode_packet(candidate) {
+                self.buffer.drain(..raw_end);
+                return Ok(Some(pkt));
+            }
+        }
 
-        let packet_len = 2 + raw_len;
-        let packet: Vec<u8> = self.buffer.drain(..packet_len).collect();
-        decode_packet(&packet).map(Some)
+        // Not enough data yet, or no valid frame found in buffer.
+        // Keep at most 512 bytes to prevent unbounded growth.
+        if self.buffer.len() > 512 {
+            self.buffer.drain(..self.buffer.len() - 512);
+        }
+        Ok(None)
     }
 }
 
