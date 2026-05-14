@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
 
 use crate::hostmode::{
@@ -15,6 +15,16 @@ use crate::{PactorLinkEvent, PactorLinkStatus, PactorTransport, ScsPactorError};
 const STATUS_CHANNEL: u8 = 254;
 const EXTENDED_POLL_CHANNEL: u8 = 255;
 const MAX_HOSTMODE_RETRIES: u8 = 3;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PactorChannelState {
+    status_messages_pending: u32,
+    frames_received_pending: u32,
+    frames_not_transmitted: u32,
+    frames_not_acknowledged: u32,
+    retries: u32,
+    link_state: u32,
+}
 
 #[derive(Clone, Debug)]
 pub struct UsbPactorConfig {
@@ -248,6 +258,19 @@ impl UsbPactorTransport {
         Ok(response.payload)
     }
 
+    async fn poll_pactor_channel_state(&self) -> Result<PactorChannelState, ScsPactorError> {
+        let response = self
+            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec()))
+            .await?;
+        if response.channel != PACTOR_CHANNEL {
+            return Err(ScsPactorError::Protocol(format!(
+                "expected channel {PACTOR_CHANNEL} L response, got {}",
+                response.channel
+            )));
+        }
+        parse_pactor_channel_state(&response.payload)
+    }
+
     /// Send a data frame on the given channel.
     async fn send_data_frame(&self, channel: u8, payload: &[u8]) -> Result<(), ScsPactorError> {
         self.send_hostmode_frame(HostmodeFrame::new(channel, payload.to_vec()))
@@ -343,6 +366,31 @@ impl UsbPactorTransport {
     }
 }
 
+fn parse_pactor_channel_state(payload: &[u8]) -> Result<PactorChannelState, ScsPactorError> {
+    let line = String::from_utf8_lossy(payload);
+    let fields = line
+        .trim_matches(char::from(0))
+        .split_whitespace()
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ScsPactorError::Protocol(format!("invalid L response {line:?}: {e}")))?;
+
+    if fields.len() < 6 {
+        return Err(ScsPactorError::Protocol(format!(
+            "short L response {line:?}"
+        )));
+    }
+
+    Ok(PactorChannelState {
+        status_messages_pending: fields[0],
+        frames_received_pending: fields[1],
+        frames_not_transmitted: fields[2],
+        frames_not_acknowledged: fields[3],
+        retries: fields[4],
+        link_state: fields[5],
+    })
+}
+
 impl Drop for UsbPactorTransport {
     fn drop(&mut self) {
         self.read_task.abort();
@@ -414,19 +462,46 @@ impl PactorTransport for UsbPactorTransport {
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
         self.send_host_command(b'C', remote_call.as_bytes()).await?;
+        let deadline = Instant::now() + self.command_timeout;
+        let mut saw_link_setup = false;
+
         loop {
-            let line = timeout(self.command_timeout, self.read_status_line())
-                .await
-                .map_err(|_| ScsPactorError::Timeout)??;
-            match Self::parse_status_line(&line)? {
-                PactorLinkEvent::Status(PactorLinkStatus::Connected { .. }) => return Ok(()),
-                PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
-                    return Err(ScsPactorError::Busy)
+            if Instant::now() >= deadline {
+                return Err(ScsPactorError::Timeout);
+            }
+
+            if let Ok(Ok(line)) =
+                timeout(Duration::from_millis(200), self.read_status_line()).await
+            {
+                match Self::parse_status_line(&line) {
+                    Ok(PactorLinkEvent::Status(PactorLinkStatus::Connected { .. })) => {
+                        return Ok(())
+                    }
+                    Ok(PactorLinkEvent::Status(PactorLinkStatus::Connecting { .. })) => {
+                        saw_link_setup = true;
+                    }
+                    Ok(PactorLinkEvent::Status(PactorLinkStatus::Busy)) => {
+                        return Err(ScsPactorError::Busy)
+                    }
+                    Ok(PactorLinkEvent::Status(PactorLinkStatus::Queued)) => {}
+                    Ok(PactorLinkEvent::Status(
+                        PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
+                    )) => return Err(ScsPactorError::Io(std::io::Error::other(line))),
+                    Ok(_) => {}
+                    Err(_) => {}
                 }
-                PactorLinkEvent::Status(PactorLinkStatus::Queued) => {}
-                PactorLinkEvent::Status(
-                    PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
-                ) => return Err(ScsPactorError::Io(std::io::Error::other(line))),
+                continue;
+            }
+
+            let state = self.poll_pactor_channel_state().await?;
+            match state.link_state {
+                1 => saw_link_setup = true,
+                2 | 4 | 5 | 6 => return Ok(()),
+                0 if saw_link_setup => {
+                    return Err(ScsPactorError::Io(std::io::Error::other(
+                        "PACTOR link setup failed",
+                    )))
+                }
                 _ => {}
             }
         }
