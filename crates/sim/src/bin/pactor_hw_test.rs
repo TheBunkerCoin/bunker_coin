@@ -215,7 +215,7 @@ async fn diagnose_connect(
 ) -> anyhow::Result<()> {
     println!("Diagnosing connect to {remote_call} ...");
     modem
-        .hostmode_transaction(HostmodeFrame::with_code(
+        .send_hostmode_frame_no_response(HostmodeFrame::with_code(
             PACTOR_CHANNEL,
             TYPE_COMMAND | 0x40,
             format!("C {remote_call}").into_bytes(),

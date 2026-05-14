@@ -158,6 +158,13 @@ impl UsbPactorTransport {
         self.write_encoded_frame(&encoded).await
     }
 
+    pub async fn send_hostmode_frame_no_response(
+        &self,
+        frame: HostmodeFrame,
+    ) -> Result<(), ScsPactorError> {
+        self.send_hostmode_frame(frame).await
+    }
+
     async fn encode_outbound_frame(
         &self,
         frame: HostmodeFrame,
@@ -459,7 +466,10 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
-        self.send_host_command(b'C', remote_call.as_bytes()).await?;
+        let mut payload = b"C ".to_vec();
+        payload.extend_from_slice(remote_call.as_bytes());
+        self.send_hostmode_frame(HostmodeFrame::command(PACTOR_CHANNEL, payload))
+            .await?;
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
 
