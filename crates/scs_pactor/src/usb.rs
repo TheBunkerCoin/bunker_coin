@@ -8,7 +8,7 @@ use tokio::time::{timeout, Instant};
 use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
 
 use crate::hostmode::{
-    encode_frame, HostmodeDecoder, HostmodeFrame, HostmodePacket, PACTOR_CHANNEL,
+    encode_frame, HostmodeDecoder, HostmodeFrame, HostmodePacket, PACTOR_CHANNEL, TYPE_COMMAND,
 };
 use crate::{PactorLinkEvent, PactorLinkStatus, PactorTransport, ScsPactorError};
 
@@ -259,8 +259,15 @@ impl UsbPactorTransport {
     }
 
     async fn poll_pactor_channel_state(&self) -> Result<PactorChannelState, ScsPactorError> {
+        // The DRAGON reliably answers L status polls with the hostmode reset
+        // bit set (0x40). This also resynchronizes after terminal/hostmode
+        // transitions and mirrors the hardware-test verifier.
         let response = self
-            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec()))
+            .hostmode_transaction(HostmodeFrame::with_code(
+                PACTOR_CHANNEL,
+                TYPE_COMMAND | 0x40,
+                b"L".to_vec(),
+            ))
             .await?;
         if response.channel != PACTOR_CHANNEL {
             return Err(ScsPactorError::Protocol(format!(
