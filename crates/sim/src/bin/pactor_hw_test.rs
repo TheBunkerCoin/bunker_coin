@@ -5,8 +5,11 @@
 //!
 //! ```text
 //! cargo run --bin pactor_hw_test -- \
-//!   --port-a /dev/ttyUSB0 --port-b /dev/ttyUSB1
+//!   --port-a /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR83NDYP-if00-port0 \
+//!   --port-b /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR752ZE5-if00-port0
 //! ```
+//!
+//! SCS DRAGON 7400/P4dragon USB serial uses 829440 baud by default.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
