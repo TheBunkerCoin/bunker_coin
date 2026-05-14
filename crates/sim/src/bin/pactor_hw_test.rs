@@ -40,8 +40,8 @@ struct Args {
     #[arg(long, default_value = "NODE")]
     call_b: String,
 
-    /// Baud rate for serial ports
-    #[arg(long, default_value_t = 230_400)]
+    /// Baud rate for serial ports (SCS Dragon DR-7400 uses 829440)
+    #[arg(long, default_value_t = 829_440)]
     baud: u32,
 }
 

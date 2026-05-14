@@ -29,7 +29,7 @@ impl UsbPactorConfig {
     pub fn new(port: impl Into<String>) -> Self {
         Self {
             port: port.into(),
-            baud_rate: 115_200,
+            baud_rate: 829_440,
             read_timeout: Some(Duration::from_secs(10)),
             write_timeout: Some(Duration::from_secs(10)),
             command_timeout: Duration::from_secs(10),
