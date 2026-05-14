@@ -42,7 +42,7 @@ impl UsbPactorConfig {
             baud_rate: 829_440,
             read_timeout: Some(Duration::from_secs(10)),
             write_timeout: Some(Duration::from_secs(10)),
-            command_timeout: Duration::from_secs(10),
+            command_timeout: Duration::from_secs(90),
         }
     }
 }

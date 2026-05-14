@@ -46,6 +46,10 @@ struct Args {
     /// Baud rate for serial ports (SCS Dragon DR-7400 uses 829440)
     #[arg(long, default_value_t = 829_440)]
     baud: u32,
+
+    /// Maximum time to wait for PACTOR link establishment
+    #[arg(long, default_value_t = 90)]
+    connect_timeout_secs: u64,
 }
 
 /// Read all pending bytes from the serial port, printing hex + ASCII.
@@ -225,6 +229,7 @@ async fn init_hostmode(
     port: &str,
     baud: u32,
     callsign: &str,
+    command_timeout: Duration,
 ) -> anyhow::Result<UsbPactorTransport> {
     let mut serial = open_serial(port, baud)?;
 
@@ -336,7 +341,8 @@ async fn init_hostmode(
             }
 
             // Success — wrap in transport
-            let config = UsbPactorConfig::new(port);
+            let mut config = UsbPactorConfig::new(port);
+            config.command_timeout = command_timeout;
             let transport = UsbPactorTransport::from_stream(serial, config);
             return Ok(transport);
         }
@@ -352,7 +358,8 @@ async fn init_hostmode(
             let packets2 = try_decode_hostmode(&resp2);
             if !packets2.is_empty() {
                 println!("  hostmode verified via G poll!");
-                let config = UsbPactorConfig::new(port);
+                let mut config = UsbPactorConfig::new(port);
+                config.command_timeout = command_timeout;
                 let transport = UsbPactorTransport::from_stream(serial, config);
                 return Ok(transport);
             }
@@ -365,7 +372,8 @@ async fn init_hostmode(
     // The transport's reader task may be able to sync even if our manual
     // decode couldn't.
     println!("  fallback: trying UsbPactorTransport wrapper ...");
-    let config = UsbPactorConfig::new(port);
+    let mut config = UsbPactorConfig::new(port);
+    config.command_timeout = command_timeout;
     let transport = UsbPactorTransport::from_stream(serial, config);
 
     for attempt in 1..=3 {
@@ -387,10 +395,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     println!("Initializing modem A on {} ...", args.port_a);
-    let modem_a = init_hostmode(&args.port_a, args.baud, &args.call_a).await?;
+    let command_timeout = Duration::from_secs(args.connect_timeout_secs);
+    let modem_a = init_hostmode(&args.port_a, args.baud, &args.call_a, command_timeout).await?;
 
     println!("Initializing modem B on {} ...", args.port_b);
-    let modem_b = init_hostmode(&args.port_b, args.baud, &args.call_b).await?;
+    let modem_b = init_hostmode(&args.port_b, args.baud, &args.call_b, command_timeout).await?;
 
     println!("Setting callsigns: A={}, B={}", args.call_a, args.call_b);
     modem_a.set_mycall(&args.call_a).await?;
