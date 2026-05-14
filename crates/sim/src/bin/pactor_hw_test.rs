@@ -43,17 +43,26 @@ struct Args {
     baud: u32,
 }
 
-/// Drain any pending bytes from the serial port (non-blocking read until empty).
-async fn drain_serial(serial: &mut tokio_serial::SerialStream) {
+/// Read all pending bytes from the serial port, printing hex + ASCII.
+/// Returns all bytes collected.
+async fn drain_serial(serial: &mut tokio_serial::SerialStream) -> Vec<u8> {
+    let mut all = Vec::new();
     let mut buf = [0u8; 1024];
     loop {
-        match tokio::time::timeout(Duration::from_millis(200), serial.read(&mut buf)).await {
+        match tokio::time::timeout(Duration::from_millis(500), serial.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
-                println!("  drained {} bytes hex: {:02x?}", n, &buf[..n]);
+                let chunk = &buf[..n];
+                let ascii: String = chunk
+                    .iter()
+                    .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                    .collect();
+                println!("  rx {} bytes hex={:02x?} ascii=\"{}\"", n, chunk, ascii);
+                all.extend_from_slice(chunk);
             }
             _ => break,
         }
     }
+    all
 }
 
 /// Open a serial port.
@@ -74,15 +83,15 @@ fn open_serial(port: &str, baud: u32) -> anyhow::Result<tokio_serial::SerialStre
     Ok(serial)
 }
 
-/// Send an ASCII command and wait for the modem to process it.
-async fn send_ascii(serial: &mut tokio_serial::SerialStream, cmd: &str) -> anyhow::Result<()> {
+/// Send an ASCII command and read the modem's full response.
+async fn send_ascii(serial: &mut tokio_serial::SerialStream, cmd: &str) -> anyhow::Result<Vec<u8>> {
     println!("  >> {cmd}");
     serial.write_all(cmd.as_bytes()).await?;
     serial.write_all(b"\r").await?;
     serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    drain_serial(serial).await;
-    Ok(())
+    // Give the modem time to process and respond
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    Ok(drain_serial(serial).await)
 }
 
 /// Try to verify hostmode is active on an already-wrapped transport.
@@ -119,9 +128,23 @@ async fn send_hostmode_quit(serial: &mut tokio_serial::SerialStream) -> anyhow::
     println!("  hostmode quit bytes: {:02x?}", encoded);
     serial.write_all(&encoded).await?;
     serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     drain_serial(serial).await;
     Ok(())
+}
+
+/// Send a raw byte sequence and drain the response.
+async fn send_raw(
+    serial: &mut tokio_serial::SerialStream,
+    label: &str,
+    bytes: &[u8],
+    wait_ms: u64,
+) -> anyhow::Result<Vec<u8>> {
+    println!("  >> {label} ({} bytes: {:02x?})", bytes.len(), bytes);
+    serial.write_all(bytes).await?;
+    serial.flush().await?;
+    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+    Ok(drain_serial(serial).await)
 }
 
 /// Initialize an SCS modem into JHOST4 CRC hostmode.
@@ -138,7 +161,7 @@ async fn init_hostmode(
     callsign: &str,
 ) -> anyhow::Result<UsbPactorTransport> {
     // === Attempt 1: modem may already be in hostmode ===
-    println!("  trying direct hostmode poll ...");
+    println!("  [1/3] trying direct hostmode poll ...");
     {
         let serial = open_serial(port, baud)?;
         let config = UsbPactorConfig::new(port);
@@ -154,33 +177,32 @@ async fn init_hostmode(
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // === Attempt 2: full terminal-mode init (matching ptc-go) ===
+    println!("  [2/3] full terminal-mode init ...");
     let mut serial = open_serial(port, baud)?;
 
-    // Exit any existing CRC hostmode first. Plain ASCII JHOST0 is only useful
-    // after we are already back in terminal mode.
+    // First, drain anything pending from the modem
+    println!("  draining initial buffer ...");
+    drain_serial(&mut serial).await;
+
+    // Send ESC to break out of any mode the modem might be in
+    send_raw(&mut serial, "ESC", b"\x1b", 500).await?;
+
+    // Exit any existing CRC hostmode by sending the binary-framed JHOST0
     println!("  exiting any existing hostmode ...");
     send_hostmode_quit(&mut serial).await?;
 
-    // A blank terminal command gives the modem a chance to print the prompt.
-    send_ascii(&mut serial, "").await?;
-
-    // Try ASCII JHOST0 too, in case the modem is already in terminal mode.
+    // Also try ASCII JHOST0 in case the modem is in terminal mode
     send_ascii(&mut serial, "JHOST0").await?;
+
+    // Send ESC + CR to get to clean command prompt
+    send_raw(&mut serial, "ESC", b"\x1b", 300).await?;
+    send_raw(&mut serial, "CR", b"\r", 500).await?;
 
     // Quit to main menu
     send_ascii(&mut serial, "Quit").await?;
 
-    // ESC again to be sure we're at the command prompt
-    serial.write_all(b"\x1b").await?;
-    serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    drain_serial(&mut serial).await;
-
-    // Send CR to get a clean prompt
-    serial.write_all(b"\r").await?;
-    serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    drain_serial(&mut serial).await;
+    // ESC + CR again to be sure we're at the command prompt
+    send_raw(&mut serial, "ESC+CR", b"\x1b\r", 500).await?;
 
     // Pre-hostmode config commands (matching ptc-go)
     let commands = [
@@ -196,24 +218,55 @@ async fn init_hostmode(
         "CONType 3".to_owned(),
         "MODE 0".to_owned(),
     ];
-    for command in commands {
-        send_ascii(&mut serial, &command).await?;
+    for command in &commands {
+        send_ascii(&mut serial, command).await?;
     }
 
     // Enter JHOST4 CRC hostmode
     println!("  entering JHOST4 ...");
-    serial.write_all(b"JHOST4\r").await?;
-    serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    drain_serial(&mut serial).await;
+    let jhost_resp = send_ascii(&mut serial, "JHOST4").await?;
+    // Give extra time for mode switch
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let extra = drain_serial(&mut serial).await;
+    println!(
+        "  JHOST4 response: {} + {} bytes",
+        jhost_resp.len(),
+        extra.len()
+    );
 
-    // Wrap in hostmode transport and verify
+    // Wrap in hostmode transport and verify with retries
     let config = UsbPactorConfig::new(port);
     let transport = UsbPactorTransport::from_stream(serial, config);
 
-    println!("  verifying hostmode after JHOST4 ...");
-    if verify_hostmode(&transport).await {
-        return Ok(transport);
+    for attempt in 1..=3 {
+        println!("  verifying hostmode (attempt {attempt}/3) ...");
+        if verify_hostmode(&transport).await {
+            return Ok(transport);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // === Attempt 3: try different baud rates ===
+    drop(transport);
+    println!("  [3/3] hostmode failed, trying raw CRC frame at different baud rates ...");
+
+    for test_baud in [230_400u32, 115_200, 57_600, 38_400, 19_200, 9600] {
+        if test_baud == baud {
+            continue; // already tried this one
+        }
+        println!("  trying baud {test_baud} ...");
+        let Ok(mut test_serial) = open_serial(port, test_baud) else {
+            continue;
+        };
+        // Send ESC + CR
+        let _ = send_raw(&mut test_serial, "ESC+CR", b"\x1b\r", 500).await;
+        let resp = send_ascii(&mut test_serial, "").await?;
+        if !resp.is_empty() {
+            println!("  got response at baud {test_baud}! Retrying init at this baud.");
+            drop(test_serial);
+            // Recurse with the working baud rate
+            return Box::pin(init_hostmode(port, test_baud, callsign)).await;
+        }
     }
 
     Err(anyhow::anyhow!(
