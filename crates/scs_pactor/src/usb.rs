@@ -583,6 +583,11 @@ impl PactorTransport for UsbPactorTransport {
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
         let mut poll_count = 0u32;
+        // The modem may not respond to polls while it is busy with an RF
+        // connect attempt. Use a short per-poll timeout and keep retrying
+        // until the overall deadline. The modem will resume responding
+        // once its internal connect attempt completes or times out.
+        let poll_timeout = Duration::from_secs(5);
 
         loop {
             if Instant::now() >= deadline {
@@ -590,7 +595,34 @@ impl PactorTransport for UsbPactorTransport {
             }
 
             poll_count += 1;
-            let state = self.poll_pactor_channel_state().await?;
+            let l_frame = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
+            let l_resp = self
+                .send_command_best_effort_ack(l_frame, poll_timeout)
+                .await?;
+            let state = match l_resp {
+                Some(resp) => {
+                    eprintln!(
+                        "[connect] poll {poll_count}: raw={:?}",
+                        String::from_utf8_lossy(&resp.payload)
+                    );
+                    match parse_pactor_channel_state(&resp.payload) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[connect] poll {poll_count}: parse error: {e}");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "[connect] poll {poll_count}: no response (modem busy with RF)"
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
             eprintln!(
                 "[connect] poll {poll_count}: link_state={} status_pending={} rx_pending={} retries={}",
                 state.link_state,
@@ -615,30 +647,36 @@ impl PactorTransport for UsbPactorTransport {
 
             // Also check if there are status messages we should read
             if state.status_messages_pending > 0 {
-                let g_resp = self
-                    .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, b"G".to_vec()))
-                    .await?;
-                let g_text = String::from_utf8_lossy(&g_resp.payload);
-                eprintln!("[connect] G poll: {:?}", g_text);
-                if let Ok(event) = Self::parse_status_line(&g_text) {
-                    match event {
-                        PactorLinkEvent::Status(PactorLinkStatus::Connected { .. }) => {
-                            return Ok(())
+                let g_frame = HostmodeFrame::command(PACTOR_CHANNEL, b"G".to_vec());
+                if let Some(g_resp) = self
+                    .send_command_best_effort_ack(g_frame, poll_timeout)
+                    .await?
+                {
+                    let g_text = String::from_utf8_lossy(&g_resp.payload);
+                    eprintln!("[connect] G poll: {:?}", g_text);
+                    if let Ok(event) = Self::parse_status_line(&g_text) {
+                        match event {
+                            PactorLinkEvent::Status(PactorLinkStatus::Connected { .. }) => {
+                                return Ok(())
+                            }
+                            PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
+                                return Err(ScsPactorError::Busy)
+                            }
+                            PactorLinkEvent::Status(
+                                PactorLinkStatus::Disconnected
+                                | PactorLinkStatus::LinkFailure,
+                            ) => {
+                                return Err(ScsPactorError::Io(std::io::Error::other(
+                                    g_text.into_owned(),
+                                )))
+                            }
+                            PactorLinkEvent::Status(PactorLinkStatus::Connecting {
+                                ..
+                            }) => {
+                                saw_link_setup = true;
+                            }
+                            _ => {}
                         }
-                        PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
-                            return Err(ScsPactorError::Busy)
-                        }
-                        PactorLinkEvent::Status(
-                            PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
-                        ) => {
-                            return Err(ScsPactorError::Io(std::io::Error::other(
-                                g_text.into_owned(),
-                            )))
-                        }
-                        PactorLinkEvent::Status(PactorLinkStatus::Connecting { .. }) => {
-                            saw_link_setup = true;
-                        }
-                        _ => {}
                     }
                 }
             }
