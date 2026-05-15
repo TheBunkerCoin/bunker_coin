@@ -245,7 +245,7 @@ async fn diagnose_connect(
         String::from_utf8_lossy(&connect_frame.payload)
     );
     modem
-        .send_hostmode_frame_no_response(connect_frame)
+        .send_hostmode_frame_and_advance(connect_frame)
         .await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let deadline = Instant::now() + duration;
