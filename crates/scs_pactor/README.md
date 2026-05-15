@@ -19,8 +19,9 @@ Example device paths:
 Before running against hardware:
 
 1. Connect the modem over USB and confirm the serial port path.
-2. Put the HF rig on the intended frequency; this crate does not control CAT,
-   tuning, or the auto-tuner.
+2. The hardware test's `--frequency` flag tunes the radio via the modem's
+   built-in TRX CI-V interface (see `--trx-baud` and `--trx-addr` for
+   non-default CI-V settings).
 3. Choose your station callsign for `MYCALL`.
 4. Choose a known reachable PACTOR node callsign for `connect_peer`.
 
@@ -30,7 +31,8 @@ For repeatable Linux hardware tests, prefer the stable by-id paths because
 ```text
 cargo run -p bunker_coin_sim --bin pactor_hw_test -- \
   --port-a /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR83NDYP-if00-port0 \
-  --port-b /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR752ZE5-if00-port0
+  --port-b /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR752ZE5-if00-port0 \
+  --frequency 14079.0
 ```
 
 The hardware test defaults to `--baud 829440`. If a modem has been configured

@@ -6,7 +6,8 @@
 //! ```text
 //! cargo run --bin pactor_hw_test -- \
 //!   --port-a /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR83NDYP-if00-port0 \
-//!   --port-b /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR752ZE5-if00-port0
+//!   --port-b /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR752ZE5-if00-port0 \
+//!   --frequency 14079.0
 //! ```
 //!
 //! For debug logging of hostmode frames:
@@ -21,9 +22,10 @@
 //!
 //! SCS DRAGON 7400/P4dragon USB serial uses 829440 baud by default.
 //!
-//! **Note:** PACTOR requires an RF link between the two modems (either via
-//! radios on the same frequency or audio loopback cables). Without a
-//! physical connection, `connect_peer` will time out.
+//! **Note:** The `--frequency` flag tunes both radios via the modem's TRX
+//! CI-V interface. PACTOR still requires an RF path between the modems
+//! (antennas, band conditions). Without a physical connection,
+//! `connect_peer` will time out.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -72,6 +74,18 @@ struct Args {
     /// In diagnose-connect mode, send C <CALL> with the hostmode reset bit.
     #[arg(long)]
     diagnose_connect_reset: bool,
+
+    /// Radio frequency in kHz (e.g. 14079.0). Sent to both modems via TRX CI-V control.
+    #[arg(long)]
+    frequency: f64,
+
+    /// Baud rate for TRX CI-V serial port (IC-7300 default: 19200)
+    #[arg(long, default_value_t = 19200)]
+    trx_baud: u32,
+
+    /// CI-V address of the radio in hex (IC-7300 default: A2)
+    #[arg(long, default_value = "A2")]
+    trx_addr: String,
 }
 
 /// Read all pending bytes from the serial port, printing hex + ASCII.
@@ -306,6 +320,9 @@ async fn init_hostmode(
     baud: u32,
     callsign: &str,
     command_timeout: Duration,
+    frequency: f64,
+    trx_baud: u32,
+    trx_addr: &str,
 ) -> anyhow::Result<UsbPactorTransport> {
     let mut serial = open_serial(port, baud)?;
 
@@ -354,6 +371,15 @@ async fn init_hostmode(
         send_ascii(&mut serial, command).await?;
     }
 
+    // === Step 2b: Configure TRX CI-V and tune radio ===
+    println!("  step 2b: TRX frequency control ...");
+    send_ascii(
+        &mut serial,
+        &format!("TRX TYpe I {trx_baud} ${trx_addr}"),
+    )
+    .await?;
+    send_ascii(&mut serial, &format!("TRX Frequency {frequency}")).await?;
+
     // === Step 3: Enter JHOST4 CRC hostmode ===
     // ptc-go sends this as a terminal-mode ASCII command
     println!("  step 3: entering JHOST4 ...");
@@ -401,10 +427,28 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Initializing modem A on {} ...", args.port_a);
     let command_timeout = Duration::from_secs(args.connect_timeout_secs);
-    let modem_a = init_hostmode(&args.port_a, args.baud, &args.call_a, command_timeout).await?;
+    let modem_a = init_hostmode(
+        &args.port_a,
+        args.baud,
+        &args.call_a,
+        command_timeout,
+        args.frequency,
+        args.trx_baud,
+        &args.trx_addr,
+    )
+    .await?;
 
     println!("Initializing modem B on {} ...", args.port_b);
-    let modem_b = init_hostmode(&args.port_b, args.baud, &args.call_b, command_timeout).await?;
+    let modem_b = init_hostmode(
+        &args.port_b,
+        args.baud,
+        &args.call_b,
+        command_timeout,
+        args.frequency,
+        args.trx_baud,
+        &args.trx_addr,
+    )
+    .await?;
 
     println!(
         "Callsigns configured during terminal init: A={}, B={}",
@@ -423,7 +467,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Modem A connecting to {} ...", args.call_b);
-    println!("  (PACTOR requires RF link between modems — timeout={}s)", args.connect_timeout_secs);
+    println!(
+        "  (radios tuned to {} kHz via TRX — timeout={}s)",
+        args.frequency, args.connect_timeout_secs
+    );
     println!("  Tip: use --diagnose-connect to watch L poll status during connect");
     let link_start = Instant::now();
     match modem_a.connect_peer(&args.call_b).await {
@@ -433,9 +480,9 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("connect_peer failed after {elapsed:.1?}: {e}");
             eprintln!();
             eprintln!("This usually means the two modems cannot hear each other.");
-            eprintln!("PACTOR requires a physical RF path between the modems:");
-            eprintln!("  - Two HF radios on the same frequency, or");
-            eprintln!("  - Audio loopback cables between modem audio jacks");
+            eprintln!("Check that:");
+            eprintln!("  - Both radios responded to TRX Frequency (look for cmd echo above)");
+            eprintln!("  - Antennas are connected and band conditions allow the link");
             eprintln!();
             eprintln!("To diagnose, re-run with: --diagnose-connect");
             return Err(e.into());
