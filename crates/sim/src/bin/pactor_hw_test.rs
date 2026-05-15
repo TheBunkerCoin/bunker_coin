@@ -311,37 +311,16 @@ async fn init_hostmode(
     drain_serial(&mut serial).await;
 
     // === Step 1: Exit any existing hostmode ===
-    // ptc-go sends CRC-framed JHOST0 on channel 0 first thing.
+    // Send an ASCII "JHOST0\r" — if the modem is in terminal mode this is
+    // just an unrecognized command (harmless); if it somehow ended up in
+    // hostmode the ASCII text won't be a valid CRC frame but the modem
+    // typically exits hostmode on any non-framed input after a timeout.
+    // We avoid sending CRC-framed JHOST0 because that would consume a
+    // packet-counter slot and desynchronize the transport later.
     println!("  step 1: exit any existing hostmode ...");
-    let quit_frame = HostmodeFrame::command(0, b"JHOST0".to_vec());
-    let resp = send_hostmode_raw(&mut serial, &quit_frame, "JHOST0 ch0").await?;
-
-    // Check if the response looks like a hostmode frame
-    let packets = try_decode_hostmode(&resp);
-    if !packets.is_empty() {
-        println!(
-            "  got {} hostmode packet(s) — modem WAS in hostmode",
-            packets.len()
-        );
-        for pkt in &packets {
-            println!("    {:?}", pkt);
-        }
-    }
-
-    // Also send CRC-framed JHOST0 with bit 6 set (sequence reset) in case
-    // the modem ignored the first one due to counter mismatch
-    let resp2 =
-        send_hostmode_raw_with_reset(&mut serial, 0, b"JHOST0", "JHOST0 ch0 (reset)").await?;
-    let packets2 = try_decode_hostmode(&resp2);
-    if !packets2.is_empty() {
-        println!("  got {} hostmode packet(s) after reset-bit JHOST0", packets2.len());
-        for pkt in &packets2 {
-            println!("    {:?}", pkt);
-        }
-    }
-
-    // Give the modem time to fully exit hostmode
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    serial.write_all(b"JHOST0\r").await?;
+    serial.flush().await?;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     drain_serial(&mut serial).await;
 
     // === Step 2: Terminal-mode ASCII init ===
