@@ -545,36 +545,14 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
-        // Send C command via hostmode_transaction — the modem should ACK it
-        // (ptc-go also uses writeAndGetResponse for all commands).
+        // ptc-go queues C as a fire-and-forget command. Some SCS modems do
+        // not return an immediate hostmode response for C; link progress is
+        // observed through subsequent L/G polls instead.
         let mut payload = b"C ".to_vec();
         payload.extend_from_slice(remote_call.as_bytes());
-        let c_response = self
-            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, payload))
+        self.send_hostmode_frame(HostmodeFrame::command(PACTOR_CHANNEL, payload))
             .await?;
-        let c_text = String::from_utf8_lossy(&c_response.payload);
-        eprintln!(
-            "[connect] C {remote_call} response: ch={} code=0x{:02x} payload={:?}",
-            c_response.channel, c_response.code, c_text
-        );
-
-        // Check if the modem immediately reported a terminal status
-        if let Ok(event) = Self::parse_status_line(&c_text) {
-            match event {
-                PactorLinkEvent::Status(PactorLinkStatus::Connected { .. }) => return Ok(()),
-                PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
-                    return Err(ScsPactorError::Busy)
-                }
-                PactorLinkEvent::Status(
-                    PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
-                ) => {
-                    return Err(ScsPactorError::Io(std::io::Error::other(
-                        c_text.into_owned(),
-                    )))
-                }
-                _ => {}
-            }
-        }
+        eprintln!("[connect] queued C {remote_call}");
 
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
@@ -686,7 +664,7 @@ impl PactorTransport for UsbPactorTransport {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{duplex, AsyncReadExt};
+    use tokio::io::{duplex, AsyncRead, AsyncReadExt};
 
     use super::*;
     use crate::hostmode::{
@@ -705,6 +683,20 @@ mod tests {
             read_timeout: Some(Duration::from_millis(100)),
             write_timeout: Some(Duration::from_millis(100)),
             command_timeout: Duration::from_millis(100),
+        }
+    }
+
+    async fn read_next_frame<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut HostmodeDecoder,
+        buf: &mut [u8],
+    ) -> HostmodeFrame {
+        loop {
+            if let Some(frame) = decoder.next_frame().unwrap() {
+                return frame;
+            }
+            let n = reader.read(buf).await.unwrap();
+            decoder.push(&buf[..n]);
         }
     }
 
@@ -776,7 +768,7 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command (hostmode_transaction — needs ACK)
+            // Modem receives C command (fire-and-forget, no immediate ACK).
             let n = modem_side.read(&mut buf).await.unwrap();
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
@@ -784,18 +776,8 @@ mod tests {
             assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
-            // ACK the C command with a simple status response
-            let c_ack = encode_frame(&HostmodeFrame::command(
-                PACTOR_CHANNEL,
-                b"OK".to_vec(),
-            ))
-            .unwrap();
-            modem_side.write_all(&c_ack).await.unwrap();
-
             // connect_peer then sends L poll
-            let n = modem_side.read(&mut buf).await.unwrap();
-            decoder.push(&buf[..n]);
-            let l_frame = decoder.next_frame().unwrap().unwrap();
+            let l_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
             assert!(l_frame.payload.starts_with(b"L"));
 
             // Respond with link_state=4 (connected)
@@ -822,7 +804,7 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command (hostmode_transaction — needs ACK)
+            // Modem receives C command (fire-and-forget, no immediate ACK).
             let n = modem_side.read(&mut buf).await.unwrap();
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
@@ -830,18 +812,8 @@ mod tests {
             assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
-            // ACK the C command — modem accepts it
-            let c_ack = encode_frame(&HostmodeFrame::command(
-                PACTOR_CHANNEL,
-                b"OK".to_vec(),
-            ))
-            .unwrap();
-            modem_side.write_all(&c_ack).await.unwrap();
-
             // connect_peer then sends L poll
-            let n = modem_side.read(&mut buf).await.unwrap();
-            decoder.push(&buf[..n]);
-            let l_frame = decoder.next_frame().unwrap().unwrap();
+            let l_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
             assert!(l_frame.payload.starts_with(b"L"));
 
             // Respond with status_pending=1
@@ -853,9 +825,7 @@ mod tests {
             modem_side.write_all(&l_resp).await.unwrap();
 
             // connect_peer sends G poll to read status
-            let n = modem_side.read(&mut buf).await.unwrap();
-            decoder.push(&buf[..n]);
-            let g_frame = decoder.next_frame().unwrap().unwrap();
+            let g_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
             assert!(g_frame.payload.starts_with(b"G"));
 
             // Respond with BUSY
@@ -880,7 +850,7 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command (hostmode_transaction — needs ACK)
+            // Modem receives C command (fire-and-forget, no immediate ACK).
             let n = modem_side.read(&mut buf).await.unwrap();
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
@@ -888,18 +858,8 @@ mod tests {
             assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
-            // ACK the C command
-            let c_ack = encode_frame(&HostmodeFrame::command(
-                PACTOR_CHANNEL,
-                b"OK".to_vec(),
-            ))
-            .unwrap();
-            modem_side.write_all(&c_ack).await.unwrap();
-
             // First L poll — respond with link_state=1 (setup)
-            let n = modem_side.read(&mut buf).await.unwrap();
-            decoder.push(&buf[..n]);
-            let l1 = decoder.next_frame().unwrap().unwrap();
+            let l1 = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
             assert!(l1.payload.starts_with(b"L"));
             let l1_resp = encode_frame(&HostmodeFrame::command(
                 PACTOR_CHANNEL,
@@ -909,9 +869,7 @@ mod tests {
             modem_side.write_all(&l1_resp).await.unwrap();
 
             // Second L poll — respond with link_state=4 (connected)
-            let n = modem_side.read(&mut buf).await.unwrap();
-            decoder.push(&buf[..n]);
-            let l2 = decoder.next_frame().unwrap().unwrap();
+            let l2 = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
             assert!(l2.payload.starts_with(b"L"));
             let l2_resp = encode_frame(&HostmodeFrame::command(
                 PACTOR_CHANNEL,

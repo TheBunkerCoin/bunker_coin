@@ -241,17 +241,10 @@ async fn diagnose_connect(
     let connect_frame =
         HostmodeFrame::command(PACTOR_CHANNEL, format!("C {remote_call}").into_bytes());
     println!(
-        "  >> hostmode C ch31 via transaction: payload={:?}",
+        "  >> hostmode C ch31 fire-and-forget: payload={:?}",
         String::from_utf8_lossy(&connect_frame.payload)
     );
-    let connect_response = modem.hostmode_transaction(connect_frame).await?;
-    println!(
-        "  C response: ch={} code=0x{:02x} payload_hex={:02x?} payload_ascii={:?}",
-        connect_response.channel,
-        connect_response.code,
-        connect_response.payload,
-        String::from_utf8_lossy(&connect_response.payload)
-    );
+    modem.send_hostmode_frame_no_response(connect_frame).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let deadline = Instant::now() + duration;
     let mut attempt = 0;
@@ -259,9 +252,8 @@ async fn diagnose_connect(
     while Instant::now() < deadline {
         attempt += 1;
         let frame = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
-        match tokio::time::timeout(Duration::from_secs(3), modem.hostmode_transaction(frame)).await
-        {
-            Ok(Ok(response)) => {
+        match modem.hostmode_transaction(frame).await {
+            Ok(response) => {
                 println!(
                     "  L poll {attempt}: ch={} code=0x{:02x} payload_hex={:02x?} payload_ascii={:?}",
                     response.channel,
@@ -270,8 +262,7 @@ async fn diagnose_connect(
                     String::from_utf8_lossy(&response.payload)
                 );
             }
-            Ok(Err(err)) => println!("  L poll {attempt}: error {err}"),
-            Err(_) => println!("  L poll {attempt}: timed out"),
+            Err(err) => println!("  L poll {attempt}: error {err}"),
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
