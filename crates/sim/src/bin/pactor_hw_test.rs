@@ -79,13 +79,13 @@ struct Args {
     #[arg(long)]
     frequency: f64,
 
-    /// Baud rate for TRX CI-V serial port (IC-7300 default: 19200)
-    #[arg(long, default_value_t = 19200)]
-    trx_baud: u32,
+    /// Override TRX CI-V baud rate (only if modem's stored config is wrong)
+    #[arg(long)]
+    trx_baud: Option<u32>,
 
-    /// CI-V address of the radio in hex (IC-7300 default: A2)
-    #[arg(long, default_value = "A2")]
-    trx_addr: String,
+    /// Override TRX CI-V address in hex (only if modem's stored config is wrong)
+    #[arg(long)]
+    trx_addr: Option<String>,
 }
 
 /// Read all pending bytes from the serial port, printing hex + ASCII.
@@ -321,8 +321,8 @@ async fn init_hostmode(
     callsign: &str,
     command_timeout: Duration,
     frequency: f64,
-    trx_baud: u32,
-    trx_addr: &str,
+    trx_baud: Option<u32>,
+    trx_addr: Option<&str>,
 ) -> anyhow::Result<UsbPactorTransport> {
     let mut serial = open_serial(port, baud)?;
 
@@ -371,14 +371,49 @@ async fn init_hostmode(
         send_ascii(&mut serial, command).await?;
     }
 
-    // === Step 2b: Configure TRX CI-V and tune radio ===
+    // === Step 2b: TRX CI-V frequency control ===
     println!("  step 2b: TRX frequency control ...");
-    send_ascii(
-        &mut serial,
-        &format!("TRX TYpe I {trx_baud} ${trx_addr}"),
-    )
-    .await?;
+
+    // Query the modem's current TRX config (type, baud, CI-V address)
+    send_ascii(&mut serial, "TRX TYpe").await?;
+
+    // Only override TRX settings if the user explicitly requested it
+    if let (Some(baud_override), Some(addr_override)) = (trx_baud, trx_addr) {
+        println!("  overriding TRX config: baud={baud_override} addr=${addr_override}");
+        send_ascii(
+            &mut serial,
+            &format!("TRX TYpe I {baud_override} ${addr_override}"),
+        )
+        .await?;
+    } else if let Some(baud_override) = trx_baud {
+        println!("  overriding TRX baud: {baud_override}");
+        send_ascii(
+            &mut serial,
+            &format!("TRX TYpe I {baud_override}"),
+        )
+        .await?;
+    } else if let Some(addr_override) = trx_addr {
+        println!("  overriding TRX addr: ${addr_override}");
+        send_ascii(
+            &mut serial,
+            &format!("TRX TYpe I 19200 ${addr_override}"),
+        )
+        .await?;
+    }
+
+    // Tune the radio to the requested frequency
     send_ascii(&mut serial, &format!("TRX Frequency {frequency}")).await?;
+
+    // Verify: read back the frequency the radio is actually on
+    let readback = send_ascii(&mut serial, "TRX Frequency").await?;
+    let readback_str = String::from_utf8_lossy(&readback);
+    if readback_str.contains("ERROR") || readback_str.contains("not connected") {
+        return Err(anyhow::anyhow!(
+            "TRX frequency readback failed on {port} — is the CI-V cable connected?\n  \
+             modem response: {readback_str}"
+        ));
+    }
+    println!("  TRX frequency verified on {port}");
 
     // === Step 3: Enter JHOST4 CRC hostmode ===
     // ptc-go sends this as a terminal-mode ASCII command
@@ -434,7 +469,7 @@ async fn main() -> anyhow::Result<()> {
         command_timeout,
         args.frequency,
         args.trx_baud,
-        &args.trx_addr,
+        args.trx_addr.as_deref(),
     )
     .await?;
 
@@ -446,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
         command_timeout,
         args.frequency,
         args.trx_baud,
-        &args.trx_addr,
+        args.trx_addr.as_deref(),
     )
     .await?;
 
