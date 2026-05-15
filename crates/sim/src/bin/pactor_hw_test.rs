@@ -241,13 +241,16 @@ async fn diagnose_connect(
     let connect_frame =
         HostmodeFrame::command(PACTOR_CHANNEL, format!("C {remote_call}").into_bytes());
     println!(
-        "  >> hostmode C ch31 fire-and-forget: payload={:?}",
+        "  >> hostmode C ch31 transaction: payload={:?}",
         String::from_utf8_lossy(&connect_frame.payload)
     );
-    modem
-        .send_hostmode_frame_and_advance(connect_frame)
-        .await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let c_resp = modem.hostmode_transaction(connect_frame).await?;
+    println!(
+        "  C response: ch={} code=0x{:02x} payload={:?}",
+        c_resp.channel,
+        c_resp.code,
+        String::from_utf8_lossy(&c_resp.payload)
+    );
     let deadline = Instant::now() + duration;
     let mut attempt = 0;
 
