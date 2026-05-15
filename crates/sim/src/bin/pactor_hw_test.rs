@@ -402,14 +402,25 @@ async fn init_hostmode(
     }
 
     // Tune the radio to the requested frequency
-    send_ascii(&mut serial, &format!("TRX Frequency {frequency}")).await?;
+    let set_resp = send_ascii(&mut serial, &format!("TRX Frequency {frequency}")).await?;
+    let set_str = String::from_utf8_lossy(&set_resp);
+    if !set_str.contains("FREQUENCY CHANGED") {
+        return Err(anyhow::anyhow!(
+            "TRX Frequency set failed on {port} — radio did not confirm tune.\n  \
+             Is the CI-V cable connected? Is the radio powered on?\n  \
+             modem response: {set_str}"
+        ));
+    }
 
     // Verify: read back the frequency the radio is actually on
     let readback = send_ascii(&mut serial, "TRX Frequency").await?;
     let readback_str = String::from_utf8_lossy(&readback);
-    if readback_str.contains("ERROR") || readback_str.contains("not connected") {
+    // The modem should return a line with the frequency in kHz (digits).
+    // If CI-V is dead, we just get "cmd: " with no frequency value.
+    let has_freq = readback_str.bytes().any(|b| b.is_ascii_digit());
+    if !has_freq || readback_str.contains("ERROR") {
         return Err(anyhow::anyhow!(
-            "TRX frequency readback failed on {port} — is the CI-V cable connected?\n  \
+            "TRX frequency readback failed on {port} — radio did not report frequency.\n  \
              modem response: {readback_str}"
         ));
     }
