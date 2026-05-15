@@ -233,17 +233,25 @@ async fn diagnose_connect(
     reset_connect: bool,
 ) -> anyhow::Result<()> {
     println!("Diagnosing connect to {remote_call} ...");
-    let _ = reset_connect; // reserved for future use
+    if reset_connect {
+        println!(
+            "  note: --diagnose-connect-reset is ignored; transport-managed counters are required"
+        );
+    }
     let connect_frame =
         HostmodeFrame::command(PACTOR_CHANNEL, format!("C {remote_call}").into_bytes());
-    let connect_bytes = encode_frame(&connect_frame)?;
     println!(
-        "  >> hostmode C ch31{}: {:02x?} ({} bytes)",
-        if reset_connect { " (reset)" } else { "" },
-        connect_bytes,
-        connect_bytes.len()
+        "  >> hostmode C ch31 via transaction: payload={:?}",
+        String::from_utf8_lossy(&connect_frame.payload)
     );
-    modem.send_hostmode_frame_no_response(connect_frame).await?;
+    let connect_response = modem.hostmode_transaction(connect_frame).await?;
+    println!(
+        "  C response: ch={} code=0x{:02x} payload_hex={:02x?} payload_ascii={:?}",
+        connect_response.channel,
+        connect_response.code,
+        connect_response.payload,
+        String::from_utf8_lossy(&connect_response.payload)
+    );
     tokio::time::sleep(Duration::from_secs(1)).await;
     let deadline = Instant::now() + duration;
     let mut attempt = 0;
