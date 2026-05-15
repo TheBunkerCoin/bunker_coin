@@ -229,7 +229,7 @@ impl UsbPactorTransport {
         encode_frame(&framed)
     }
 
-    async fn write_encoded_frame(&self, encoded: &[u8]) -> Result<(), ScsPactorError> {
+    pub async fn write_encoded_frame(&self, encoded: &[u8]) -> Result<(), ScsPactorError> {
         let mut writer = self.writer.lock().await;
         let write = writer.write_all(encoded);
         if let Some(d) = self.write_timeout {
@@ -541,19 +541,20 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
-        // Send the C command as a normal transaction. The modem ACKs the
-        // command and the packet counter stays synchronized automatically.
+        // Send C as a raw frame, bypassing the packet counter. The SCS
+        // modem does not ACK the C command (it starts a long-running connect
+        // operation), so counter-tracked framing would desync. By encoding
+        // the frame directly with TYPE_COMMAND (no counter bits) and not
+        // advancing the counter, subsequent L/G polls stay in sync.
         let mut payload = b"C ".to_vec();
         payload.extend_from_slice(remote_call.as_bytes());
-        let c_resp = self
-            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, payload))
-            .await?;
+        let frame = HostmodeFrame::command(PACTOR_CHANNEL, payload);
+        let encoded = encode_frame(&frame)?;
         eprintln!(
-            "[connect] C {remote_call} response: ch={} code=0x{:02x} payload={:?}",
-            c_resp.channel,
-            c_resp.code,
-            String::from_utf8_lossy(&c_resp.payload)
+            "[connect] sending C {remote_call} raw (bypassing counter): {:02x?}",
+            &encoded
         );
+        self.write_encoded_frame(&encoded).await?;
 
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
@@ -769,20 +770,17 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command as a normal transaction.
+            // Modem receives C command as raw frame (no counter bits).
             let c_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
             assert_eq!(c_frame.channel, PACTOR_CHANNEL);
             assert_eq!(c_frame.code, TYPE_COMMAND);
             assert_eq!(c_frame.payload, b"C NODE");
 
-            // ACK the C command
-            let c_ack =
-                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
-            modem_side.write_all(&c_ack).await.unwrap();
+            // No ACK — C is fire-and-forget. Counter unchanged.
 
-            // connect_peer then sends L poll — counter toggled after C ACK.
+            // connect_peer sends L poll — counter still at initial value.
             let l_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(l_frame.code, TYPE_COMMAND_COUNTER);
+            assert_eq!(l_frame.code, TYPE_COMMAND);
             assert!(l_frame.payload.starts_with(b"L"));
 
             // Respond with link_state=4 (connected)
@@ -809,20 +807,17 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command as transaction.
+            // Modem receives C command as raw frame (no counter bits).
             let c_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
             assert_eq!(c_frame.channel, PACTOR_CHANNEL);
             assert_eq!(c_frame.code, TYPE_COMMAND);
             assert_eq!(c_frame.payload, b"C NODE");
 
-            // ACK the C command
-            let c_ack =
-                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
-            modem_side.write_all(&c_ack).await.unwrap();
+            // No ACK — C is fire-and-forget. Counter unchanged.
 
-            // connect_peer then sends L poll — counter toggled after C ACK.
+            // connect_peer sends L poll — counter still at initial value.
             let l_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(l_frame.code, TYPE_COMMAND_COUNTER);
+            assert_eq!(l_frame.code, TYPE_COMMAND);
             assert!(l_frame.payload.starts_with(b"L"));
 
             // Respond with status_pending=1
@@ -833,9 +828,10 @@ mod tests {
             .unwrap();
             modem_side.write_all(&l_resp).await.unwrap();
 
-            // connect_peer sends G poll to read status
+            // connect_peer sends G poll to read status — counter toggled
+            // after L ACK.
             let g_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(g_frame.code, TYPE_COMMAND);
+            assert_eq!(g_frame.code, TYPE_COMMAND_COUNTER);
             assert!(g_frame.payload.starts_with(b"G"));
 
             // Respond with BUSY
@@ -860,20 +856,17 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command as transaction.
+            // Modem receives C command as raw frame (no counter bits).
             let c_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
             assert_eq!(c_frame.channel, PACTOR_CHANNEL);
             assert_eq!(c_frame.code, TYPE_COMMAND);
             assert_eq!(c_frame.payload, b"C NODE");
 
-            // ACK the C command
-            let c_ack =
-                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
-            modem_side.write_all(&c_ack).await.unwrap();
+            // No ACK — C is fire-and-forget. Counter unchanged.
 
-            // First L poll — counter toggled after C ACK.
+            // First L poll — counter still at initial value.
             let l1 = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(l1.code, TYPE_COMMAND_COUNTER);
+            assert_eq!(l1.code, TYPE_COMMAND);
             assert!(l1.payload.starts_with(b"L"));
             let l1_resp = encode_frame(&HostmodeFrame::command(
                 PACTOR_CHANNEL,
@@ -884,7 +877,7 @@ mod tests {
 
             // Second L poll — counter toggled after first L ACK.
             let l2 = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(l2.code, TYPE_COMMAND);
+            assert_eq!(l2.code, TYPE_COMMAND_COUNTER);
             assert!(l2.payload.starts_with(b"L"));
             let l2_resp = encode_frame(&HostmodeFrame::command(
                 PACTOR_CHANNEL,

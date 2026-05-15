@@ -238,19 +238,17 @@ async fn diagnose_connect(
             "  note: --diagnose-connect-reset is ignored; transport-managed counters are required"
         );
     }
+    // Send C as a raw frame bypassing the packet counter. The modem does
+    // not ACK the C command, so counter-tracked framing would desync.
     let connect_frame =
         HostmodeFrame::command(PACTOR_CHANNEL, format!("C {remote_call}").into_bytes());
+    let encoded = encode_frame(&connect_frame)?;
     println!(
-        "  >> hostmode C ch31 transaction: payload={:?}",
-        String::from_utf8_lossy(&connect_frame.payload)
+        "  >> hostmode C ch31 raw (no counter): {:02x?}",
+        &encoded
     );
-    let c_resp = modem.hostmode_transaction(connect_frame).await?;
-    println!(
-        "  C response: ch={} code=0x{:02x} payload={:?}",
-        c_resp.channel,
-        c_resp.code,
-        String::from_utf8_lossy(&c_resp.payload)
-    );
+    modem.write_encoded_frame(&encoded).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let deadline = Instant::now() + duration;
     let mut attempt = 0;
 
