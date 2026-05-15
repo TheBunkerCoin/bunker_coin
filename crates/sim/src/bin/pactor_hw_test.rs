@@ -233,15 +233,9 @@ async fn diagnose_connect(
     reset_connect: bool,
 ) -> anyhow::Result<()> {
     println!("Diagnosing connect to {remote_call} ...");
-    let connect_frame = if reset_connect {
-        HostmodeFrame::with_code(
-            PACTOR_CHANNEL,
-            TYPE_COMMAND | 0x40,
-            format!("C {remote_call}").into_bytes(),
-        )
-    } else {
-        HostmodeFrame::command(PACTOR_CHANNEL, format!("C {remote_call}").into_bytes())
-    };
+    let _ = reset_connect; // reserved for future use
+    let connect_frame =
+        HostmodeFrame::command(PACTOR_CHANNEL, format!("C {remote_call}").into_bytes());
     let connect_bytes = encode_frame(&connect_frame)?;
     println!(
         "  >> hostmode C ch31{}: {:02x?} ({} bytes)",
@@ -256,7 +250,7 @@ async fn diagnose_connect(
 
     while Instant::now() < deadline {
         attempt += 1;
-        let frame = HostmodeFrame::with_code(PACTOR_CHANNEL, TYPE_COMMAND | 0x40, b"L".to_vec());
+        let frame = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
         match tokio::time::timeout(Duration::from_secs(3), modem.hostmode_transaction(frame)).await
         {
             Ok(Ok(response)) => {

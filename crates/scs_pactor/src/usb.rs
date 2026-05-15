@@ -68,34 +68,32 @@ pub struct UsbPactorTransport {
 #[derive(Debug)]
 struct PacketCounter {
     /// Whether the next frame should have the counter bit (0x80) set.
+    /// Matches ptc-go: starts false, toggles after each successful ACK.
     toggle: bool,
-    /// Whether the next frame is the first one (needs reset bit 0x40).
-    first: bool,
 }
 
 impl PacketCounter {
     fn new() -> Self {
-        Self {
-            toggle: false,
-            first: true,
-        }
+        Self { toggle: false }
     }
 
-    /// Apply counter bits to the type byte for the next outbound frame.
+    /// Apply counter bit to the type byte for the next outbound frame.
+    /// ptc-go uses only bits 0 (cmd/data) and 7 (counter toggle):
+    ///   0x00 = data, counter=0
+    ///   0x01 = command, counter=0
+    ///   0x80 = data, counter=1
+    ///   0x81 = command, counter=1
     fn apply(&self, code: u8) -> u8 {
-        let mut c = code & 0x3F; // clear counter bits
-        if self.first {
-            c |= 0x40; // sequence reset
-        }
+        let base = code & 0x01; // keep only cmd/data bit
         if self.toggle {
-            c |= 0x80; // counter bit
+            base | 0x80
+        } else {
+            base
         }
-        c
     }
 
     /// Advance the counter after a successful ACK (not a repeat request).
     fn advance(&mut self) {
-        self.first = false;
         self.toggle = !self.toggle;
     }
 }
@@ -335,15 +333,8 @@ impl UsbPactorTransport {
     }
 
     async fn poll_pactor_channel_state(&self) -> Result<PactorChannelState, ScsPactorError> {
-        // The DRAGON reliably answers L status polls with the hostmode reset
-        // bit set (0x40). This also resynchronizes after terminal/hostmode
-        // transitions and mirrors the hardware-test verifier.
         let response = self
-            .hostmode_transaction(HostmodeFrame::with_code(
-                PACTOR_CHANNEL,
-                TYPE_COMMAND | 0x40,
-                b"L".to_vec(),
-            ))
+            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec()))
             .await?;
         if response.channel != PACTOR_CHANNEL {
             return Err(ScsPactorError::Protocol(format!(
@@ -703,7 +694,9 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt};
 
     use super::*;
-    use crate::hostmode::{decode_frame, encode_repeat_request, TYPE_COMMAND, TYPE_DATA};
+    use crate::hostmode::{
+        decode_frame, encode_repeat_request, TYPE_COMMAND, TYPE_COMMAND_COUNTER, TYPE_DATA,
+    };
 
     /// Strip counter bits (7,6) from the type byte to get the base code.
     fn base_code(code: u8) -> u8 {
@@ -1039,15 +1032,12 @@ mod tests {
         let first = &frames[0];
         let second = &frames[1];
 
-        // First frame: reset bit (0x40) set, counter=0 → 0x41
-        assert_eq!(base_code(first.code), TYPE_COMMAND);
-        assert!(first.code & 0x40 != 0, "first frame should have reset bit");
+        // First frame: counter=0 → type=0x01
+        assert_eq!(first.code, TYPE_COMMAND);
         assert_eq!(first.payload, b"I A");
 
-        // Second frame: counter toggled (0x80), no reset bit → 0x81
-        assert_eq!(base_code(second.code), TYPE_COMMAND);
-        assert!(second.code & 0x80 != 0, "second frame should have counter bit toggled");
-        assert!(second.code & 0x40 == 0, "second frame should NOT have reset bit");
+        // Second frame: counter toggled → type=0x81
+        assert_eq!(second.code, TYPE_COMMAND_COUNTER);
         assert_eq!(second.payload, b"I B");
     }
 }
