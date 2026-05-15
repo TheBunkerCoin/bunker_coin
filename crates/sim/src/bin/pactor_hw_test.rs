@@ -491,8 +491,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Modem A connecting to {} ...", args.call_b);
+    println!("  (PACTOR requires RF link between modems — timeout={}s)", args.connect_timeout_secs);
+    println!("  Tip: use --diagnose-connect to watch L poll status during connect");
     let link_start = Instant::now();
-    modem_a.connect_peer(&args.call_b).await?;
+    match modem_a.connect_peer(&args.call_b).await {
+        Ok(()) => {}
+        Err(e) => {
+            let elapsed = link_start.elapsed();
+            eprintln!("connect_peer failed after {elapsed:.1?}: {e}");
+            eprintln!();
+            eprintln!("This usually means the two modems cannot hear each other.");
+            eprintln!("PACTOR requires a physical RF path between the modems:");
+            eprintln!("  - Two HF radios on the same frequency, or");
+            eprintln!("  - Audio loopback cables between modem audio jacks");
+            eprintln!();
+            eprintln!("To diagnose, re-run with: --diagnose-connect");
+            return Err(e.into());
+        }
+    }
     let link_elapsed = link_start.elapsed();
     println!("Link established in {link_elapsed:.2?}");
 
