@@ -55,10 +55,49 @@ pub struct UsbPactorTransport {
     event_rx: Mutex<mpsc::Receiver<PactorLinkEvent>>,
     packet_rx: Mutex<mpsc::Receiver<HostmodePacket>>,
     transaction_lock: Mutex<()>,
+    /// Packet counter state. The SCS hostmode protocol toggles bit 7 (0x80) of
+    /// the type byte on each successfully ACKed frame. The first frame after
+    /// entering hostmode must set bit 6 (0x40) to reset the modem's counter.
+    packet_counter: Mutex<PacketCounter>,
     read_task: JoinHandle<()>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
     command_timeout: Duration,
+}
+
+#[derive(Debug)]
+struct PacketCounter {
+    /// Whether the next frame should have the counter bit (0x80) set.
+    toggle: bool,
+    /// Whether the next frame is the first one (needs reset bit 0x40).
+    first: bool,
+}
+
+impl PacketCounter {
+    fn new() -> Self {
+        Self {
+            toggle: false,
+            first: true,
+        }
+    }
+
+    /// Apply counter bits to the type byte for the next outbound frame.
+    fn apply(&self, code: u8) -> u8 {
+        let mut c = code & 0x3F; // clear counter bits
+        if self.first {
+            c |= 0x40; // sequence reset
+        }
+        if self.toggle {
+            c |= 0x80; // counter bit
+        }
+        c
+    }
+
+    /// Advance the counter after a successful ACK (not a repeat request).
+    fn advance(&mut self) {
+        self.first = false;
+        self.toggle = !self.toggle;
+    }
 }
 
 impl UsbPactorTransport {
@@ -162,6 +201,7 @@ impl UsbPactorTransport {
             event_rx: Mutex::new(event_rx),
             packet_rx: Mutex::new(packet_rx),
             transaction_lock: Mutex::new(()),
+            packet_counter: Mutex::new(PacketCounter::new()),
             read_task,
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
@@ -171,7 +211,12 @@ impl UsbPactorTransport {
 
     async fn send_hostmode_frame(&self, frame: HostmodeFrame) -> Result<(), ScsPactorError> {
         let encoded = self.encode_outbound_frame(frame).await?;
-        self.write_encoded_frame(&encoded).await
+        self.write_encoded_frame(&encoded).await?;
+        // Fire-and-forget: advance counter optimistically since we
+        // won't see the ACK. The modem will send a repeat request if
+        // there's a mismatch, which hostmode_transaction handles.
+        self.packet_counter.lock().await.advance();
+        Ok(())
     }
 
     pub async fn send_hostmode_frame_no_response(
@@ -185,7 +230,10 @@ impl UsbPactorTransport {
         &self,
         frame: HostmodeFrame,
     ) -> Result<Vec<u8>, ScsPactorError> {
-        encode_frame(&frame)
+        let counter = self.packet_counter.lock().await;
+        let code_with_counter = counter.apply(frame.code);
+        let framed = HostmodeFrame::with_code(frame.channel, code_with_counter, frame.payload);
+        encode_frame(&framed)
     }
 
     async fn write_encoded_frame(&self, encoded: &[u8]) -> Result<(), ScsPactorError> {
@@ -218,6 +266,8 @@ impl UsbPactorTransport {
             self.write_encoded_frame(&encoded).await?;
             match self.recv_hostmode_packet(self.command_timeout).await? {
                 HostmodePacket::Frame(response) => {
+                    // Successful ACK — advance the packet counter
+                    self.packet_counter.lock().await.advance();
                     eprintln!(
                         "[tx] hostmode_transaction response: ch={} code=0x{:02x} payload={:02x?}",
                         response.channel, response.code, &response.payload
@@ -232,6 +282,7 @@ impl UsbPactorTransport {
                             "hostmode repeat request limit exceeded".to_owned(),
                         ));
                     }
+                    // Don't advance counter on repeat — resend same frame
                 }
             }
         }
@@ -654,6 +705,11 @@ mod tests {
     use super::*;
     use crate::hostmode::{decode_frame, encode_repeat_request, TYPE_COMMAND, TYPE_DATA};
 
+    /// Strip counter bits (7,6) from the type byte to get the base code.
+    fn base_code(code: u8) -> u8 {
+        code & 0x3F
+    }
+
     fn test_config() -> UsbPactorConfig {
         UsbPactorConfig {
             port: "mock".to_owned(),
@@ -674,7 +730,7 @@ mod tests {
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
-            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"I N0CALL");
 
             // Respond with OK (set_mycall now uses hostmode_transaction)
@@ -732,7 +788,7 @@ mod tests {
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
-            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
             // Respond with CONNECTED (the hostmode_transaction consumes this)
@@ -759,7 +815,7 @@ mod tests {
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
-            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
             // Respond with BUSY
@@ -789,7 +845,7 @@ mod tests {
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
-            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
             // Respond with QUEUED — hostmode_transaction returns this
@@ -844,7 +900,7 @@ mod tests {
         let n = modem_side.read(&mut buf).await.unwrap();
         let frame = decode_frame(&buf[..n]).unwrap();
         assert_eq!(frame.channel, PACTOR_CHANNEL);
-        assert_eq!(frame.code, TYPE_COMMAND);
+        assert_eq!(base_code(frame.code), TYPE_COMMAND);
         assert_eq!(frame.payload, b"D");
     }
 
@@ -859,7 +915,7 @@ mod tests {
             let first = buf[..n].to_vec();
             let frame = decode_frame(&first).unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
-            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"V");
 
             modem_side
@@ -894,7 +950,7 @@ mod tests {
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
             assert_eq!(frame.channel, EXTENDED_POLL_CHANNEL);
-            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"G");
 
             let response = encode_frame(&HostmodeFrame::with_code(
@@ -921,7 +977,7 @@ mod tests {
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
             assert_eq!(frame.channel, STATUS_CHANNEL);
-            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(base_code(frame.code), TYPE_COMMAND);
 
             let response = encode_frame(&HostmodeFrame::with_code(
                 STATUS_CHANNEL,
@@ -957,12 +1013,12 @@ mod tests {
         let n = modem_side.read(&mut buf).await.unwrap();
         let frame = decode_frame(&buf[..n]).unwrap();
         assert_eq!(frame.channel, PACTOR_CHANNEL);
-        assert_eq!(frame.code, TYPE_DATA);
+        assert_eq!(base_code(frame.code), TYPE_DATA);
         assert_eq!(frame.payload, b"hello");
     }
 
     #[tokio::test]
-    async fn usb_transport_leaves_outbound_packet_counter_clear() {
+    async fn usb_transport_toggles_packet_counter() {
         let (transport_side, mut modem_side) = duplex(2048);
         let transport = UsbPactorTransport::from_stream(transport_side, test_config());
 
@@ -983,9 +1039,15 @@ mod tests {
         let first = &frames[0];
         let second = &frames[1];
 
-        assert_eq!(first.code, TYPE_COMMAND);
+        // First frame: reset bit (0x40) set, counter=0 → 0x41
+        assert_eq!(base_code(first.code), TYPE_COMMAND);
+        assert!(first.code & 0x40 != 0, "first frame should have reset bit");
         assert_eq!(first.payload, b"I A");
-        assert_eq!(second.code, TYPE_COMMAND);
+
+        // Second frame: counter toggled (0x80), no reset bit → 0x81
+        assert_eq!(base_code(second.code), TYPE_COMMAND);
+        assert!(second.code & 0x80 != 0, "second frame should have counter bit toggled");
+        assert!(second.code & 0x40 == 0, "second frame should NOT have reset bit");
         assert_eq!(second.payload, b"I B");
     }
 }
