@@ -9,7 +9,21 @@
 //!   --port-b /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR752ZE5-if00-port0
 //! ```
 //!
+//! For debug logging of hostmode frames:
+//! ```text
+//! RUST_LOG=scs_pactor=debug cargo run --bin pactor_hw_test -- ...
+//! ```
+//!
+//! For full trace (includes raw serial bytes):
+//! ```text
+//! RUST_LOG=scs_pactor=trace cargo run --bin pactor_hw_test -- ...
+//! ```
+//!
 //! SCS DRAGON 7400/P4dragon USB serial uses 829440 baud by default.
+//!
+//! **Note:** PACTOR requires an RF link between the two modems (either via
+//! radios on the same frequency or audio loopback cables). Without a
+//! physical connection, `connect_peer` will time out.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

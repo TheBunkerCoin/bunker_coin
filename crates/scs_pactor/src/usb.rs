@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use log::{debug, trace, warn};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -98,13 +99,15 @@ impl UsbPactorTransport {
             loop {
                 let n = match reader.read(&mut buf).await {
                     Ok(0) => {
+                        debug!("reader: EOF on serial stream");
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::Disconnected))
                             .await;
                         break;
                     }
                     Ok(n) => n,
-                    Err(_) => {
+                    Err(e) => {
+                        warn!("reader: serial read error: {e}");
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
                             .await;
@@ -112,10 +115,19 @@ impl UsbPactorTransport {
                     }
                 };
 
+                trace!("reader: got {} bytes: {:02x?}", n, &buf[..n]);
                 decoder.push(&buf[..n]);
                 loop {
                     match decoder.next_packet() {
                         Ok(Some(HostmodePacket::Frame(frame))) => {
+                            debug!(
+                                "reader: decoded frame ch={} code=0x{:02x} payload({})={:02x?} ascii={:?}",
+                                frame.channel,
+                                frame.code,
+                                frame.payload.len(),
+                                &frame.payload,
+                                String::from_utf8_lossy(&frame.payload)
+                            );
                             let _ = packet_tx.send(HostmodePacket::Frame(frame.clone())).await;
                             if route_frame(frame, &command_tx, &data_tx, &event_tx)
                                 .await
@@ -125,10 +137,12 @@ impl UsbPactorTransport {
                             }
                         }
                         Ok(Some(HostmodePacket::RepeatRequest)) => {
+                            debug!("reader: decoded RepeatRequest");
                             let _ = packet_tx.send(HostmodePacket::RepeatRequest).await;
                         }
                         Ok(None) => break,
-                        Err(_) => {
+                        Err(e) => {
+                            warn!("reader: decode error: {e}");
                             let _ = event_tx
                                 .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
                                 .await;
@@ -462,48 +476,69 @@ async fn route_frame(
 #[async_trait]
 impl PactorTransport for UsbPactorTransport {
     async fn set_mycall(&self, callsign: &str) -> Result<(), ScsPactorError> {
-        self.send_host_command(b'I', callsign.as_bytes()).await
+        let mut payload = vec![b'I', b' '];
+        payload.extend_from_slice(callsign.as_bytes());
+        let response = self
+            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, payload))
+            .await?;
+        debug!(
+            "set_mycall({callsign}): ch={} code=0x{:02x} payload={:?}",
+            response.channel,
+            response.code,
+            String::from_utf8_lossy(&response.payload)
+        );
+        Ok(())
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
+        // Send the connect command using hostmode_transaction so we get the
+        // modem's ACK/response. This ensures the command was received.
         let mut payload = b"C ".to_vec();
         payload.extend_from_slice(remote_call.as_bytes());
-        self.send_hostmode_frame(HostmodeFrame::command(PACTOR_CHANNEL, payload))
+        let response = self
+            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, payload))
             .await?;
+        let resp_text = String::from_utf8_lossy(&response.payload);
+        debug!(
+            "connect_peer({remote_call}): initial response ch={} code=0x{:02x} payload={:?}",
+            response.channel, response.code, resp_text,
+        );
+
+        // Check if the modem immediately reported a terminal status
+        if let Ok(event) = Self::parse_status_line(&resp_text) {
+            match event {
+                PactorLinkEvent::Status(PactorLinkStatus::Connected { .. }) => return Ok(()),
+                PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
+                    return Err(ScsPactorError::Busy)
+                }
+                PactorLinkEvent::Status(
+                    PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
+                ) => {
+                    return Err(ScsPactorError::Io(std::io::Error::other(
+                        resp_text.into_owned(),
+                    )))
+                }
+                _ => {}
+            }
+        }
+
+        // Now poll the channel state until connected or timeout.
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
+        let mut poll_count = 0u32;
 
         loop {
             if Instant::now() >= deadline {
                 return Err(ScsPactorError::Timeout);
             }
 
-            if let Ok(Ok(line)) =
-                timeout(Duration::from_millis(200), self.read_status_line()).await
-            {
-                match Self::parse_status_line(&line) {
-                    Ok(PactorLinkEvent::Status(PactorLinkStatus::Connected { .. })) => {
-                        return Ok(())
-                    }
-                    Ok(PactorLinkEvent::Status(PactorLinkStatus::Connecting { .. })) => {
-                        saw_link_setup = true;
-                    }
-                    Ok(PactorLinkEvent::Status(PactorLinkStatus::Busy)) => {
-                        return Err(ScsPactorError::Busy)
-                    }
-                    Ok(PactorLinkEvent::Status(PactorLinkStatus::Queued)) => {}
-                    Ok(PactorLinkEvent::Status(
-                        PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
-                    )) => return Err(ScsPactorError::Io(std::io::Error::other(line))),
-                    Ok(_) => {}
-                    Err(_) => {}
-                }
-                continue;
-            }
+            // Small delay between polls to avoid flooding the modem
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
+            poll_count += 1;
             let state = self.poll_pactor_channel_state().await?;
-            println!(
-                "  connect state: pending_status={} pending_rx={} not_tx={} not_ack={} retries={} link_state={}",
+            debug!(
+                "connect_peer poll {poll_count}: status_pending={} rx_pending={} not_tx={} not_ack={} retries={} link_state={}",
                 state.status_messages_pending,
                 state.frames_received_pending,
                 state.frames_not_transmitted,
@@ -511,15 +546,50 @@ impl PactorTransport for UsbPactorTransport {
                 state.retries,
                 state.link_state
             );
+
             match state.link_state {
                 1 => saw_link_setup = true,
-                2 | 4 | 5 | 6 => return Ok(()),
+                2 | 4 | 5 | 6 => {
+                    debug!("connect_peer: link established (state={})", state.link_state);
+                    return Ok(());
+                }
                 0 if saw_link_setup => {
                     return Err(ScsPactorError::Io(std::io::Error::other(
-                        "PACTOR link setup failed",
+                        "PACTOR link setup failed (returned to idle after connecting)",
                     )))
                 }
                 _ => {}
+            }
+
+            // Also check if there are status messages we should read
+            if state.status_messages_pending > 0 {
+                // Poll G to get status messages
+                let g_resp = self
+                    .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, b"G".to_vec()))
+                    .await?;
+                let g_text = String::from_utf8_lossy(&g_resp.payload);
+                debug!("connect_peer G poll: {:?}", g_text);
+                if let Ok(event) = Self::parse_status_line(&g_text) {
+                    match event {
+                        PactorLinkEvent::Status(PactorLinkStatus::Connected { .. }) => {
+                            return Ok(())
+                        }
+                        PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
+                            return Err(ScsPactorError::Busy)
+                        }
+                        PactorLinkEvent::Status(
+                            PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
+                        ) => {
+                            return Err(ScsPactorError::Io(std::io::Error::other(
+                                g_text.into_owned(),
+                            )))
+                        }
+                        PactorLinkEvent::Status(PactorLinkStatus::Connecting { .. }) => {
+                            saw_link_setup = true;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -583,17 +653,25 @@ mod tests {
 
     #[tokio::test]
     async fn usb_transport_writes_commands_as_hostmode_frames() {
-        let (transport_side, mut modem_side) = duplex(1024);
+        let (transport_side, mut modem_side) = duplex(4096);
         let transport = UsbPactorTransport::from_stream(transport_side, test_config());
 
-        transport.set_mycall("N0CALL").await.unwrap();
+        let modem = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = modem_side.read(&mut buf).await.unwrap();
+            let frame = decode_frame(&buf[..n]).unwrap();
+            assert_eq!(frame.channel, PACTOR_CHANNEL);
+            assert_eq!(frame.code, TYPE_COMMAND);
+            assert_eq!(frame.payload, b"I N0CALL");
 
-        let mut buf = [0u8; 1024];
-        let n = modem_side.read(&mut buf).await.unwrap();
-        let frame = decode_frame(&buf[..n]).unwrap();
-        assert_eq!(frame.channel, PACTOR_CHANNEL);
-        assert_eq!(frame.code, TYPE_COMMAND);
-        assert_eq!(frame.payload, b"I N0CALL");
+            // Respond with OK (set_mycall now uses hostmode_transaction)
+            let ok =
+                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
+            modem_side.write_all(&ok).await.unwrap();
+        });
+
+        transport.set_mycall("N0CALL").await.unwrap();
+        modem.await.unwrap();
     }
 
     #[tokio::test]
@@ -632,17 +710,19 @@ mod tests {
 
     #[tokio::test]
     async fn usb_transport_connect_peer_waits_for_connected_status() {
-        let (transport_side, mut modem_side) = duplex(2048);
+        let (transport_side, mut modem_side) = duplex(4096);
         let transport = UsbPactorTransport::from_stream(transport_side, test_config());
 
         let modem = tokio::spawn(async move {
             let mut buf = [0u8; 1024];
+            // First: modem receives C command via hostmode_transaction
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
             assert_eq!(frame.code, TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
+            // Respond with CONNECTED (the hostmode_transaction consumes this)
             let connected = encode_frame(&HostmodeFrame::command(
                 PACTOR_CHANNEL,
                 b"CONNECTED NODE".to_vec(),
@@ -657,17 +737,19 @@ mod tests {
 
     #[tokio::test]
     async fn usb_transport_connect_peer_reports_busy_status() {
-        let (transport_side, mut modem_side) = duplex(2048);
+        let (transport_side, mut modem_side) = duplex(4096);
         let transport = UsbPactorTransport::from_stream(transport_side, test_config());
 
         let modem = tokio::spawn(async move {
             let mut buf = [0u8; 1024];
+            // Modem receives C command via hostmode_transaction
             let n = modem_side.read(&mut buf).await.unwrap();
             let frame = decode_frame(&buf[..n]).unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
             assert_eq!(frame.code, TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
+            // Respond with BUSY
             let busy =
                 encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"BUSY".to_vec())).unwrap();
             modem_side.write_all(&busy).await.unwrap();
@@ -681,25 +763,42 @@ mod tests {
     #[tokio::test]
     async fn usb_transport_connect_peer_waits_through_queued_status() {
         let (transport_side, mut modem_side) = duplex(4096);
-        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+        let mut config = test_config();
+        config.command_timeout = Duration::from_secs(10);
+        let transport = UsbPactorTransport::from_stream(transport_side, config);
 
         let modem = tokio::spawn(async move {
+            let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
+
+            // Read C command (hostmode_transaction)
             let n = modem_side.read(&mut buf).await.unwrap();
-            let frame = decode_frame(&buf[..n]).unwrap();
+            decoder.push(&buf[..n]);
+            let frame = decoder.next_frame().unwrap().unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
             assert_eq!(frame.code, TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
+            // Respond with QUEUED — hostmode_transaction returns this
             let queued =
                 encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"QUEUED".to_vec())).unwrap();
-            let connected = encode_frame(&HostmodeFrame::command(
+            modem_side.write_all(&queued).await.unwrap();
+
+            // connect_peer will sleep 2s, then send L poll (poll_pactor_channel_state)
+            let n = modem_side.read(&mut buf).await.unwrap();
+            decoder.push(&buf[..n]);
+            let l_frame = decoder.next_frame().unwrap().unwrap();
+            assert_eq!(l_frame.channel, PACTOR_CHANNEL);
+            // L command payload
+            assert!(l_frame.payload.starts_with(b"L"));
+
+            // Respond with link_state=2 (connected) — 6 space-separated fields
+            let l_resp = encode_frame(&HostmodeFrame::command(
                 PACTOR_CHANNEL,
-                b"CONNECTED NODE".to_vec(),
+                b"0 0 0 0 0 2".to_vec(),
             ))
             .unwrap();
-            modem_side.write_all(&queued).await.unwrap();
-            modem_side.write_all(&connected).await.unwrap();
+            modem_side.write_all(&l_resp).await.unwrap();
         });
 
         transport.connect_peer("NODE").await.unwrap();
