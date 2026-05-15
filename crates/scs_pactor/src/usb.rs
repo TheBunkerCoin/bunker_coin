@@ -216,6 +216,15 @@ impl UsbPactorTransport {
         // the modem expects.
     }
 
+    pub async fn send_hostmode_frame_no_response_advance_counter(
+        &self,
+        frame: HostmodeFrame,
+    ) -> Result<(), ScsPactorError> {
+        self.send_hostmode_frame(frame).await?;
+        self.packet_counter.lock().await.advance();
+        Ok(())
+    }
+
     pub async fn send_hostmode_frame_no_response(
         &self,
         frame: HostmodeFrame,
@@ -550,7 +559,10 @@ impl PactorTransport for UsbPactorTransport {
         // observed through subsequent L/G polls instead.
         let mut payload = b"C ".to_vec();
         payload.extend_from_slice(remote_call.as_bytes());
-        self.send_hostmode_frame(HostmodeFrame::command(PACTOR_CHANNEL, payload))
+        self.send_hostmode_frame_no_response_advance_counter(HostmodeFrame::command(
+            PACTOR_CHANNEL,
+            payload,
+        ))
             .await?;
         eprintln!("[connect] queued C {remote_call}");
 
@@ -773,11 +785,12 @@ mod tests {
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
-            assert_eq!(base_code(frame.code), TYPE_COMMAND);
+            assert_eq!(frame.code, TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
             // connect_peer then sends L poll
             let l_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
+            assert_eq!(l_frame.code, TYPE_COMMAND_COUNTER);
             assert!(l_frame.payload.starts_with(b"L"));
 
             // Respond with link_state=4 (connected)
@@ -809,11 +822,12 @@ mod tests {
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
-            assert_eq!(base_code(frame.code), TYPE_COMMAND);
+            assert_eq!(frame.code, TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
             // connect_peer then sends L poll
             let l_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
+            assert_eq!(l_frame.code, TYPE_COMMAND_COUNTER);
             assert!(l_frame.payload.starts_with(b"L"));
 
             // Respond with status_pending=1
@@ -826,6 +840,7 @@ mod tests {
 
             // connect_peer sends G poll to read status
             let g_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
+            assert_eq!(g_frame.code, TYPE_COMMAND);
             assert!(g_frame.payload.starts_with(b"G"));
 
             // Respond with BUSY
@@ -855,11 +870,12 @@ mod tests {
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
-            assert_eq!(base_code(frame.code), TYPE_COMMAND);
+            assert_eq!(frame.code, TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
             // First L poll — respond with link_state=1 (setup)
             let l1 = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
+            assert_eq!(l1.code, TYPE_COMMAND_COUNTER);
             assert!(l1.payload.starts_with(b"L"));
             let l1_resp = encode_frame(&HostmodeFrame::command(
                 PACTOR_CHANNEL,
@@ -870,6 +886,7 @@ mod tests {
 
             // Second L poll — respond with link_state=4 (connected)
             let l2 = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
+            assert_eq!(l2.code, TYPE_COMMAND);
             assert!(l2.payload.starts_with(b"L"));
             let l2_resp = encode_frame(&HostmodeFrame::command(
                 PACTOR_CHANNEL,
