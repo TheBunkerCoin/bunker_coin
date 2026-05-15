@@ -209,12 +209,11 @@ impl UsbPactorTransport {
 
     async fn send_hostmode_frame(&self, frame: HostmodeFrame) -> Result<(), ScsPactorError> {
         let encoded = self.encode_outbound_frame(frame).await?;
-        self.write_encoded_frame(&encoded).await?;
-        // Fire-and-forget: advance counter optimistically since we
-        // won't see the ACK. The modem will send a repeat request if
-        // there's a mismatch, which hostmode_transaction handles.
-        self.packet_counter.lock().await.advance();
-        Ok(())
+        self.write_encoded_frame(&encoded).await
+        // Do NOT advance the counter here — fire-and-forget sends don't
+        // get an ACK, so the modem will still be at the old counter value.
+        // The next hostmode_transaction will use the same counter, which
+        // the modem expects.
     }
 
     pub async fn send_hostmode_frame_no_response(
@@ -546,16 +545,36 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
-        // ptc-go sends the connect command fire-and-forget (no immediate
-        // response expected) then polls L status to detect link establishment.
+        // Send C command via hostmode_transaction — the modem should ACK it
+        // (ptc-go also uses writeAndGetResponse for all commands).
         let mut payload = b"C ".to_vec();
         payload.extend_from_slice(remote_call.as_bytes());
-        self.send_hostmode_frame(HostmodeFrame::command(PACTOR_CHANNEL, payload))
+        let c_response = self
+            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, payload))
             .await?;
-        eprintln!("[connect] sent C {remote_call}, polling L for link state...");
+        let c_text = String::from_utf8_lossy(&c_response.payload);
+        eprintln!(
+            "[connect] C {remote_call} response: ch={} code=0x{:02x} payload={:?}",
+            c_response.channel, c_response.code, c_text
+        );
 
-        // Give the modem a moment to process the connect command
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Check if the modem immediately reported a terminal status
+        if let Ok(event) = Self::parse_status_line(&c_text) {
+            match event {
+                PactorLinkEvent::Status(PactorLinkStatus::Connected { .. }) => return Ok(()),
+                PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
+                    return Err(ScsPactorError::Busy)
+                }
+                PactorLinkEvent::Status(
+                    PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
+                ) => {
+                    return Err(ScsPactorError::Io(std::io::Error::other(
+                        c_text.into_owned(),
+                    )))
+                }
+                _ => {}
+            }
+        }
 
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
@@ -757,7 +776,7 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command (fire-and-forget, no response needed)
+            // Modem receives C command (hostmode_transaction — needs ACK)
             let n = modem_side.read(&mut buf).await.unwrap();
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
@@ -765,7 +784,15 @@ mod tests {
             assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
-            // connect_peer sleeps 1s then sends L poll
+            // ACK the C command with a simple status response
+            let c_ack = encode_frame(&HostmodeFrame::command(
+                PACTOR_CHANNEL,
+                b"OK".to_vec(),
+            ))
+            .unwrap();
+            modem_side.write_all(&c_ack).await.unwrap();
+
+            // connect_peer then sends L poll
             let n = modem_side.read(&mut buf).await.unwrap();
             decoder.push(&buf[..n]);
             let l_frame = decoder.next_frame().unwrap().unwrap();
@@ -795,7 +822,7 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command (fire-and-forget)
+            // Modem receives C command (hostmode_transaction — needs ACK)
             let n = modem_side.read(&mut buf).await.unwrap();
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
@@ -803,7 +830,15 @@ mod tests {
             assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
 
-            // connect_peer sleeps 1s then sends L poll
+            // ACK the C command — modem accepts it
+            let c_ack = encode_frame(&HostmodeFrame::command(
+                PACTOR_CHANNEL,
+                b"OK".to_vec(),
+            ))
+            .unwrap();
+            modem_side.write_all(&c_ack).await.unwrap();
+
+            // connect_peer then sends L poll
             let n = modem_side.read(&mut buf).await.unwrap();
             decoder.push(&buf[..n]);
             let l_frame = decoder.next_frame().unwrap().unwrap();
@@ -845,13 +880,21 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command (fire-and-forget)
+            // Modem receives C command (hostmode_transaction — needs ACK)
             let n = modem_side.read(&mut buf).await.unwrap();
             decoder.push(&buf[..n]);
             let frame = decoder.next_frame().unwrap().unwrap();
             assert_eq!(frame.channel, PACTOR_CHANNEL);
             assert_eq!(base_code(frame.code), TYPE_COMMAND);
             assert_eq!(frame.payload, b"C NODE");
+
+            // ACK the C command
+            let c_ack = encode_frame(&HostmodeFrame::command(
+                PACTOR_CHANNEL,
+                b"OK".to_vec(),
+            ))
+            .unwrap();
+            modem_side.write_all(&c_ack).await.unwrap();
 
             // First L poll — respond with link_state=1 (setup)
             let n = modem_side.read(&mut buf).await.unwrap();
@@ -1030,29 +1073,42 @@ mod tests {
         let (transport_side, mut modem_side) = duplex(2048);
         let transport = UsbPactorTransport::from_stream(transport_side, test_config());
 
-        transport.send_command("MYCALL A").await.unwrap();
-        transport.send_command("MYCALL B").await.unwrap();
+        // Use hostmode_transaction so counter advances after each ACK.
+        let modem = tokio::spawn(async move {
+            let mut decoder = HostmodeDecoder::new();
+            let mut buf = [0u8; 1024];
+            let mut frames = Vec::new();
 
-        let mut decoder = HostmodeDecoder::new();
-        let mut frames = Vec::new();
-        let mut buf = [0u8; 1024];
-        while frames.len() < 2 {
-            let n = modem_side.read(&mut buf).await.unwrap();
-            decoder.push(&buf[..n]);
-            while let Some(frame) = decoder.next_frame().unwrap() {
-                frames.push(frame);
+            for _ in 0..2 {
+                let n = modem_side.read(&mut buf).await.unwrap();
+                decoder.push(&buf[..n]);
+                while let Some(frame) = decoder.next_frame().unwrap() {
+                    frames.push(frame);
+                    // Send ACK response
+                    let ack = encode_frame(&HostmodeFrame::command(
+                        PACTOR_CHANNEL,
+                        b"OK".to_vec(),
+                    ))
+                    .unwrap();
+                    modem_side.write_all(&ack).await.unwrap();
+                }
             }
-        }
+            frames
+        });
 
-        let first = &frames[0];
-        let second = &frames[1];
+        // set_mycall uses hostmode_transaction
+        transport.set_mycall("A").await.unwrap();
+        transport.set_mycall("B").await.unwrap();
 
-        // First frame: counter=0 → type=0x01
-        assert_eq!(first.code, TYPE_COMMAND);
-        assert_eq!(first.payload, b"I A");
+        let frames = modem.await.unwrap();
+        assert_eq!(frames.len(), 2);
+
+        // First frame: counter=false → type=0x01
+        assert_eq!(frames[0].code, TYPE_COMMAND);
+        assert_eq!(frames[0].payload, b"I A");
 
         // Second frame: counter toggled → type=0x81
-        assert_eq!(second.code, TYPE_COMMAND_COUNTER);
-        assert_eq!(second.payload, b"I B");
+        assert_eq!(frames[1].code, TYPE_COMMAND_COUNTER);
+        assert_eq!(frames[1].payload, b"I B");
     }
 }
