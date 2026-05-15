@@ -390,67 +390,17 @@ async fn init_hostmode(
         }
     }
 
-    // === Step 4: Verify hostmode with sequence-reset bit ===
-    // Send an L (status) command on channel 31 with bit 6 set (0x41 type byte)
-    // to force the modem to ACK regardless of counter state.
-    println!("  step 4: verifying hostmode ...");
-    for attempt in 1..=5 {
-        println!("  verify attempt {attempt}/5 ...");
-
-        // Send raw CRC-framed poll with sequence reset bit
-        let resp = send_hostmode_raw_with_reset(
-            &mut serial,
-            PACTOR_CHANNEL,
-            b"L",
-            &format!("L ch{PACTOR_CHANNEL} (reset)"),
-        )
-        .await?;
-
-        let packets = try_decode_hostmode(&resp);
-        if !packets.is_empty() {
-            println!("  hostmode verified! Got {} packet(s):", packets.len());
-            for pkt in &packets {
-                println!("    {:?}", pkt);
-            }
-
-            // Success — wrap in transport
-            let mut config = UsbPactorConfig::new(port);
-            config.command_timeout = command_timeout;
-            let transport = UsbPactorTransport::from_stream(serial, config);
-            return Ok(transport);
-        }
-
-        // Also try without the reset bit in case the modem already synced
-        if attempt >= 3 {
-            let resp2 = send_hostmode_raw(
-                &mut serial,
-                &HostmodeFrame::command(PACTOR_CHANNEL, b"G".to_vec()),
-                &format!("G ch{PACTOR_CHANNEL}"),
-            )
-            .await?;
-            let packets2 = try_decode_hostmode(&resp2);
-            if !packets2.is_empty() {
-                println!("  hostmode verified via G poll!");
-                let mut config = UsbPactorConfig::new(port);
-                config.command_timeout = command_timeout;
-                let transport = UsbPactorTransport::from_stream(serial, config);
-                return Ok(transport);
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    // === Fallback: try wrapping in transport anyway ===
-    // The transport's reader task may be able to sync even if our manual
-    // decode couldn't.
-    println!("  fallback: trying UsbPactorTransport wrapper ...");
+    // === Step 4: Wrap in transport and verify via hostmode_transaction ===
+    // The transport handles packet counter (reset bit on first frame, toggling
+    // on subsequent frames). We skip raw verification to avoid desynchronizing
+    // the counter — let the transport's first transaction be the verification.
+    println!("  step 4: verifying hostmode via transport ...");
     let mut config = UsbPactorConfig::new(port);
     config.command_timeout = command_timeout;
     let transport = UsbPactorTransport::from_stream(serial, config);
 
-    for attempt in 1..=3 {
-        println!("  transport verify attempt {attempt}/3 ...");
+    for attempt in 1..=5 {
+        println!("  verify attempt {attempt}/5 ...");
         if verify_hostmode(&transport).await {
             return Ok(transport);
         }
