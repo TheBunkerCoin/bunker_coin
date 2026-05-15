@@ -95,11 +95,12 @@ impl UsbPactorTransport {
         let read_task = tokio::spawn(async move {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
+            eprintln!("[reader] task started");
 
             loop {
                 let n = match reader.read(&mut buf).await {
                     Ok(0) => {
-                        debug!("reader: EOF on serial stream");
+                        eprintln!("[reader] EOF on serial stream");
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::Disconnected))
                             .await;
@@ -107,7 +108,7 @@ impl UsbPactorTransport {
                     }
                     Ok(n) => n,
                     Err(e) => {
-                        warn!("reader: serial read error: {e}");
+                        eprintln!("[reader] serial read error: {e}");
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
                             .await;
@@ -115,18 +116,19 @@ impl UsbPactorTransport {
                     }
                 };
 
-                trace!("reader: got {} bytes: {:02x?}", n, &buf[..n]);
+                eprintln!("[reader] got {} bytes: {:02x?}", n, &buf[..n]);
                 decoder.push(&buf[..n]);
                 loop {
                     match decoder.next_packet() {
                         Ok(Some(HostmodePacket::Frame(frame))) => {
-                            debug!(
-                                "reader: decoded frame ch={} code=0x{:02x} payload({})={:02x?} ascii={:?}",
+                            let ascii = String::from_utf8_lossy(&frame.payload);
+                            eprintln!(
+                                "[reader] decoded frame ch={} code=0x{:02x} payload({})={:02x?} ascii={:?}",
                                 frame.channel,
                                 frame.code,
                                 frame.payload.len(),
                                 &frame.payload,
-                                String::from_utf8_lossy(&frame.payload)
+                                ascii
                             );
                             let _ = packet_tx.send(HostmodePacket::Frame(frame.clone())).await;
                             if route_frame(frame, &command_tx, &data_tx, &event_tx)
@@ -137,12 +139,12 @@ impl UsbPactorTransport {
                             }
                         }
                         Ok(Some(HostmodePacket::RepeatRequest)) => {
-                            debug!("reader: decoded RepeatRequest");
+                            eprintln!("[reader] decoded RepeatRequest");
                             let _ = packet_tx.send(HostmodePacket::RepeatRequest).await;
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            warn!("reader: decode error: {e}");
+                            eprintln!("[reader] decode error: {e}");
                             let _ = event_tx
                                 .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
                                 .await;
@@ -205,15 +207,26 @@ impl UsbPactorTransport {
         frame: HostmodeFrame,
     ) -> Result<HostmodeFrame, ScsPactorError> {
         let _transaction = self.transaction_lock.lock().await;
-        let encoded = self.encode_outbound_frame(frame).await?;
+        let encoded = self.encode_outbound_frame(frame.clone()).await?;
+        eprintln!(
+            "[tx] hostmode_transaction: ch={} code=0x{:02x} payload={:02x?} encoded={:02x?}",
+            frame.channel, frame.code, &frame.payload, &encoded
+        );
         let mut retries = 0;
 
         loop {
             self.write_encoded_frame(&encoded).await?;
             match self.recv_hostmode_packet(self.command_timeout).await? {
-                HostmodePacket::Frame(response) => return Ok(response),
+                HostmodePacket::Frame(response) => {
+                    eprintln!(
+                        "[tx] hostmode_transaction response: ch={} code=0x{:02x} payload={:02x?}",
+                        response.channel, response.code, &response.payload
+                    );
+                    return Ok(response);
+                }
                 HostmodePacket::RepeatRequest => {
                     retries += 1;
+                    eprintln!("[tx] repeat request (retry {retries}/{MAX_HOSTMODE_RETRIES})");
                     if retries > MAX_HOSTMODE_RETRIES {
                         return Err(ScsPactorError::Protocol(
                             "hostmode repeat request limit exceeded".to_owned(),
