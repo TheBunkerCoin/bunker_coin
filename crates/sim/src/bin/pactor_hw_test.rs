@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use bunker_coin_radio::{Network, NetworkMessage, PactorRadioNode};
 use clap::Parser;
 use scs_pactor::hostmode::{
-    encode_frame, HostmodeDecoder, HostmodeFrame, HostmodePacket, PACTOR_CHANNEL, TYPE_COMMAND,
+    HostmodeDecoder, HostmodeFrame, HostmodePacket, PACTOR_CHANNEL,
 };
 use scs_pactor::{PactorTransport, UsbPactorConfig, UsbPactorTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -76,16 +76,33 @@ struct Args {
     diagnose_connect_reset: bool,
 
     /// Radio frequency in kHz (e.g. 14079.0). Sent to both modems via TRX CI-V control.
+    /// If omitted, TRX tuning is skipped (useful with --diagnose-connect).
     #[arg(long)]
-    frequency: f64,
+    frequency: Option<f64>,
 
-    /// Override TRX CI-V baud rate (only if modem's stored config is wrong)
+    /// Override TRX CI-V baud rate for both modems (must pair with --trx-addr)
     #[arg(long)]
     trx_baud: Option<u32>,
 
-    /// Override TRX CI-V address in hex (only if modem's stored config is wrong)
+    /// Override TRX CI-V address in hex for both modems (must pair with --trx-baud)
     #[arg(long)]
     trx_addr: Option<String>,
+
+    /// Override TRX CI-V baud rate for modem A only (must pair with --trx-addr-a)
+    #[arg(long)]
+    trx_baud_a: Option<u32>,
+
+    /// Override TRX CI-V address in hex for modem A only (must pair with --trx-baud-a)
+    #[arg(long)]
+    trx_addr_a: Option<String>,
+
+    /// Override TRX CI-V baud rate for modem B only (must pair with --trx-addr-b)
+    #[arg(long)]
+    trx_baud_b: Option<u32>,
+
+    /// Override TRX CI-V address in hex for modem B only (must pair with --trx-baud-b)
+    #[arg(long)]
+    trx_addr_b: Option<String>,
 }
 
 /// Read all pending bytes from the serial port, printing hex + ASCII.
@@ -182,39 +199,6 @@ async fn send_ascii(
     Ok(read_all(serial, 800).await)
 }
 
-/// Send a CRC-framed hostmode command and read the raw response bytes.
-/// Does NOT use UsbPactorTransport — works directly on the serial port for
-/// low-level debugging.
-async fn send_hostmode_raw(
-    serial: &mut tokio_serial::SerialStream,
-    frame: &HostmodeFrame,
-    label: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let encoded = encode_frame(frame)?;
-    println!(
-        "  >> hostmode {label}: {:02x?} ({} bytes)",
-        encoded,
-        encoded.len()
-    );
-    serial.write_all(&encoded).await?;
-    serial.flush().await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    Ok(read_all(serial, 1000).await)
-}
-
-/// Send a CRC-framed hostmode command with bit 6 (sequence reset) set.
-/// This should be used for the first frame after entering hostmode to ensure
-/// the modem ACKs regardless of its internal packet counter state.
-async fn send_hostmode_raw_with_reset(
-    serial: &mut tokio_serial::SerialStream,
-    channel: u8,
-    payload: &[u8],
-    label: &str,
-) -> anyhow::Result<Vec<u8>> {
-    // Bit 6 = sequence reset, Bit 0 = 1 for command → 0x41
-    let frame = HostmodeFrame::with_code(channel, TYPE_COMMAND | 0x40, payload.to_vec());
-    send_hostmode_raw(serial, &frame, label).await
-}
 
 /// Try to verify hostmode is active on an already-wrapped transport.
 async fn verify_hostmode(transport: &UsbPactorTransport) -> bool {
@@ -320,7 +304,7 @@ async fn init_hostmode(
     baud: u32,
     callsign: &str,
     command_timeout: Duration,
-    frequency: f64,
+    frequency: Option<f64>,
     trx_baud: Option<u32>,
     trx_addr: Option<&str>,
 ) -> anyhow::Result<UsbPactorTransport> {
@@ -372,49 +356,49 @@ async fn init_hostmode(
     }
 
     // === Step 2b: TRX CI-V frequency control ===
-    println!("  step 2b: TRX frequency control ...");
+    if let Some(frequency) = frequency {
+        println!("  step 2b: TRX frequency control ...");
 
-    // Query the modem's current TRX config (type, baud, CI-V address)
-    send_ascii(&mut serial, "TRX TYpe").await?;
+        // Query the modem's current TRX config (type, baud, CI-V address)
+        send_ascii(&mut serial, "TRX TYpe").await?;
 
-    // Only override TRX settings if the user explicitly requested it
-    if let (Some(baud_override), Some(addr_override)) = (trx_baud, trx_addr) {
-        println!("  overriding TRX config: baud={baud_override} addr=${addr_override}");
-        send_ascii(
-            &mut serial,
-            &format!("TRX TYpe I {baud_override} ${addr_override}"),
-        )
-        .await?;
-    } else if let Some(baud_override) = trx_baud {
-        println!("  overriding TRX baud: {baud_override}");
-        send_ascii(
-            &mut serial,
-            &format!("TRX TYpe I {baud_override}"),
-        )
-        .await?;
-    } else if let Some(addr_override) = trx_addr {
-        println!("  overriding TRX addr: ${addr_override}");
-        send_ascii(
-            &mut serial,
-            &format!("TRX TYpe I 19200 ${addr_override}"),
-        )
-        .await?;
+        // Only override TRX settings if the user explicitly requested it.
+        // Require both baud and addr together to avoid hardcoding either value.
+        match (trx_baud, trx_addr) {
+            (Some(baud_override), Some(addr_override)) => {
+                println!("  overriding TRX config: baud={baud_override} addr=${addr_override}");
+                send_ascii(
+                    &mut serial,
+                    &format!("TRX TYpe I {baud_override} ${addr_override}"),
+                )
+                .await?;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(anyhow::anyhow!(
+                    "TRX override on {port}: --trx-baud and --trx-addr must be specified together \
+                     (the SCS TRX TYpe command requires both baud and address)"
+                ));
+            }
+            (None, None) => { /* use modem's stored config */ }
+        }
+
+        // Tune the radio to the requested frequency.
+        // A successful tune returns "*** TRX FREQUENCY CHANGED".
+        // If CI-V is dead (cable disconnected, radio off, wrong address), the
+        // modem returns just "cmd: " with no confirmation.
+        let set_resp = send_ascii(&mut serial, &format!("TRX Frequency {frequency}")).await?;
+        let set_str = String::from_utf8_lossy(&set_resp);
+        if !set_str.contains("FREQUENCY CHANGED") {
+            return Err(anyhow::anyhow!(
+                "TRX Frequency set failed on {port} — radio did not confirm tune.\n  \
+                 Is the CI-V cable connected? Is the radio powered on?\n  \
+                 modem response: {set_str}"
+            ));
+        }
+        println!("  TRX frequency confirmed on {port}");
+    } else {
+        println!("  step 2b: TRX skipped (no --frequency given)");
     }
-
-    // Tune the radio to the requested frequency.
-    // A successful tune returns "*** TRX FREQUENCY CHANGED".
-    // If CI-V is dead (cable disconnected, radio off, wrong address), the
-    // modem returns just "cmd: " with no confirmation.
-    let set_resp = send_ascii(&mut serial, &format!("TRX Frequency {frequency}")).await?;
-    let set_str = String::from_utf8_lossy(&set_resp);
-    if !set_str.contains("FREQUENCY CHANGED") {
-        return Err(anyhow::anyhow!(
-            "TRX Frequency set failed on {port} — radio did not confirm tune.\n  \
-             Is the CI-V cable connected? Is the radio powered on?\n  \
-             modem response: {set_str}"
-        ));
-    }
-    println!("  TRX frequency confirmed on {port}");
 
     // === Step 3: Enter JHOST4 CRC hostmode ===
     // ptc-go sends this as a terminal-mode ASCII command
@@ -463,26 +447,30 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Initializing modem A on {} ...", args.port_a);
     let command_timeout = Duration::from_secs(args.connect_timeout_secs);
+    let trx_baud_a = args.trx_baud_a.or(args.trx_baud);
+    let trx_addr_a = args.trx_addr_a.as_deref().or(args.trx_addr.as_deref());
     let modem_a = init_hostmode(
         &args.port_a,
         args.baud,
         &args.call_a,
         command_timeout,
         args.frequency,
-        args.trx_baud,
-        args.trx_addr.as_deref(),
+        trx_baud_a,
+        trx_addr_a,
     )
     .await?;
 
     println!("Initializing modem B on {} ...", args.port_b);
+    let trx_baud_b = args.trx_baud_b.or(args.trx_baud);
+    let trx_addr_b = args.trx_addr_b.as_deref().or(args.trx_addr.as_deref());
     let modem_b = init_hostmode(
         &args.port_b,
         args.baud,
         &args.call_b,
         command_timeout,
         args.frequency,
-        args.trx_baud,
-        args.trx_addr.as_deref(),
+        trx_baud_b,
+        trx_addr_b,
     )
     .await?;
 
@@ -503,10 +491,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Modem A connecting to {} ...", args.call_b);
-    println!(
-        "  (radios tuned to {} kHz via TRX — timeout={}s)",
-        args.frequency, args.connect_timeout_secs
-    );
+    if let Some(freq) = args.frequency {
+        println!(
+            "  (radios tuned to {} kHz via TRX — timeout={}s)",
+            freq, args.connect_timeout_secs
+        );
+    } else {
+        println!(
+            "  (TRX tuning skipped — timeout={}s)",
+            args.connect_timeout_secs
+        );
+    }
     println!("  Tip: use --diagnose-connect to watch L poll status during connect");
     let link_start = Instant::now();
     match modem_a.connect_peer(&args.call_b).await {
