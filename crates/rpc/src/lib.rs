@@ -198,6 +198,7 @@ pub struct MempoolEntry {
     pub nonce: u64,
     pub fee: u64,
     pub body_type: String,
+    pub body: TransactionBodyResponse,
     pub received_at: u64,
 }
 
@@ -560,6 +561,7 @@ async fn submit_transaction(
         nonce: tx.nonce,
         fee: tx.fee,
         body_type: body_type.to_string(),
+        body: core_tx_to_body_response(&tx.body),
         received_at: now,
     };
 
@@ -783,7 +785,7 @@ async fn get_transaction(
                 "sender": entry.sender,
                 "nonce": entry.nonce,
                 "fee": entry.fee,
-                "body_type": entry.body_type,
+                "body": entry.body,
                 "status": { "location": "mempool" },
             }))
             .into_response();
