@@ -3,8 +3,7 @@
 Work in progress, this is just a very basic version for the block explorer.
 
 ## Overview
-The BunkerCoin API provides access to blockchain data including blocks and node status. The API runs on port 3001 and returns JSON responses.
-
+The BunkerCoin API provides access to blockchain data including blocks, transactions, accounts, and node status. The API runs on port 3001 and returns JSON responses.
 
 ## Endpoints
 
@@ -32,14 +31,16 @@ The pagination is designed for infinite scroll patterns:
     "parent_slot": 122,
     "parent_hash": "9f8e7d6c5b4a...",
     "producer": 0,
-    "timestamp": 1234567890123,
+    "proposed_timestamp": 1234567890123,
+    "finalized_timestamp": 1234567890200,
     "status": "finalized"
   },
   {
     "type": "skip",
     "slot": 122,
     "hash": "skip-122",
-    "timestamp": 1234567890100,
+    "proposed_timestamp": 1234567890100,
+    "finalized_timestamp": 1234567890150,
     "status": "finalized"
   }
 ]
@@ -47,13 +48,16 @@ The pagination is designed for infinite scroll patterns:
 
 Note: Items are ordered newest to oldest within the response array.
 
-### GET /block/:hash
-Returns a specific block or skip certificate by its hash.
+### GET /block/{hash}
+Returns a specific block by its hash, with optional transaction details.
 
 #### Parameters
-- `hash`: The block hash (64 character hex string) or skip certificate identifier
+- `hash` (path): The block hash (64-character hex string) or skip certificate identifier
 
-#### Response for Block
+#### Query Parameters
+- `include_transactions` (optional): When `true`, include decoded transactions in the response. Only available for blocks loaded from the blockstore.
+
+#### Response
 ```json
 {
   "type": "block",
@@ -62,23 +66,34 @@ Returns a specific block or skip certificate by its hash.
   "parent_slot": 122,
   "parent_hash": "9f8e7d6c5b4a...",
   "producer": 0,
-  "timestamp": 1234567890123,
-  "status": "finalized"
+  "proposed_timestamp": 1234567890123,
+  "finalized_timestamp": 1234567890200,
+  "status": "finalized",
+  "transactions": [
+    {
+      "hash": "abc123...",
+      "sender": "def456...",
+      "nonce": 1,
+      "fee": 100,
+      "body": { "type": "Transfer", "to": "789abc...", "amount": 5000 }
+    }
+  ]
 }
 ```
 
-#### Response for Skip Certificate
-```json
-{
-  "type": "skip",
-  "slot": 122,
-  "hash": "skip-122",
-  "timestamp": 1234567890100,
-  "status": "finalized"
-}
-```
+The `transactions` field is only present when `include_transactions=true` and the block is loaded from the blockstore. Returns 404 if not found.
 
-Returns 404 if block/skip not found.
+### GET /block/slot/{slot_num}
+Returns a specific block by its slot number, with optional transaction details. Checks in-memory blocks first, then falls back to the blockstore.
+
+#### Parameters
+- `slot_num` (path): The slot number (unsigned integer)
+
+#### Query Parameters
+- `include_transactions` (optional): When `true`, include decoded transactions in the response. Only available for blocks loaded from the blockstore.
+
+#### Response
+Same shape as `GET /block/{hash}`. Returns 404 if no block exists at the given slot.
 
 ### GET /nodes
 Returns the current status of all nodes in the network.
@@ -91,6 +106,179 @@ Returns the current status of all nodes in the network.
     "finalized_slot": 120
   }
 ]
+```
+
+### GET /radio
+Returns current radio network statistics.
+
+#### Response
+```json
+{
+  "bandwidth_bps": 4800,
+  "packet_loss_percent": 15.0,
+  "latency_ms": 250,
+  "jitter_ms": 50,
+  "packets_sent": 1024,
+  "packets_dropped": 42,
+  "current_throughput_bps": 3200.0
+}
+```
+
+### GET /transactions/{hash}
+Returns a transaction by its hash. Checks the mempool first, then scans the blockstore.
+
+#### Parameters
+- `hash` (path): The transaction hash (64-character hex string)
+
+#### Response (mempool)
+```json
+{
+  "hash": "abc123...",
+  "sender": "def456...",
+  "nonce": 1,
+  "fee": 100,
+  "body_type": "Transfer",
+  "status": { "location": "mempool" }
+}
+```
+
+#### Response (confirmed)
+```json
+{
+  "hash": "abc123...",
+  "sender": "def456...",
+  "nonce": 1,
+  "fee": 100,
+  "body": { "type": "Transfer", "to": "789abc...", "amount": 5000 },
+  "status": {
+    "location": "confirmed",
+    "slot": 123,
+    "block_hash": "a1b2c3d4e5f6..."
+  }
+}
+```
+
+Returns 404 if not found.
+
+### POST /transactions
+Submit a new transaction to the mempool.
+
+#### Request Body
+```json
+{
+  "sender": "def456...",
+  "nonce": 1,
+  "fee": 100,
+  "body": { "Transfer": { "to": "789abc...", "amount": 5000 } },
+  "signature": "aabbccdd..."
+}
+```
+
+All hex fields are 64-character hex strings (32 bytes) except `signature` which is 128 characters (64 bytes).
+
+**Transaction body variants:**
+- `Transfer`: `{ "to": "<hex>", "amount": <u64> }`
+- `TokenTransfer`: `{ "to": "<hex>", "token_id": "<hex>", "amount": <u64> }`
+- `Mint`: `{ "ticker": "<string 3-8 chars>", "max_supply": <u64>, "metadata_hash": "<hex>" }`
+- `Bond`: `{ "validator": "<hex>", "amount": <u64> }`
+- `Retire`: `{ "validator": "<hex>", "amount": <u64> }`
+- `Withdraw`: `{ "validator": "<hex>" }`
+- `UnJail`
+- `SetCommission`: `{ "rate": <u16> }`
+
+#### Response (success)
+```json
+{ "hash": "abc123..." }
+```
+
+#### Error Responses
+- `400 Bad Request`: Invalid sender, signature, or body
+- `409 Conflict`: Transaction already in mempool
+- `503 Service Unavailable`: Mempool full (max 10,000 transactions)
+
+### GET /mempool
+Returns a paginated list of pending mempool transactions.
+
+#### Query Parameters
+- `limit` (optional): Maximum number of items to return (default: 100, max: 500)
+- `offset` (optional): Number of items to skip (default: 0)
+
+#### Response
+```json
+{
+  "transactions": [
+    {
+      "hash": "abc123...",
+      "sender": "def456...",
+      "nonce": 1,
+      "fee": 100,
+      "body_type": "Transfer",
+      "received_at": 1234567890123
+    }
+  ],
+  "total": 42,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+### GET /mempool/{hash}
+Returns a specific mempool transaction by hash.
+
+#### Parameters
+- `hash` (path): The transaction hash (64-character hex string)
+
+#### Response
+```json
+{
+  "hash": "abc123...",
+  "sender": "def456...",
+  "nonce": 1,
+  "fee": 100,
+  "body_type": "Transfer",
+  "received_at": 1234567890123
+}
+```
+
+Returns 404 if not found.
+
+### GET /accounts/{pubkey}
+Returns account information for a given public key. Returns zero balances for unknown accounts.
+
+#### Parameters
+- `pubkey` (path): The account public key (64-character hex string)
+
+#### Response
+```json
+{
+  "pubkey": "def456...",
+  "native_balance": 1000000,
+  "token_balances": {
+    "abc123...": 500
+  },
+  "nonce": 5
+}
+```
+
+Returns `400 Bad Request` if the pubkey is invalid hex or wrong length.
+
+### GET /tokens
+Returns all registered tokens.
+
+#### Response
+```json
+{
+  "tokens": [
+    {
+      "id": "abc123...",
+      "ticker": "BNK",
+      "current_supply": 1000000,
+      "max_supply": 10000000,
+      "metadata_hash": "def456...",
+      "creator": "789abc..."
+    }
+  ]
+}
 ```
 
 ## WebSocket Endpoint
@@ -108,7 +296,8 @@ Connect to: `ws://localhost:3001/ws`
   "packets_transmitted_2s": 2,
   "bytes_transmitted_2s": 2100,
   "effective_throughput_bps_2s": 8400.0,
-  "packet_loss_rate_2s": 25.0
+  "packet_loss_rate_2s": 25.0,
+  "packets_queued": 12
 }
 ```
 
@@ -118,7 +307,8 @@ Connect to: `ws://localhost:3001/ws`
 - `packets_transmitted_2s`: Number of packets transmitted in the last 2 seconds
 - `bytes_transmitted_2s`: Total bytes transmitted in the last 2 seconds
 - `effective_throughput_bps_2s`: Effective throughput in bits per second (last 2s)
-- `packet_loss_rate_2s`: Packet loss percentage in the last 2 seconds (capped at 25%)
+- `packet_loss_rate_2s`: Packet loss percentage in the last 2 seconds
+- `packets_queued`: Number of packets currently queued for transmission
 
 #### Block Update
 ```json
@@ -138,7 +328,38 @@ Connect to: `ws://localhost:3001/ws`
 }
 ```
 
+#### Status Change
+```json
+{
+  "type": "block_update",
+  "status_change": {
+    "slot": 123,
+    "hash": "abcd...",
+    "old_status": "proposed",
+    "new_status": "finalized"
+  }
+}
+```
+
+#### Transaction Received
+```json
+{
+  "type": "transaction_received",
+  "hash": "abc123...",
+  "sender": "def456...",
+  "fee": 100,
+  "body_type": "Transfer"
+}
+```
+
+## Slot Status Values
+Blocks and skip certificates progress through these statuses:
+- `pending` — slot is awaiting a block or skip
+- `proposed` — a block has been proposed for this slot
+- `notarized` — the block has been notarized by validators
+- `finalized` — the block is finalized and immutable
+
 ## CORS Policy
-The API currently allows cross-origin requests from:
+The API allows cross-origin requests from:
 - Any `http://localhost` port
 - Any subdomain of `*.bunkercoin.io`
