@@ -80,6 +80,16 @@ struct Args {
     #[arg(long)]
     frequency: Option<f64>,
 
+    /// Override frequency for modem A only in kHz (e.g. 97000.0 for 97 MHz).
+    /// Takes precedence over --frequency for modem A.
+    #[arg(long)]
+    frequency_a: Option<f64>,
+
+    /// Override frequency for modem B only in kHz (e.g. 97000.0 for 97 MHz).
+    /// Takes precedence over --frequency for modem B.
+    #[arg(long)]
+    frequency_b: Option<f64>,
+
     /// Override TRX CI-V baud rate for both modems (must pair with --trx-addr)
     #[arg(long)]
     trx_baud: Option<u32>,
@@ -447,6 +457,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Initializing modem A on {} ...", args.port_a);
     let command_timeout = Duration::from_secs(args.connect_timeout_secs);
+    let freq_a = args.frequency_a.or(args.frequency);
     let trx_baud_a = args.trx_baud_a.or(args.trx_baud);
     let trx_addr_a = args.trx_addr_a.as_deref().or(args.trx_addr.as_deref());
     let modem_a = init_hostmode(
@@ -454,13 +465,14 @@ async fn main() -> anyhow::Result<()> {
         args.baud,
         &args.call_a,
         command_timeout,
-        args.frequency,
+        freq_a,
         trx_baud_a,
         trx_addr_a,
     )
     .await?;
 
     println!("Initializing modem B on {} ...", args.port_b);
+    let freq_b = args.frequency_b.or(args.frequency);
     let trx_baud_b = args.trx_baud_b.or(args.trx_baud);
     let trx_addr_b = args.trx_addr_b.as_deref().or(args.trx_addr.as_deref());
     let modem_b = init_hostmode(
@@ -468,7 +480,7 @@ async fn main() -> anyhow::Result<()> {
         args.baud,
         &args.call_b,
         command_timeout,
-        args.frequency,
+        freq_b,
         trx_baud_b,
         trx_addr_b,
     )
