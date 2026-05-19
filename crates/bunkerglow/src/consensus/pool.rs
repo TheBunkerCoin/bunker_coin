@@ -803,7 +803,11 @@ impl PoolImpl {
         let current_window_start = (fin / SLOTS_PER_WINDOW) * SLOTS_PER_WINDOW;
         let current_window_end = current_window_start + SLOTS_PER_WINDOW - 1;
 
-        if fin < current_window_end {
+        if fin < current_window_end && fin > 0 {
+            // Only emit mid-window timeouts for a genuine restart (fin > 0).
+            // At genesis (fin == 0), the first window hasn't started yet —
+            // emitting timeouts would skip-certify slots before the block
+            // producer has a chance to run.
             println!(
                 "[Pool::load_from_db] Mid-window restart detected, emitting timeouts for slots {}..{}",
                 next_slot, current_window_end
@@ -817,7 +821,7 @@ impl PoolImpl {
                     .votor_event_channel
                     .try_send(VotorEvent::Timeout(Slot::new(slot)));
             }
-        } else {
+        } else if fin >= current_window_end {
             let next_window_start = Slot::new(fin + 1);
             if let Some((parent_slot, parent_hash)) = self
                 .parent_ready_tracker

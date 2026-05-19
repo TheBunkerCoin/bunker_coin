@@ -600,13 +600,18 @@ pub async fn multi_node_consensus_simulation_with_api(
         >,
     >,
     execution_state: std::sync::Arc<tokio::sync::RwLock<bunker_coin_core::execution::State>>,
+    tx_sender_slot: std::sync::Arc<
+        tokio::sync::RwLock<
+            Option<tokio::sync::mpsc::UnboundedSender<bunker_coin_core::transaction::Transaction>>,
+        >,
+    >,
 ) {
     use bunkerglow::all2all::TrivialAll2All;
     use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
     use bunkerglow::crypto::{aggsig, signature::SecretKey};
     use bunkerglow::disseminator::Rotor;
     use bunkerglow::network::simulated::SimulatedNetworkCore;
-    use bunkerglow::network::{localhost_ip_sockaddr, SimulatedNetwork};
+    use bunkerglow::network::{localhost_ip_sockaddr, Network, SimulatedNetwork};
     use bunkerglow::repair::{RepairRequest, RepairResponse};
     use bunkerglow::shredder::Shred;
     use bunkerglow::Transaction;
@@ -688,6 +693,45 @@ pub async fn multi_node_consensus_simulation_with_api(
     if let Some((_, _, blockstore)) = pools_and_blockstores.first() {
         let mut bs_ref = blockstore_ref.write().await;
         *bs_ref = Some(blockstore.clone());
+    }
+
+    // RPC → consensus bridge: inject transactions from the API into the tx network
+    {
+        let injector_id = num_nodes as u64; // id beyond the validator range
+        let injector_net: SimulatedNetwork<Transaction, Transaction> =
+            txs_core.join_unlimited(injector_id).await;
+
+        let (tx_send, mut tx_recv) =
+            tokio::sync::mpsc::unbounded_channel::<bunker_coin_core::transaction::Transaction>();
+
+        // Store the sender so the API can forward transactions
+        *tx_sender_slot.write().await = Some(tx_send);
+
+        // Collect all validator txs_net addresses (port = validator id)
+        let all_validator_addrs: Vec<std::net::SocketAddr> = (0..num_nodes)
+            .map(|i| localhost_ip_sockaddr(i as u16))
+            .collect();
+
+        // Bridge task: encode CoreTransaction → bunkerglow::Transaction, broadcast to all nodes
+        tokio::spawn(async move {
+            while let Some(core_tx) = tx_recv.recv().await {
+                match bincode::serde::encode_to_vec(&core_tx, bincode::config::standard()) {
+                    Ok(bytes) => {
+                        let bunkerglow_tx = Transaction(bytes);
+                        if let Err(e) = injector_net
+                            .send_to_many(&bunkerglow_tx, all_validator_addrs.iter().copied())
+                            .await
+                        {
+                            log::warn!("Failed to inject transaction into consensus: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to encode transaction for consensus: {e}");
+                    }
+                }
+            }
+            log::info!("TX bridge task shutting down");
+        });
     }
 
     {

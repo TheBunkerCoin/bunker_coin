@@ -1,10 +1,11 @@
 //! multi-node radio simulation for BunkerCoin
 
 use bunker_coin_core::execution::State as ExecutionState;
+use bunker_coin_core::transaction::Transaction as CoreTransaction;
 use bunker_coin_sim::scenarios;
 use rpc::{run_api, RadioStats, SharedState};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task;
 
 #[tokio::main]
@@ -50,6 +51,9 @@ async fn main() {
     let blockstore_ref = Arc::new(RwLock::new(None));
     let blockstore_for_api = blockstore_ref.clone();
     let execution_state = Arc::new(RwLock::new(ExecutionState::new()));
+    let tx_sender_slot: Arc<RwLock<Option<mpsc::UnboundedSender<CoreTransaction>>>> =
+        Arc::new(RwLock::new(None));
+    let tx_sender_for_api = tx_sender_slot.clone();
 
     let state = SharedState {
         blocks: blocks.clone(),
@@ -67,8 +71,10 @@ async fn main() {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         let bs = blockstore_for_api.read().await.clone();
+        let tx_sender = tx_sender_for_api.read().await.clone();
         let mut state = state;
         state.blockstore = bs;
+        state.tx_sender = tx_sender;
 
         run_api(state).await;
     });
@@ -81,6 +87,7 @@ async fn main() {
         updates_tx,
         blockstore_ref,
         execution_state,
+        tx_sender_slot,
     )
     .await;
 
