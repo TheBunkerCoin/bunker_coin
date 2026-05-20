@@ -18,6 +18,7 @@ use bunkerglow::Slot;
 use futures::{sink::SinkExt, stream::StreamExt};
 use hex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -168,6 +169,14 @@ pub enum WebSocketUpdate {
         fee: u64,
         body_type: String,
     },
+    #[serde(rename = "transaction_finalized")]
+    TransactionFinalized {
+        hash: String,
+        slot: u64,
+        block_hash: String,
+        success: bool,
+        error: Option<String>,
+    },
 }
 
 // -- node / radio types --
@@ -200,6 +209,25 @@ pub struct MempoolEntry {
     pub body_type: String,
     pub body: TransactionBodyResponse,
     pub received_at: u64,
+}
+
+// -- transaction result types --
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum TxFinalStatus {
+    Finalized,
+    Failed,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct TxResult {
+    pub hash: String,
+    pub slot: u64,
+    pub block_hash: String,
+    pub status: TxFinalStatus,
+    pub error: Option<String>,
+    pub executed_at: u64,
 }
 
 // -- transaction response types --
@@ -295,6 +323,7 @@ pub struct SharedState {
     pub mempool: Arc<RwLock<Vec<MempoolEntry>>>,
     pub tx_sender: Option<mpsc::UnboundedSender<CoreTransaction>>,
     pub execution_state: Arc<RwLock<ExecutionState>>,
+    pub tx_results: Arc<RwLock<HashMap<String, TxResult>>>,
 }
 
 // -- hex decode helpers --
@@ -386,7 +415,17 @@ fn body_type_name(body: &TransactionBody) -> &'static str {
 // -- decode / conversion helpers --
 
 fn decode_raw_transaction(raw: &bunkerglow::Transaction) -> Option<CoreTransaction> {
-    bincode::serde::decode_from_slice(&raw.0, bincode::config::standard())
+    // Transaction.0 may have a wincode Vec<u8> length prefix (8-byte LE u64)
+    // wrapping the bincode payload. Try raw first, then skip the prefix.
+    let data = &raw.0;
+    bincode::serde::decode_from_slice(data, bincode::config::standard())
+        .or_else(|_| {
+            if data.len() > 8 {
+                bincode::serde::decode_from_slice(&data[8..], bincode::config::standard())
+            } else {
+                Err(bincode::error::DecodeError::Other("too short"))
+            }
+        })
         .ok()
         .map(|(tx, _)| tx)
 }
@@ -776,7 +815,37 @@ async fn get_transaction(
     Path(hash): Path<String>,
     state: axum::extract::State<SharedState>,
 ) -> impl IntoResponse {
-    // check mempool first (cheap, in-memory)
+    // check tx_results first (finalized transactions)
+    {
+        let results = state.tx_results.read().await;
+        if let Some(result) = results.get(&hash) {
+            // find the original tx details from blockstore
+            let (sender, nonce, fee, body) = find_tx_details_in_blockstore(&state, &hash).await
+                .unwrap_or_else(|| ("unknown".to_string(), 0, 0, None));
+
+            let success = matches!(result.status, TxFinalStatus::Finalized);
+            let mut resp = serde_json::json!({
+                "hash": hash,
+                "sender": sender,
+                "nonce": nonce,
+                "fee": fee,
+                "status": {
+                    "location": "finalized",
+                    "slot": result.slot,
+                    "block_hash": result.block_hash,
+                    "executed": true,
+                    "success": success,
+                    "error": result.error,
+                },
+            });
+            if let Some(body_resp) = body {
+                resp["body"] = serde_json::to_value(body_resp).unwrap_or_default();
+            }
+            return Json(resp).into_response();
+        }
+    }
+
+    // check mempool (in-memory)
     {
         let pool = state.mempool.read().await;
         if let Some(entry) = pool.iter().find(|e| e.hash == hash) {
@@ -792,46 +861,74 @@ async fn get_transaction(
         }
     }
 
-    // scan blockstore
-    if let Some(bs_arc) = &state.blockstore {
-        let bs = bs_arc.read().await;
-        // get an upper bound on slots to scan
-        let blocks = state.blocks.read().await;
-        let highest_mem_slot = blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
-        drop(blocks);
+    // scan blockstore (confirmed but not yet finalized/executed)
+    if let Some((sender, nonce, fee, body, slot_u64, blk_hash)) =
+        find_tx_in_blockstore(&state, &hash).await
+    {
+        let mut resp = serde_json::json!({
+            "hash": hash,
+            "sender": sender,
+            "nonce": nonce,
+            "fee": fee,
+            "status": {
+                "location": "confirmed",
+                "slot": slot_u64,
+                "block_hash": blk_hash,
+            },
+        });
+        if let Some(body_resp) = body {
+            resp["body"] = serde_json::to_value(body_resp).unwrap_or_default();
+        }
+        return Json(resp).into_response();
+    }
 
-        for slot_u64 in 0..=highest_mem_slot + 200 {
-            let slot = Slot::new(slot_u64);
-            if let Some(blk_hash) = bs.canonical_block_hash(slot) {
-                let block_hash: DoubleMerkleRoot = blk_hash.clone().into();
-                let block_id = (slot, block_hash);
-                if let Some(blk) = bs.get_block(&block_id) {
-                    for raw_tx in blk.transactions() {
-                        if let Some(core_tx) = decode_raw_transaction(raw_tx) {
-                            let tx_hash = hex::encode(core_tx.hash());
-                            if tx_hash == hash {
-                                return Json(serde_json::json!({
-                                    "hash": tx_hash,
-                                    "sender": hex::encode(core_tx.sender),
-                                    "nonce": core_tx.nonce,
-                                    "fee": core_tx.fee,
-                                    "body": core_tx_to_body_response(&core_tx.body),
-                                    "status": {
-                                        "location": "confirmed",
-                                        "slot": slot_u64,
-                                        "block_hash": hex::encode(blk_hash),
-                                    },
-                                }))
-                                .into_response();
-                            }
+    axum::http::StatusCode::NOT_FOUND.into_response()
+}
+
+async fn find_tx_details_in_blockstore(
+    state: &SharedState,
+    hash: &str,
+) -> Option<(String, u64, u64, Option<TransactionBodyResponse>)> {
+    find_tx_in_blockstore(state, hash)
+        .await
+        .map(|(sender, nonce, fee, body, _slot, _blk_hash)| (sender, nonce, fee, body))
+}
+
+async fn find_tx_in_blockstore(
+    state: &SharedState,
+    hash: &str,
+) -> Option<(String, u64, u64, Option<TransactionBodyResponse>, u64, String)> {
+    let bs_arc = state.blockstore.as_ref()?;
+    let bs = bs_arc.read().await;
+    let blocks = state.blocks.read().await;
+    let highest_mem_slot = blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
+    drop(blocks);
+
+    for slot_u64 in 0..=highest_mem_slot + 200 {
+        let slot = Slot::new(slot_u64);
+        if let Some(blk_hash) = bs.canonical_block_hash(slot) {
+            let block_hash: DoubleMerkleRoot = blk_hash.clone().into();
+            let block_id = (slot, block_hash);
+            if let Some(blk) = bs.get_block(&block_id) {
+                for raw_tx in blk.transactions() {
+                    if let Some(core_tx) = decode_raw_transaction(raw_tx) {
+                        let tx_hash = hex::encode(core_tx.hash());
+                        if tx_hash == hash {
+                            return Some((
+                                hex::encode(core_tx.sender),
+                                core_tx.nonce,
+                                core_tx.fee,
+                                Some(core_tx_to_body_response(&core_tx.body)),
+                                slot_u64,
+                                hex::encode(blk_hash),
+                            ));
                         }
                     }
                 }
             }
         }
     }
-
-    axum::http::StatusCode::NOT_FOUND.into_response()
+    None
 }
 
 // -- websocket --

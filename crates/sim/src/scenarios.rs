@@ -605,6 +605,8 @@ pub async fn multi_node_consensus_simulation_with_api(
             Option<tokio::sync::mpsc::UnboundedSender<bunker_coin_core::transaction::Transaction>>,
         >,
     >,
+    mempool: std::sync::Arc<tokio::sync::RwLock<Vec<rpc::MempoolEntry>>>,
+    tx_results: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, rpc::TxResult>>>,
 ) {
     use bunkerglow::all2all::TrivialAll2All;
     use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
@@ -712,21 +714,55 @@ pub async fn multi_node_consensus_simulation_with_api(
             .map(|i| localhost_ip_sockaddr(i as u16))
             .collect();
 
-        // Bridge task: encode CoreTransaction → bunkerglow::Transaction, broadcast to all nodes
+        // Bridge task: encode CoreTransaction → bunkerglow::Transaction, broadcast to all nodes.
+        // Also periodically re-broadcasts pending mempool txs so they get picked up by block producers.
+        let tx_results_for_bridge = tx_results.clone();
         tokio::spawn(async move {
-            while let Some(core_tx) = tx_recv.recv().await {
-                match bincode::serde::encode_to_vec(&core_tx, bincode::config::standard()) {
-                    Ok(bytes) => {
-                        let bunkerglow_tx = Transaction(bytes);
-                        if let Err(e) = injector_net
-                            .send_to_many(&bunkerglow_tx, all_validator_addrs.iter().copied())
-                            .await
-                        {
-                            log::warn!("Failed to inject transaction into consensus: {e}");
+            use tokio::time::{interval, Duration};
+
+            // Keep encoded txs for re-broadcasting until they're finalized
+            let mut pending_txs: Vec<(String, Transaction)> = Vec::new();
+
+            let mut rebroadcast_interval = interval(Duration::from_secs(10));
+            rebroadcast_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    maybe_tx = tx_recv.recv() => {
+                        let Some(core_tx) = maybe_tx else { break };
+                        let tx_hash = hex::encode(core_tx.hash());
+                        match bincode::serde::encode_to_vec(&core_tx, bincode::config::standard()) {
+                            Ok(bytes) => {
+                                let bunkerglow_tx = Transaction(bytes);
+                                if let Err(e) = injector_net
+                                    .send_to_many(&bunkerglow_tx, all_validator_addrs.iter().copied())
+                                    .await
+                                {
+                                    log::warn!("Failed to inject transaction into consensus: {e}");
+                                }
+                                pending_txs.push((tx_hash, bunkerglow_tx));
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to encode transaction for consensus: {e}");
+                            }
                         }
                     }
-                    Err(e) => {
-                        log::warn!("Failed to encode transaction for consensus: {e}");
+                    _ = rebroadcast_interval.tick() => {
+                        // Remove txs that have been finalized
+                        let results = tx_results_for_bridge.read().await;
+                        pending_txs.retain(|(hash, _)| !results.contains_key(hash));
+                        drop(results);
+
+                        if pending_txs.is_empty() {
+                            continue;
+                        }
+
+                        log::info!("Re-broadcasting {} pending mempool txs", pending_txs.len());
+                        for (_hash, bunkerglow_tx) in &pending_txs {
+                            let _ = injector_net
+                                .send_to_many(bunkerglow_tx, all_validator_addrs.iter().copied())
+                                .await;
+                        }
                     }
                 }
             }
@@ -753,6 +789,8 @@ pub async fn multi_node_consensus_simulation_with_api(
         let pools_and_blockstores = pools_and_blockstores.clone();
         let validators = validators.clone();
         let execution_state = execution_state.clone();
+        let mempool = mempool.clone();
+        let tx_results = tx_results.clone();
 
         tokio::spawn(async move {
             let epoch_info = bunkerglow::consensus::EpochInfo::new(0, 0, validators.clone());
@@ -1081,6 +1119,7 @@ pub async fn multi_node_consensus_simulation_with_api(
                         for slot in (last_executed_slot + 1)..=consensus_finalized_slot {
                             let slot_id = Slot::new(slot);
                             if let Some(hash) = bs.canonical_block_hash(slot_id) {
+                                let blk_hash_hex = hex::encode(&hash);
                                 let block_hash: DoubleMerkleRoot = hash.into();
                                 let block_id = (slot_id, block_hash);
                                 if let Some(block) = bs.get_block(&block_id) {
@@ -1089,13 +1128,27 @@ pub async fn multi_node_consensus_simulation_with_api(
                                         raw_txs
                                             .iter()
                                             .filter_map(|raw| {
+                                                // Transaction.0 may have a wincode Vec<u8> length
+                                                // prefix (8-byte LE u64) wrapping the bincode payload.
+                                                // Try raw first, then try skipping the prefix.
+                                                let data = &raw.0;
                                                 bincode::serde::decode_from_slice(
-                                                    &raw.0,
+                                                    data,
                                                     bincode::config::standard(),
                                                 )
+                                                .or_else(|_| {
+                                                    if data.len() > 8 {
+                                                        bincode::serde::decode_from_slice(
+                                                            &data[8..],
+                                                            bincode::config::standard(),
+                                                        )
+                                                    } else {
+                                                        Err(bincode::error::DecodeError::Other("too short"))
+                                                    }
+                                                })
                                                 .ok()
+                                                .map(|(tx, _)| tx)
                                             })
-                                            .map(|(tx, _)| tx)
                                             .collect();
 
                                     if !core_txs.is_empty() {
@@ -1110,6 +1163,49 @@ pub async fn multi_node_consensus_simulation_with_api(
                                             err_count,
                                             core_txs.len()
                                         );
+
+                                        let now = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis() as u64;
+
+                                        // record tx results, prune mempool, send WS events
+                                        let mut pool = mempool.write().await;
+                                        let mut results_map = tx_results.write().await;
+
+                                        for (core_tx, exec_result) in core_txs.iter().zip(results.iter()) {
+                                            let tx_hash = hex::encode(core_tx.hash());
+
+                                            let (status, error) = match exec_result {
+                                                Ok(()) => (rpc::TxFinalStatus::Finalized, None),
+                                                Err(e) => (rpc::TxFinalStatus::Failed, Some(e.to_string())),
+                                            };
+
+                                            let success = exec_result.is_ok();
+
+                                            results_map.insert(tx_hash.clone(), rpc::TxResult {
+                                                hash: tx_hash.clone(),
+                                                slot,
+                                                block_hash: blk_hash_hex.clone(),
+                                                status,
+                                                error: error.clone(),
+                                                executed_at: now,
+                                            });
+
+                                            // prune from mempool
+                                            pool.retain(|entry| entry.hash != tx_hash);
+
+                                            // send WS event
+                                            let _ = updates_tx.send(
+                                                rpc::WebSocketUpdate::TransactionFinalized {
+                                                    hash: tx_hash,
+                                                    slot,
+                                                    block_hash: blk_hash_hex.clone(),
+                                                    success,
+                                                    error,
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                             }

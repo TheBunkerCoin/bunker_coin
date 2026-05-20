@@ -3,7 +3,8 @@
 use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::Transaction as CoreTransaction;
 use bunker_coin_sim::scenarios;
-use rpc::{run_api, RadioStats, SharedState};
+use rpc::{run_api, RadioStats, SharedState, TxResult};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task;
@@ -54,6 +55,9 @@ async fn main() {
     let tx_sender_slot: Arc<RwLock<Option<mpsc::UnboundedSender<CoreTransaction>>>> =
         Arc::new(RwLock::new(None));
     let tx_sender_for_api = tx_sender_slot.clone();
+    let mempool: Arc<RwLock<Vec<rpc::MempoolEntry>>> = Arc::new(RwLock::new(Vec::new()));
+    let tx_results: Arc<RwLock<HashMap<String, TxResult>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     let state = SharedState {
         blocks: blocks.clone(),
@@ -61,9 +65,10 @@ async fn main() {
         radio_stats: radio_stats.clone(),
         updates: updates_tx.clone(),
         blockstore: None,
-        mempool: Arc::new(RwLock::new(Vec::new())),
+        mempool: mempool.clone(),
         tx_sender: None,
         execution_state: execution_state.clone(),
+        tx_results: tx_results.clone(),
     };
 
     // api in dedicated task
@@ -88,6 +93,8 @@ async fn main() {
         blockstore_ref,
         execution_state,
         tx_sender_slot,
+        mempool,
+        tx_results,
     )
     .await;
 
