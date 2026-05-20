@@ -3,6 +3,7 @@
 use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::Transaction as CoreTransaction;
 use bunker_coin_sim::scenarios;
+use ed25519_dalek::SigningKey;
 use rpc::{run_api, RadioStats, SharedState, TxResult};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,7 +52,23 @@ async fn main() {
 
     let blockstore_ref = Arc::new(RwLock::new(None));
     let blockstore_for_api = blockstore_ref.clone();
-    let execution_state = Arc::new(RwLock::new(ExecutionState::new()));
+
+    // deterministic genesis keypair from a fixed seed
+    let genesis_seed: [u8; 32] = [1u8; 32];
+    let genesis_sk = SigningKey::from_bytes(&genesis_seed);
+    let genesis_pk: [u8; 32] = genesis_sk.verifying_key().to_bytes();
+
+    let mut exec_state = ExecutionState::new();
+    exec_state.get_or_create_account(&genesis_pk).native_balance = 1_000_000_000;
+    let execution_state = Arc::new(RwLock::new(exec_state));
+
+    log::info!(
+        "Genesis account funded: {} with 1,000,000,000 native",
+        hex::encode(genesis_pk)
+    );
+
+    let genesis_signing_key = Arc::new(genesis_sk);
+
     let tx_sender_slot: Arc<RwLock<Option<mpsc::UnboundedSender<CoreTransaction>>>> =
         Arc::new(RwLock::new(None));
     let tx_sender_for_api = tx_sender_slot.clone();
@@ -69,6 +86,7 @@ async fn main() {
         tx_sender: None,
         execution_state: execution_state.clone(),
         tx_results: tx_results.clone(),
+        genesis_signing_key: Some(genesis_signing_key),
     };
 
     // api in dedicated task

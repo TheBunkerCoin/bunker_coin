@@ -16,6 +16,7 @@ use bunkerglow::crypto::merkle::{DoubleMerkleRoot, MerkleRoot};
 use bunkerglow::crypto::Hash;
 use bunkerglow::Slot;
 use futures::{sink::SinkExt, stream::StreamExt};
+use ed25519_dalek::SigningKey;
 use hex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -324,6 +325,7 @@ pub struct SharedState {
     pub tx_sender: Option<mpsc::UnboundedSender<CoreTransaction>>,
     pub execution_state: Arc<RwLock<ExecutionState>>,
     pub tx_results: Arc<RwLock<HashMap<String, TxResult>>>,
+    pub genesis_signing_key: Option<Arc<SigningKey>>,
 }
 
 // -- hex decode helpers --
@@ -557,13 +559,35 @@ async fn submit_transaction(
         }
     };
 
-    let tx = CoreTransaction {
+    let mut tx = CoreTransaction {
         sender,
         nonce: req.nonce,
         fee: req.fee,
         body,
         signature,
     };
+
+    // server-side signing: if signature is all zeros and sender matches genesis pubkey,
+    // auto-fill the nonce from current execution state and sign it
+    if tx.signature == [0u8; 64] {
+        if let Some(sk) = &state.genesis_signing_key {
+            let genesis_pk = sk.verifying_key().to_bytes();
+            if tx.sender == genesis_pk {
+                // auto-fill nonce from current account state
+                let exec = state.execution_state.read().await;
+                let current_nonce = exec
+                    .get_account(&genesis_pk)
+                    .map(|a| a.nonce)
+                    .unwrap_or(0);
+                drop(exec);
+                tx.nonce = current_nonce;
+
+                use ed25519_dalek::Signer;
+                let msg = tx.signing_hash();
+                tx.signature = sk.sign(&msg).to_bytes();
+            }
+        }
+    }
 
     let hash = hex::encode(tx.hash());
     let body_type = body_type_name(&tx.body);
@@ -1028,6 +1052,34 @@ async fn get_tokens(state: axum::extract::State<SharedState>) -> Json<serde_json
         })
         .collect();
     Json(serde_json::json!({ "tokens": tokens }))
+}
+
+// -- genesis handler --
+
+async fn get_genesis(state: axum::extract::State<SharedState>) -> impl IntoResponse {
+    let Some(sk) = &state.genesis_signing_key else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no genesis keypair configured" })),
+        )
+            .into_response();
+    };
+
+    let pk = sk.verifying_key().to_bytes();
+    let pk_hex = hex::encode(pk);
+
+    let exec = state.execution_state.read().await;
+    let balance = exec
+        .get_account(&pk)
+        .map(|a| a.native_balance)
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "public_key": pk_hex,
+        "secret_key": hex::encode(sk.to_bytes()),
+        "balance": balance,
+    }))
+    .into_response()
 }
 
 // -- server --
@@ -1741,6 +1793,7 @@ pub async fn run_api(state: SharedState) {
         .route("/mempool/{hash}", get(mempool_transaction))
         .route("/accounts/{pubkey}", get(get_account))
         .route("/tokens", get(get_tokens))
+        .route("/genesis", get(get_genesis))
         .route("/ws", get(websocket_handler))
         .layer(cors)
         .with_state(state);

@@ -31,4 +31,5 @@ hex = "0.4"
 bincode = "2"
 wincode = { version = "0.2", features = ["derive"] }
 
-rpc = { path = "../rpc" } 
+rpc = { path = "../rpc" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }

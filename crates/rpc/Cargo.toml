@@ -14,3 +14,4 @@ bunkerglow = { workspace = true }
 hex = "0.4"
 bincode = { workspace = true }
 bunker_coin_core = { workspace = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
