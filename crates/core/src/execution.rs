@@ -29,6 +29,8 @@ pub enum ExecutionError {
     InsufficientSelfStake,
     CommissionTooHigh,
     NotValidator,
+    BurnExceedsSupply,
+    NotTokenCreator,
 }
 
 impl std::fmt::Display for ExecutionError {
@@ -70,6 +72,8 @@ impl std::fmt::Display for ExecutionError {
             Self::InsufficientSelfStake => write!(f, "self-bond below minimum"),
             Self::CommissionTooHigh => write!(f, "commission rate exceeds maximum"),
             Self::NotValidator => write!(f, "sender is not a validator"),
+            Self::BurnExceedsSupply => write!(f, "burn amount exceeds current supply"),
+            Self::NotTokenCreator => write!(f, "only the token creator can update metadata"),
         }
     }
 }
@@ -335,6 +339,52 @@ impl State {
                 self.staking.queue_commission_change(sender, *rate);
                 Ok(())
             }
+
+            TransactionBody::Burn { token_id, amount } => {
+                if *amount == 0 {
+                    return Err(ExecutionError::ZeroAmount);
+                }
+                if !self.tokens.contains_key(token_id) {
+                    return Err(ExecutionError::TokenNotFound(*token_id));
+                }
+                let sender_acc = self.accounts.get_mut(&sender).unwrap();
+                let sender_token_bal = sender_acc
+                    .token_balances
+                    .get(token_id)
+                    .copied()
+                    .unwrap_or(0);
+                if sender_token_bal < *amount {
+                    return Err(ExecutionError::InsufficientTokenBalance {
+                        required: *amount,
+                        available: sender_token_bal,
+                    });
+                }
+                let meta = self.tokens.get(token_id).unwrap();
+                if *amount > meta.current_supply {
+                    return Err(ExecutionError::BurnExceedsSupply);
+                }
+                *sender_acc.token_balances.get_mut(token_id).unwrap() -= amount;
+                if *sender_acc.token_balances.get(token_id).unwrap() == 0 {
+                    sender_acc.token_balances.remove(token_id);
+                }
+                self.tokens.get_mut(token_id).unwrap().current_supply -= amount;
+                Ok(())
+            }
+
+            TransactionBody::UpdateMetadata {
+                token_id,
+                metadata_hash,
+            } => {
+                let meta = self
+                    .tokens
+                    .get(token_id)
+                    .ok_or(ExecutionError::TokenNotFound(*token_id))?;
+                if meta.creator != sender {
+                    return Err(ExecutionError::NotTokenCreator);
+                }
+                self.tokens.get_mut(token_id).unwrap().metadata_hash = *metadata_hash;
+                Ok(())
+            }
         }
     }
 
@@ -354,25 +404,71 @@ impl State {
         // 4. apply pending commission changes
         self.staking.apply_commission_changes();
 
-        // 5. distribute tx_fee_pool pro-rata by active stake (with dust threshold)
+        // 5. distribute fee pools with commission
         let total_stake = self.staking.total_active_stake();
-        let mut distributed: Amount = 0;
+        let pools_to_distribute = [self.tx_fee_pool, self.msg_fee_pool, self.bridge_fee_pool];
+        let mut pool_distributed = [0u64; 3];
 
-        if total_stake > 0 && self.tx_fee_pool > 0 {
+        if total_stake > 0 {
             let active_validators: Vec<(PublicKey, Amount)> =
                 self.staking.validator_set().into_iter().collect();
 
-            for (validator, stake) in &active_validators {
-                let share =
-                    (self.tx_fee_pool as u128 * *stake as u128 / total_stake as u128) as Amount;
-                if share >= DUST_THRESHOLD {
-                    self.get_or_create_account(validator).native_balance += share;
-                    distributed += share;
+            for (pool_idx, &pool_amount) in pools_to_distribute.iter().enumerate() {
+                if pool_amount == 0 {
+                    continue;
+                }
+
+                for (validator, stake) in &active_validators {
+                    let gross_share =
+                        (pool_amount as u128 * *stake as u128 / total_stake as u128) as Amount;
+                    if gross_share < DUST_THRESHOLD {
+                        continue;
+                    }
+
+                    let commission_rate = self
+                        .staking
+                        .commission_rates
+                        .get(validator)
+                        .copied()
+                        .unwrap_or(0) as u128;
+                    let commission_amount =
+                        (gross_share as u128 * commission_rate / 10000) as Amount;
+                    let delegator_pool = gross_share - commission_amount;
+
+                    // credit commission to validator
+                    if commission_amount >= DUST_THRESHOLD {
+                        self.get_or_create_account(validator).native_balance += commission_amount;
+                        pool_distributed[pool_idx] += commission_amount;
+                    }
+
+                    // distribute remainder to delegators pro-rata
+                    let delegators = self.staking.delegators_of(validator);
+                    let validator_total_delegated: Amount =
+                        delegators.iter().map(|(_, a)| *a).sum();
+
+                    if validator_total_delegated > 0 && delegator_pool > 0 {
+                        for (delegator, del_amount) in &delegators {
+                            let del_share = (delegator_pool as u128 * *del_amount as u128
+                                / validator_total_delegated as u128)
+                                as Amount;
+                            if del_share >= DUST_THRESHOLD {
+                                self.get_or_create_account(delegator).native_balance += del_share;
+                                pool_distributed[pool_idx] += del_share;
+                            }
+                        }
+                    } else if delegator_pool >= DUST_THRESHOLD {
+                        // no delegator_stakes tracked yet (legacy), credit to validator
+                        self.get_or_create_account(validator).native_balance += delegator_pool;
+                        pool_distributed[pool_idx] += delegator_pool;
+                    }
                 }
             }
         }
 
-        self.tx_fee_pool -= distributed;
+        let distributed = pool_distributed[0];
+        self.tx_fee_pool -= pool_distributed[0];
+        self.msg_fee_pool -= pool_distributed[1];
+        self.bridge_fee_pool -= pool_distributed[2];
 
         // 6. collect deactivated validators (below MIN_SELF_STAKE)
         let deactivated = self.staking.validators_below_min_self_stake();
@@ -460,6 +556,15 @@ impl State {
         for (pk, rate) in &commissions {
             hasher.update(*pk);
             hasher.update(rate.to_le_bytes());
+        }
+
+        // delegator_stakes — sort by key for determinism
+        let mut del_stakes: Vec<_> = self.staking.delegator_stakes.iter().collect();
+        del_stakes.sort_by_key(|(k, _)| *k);
+        for ((delegator, validator), amount) in &del_stakes {
+            hasher.update(delegator);
+            hasher.update(validator);
+            hasher.update(amount.to_le_bytes());
         }
 
         // pending commission changes
@@ -1185,24 +1290,25 @@ mod tests {
     }
 
     #[test]
-    fn three_fee_pools_independent() {
+    fn three_fee_pools_all_distributed() {
         let mut state = State::new();
         let validator: PublicKey = [1u8; 32];
 
         state.staking.delegations.insert(validator, MIN_SELF_STAKE);
         state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
+        state.staking.delegator_stakes.insert((validator, validator), MIN_SELF_STAKE);
         state.tx_fee_pool = 100;
         state.msg_fee_pool = 200;
         state.bridge_fee_pool = 300;
 
         let result = state.process_epoch_transition(0);
 
-        // only tx_fee_pool should be distributed
+        // all pools distributed
         assert_eq!(result.fees_distributed, 100);
         assert_eq!(state.tx_fee_pool, 0);
-        assert_eq!(state.msg_fee_pool, 200);
-        assert_eq!(state.bridge_fee_pool, 300);
-        assert_eq!(state.get_account(&validator).unwrap().native_balance, 100);
+        assert_eq!(state.msg_fee_pool, 0);
+        assert_eq!(state.bridge_fee_pool, 0);
+        assert_eq!(state.get_account(&validator).unwrap().native_balance, 600);
     }
 
     #[test]
@@ -1741,5 +1847,352 @@ mod tests {
         let result = state.process_epoch_transition(0);
         assert!(result.deactivated.contains(&v2));
         assert!(!result.deactivated.contains(&v1));
+    }
+
+    // -- Burn tests --
+
+    fn mint_token(sk: &SigningKey, pk: &PublicKey, state: &mut State, ticker: &str, supply: Amount, nonce: u64) -> TokenId {
+        let mut tx = Transaction {
+            sender: *pk,
+            nonce,
+            fee: 1,
+            body: TransactionBody::Mint {
+                ticker: ticker.to_string(),
+                max_supply: supply,
+                metadata_hash: [0; 32],
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+        state.next_token_id.wrapping_sub(1).to_le_bytes()
+    }
+
+    #[test]
+    fn burn_reduces_balance_and_supply() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        let token_id = mint_token(&sk, &pk, &mut state, "BNK", 1000, 0);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::Burn {
+                token_id,
+                amount: 300,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+
+        assert_eq!(
+            *state.get_account(&pk).unwrap().token_balances.get(&token_id).unwrap(),
+            700
+        );
+        assert_eq!(state.tokens.get(&token_id).unwrap().current_supply, 700);
+    }
+
+    #[test]
+    fn burn_insufficient_balance() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        let token_id = mint_token(&sk, &pk, &mut state, "BNK", 100, 0);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::Burn {
+                token_id,
+                amount: 200,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::InsufficientTokenBalance { .. }));
+    }
+
+    #[test]
+    fn burn_token_not_found() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::Burn {
+                token_id: [0, 0, 0, 99],
+                amount: 50,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::TokenNotFound(_)));
+    }
+
+    #[test]
+    fn burn_zero_amount() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        let token_id = mint_token(&sk, &pk, &mut state, "BNK", 100, 0);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::Burn {
+                token_id,
+                amount: 0,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::ZeroAmount));
+    }
+
+    #[test]
+    fn burn_entire_balance_removes_entry() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        let token_id = mint_token(&sk, &pk, &mut state, "BNK", 100, 0);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::Burn {
+                token_id,
+                amount: 100,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+
+        assert!(!state.get_account(&pk).unwrap().token_balances.contains_key(&token_id));
+        assert_eq!(state.tokens.get(&token_id).unwrap().current_supply, 0);
+    }
+
+    // -- UpdateMetadata tests --
+
+    #[test]
+    fn update_metadata_success() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+        let token_id = mint_token(&sk, &pk, &mut state, "BNK", 100, 0);
+
+        let new_hash = [0xFFu8; 32];
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 1,
+            fee: 1,
+            body: TransactionBody::UpdateMetadata {
+                token_id,
+                metadata_hash: new_hash,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+
+        assert_eq!(state.tokens.get(&token_id).unwrap().metadata_hash, new_hash);
+    }
+
+    #[test]
+    fn update_metadata_not_creator() {
+        let (sk_a, pk_a) = make_keypair();
+        let (sk_b, pk_b) = make_keypair();
+        let mut state = funded_state(&pk_a, 10_000);
+        state.get_or_create_account(&pk_b).native_balance = 10_000;
+        let token_id = mint_token(&sk_a, &pk_a, &mut state, "BNK", 100, 0);
+
+        let mut tx = Transaction {
+            sender: pk_b,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::UpdateMetadata {
+                token_id,
+                metadata_hash: [0xAA; 32],
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk_b, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::NotTokenCreator));
+    }
+
+    #[test]
+    fn update_metadata_token_not_found() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 10_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 1,
+            body: TransactionBody::UpdateMetadata {
+                token_id: [0, 0, 0, 99],
+                metadata_hash: [0xAA; 32],
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::TokenNotFound(_)));
+    }
+
+    // -- Phase 3: Fee distribution with commission tests --
+
+    #[test]
+    fn fee_distribution_with_commission() {
+        let mut state = State::new();
+
+        let validator: PublicKey = [1u8; 32];
+        let delegator: PublicKey = [2u8; 32];
+
+        // set up: validator has 500 self-stake, delegator has 500
+        state.staking.delegations.insert(validator, 1000);
+        state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
+        state.staking.delegator_stakes.insert((validator, validator), 500);
+        state.staking.delegator_stakes.insert((delegator, validator), 500);
+        state.staking.commission_rates.insert(validator, 1000); // 10% commission
+        state.tx_fee_pool = 1000;
+
+        state.process_epoch_transition(0);
+
+        // gross share = 1000 (only validator)
+        // commission = 1000 * 10% = 100 → validator
+        // delegator_pool = 900
+        // validator share of delegator_pool = 900 * 500/1000 = 450
+        // delegator share = 900 * 500/1000 = 450
+        // validator total = 100 + 450 = 550
+        // delegator total = 450
+        assert_eq!(state.get_account(&validator).unwrap().native_balance, 550);
+        assert_eq!(state.get_account(&delegator).unwrap().native_balance, 450);
+        assert_eq!(state.tx_fee_pool, 0);
+    }
+
+    #[test]
+    fn fee_distribution_no_commission() {
+        let mut state = State::new();
+
+        let validator: PublicKey = [1u8; 32];
+        let delegator: PublicKey = [2u8; 32];
+
+        state.staking.delegations.insert(validator, 1000);
+        state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
+        state.staking.delegator_stakes.insert((validator, validator), 600);
+        state.staking.delegator_stakes.insert((delegator, validator), 400);
+        // no commission set (defaults to 0)
+        state.tx_fee_pool = 1000;
+
+        state.process_epoch_transition(0);
+
+        // gross share = 1000, commission = 0
+        // validator share = 1000 * 600/1000 = 600
+        // delegator share = 1000 * 400/1000 = 400
+        assert_eq!(state.get_account(&validator).unwrap().native_balance, 600);
+        assert_eq!(state.get_account(&delegator).unwrap().native_balance, 400);
+    }
+
+    #[test]
+    fn fee_distribution_multi_validator_with_commission() {
+        let mut state = State::new();
+
+        let v1: PublicKey = [1u8; 32];
+        let v2: PublicKey = [2u8; 32];
+        let d1: PublicKey = [3u8; 32];
+
+        state.staking.delegations.insert(v1, 500);
+        state.staking.delegations.insert(v2, 500);
+        state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(v2, MIN_SELF_STAKE);
+        state.staking.delegator_stakes.insert((v1, v1), 500);
+        state.staking.delegator_stakes.insert((v2, v2), 300);
+        state.staking.delegator_stakes.insert((d1, v2), 200);
+        state.staking.commission_rates.insert(v2, 2000); // 20% commission on v2
+        state.tx_fee_pool = 1000;
+
+        state.process_epoch_transition(0);
+
+        // v1 gross = 1000 * 500/1000 = 500, no commission
+        // v1 gets all 500 (sole delegator)
+        assert_eq!(state.get_account(&v1).unwrap().native_balance, 500);
+
+        // v2 gross = 1000 * 500/1000 = 500
+        // commission = 500 * 20% = 100 → v2
+        // delegator_pool = 400
+        // v2 self share = 400 * 300/500 = 240
+        // d1 share = 400 * 200/500 = 160
+        // v2 total = 100 + 240 = 340
+        assert_eq!(state.get_account(&v2).unwrap().native_balance, 340);
+        assert_eq!(state.get_account(&d1).unwrap().native_balance, 160);
+    }
+
+    #[test]
+    fn all_fee_pools_distributed() {
+        let mut state = State::new();
+
+        let validator: PublicKey = [1u8; 32];
+
+        state.staking.delegations.insert(validator, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
+        state.staking.delegator_stakes.insert((validator, validator), MIN_SELF_STAKE);
+        state.tx_fee_pool = 100;
+        state.msg_fee_pool = 200;
+        state.bridge_fee_pool = 300;
+
+        state.process_epoch_transition(0);
+
+        assert_eq!(state.tx_fee_pool, 0);
+        assert_eq!(state.msg_fee_pool, 0);
+        assert_eq!(state.bridge_fee_pool, 0);
+        assert_eq!(state.get_account(&validator).unwrap().native_balance, 600);
+    }
+
+    #[test]
+    fn delegator_stakes_tracked_on_bond_activation() {
+        let mut state = State::new();
+        let delegator: PublicKey = [1u8; 32];
+        let validator: PublicKey = [2u8; 32];
+
+        state.staking.queue_bond(delegator, validator, 500, 0);
+        state.process_epoch_transition(0);
+
+        assert_eq!(
+            state.staking.delegator_stakes.get(&(delegator, validator)).copied().unwrap(),
+            500
+        );
+    }
+
+    #[test]
+    fn delegator_stakes_reduced_on_retire() {
+        let mut state = State::new();
+        let delegator: PublicKey = [1u8; 32];
+        let validator: PublicKey = [2u8; 32];
+
+        state.staking.delegations.insert(validator, 1000);
+        state.staking.delegator_stakes.insert((delegator, validator), 1000);
+        state.staking.queue_retire(delegator, validator, 500, 0);
+
+        // epoch 0->1: too early
+        state.process_epoch_transition(0);
+        assert_eq!(
+            state.staking.delegator_stakes.get(&(delegator, validator)).copied().unwrap(),
+            1000
+        );
+
+        // epoch 1->2: retirement completes
+        state.process_epoch_transition(1);
+        assert_eq!(
+            state.staking.delegator_stakes.get(&(delegator, validator)).copied().unwrap(),
+            500
+        );
     }
 }

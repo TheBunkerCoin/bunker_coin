@@ -244,6 +244,8 @@ pub enum TransactionBodyResponse {
     Withdraw { validator: String },
     UnJail,
     SetCommission { rate: u16 },
+    Burn { token_id: String, amount: u64 },
+    UpdateMetadata { token_id: String, metadata_hash: String },
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -309,6 +311,14 @@ enum TransactionBodyRequest {
     UnJail,
     SetCommission {
         rate: u16,
+    },
+    Burn {
+        token_id: String,
+        amount: u64,
+    },
+    UpdateMetadata {
+        token_id: String,
+        metadata_hash: String,
     },
 }
 
@@ -398,6 +408,17 @@ fn convert_body(body: TransactionBodyRequest) -> Result<TransactionBody, String>
         TransactionBodyRequest::SetCommission { rate } => {
             Ok(TransactionBody::SetCommission { rate })
         }
+        TransactionBodyRequest::Burn { token_id, amount } => Ok(TransactionBody::Burn {
+            token_id: decode_token_id(&token_id)?,
+            amount,
+        }),
+        TransactionBodyRequest::UpdateMetadata {
+            token_id,
+            metadata_hash,
+        } => Ok(TransactionBody::UpdateMetadata {
+            token_id: decode_token_id(&token_id)?,
+            metadata_hash: decode_hash32(&metadata_hash)?,
+        }),
     }
 }
 
@@ -411,6 +432,8 @@ fn body_type_name(body: &TransactionBody) -> &'static str {
         TransactionBody::Withdraw { .. } => "Withdraw",
         TransactionBody::UnJail => "UnJail",
         TransactionBody::SetCommission { .. } => "SetCommission",
+        TransactionBody::Burn { .. } => "Burn",
+        TransactionBody::UpdateMetadata { .. } => "UpdateMetadata",
     }
 }
 
@@ -462,6 +485,17 @@ fn core_tx_to_body_response(body: &TransactionBody) -> TransactionBodyResponse {
         TransactionBody::UnJail => TransactionBodyResponse::UnJail,
         TransactionBody::SetCommission { rate } => TransactionBodyResponse::SetCommission {
             rate: *rate,
+        },
+        TransactionBody::Burn { token_id, amount } => TransactionBodyResponse::Burn {
+            token_id: hex::encode(token_id),
+            amount: *amount,
+        },
+        TransactionBody::UpdateMetadata {
+            token_id,
+            metadata_hash,
+        } => TransactionBodyResponse::UpdateMetadata {
+            token_id: hex::encode(token_id),
+            metadata_hash: hex::encode(metadata_hash),
         },
     }
 }
@@ -1052,6 +1086,192 @@ async fn get_tokens(state: axum::extract::State<SharedState>) -> Json<serde_json
         })
         .collect();
     Json(serde_json::json!({ "tokens": tokens }))
+}
+
+// -- single token handler --
+
+async fn get_token(
+    Path(id_hex): Path<String>,
+    state: axum::extract::State<SharedState>,
+) -> impl IntoResponse {
+    let token_id = match decode_token_id(&id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid token id: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let exec = state.execution_state.read().await;
+    if let Some(t) = exec.tokens.get(&token_id) {
+        Json(serde_json::json!({
+            "id": hex::encode(t.id),
+            "ticker": t.ticker,
+            "current_supply": t.current_supply,
+            "max_supply": t.max_supply,
+            "metadata_hash": hex::encode(t.metadata_hash),
+            "creator": hex::encode(t.creator),
+        }))
+        .into_response()
+    } else {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "token not found" })),
+        )
+            .into_response()
+    }
+}
+
+// -- token holders handler --
+
+async fn get_token_holders(
+    Path(id_hex): Path<String>,
+    Query(p): Query<Pagination>,
+    state: axum::extract::State<SharedState>,
+) -> impl IntoResponse {
+    let token_id = match decode_token_id(&id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid token id: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let exec = state.execution_state.read().await;
+    if !exec.tokens.contains_key(&token_id) {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "token not found" })),
+        )
+            .into_response();
+    }
+
+    let mut holders: Vec<serde_json::Value> = exec
+        .accounts
+        .iter()
+        .filter_map(|(pk, acc)| {
+            let bal = acc.token_balances.get(&token_id).copied().unwrap_or(0);
+            if bal > 0 {
+                Some(serde_json::json!({ "pubkey": hex::encode(pk), "balance": bal }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // sort by balance descending for deterministic output
+    holders.sort_by(|a, b| {
+        b["balance"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["balance"].as_u64().unwrap_or(0))
+    });
+
+    let total = holders.len();
+    let limit = p.limit.unwrap_or(100).min(500);
+    let offset = p.offset.unwrap_or(0);
+
+    let page: Vec<_> = holders.into_iter().skip(offset).take(limit).collect();
+
+    Json(serde_json::json!({
+        "holders": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }))
+    .into_response()
+}
+
+// -- account tokens handler --
+
+async fn get_account_tokens(
+    Path(pubkey_hex): Path<String>,
+    state: axum::extract::State<SharedState>,
+) -> impl IntoResponse {
+    let pubkey = match decode_pubkey(&pubkey_hex) {
+        Ok(pk) => pk,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid pubkey: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let exec = state.execution_state.read().await;
+    let account = exec.get_account(&pubkey);
+
+    let tokens: Vec<serde_json::Value> = match account {
+        Some(acc) => acc
+            .token_balances
+            .iter()
+            .filter(|(_, bal)| **bal > 0)
+            .map(|(tid, bal)| {
+                let meta = exec.tokens.get(tid);
+                let mut entry = serde_json::json!({
+                    "token_id": hex::encode(tid),
+                    "balance": *bal,
+                });
+                if let Some(m) = meta {
+                    entry["ticker"] = serde_json::json!(m.ticker);
+                    entry["current_supply"] = serde_json::json!(m.current_supply);
+                    entry["max_supply"] = serde_json::json!(m.max_supply);
+                    entry["metadata_hash"] = serde_json::json!(hex::encode(m.metadata_hash));
+                    entry["creator"] = serde_json::json!(hex::encode(m.creator));
+                }
+                entry
+            })
+            .collect(),
+        None => vec![],
+    };
+
+    Json(serde_json::json!({
+        "pubkey": pubkey_hex,
+        "tokens": tokens,
+    }))
+    .into_response()
+}
+
+// -- staking overview handler --
+
+async fn get_staking(state: axum::extract::State<SharedState>) -> Json<serde_json::Value> {
+    let exec = state.execution_state.read().await;
+    let validator_set: Vec<serde_json::Value> = exec
+        .staking
+        .validator_set()
+        .iter()
+        .map(|(pk, stake)| {
+            let commission = exec
+                .staking
+                .commission_rates
+                .get(pk)
+                .copied()
+                .unwrap_or(0);
+            serde_json::json!({
+                "pubkey": hex::encode(pk),
+                "stake": *stake,
+                "commission_bps": commission,
+            })
+        })
+        .collect();
+
+    let total_active_stake = exec.staking.total_active_stake();
+    let total_stake = exec.staking.total_stake();
+    let current_epoch = exec.current_epoch;
+
+    Json(serde_json::json!({
+        "validators": validator_set,
+        "total_active_stake": total_active_stake,
+        "total_stake": total_stake,
+        "current_epoch": current_epoch,
+    }))
 }
 
 // -- genesis handler --
@@ -1792,7 +2012,11 @@ pub async fn run_api(state: SharedState) {
         .route("/mempool", get(mempool))
         .route("/mempool/{hash}", get(mempool_transaction))
         .route("/accounts/{pubkey}", get(get_account))
+        .route("/accounts/{pubkey}/tokens", get(get_account_tokens))
         .route("/tokens", get(get_tokens))
+        .route("/tokens/{id}", get(get_token))
+        .route("/tokens/{id}/holders", get(get_token_holders))
+        .route("/staking", get(get_staking))
         .route("/genesis", get(get_genesis))
         .route("/ws", get(websocket_handler))
         .layer(cors)

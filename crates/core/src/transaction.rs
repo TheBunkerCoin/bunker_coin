@@ -78,6 +78,19 @@ impl Transaction {
                 hasher.update([7u8]);
                 hasher.update(rate.to_le_bytes());
             }
+            TransactionBody::Burn { token_id, amount } => {
+                hasher.update([8u8]);
+                hasher.update(token_id);
+                hasher.update(amount.to_le_bytes());
+            }
+            TransactionBody::UpdateMetadata {
+                token_id,
+                metadata_hash,
+            } => {
+                hasher.update([9u8]);
+                hasher.update(token_id);
+                hasher.update(metadata_hash);
+            }
         }
 
         hasher.finalize().into()
@@ -114,6 +127,14 @@ pub enum TransactionBody {
     UnJail,
     SetCommission {
         rate: u16,
+    },
+    Burn {
+        token_id: TokenId,
+        amount: Amount,
+    },
+    UpdateMetadata {
+        token_id: TokenId,
+        metadata_hash: [u8; 32],
     },
 }
 
@@ -291,6 +312,14 @@ mod tests {
             TransactionBody::Withdraw { validator: pk(2) },
             TransactionBody::UnJail,
             TransactionBody::SetCommission { rate: 500 },
+            TransactionBody::Burn {
+                token_id: [0, 0, 0, 1],
+                amount: 100,
+            },
+            TransactionBody::UpdateMetadata {
+                token_id: [0, 0, 0, 1],
+                metadata_hash: [0xCD; 32],
+            },
         ];
 
         let hashes: Vec<[u8; 32]> = variants
@@ -348,6 +377,14 @@ mod tests {
             TransactionBody::Withdraw { validator: pk(2) },
             TransactionBody::UnJail,
             TransactionBody::SetCommission { rate: 500 },
+            TransactionBody::Burn {
+                token_id: [0, 0, 0, 1],
+                amount: 100,
+            },
+            TransactionBody::UpdateMetadata {
+                token_id: [0, 0, 0, 1],
+                metadata_hash: [0xCD; 32],
+            },
         ];
 
         for body in variants {
