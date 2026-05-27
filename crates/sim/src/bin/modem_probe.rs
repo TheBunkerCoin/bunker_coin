@@ -173,7 +173,10 @@ async fn main() -> anyhow::Result<()> {
     print_bytes("JHOST0 resp", &resp);
     let packets = try_decode_hostmode(&resp);
     if !packets.is_empty() {
-        println!("  Modem responded in hostmode! {} packet(s):", packets.len());
+        println!(
+            "  Modem responded in hostmode! {} packet(s):",
+            packets.len()
+        );
         for (i, pkt) in packets.iter().enumerate() {
             match pkt {
                 HostmodePacket::Frame(f) => {

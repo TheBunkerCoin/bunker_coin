@@ -4,11 +4,11 @@ use bincode;
 use bunker_coin_radio::{
     Network as RadioNetwork, NetworkMessage, PactorRadioNode, RadioConfig, SimulatedRadioNetwork,
 };
-use bunkerglow::Slot;
 use bunkerglow::crypto::merkle::{DoubleMerkleRoot, MerkleRoot};
 use bunkerglow::crypto::signature::SecretKey;
 use bunkerglow::shredder::{RegularShredder, Shredder};
 use bunkerglow::types::slice::create_slice_with_invalid_txs;
+use bunkerglow::Slot;
 use hex;
 use rpc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -156,8 +156,8 @@ pub struct PactorMeasuredThroughputSample {
     pub degraded_retransmissions: u64,
 }
 
-pub async fn pactor_radio_proto_degradation_demo()
--> Result<PactorRadioProtoComparison, scs_pactor::ScsPactorError> {
+pub async fn pactor_radio_proto_degradation_demo(
+) -> Result<PactorRadioProtoComparison, scs_pactor::ScsPactorError> {
     let clean_config = scs_pactor::SimulatedPactorConfig {
         packet_loss: 0.0,
         latency: std::time::Duration::ZERO,
@@ -205,8 +205,8 @@ pub fn pactor_throughput_report() -> Vec<PactorThroughputSample> {
     .collect()
 }
 
-pub async fn pactor_measured_throughput_report()
--> Result<Vec<PactorMeasuredThroughputSample>, scs_pactor::ScsPactorError> {
+pub async fn pactor_measured_throughput_report(
+) -> Result<Vec<PactorMeasuredThroughputSample>, scs_pactor::ScsPactorError> {
     let mut samples = Vec::new();
     for speed in [
         scs_pactor::PactorSpeed::P1,
@@ -477,16 +477,16 @@ pub async fn multi_node_real_radio_simulation(num_nodes: usize) {
 }
 
 pub async fn multi_node_consensus_simulation(num_nodes: usize) {
-    use bunkerglow::Transaction;
-    use bunkerglow::ValidatorInfo;
     use bunkerglow::all2all::TrivialAll2All;
     use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
     use bunkerglow::crypto::{aggsig, signature::SecretKey};
     use bunkerglow::disseminator::Rotor;
     use bunkerglow::network::simulated::SimulatedNetworkCore;
-    use bunkerglow::network::{SimulatedNetwork, localhost_ip_sockaddr};
+    use bunkerglow::network::{localhost_ip_sockaddr, SimulatedNetwork};
     use bunkerglow::repair::{RepairRequest, RepairResponse};
     use bunkerglow::shredder::Shred;
+    use bunkerglow::Transaction;
+    use bunkerglow::ValidatorInfo;
     use std::sync::Arc;
     use tokio::time::Duration;
 
@@ -615,16 +615,16 @@ pub async fn multi_node_consensus_simulation_with_api(
         tokio::sync::RwLock<std::collections::HashMap<String, rpc::TxResult>>,
     >,
 ) {
-    use bunkerglow::Transaction;
-    use bunkerglow::ValidatorInfo;
     use bunkerglow::all2all::TrivialAll2All;
     use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
     use bunkerglow::crypto::{aggsig, signature::SecretKey};
     use bunkerglow::disseminator::Rotor;
     use bunkerglow::network::simulated::SimulatedNetworkCore;
-    use bunkerglow::network::{Network, SimulatedNetwork, localhost_ip_sockaddr};
+    use bunkerglow::network::{localhost_ip_sockaddr, Network, SimulatedNetwork};
     use bunkerglow::repair::{RepairRequest, RepairResponse};
     use bunkerglow::shredder::Shred;
+    use bunkerglow::Transaction;
+    use bunkerglow::ValidatorInfo;
     use hex;
     use std::sync::Arc;
     use tokio::time::Duration;
@@ -731,7 +731,7 @@ pub async fn multi_node_consensus_simulation_with_api(
         // Also periodically re-broadcasts pending mempool txs so they get picked up by block producers.
         let tx_results_for_bridge = tx_results.clone();
         tokio::spawn(async move {
-            use tokio::time::{Duration, interval};
+            use tokio::time::{interval, Duration};
 
             // Keep encoded txs for re-broadcasting until they're finalized
             let mut pending_txs: Vec<(String, Transaction)> = Vec::new();

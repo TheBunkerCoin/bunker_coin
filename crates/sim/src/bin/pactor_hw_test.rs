@@ -32,9 +32,7 @@ use std::time::{Duration, Instant};
 
 use bunker_coin_radio::{Network, NetworkMessage, PactorRadioNode};
 use clap::Parser;
-use scs_pactor::hostmode::{
-    HostmodeDecoder, HostmodeFrame, HostmodePacket, PACTOR_CHANNEL,
-};
+use scs_pactor::hostmode::{HostmodeDecoder, HostmodeFrame, HostmodePacket, PACTOR_CHANNEL};
 use scs_pactor::{PactorTransport, UsbPactorConfig, UsbPactorTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serial::{DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderExt, StopBits};
@@ -197,10 +195,7 @@ fn open_serial(port: &str, baud: u32) -> anyhow::Result<tokio_serial::SerialStre
 }
 
 /// Send an ASCII command (terminal mode) and read response.
-async fn send_ascii(
-    serial: &mut tokio_serial::SerialStream,
-    cmd: &str,
-) -> anyhow::Result<Vec<u8>> {
+async fn send_ascii(serial: &mut tokio_serial::SerialStream, cmd: &str) -> anyhow::Result<Vec<u8>> {
     println!("  >> {cmd}");
     serial.write_all(cmd.as_bytes()).await?;
     serial.write_all(b"\r").await?;
@@ -209,12 +204,14 @@ async fn send_ascii(
     Ok(read_all(serial, 800).await)
 }
 
-
 /// Try to verify hostmode is active on an already-wrapped transport.
 async fn verify_hostmode(transport: &UsbPactorTransport) -> bool {
     let status = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
-    match tokio::time::timeout(Duration::from_secs(3), transport.hostmode_transaction(status))
-        .await
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        transport.hostmode_transaction(status),
+    )
+    .await
     {
         Ok(Ok(frame)) => {
             println!(

@@ -4,10 +4,10 @@ use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::Transaction as CoreTransaction;
 use bunker_coin_sim::scenarios;
 use ed25519_dalek::SigningKey;
-use rpc::{RadioStats, SharedState, TxResult, run_api};
+use rpc::{run_api, RadioStats, SharedState, TxResult};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task;
 
 #[tokio::main]

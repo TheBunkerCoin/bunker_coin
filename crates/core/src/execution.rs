@@ -1296,7 +1296,10 @@ mod tests {
 
         state.staking.delegations.insert(validator, MIN_SELF_STAKE);
         state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
-        state.staking.delegator_stakes.insert((validator, validator), MIN_SELF_STAKE);
+        state
+            .staking
+            .delegator_stakes
+            .insert((validator, validator), MIN_SELF_STAKE);
         state.tx_fee_pool = 100;
         state.msg_fee_pool = 200;
         state.bridge_fee_pool = 300;
@@ -1851,7 +1854,14 @@ mod tests {
 
     // -- Burn tests --
 
-    fn mint_token(sk: &SigningKey, pk: &PublicKey, state: &mut State, ticker: &str, supply: Amount, nonce: u64) -> TokenId {
+    fn mint_token(
+        sk: &SigningKey,
+        pk: &PublicKey,
+        state: &mut State,
+        ticker: &str,
+        supply: Amount,
+        nonce: u64,
+    ) -> TokenId {
         let mut tx = Transaction {
             sender: *pk,
             nonce,
@@ -1888,7 +1898,12 @@ mod tests {
         state.execute_tx(&tx).unwrap();
 
         assert_eq!(
-            *state.get_account(&pk).unwrap().token_balances.get(&token_id).unwrap(),
+            *state
+                .get_account(&pk)
+                .unwrap()
+                .token_balances
+                .get(&token_id)
+                .unwrap(),
             700
         );
         assert_eq!(state.tokens.get(&token_id).unwrap().current_supply, 700);
@@ -1912,7 +1927,10 @@ mod tests {
         };
         sign_tx(&sk, &mut tx);
         let err = state.execute_tx(&tx).unwrap_err();
-        assert!(matches!(err, ExecutionError::InsufficientTokenBalance { .. }));
+        assert!(matches!(
+            err,
+            ExecutionError::InsufficientTokenBalance { .. }
+        ));
     }
 
     #[test]
@@ -1975,7 +1993,11 @@ mod tests {
         sign_tx(&sk, &mut tx);
         state.execute_tx(&tx).unwrap();
 
-        assert!(!state.get_account(&pk).unwrap().token_balances.contains_key(&token_id));
+        assert!(!state
+            .get_account(&pk)
+            .unwrap()
+            .token_balances
+            .contains_key(&token_id));
         assert_eq!(state.tokens.get(&token_id).unwrap().current_supply, 0);
     }
 
@@ -2059,8 +2081,14 @@ mod tests {
         // set up: validator has 500 self-stake, delegator has 500
         state.staking.delegations.insert(validator, 1000);
         state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
-        state.staking.delegator_stakes.insert((validator, validator), 500);
-        state.staking.delegator_stakes.insert((delegator, validator), 500);
+        state
+            .staking
+            .delegator_stakes
+            .insert((validator, validator), 500);
+        state
+            .staking
+            .delegator_stakes
+            .insert((delegator, validator), 500);
         state.staking.commission_rates.insert(validator, 1000); // 10% commission
         state.tx_fee_pool = 1000;
 
@@ -2087,8 +2115,14 @@ mod tests {
 
         state.staking.delegations.insert(validator, 1000);
         state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
-        state.staking.delegator_stakes.insert((validator, validator), 600);
-        state.staking.delegator_stakes.insert((delegator, validator), 400);
+        state
+            .staking
+            .delegator_stakes
+            .insert((validator, validator), 600);
+        state
+            .staking
+            .delegator_stakes
+            .insert((delegator, validator), 400);
         // no commission set (defaults to 0)
         state.tx_fee_pool = 1000;
 
@@ -2143,7 +2177,10 @@ mod tests {
 
         state.staking.delegations.insert(validator, MIN_SELF_STAKE);
         state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
-        state.staking.delegator_stakes.insert((validator, validator), MIN_SELF_STAKE);
+        state
+            .staking
+            .delegator_stakes
+            .insert((validator, validator), MIN_SELF_STAKE);
         state.tx_fee_pool = 100;
         state.msg_fee_pool = 200;
         state.bridge_fee_pool = 300;
@@ -2166,7 +2203,12 @@ mod tests {
         state.process_epoch_transition(0);
 
         assert_eq!(
-            state.staking.delegator_stakes.get(&(delegator, validator)).copied().unwrap(),
+            state
+                .staking
+                .delegator_stakes
+                .get(&(delegator, validator))
+                .copied()
+                .unwrap(),
             500
         );
     }
@@ -2178,20 +2220,33 @@ mod tests {
         let validator: PublicKey = [2u8; 32];
 
         state.staking.delegations.insert(validator, 1000);
-        state.staking.delegator_stakes.insert((delegator, validator), 1000);
+        state
+            .staking
+            .delegator_stakes
+            .insert((delegator, validator), 1000);
         state.staking.queue_retire(delegator, validator, 500, 0);
 
         // epoch 0->1: too early
         state.process_epoch_transition(0);
         assert_eq!(
-            state.staking.delegator_stakes.get(&(delegator, validator)).copied().unwrap(),
+            state
+                .staking
+                .delegator_stakes
+                .get(&(delegator, validator))
+                .copied()
+                .unwrap(),
             1000
         );
 
         // epoch 1->2: retirement completes
         state.process_epoch_transition(1);
         assert_eq!(
-            state.staking.delegator_stakes.get(&(delegator, validator)).copied().unwrap(),
+            state
+                .staking
+                .delegator_stakes
+                .get(&(delegator, validator))
+                .copied()
+                .unwrap(),
             500
         );
     }

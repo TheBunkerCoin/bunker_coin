@@ -244,10 +244,7 @@ impl UsbPactorTransport {
         }
     }
 
-    async fn encode_outbound_frame(
-        &self,
-        frame: HostmodeFrame,
-    ) -> Result<Vec<u8>, ScsPactorError> {
+    async fn encode_outbound_frame(&self, frame: HostmodeFrame) -> Result<Vec<u8>, ScsPactorError> {
         let counter = self.packet_counter.lock().await;
         let code_with_counter = counter.apply(frame.code);
         let framed = HostmodeFrame::with_code(frame.channel, code_with_counter, frame.payload);
@@ -615,9 +612,7 @@ impl PactorTransport for UsbPactorTransport {
                     }
                 }
                 None => {
-                    eprintln!(
-                        "[connect] poll {poll_count}: no response (modem busy with RF)"
-                    );
+                    eprintln!("[connect] poll {poll_count}: no response (modem busy with RF)");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
@@ -663,16 +658,13 @@ impl PactorTransport for UsbPactorTransport {
                                 return Err(ScsPactorError::Busy)
                             }
                             PactorLinkEvent::Status(
-                                PactorLinkStatus::Disconnected
-                                | PactorLinkStatus::LinkFailure,
+                                PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
                             ) => {
                                 return Err(ScsPactorError::Io(std::io::Error::other(
                                     g_text.into_owned(),
                                 )))
                             }
-                            PactorLinkEvent::Status(PactorLinkStatus::Connecting {
-                                ..
-                            }) => {
+                            PactorLinkEvent::Status(PactorLinkStatus::Connecting { .. }) => {
                                 saw_link_setup = true;
                             }
                             _ => {}
@@ -778,8 +770,7 @@ mod tests {
             assert_eq!(frame.payload, b"I N0CALL");
 
             // Respond with OK (set_mycall now uses hostmode_transaction)
-            let ok =
-                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
+            let ok = encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
             modem_side.write_all(&ok).await.unwrap();
         });
 
@@ -1121,11 +1112,8 @@ mod tests {
                 while let Some(frame) = decoder.next_frame().unwrap() {
                     frames.push(frame);
                     // Send ACK response
-                    let ack = encode_frame(&HostmodeFrame::command(
-                        PACTOR_CHANNEL,
-                        b"OK".to_vec(),
-                    ))
-                    .unwrap();
+                    let ack = encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec()))
+                        .unwrap();
                     modem_side.write_all(&ack).await.unwrap();
                 }
             }

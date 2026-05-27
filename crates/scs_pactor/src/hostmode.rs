@@ -212,13 +212,10 @@ impl HostmodeDecoder {
         // Try length-byte format (ptc-go / Dragon)
         if self.buffer.len() >= 7 {
             if let Ok(Some(body_len)) = decoded_body_len(&self.buffer[2..]) {
-                if let Ok(Some(raw_len)) =
-                    raw_len_for_destuffed_body(&self.buffer[2..], body_len)
-                {
+                if let Ok(Some(raw_len)) = raw_len_for_destuffed_body(&self.buffer[2..], body_len) {
                     let packet_len = 2 + raw_len;
                     if self.buffer.len() >= packet_len {
-                        let candidate: Vec<u8> =
-                            self.buffer[..packet_len].to_vec();
+                        let candidate: Vec<u8> = self.buffer[..packet_len].to_vec();
                         if decode_packet(&candidate).is_ok() {
                             self.buffer.drain(..packet_len);
                             return decode_packet(&candidate).map(Some);
@@ -511,9 +508,7 @@ mod tests {
         let encoded = encode_frame(&frame).unwrap();
         assert_eq!(
             encoded,
-            vec![
-                0xaa, 0xaa, 0x00, 0x01, 0x05, 0x4a, 0x48, 0x4f, 0x53, 0x54, 0x30, 0xfb, 0x3d,
-            ]
+            vec![0xaa, 0xaa, 0x00, 0x01, 0x05, 0x4a, 0x48, 0x4f, 0x53, 0x54, 0x30, 0xfb, 0x3d,]
         );
     }
 
