@@ -281,6 +281,72 @@ Returns all registered tokens.
 }
 ```
 
+### GET /snapshots/latest
+Returns the latest finalized state snapshot checkpoint available for node bootstrapping. The response includes the snapshot manifest plus the epoch-transition checkpoint and finalization certificates that anchor the snapshot to consensus.
+
+#### Response
+```json
+{
+  "manifest": {
+    "epoch": 3,
+    "state_hash": "0123...",
+    "chunk_root": "abcd...",
+    "chunk_size": 1024,
+    "total_bytes": 4096,
+    "chunk_count": 4
+  },
+  "checkpoint": {
+    "epoch": 3,
+    "finalized_slot": 54000,
+    "transition_block": {
+      "epoch": 3,
+      "last_slot": 53999,
+      "state_hash": "0123...",
+      "snapshot_chunk_root": "abcd...",
+      "snapshot_chunk_count": 4,
+      "snapshot_total_bytes": 4096,
+      "snapshot_chunk_size": 1024
+    },
+    "finalization_certs": ["..."]
+  }
+}
+```
+
+Returns `404 Not Found` if no snapshot with a finalized epoch-transition block is available yet.
+
+### GET /snapshots/{epoch}
+Returns the snapshot manifest for a specific epoch.
+
+#### Parameters
+- `epoch` (path): Snapshot epoch number
+
+Response shape is the same as `GET /snapshots/latest`. Returns `404 Not Found` if the manifest or finalized checkpoint is unavailable.
+
+### GET /snapshots/{epoch}/chunks/{index}
+Returns one snapshot chunk and its Merkle proof. Chunks are only served when the epoch has a finalized checkpoint from the block that carried the epoch transition. A bootstrapping node downloads chunks `0..chunk_count-1`, verifies each proof against `checkpoint.transition_block.snapshot_chunk_root`, reconstructs the serialized state, decodes it, and checks that the decoded state's hash equals `checkpoint.transition_block.state_hash`.
+
+Bootstrapping must reject the snapshot unless:
+- the finalization certificates verify for the block that carried the epoch transition,
+- `manifest.state_hash` equals `checkpoint.transition_block.state_hash`,
+- `manifest.chunk_root` equals `checkpoint.transition_block.snapshot_chunk_root`,
+- the chunk count, total bytes, and chunk size match the transition block,
+- every chunk proof verifies against the chunk root,
+- the reconstructed state hashes to `state_hash`.
+
+#### Parameters
+- `epoch` (path): Snapshot epoch number
+- `index` (path): Zero-based chunk index
+
+#### Response
+```json
+{
+  "epoch": 3,
+  "index": 0,
+  "data": "001122...",
+  "proof": ["aabb...", "ccdd..."]
+}
+```
+
 ## WebSocket Endpoint
 
 Connect to: `ws://localhost:3001/ws`

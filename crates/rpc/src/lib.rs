@@ -1,28 +1,29 @@
 use axum::http::{HeaderValue, Method};
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message, WebSocket},
         Path, Query, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::{Transaction as CoreTransaction, TransactionBody};
 use bunker_coin_core::types::MAX_TICKER_LEN;
-use bunkerglow::consensus::Blockstore;
-use bunkerglow::crypto::merkle::{DoubleMerkleRoot, MerkleRoot};
-use bunkerglow::crypto::Hash;
 use bunkerglow::Slot;
-use futures::{sink::SinkExt, stream::StreamExt};
+use bunkerglow::consensus::Blockstore;
+use bunkerglow::crypto::Hash;
+use bunkerglow::crypto::merkle::{DoubleMerkleRoot, MerkleRoot};
+use bunkerglow::snapshot::{SnapshotManifest, SnapshotStore};
 use ed25519_dalek::SigningKey;
+use futures::{sink::SinkExt, stream::StreamExt};
 use hex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 const MAX_MEMPOOL_SIZE: usize = 10_000;
@@ -236,16 +237,43 @@ pub struct TxResult {
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum TransactionBodyResponse {
-    Transfer { to: String, amount: u64 },
-    TokenTransfer { to: String, token_id: String, amount: u64 },
-    Mint { ticker: String, max_supply: u64, metadata_hash: String },
-    Bond { validator: String, amount: u64 },
-    Retire { validator: String, amount: u64 },
-    Withdraw { validator: String },
+    Transfer {
+        to: String,
+        amount: u64,
+    },
+    TokenTransfer {
+        to: String,
+        token_id: String,
+        amount: u64,
+    },
+    Mint {
+        ticker: String,
+        max_supply: u64,
+        metadata_hash: String,
+    },
+    Bond {
+        validator: String,
+        amount: u64,
+    },
+    Retire {
+        validator: String,
+        amount: u64,
+    },
+    Withdraw {
+        validator: String,
+    },
     UnJail,
-    SetCommission { rate: u16 },
-    Burn { token_id: String, amount: u64 },
-    UpdateMetadata { token_id: String, metadata_hash: String },
+    SetCommission {
+        rate: u16,
+    },
+    Burn {
+        token_id: String,
+        amount: u64,
+    },
+    UpdateMetadata {
+        token_id: String,
+        metadata_hash: String,
+    },
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -336,6 +364,7 @@ pub struct SharedState {
     pub execution_state: Arc<RwLock<ExecutionState>>,
     pub tx_results: Arc<RwLock<HashMap<String, TxResult>>>,
     pub genesis_signing_key: Option<Arc<SigningKey>>,
+    pub snapshot_store: Option<Arc<SnapshotStore>>,
 }
 
 // -- hex decode helpers --
@@ -461,12 +490,20 @@ fn core_tx_to_body_response(body: &TransactionBody) -> TransactionBodyResponse {
             to: hex::encode(to),
             amount: *amount,
         },
-        TransactionBody::TokenTransfer { to, token_id, amount } => TransactionBodyResponse::TokenTransfer {
+        TransactionBody::TokenTransfer {
+            to,
+            token_id,
+            amount,
+        } => TransactionBodyResponse::TokenTransfer {
             to: hex::encode(to),
             token_id: hex::encode(token_id),
             amount: *amount,
         },
-        TransactionBody::Mint { ticker, max_supply, metadata_hash } => TransactionBodyResponse::Mint {
+        TransactionBody::Mint {
+            ticker,
+            max_supply,
+            metadata_hash,
+        } => TransactionBodyResponse::Mint {
             ticker: ticker.clone(),
             max_supply: *max_supply,
             metadata_hash: hex::encode(metadata_hash),
@@ -483,9 +520,9 @@ fn core_tx_to_body_response(body: &TransactionBody) -> TransactionBodyResponse {
             validator: hex::encode(validator),
         },
         TransactionBody::UnJail => TransactionBodyResponse::UnJail,
-        TransactionBody::SetCommission { rate } => TransactionBodyResponse::SetCommission {
-            rate: *rate,
-        },
+        TransactionBody::SetCommission { rate } => {
+            TransactionBodyResponse::SetCommission { rate: *rate }
+        }
         TransactionBody::Burn { token_id, amount } => TransactionBodyResponse::Burn {
             token_id: hex::encode(token_id),
             amount: *amount,
@@ -567,7 +604,7 @@ async fn submit_transaction(
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("invalid sender: {e}") })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -578,7 +615,7 @@ async fn submit_transaction(
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("invalid signature: {e}") })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -589,7 +626,7 @@ async fn submit_transaction(
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": e })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -609,10 +646,7 @@ async fn submit_transaction(
             if tx.sender == genesis_pk {
                 // auto-fill nonce from current account state
                 let exec = state.execution_state.read().await;
-                let current_nonce = exec
-                    .get_account(&genesis_pk)
-                    .map(|a| a.nonce)
-                    .unwrap_or(0);
+                let current_nonce = exec.get_account(&genesis_pk).map(|a| a.nonce).unwrap_or(0);
                 drop(exec);
                 tx.nonce = current_nonce;
 
@@ -878,7 +912,8 @@ async fn get_transaction(
         let results = state.tx_results.read().await;
         if let Some(result) = results.get(&hash) {
             // find the original tx details from blockstore
-            let (sender, nonce, fee, body) = find_tx_details_in_blockstore(&state, &hash).await
+            let (sender, nonce, fee, body) = find_tx_details_in_blockstore(&state, &hash)
+                .await
                 .unwrap_or_else(|| ("unknown".to_string(), 0, 0, None));
 
             let success = matches!(result.status, TxFinalStatus::Finalized);
@@ -955,7 +990,14 @@ async fn find_tx_details_in_blockstore(
 async fn find_tx_in_blockstore(
     state: &SharedState,
     hash: &str,
-) -> Option<(String, u64, u64, Option<TransactionBodyResponse>, u64, String)> {
+) -> Option<(
+    String,
+    u64,
+    u64,
+    Option<TransactionBodyResponse>,
+    u64,
+    String,
+)> {
     let bs_arc = state.blockstore.as_ref()?;
     let bs = bs_arc.read().await;
     let blocks = state.blocks.read().await;
@@ -1039,7 +1081,7 @@ async fn get_account(
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("invalid pubkey: {e}") })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -1101,7 +1143,7 @@ async fn get_token(
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("invalid token id: {e}") })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -1139,7 +1181,7 @@ async fn get_token_holders(
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("invalid token id: {e}") })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -1201,7 +1243,7 @@ async fn get_account_tokens(
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("invalid pubkey: {e}") })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -1248,12 +1290,7 @@ async fn get_staking(state: axum::extract::State<SharedState>) -> Json<serde_jso
         .validator_set()
         .iter()
         .map(|(pk, stake)| {
-            let commission = exec
-                .staking
-                .commission_rates
-                .get(pk)
-                .copied()
-                .unwrap_or(0);
+            let commission = exec.staking.commission_rates.get(pk).copied().unwrap_or(0);
             serde_json::json!({
                 "pubkey": hex::encode(pk),
                 "stake": *stake,
@@ -1274,6 +1311,187 @@ async fn get_staking(state: axum::extract::State<SharedState>) -> Json<serde_jso
     }))
 }
 
+// -- snapshot bootstrap handlers --
+
+fn manifest_json(manifest: &SnapshotManifest) -> serde_json::Value {
+    serde_json::json!({
+        "epoch": manifest.epoch,
+        "state_hash": hex::encode(manifest.state_hash),
+        "chunk_root": hex::encode(manifest.chunk_root.as_ref()),
+        "chunk_size": manifest.chunk_size,
+        "total_bytes": manifest.total_bytes,
+        "chunk_count": manifest.chunk_count,
+    })
+}
+
+fn checkpoint_json(checkpoint: &bunkerglow::snapshot::SnapshotCheckpoint) -> serde_json::Value {
+    let block = &checkpoint.transition_block;
+    serde_json::json!({
+        "epoch": checkpoint.epoch,
+        "finalized_slot": checkpoint.finalized_slot,
+        "transition_block": {
+            "epoch": block.epoch,
+            "last_slot": block.last_slot,
+            "fees_distributed": block.fees_distributed,
+            "bonds_activated": block.bonds_activated.len(),
+            "retires_completed": block.retires_completed.len(),
+            "new_validator_set": block.new_validator_set.iter().map(|(pubkey, amount)| {
+                serde_json::json!({
+                    "pubkey": hex::encode(pubkey),
+                    "stake": amount,
+                })
+            }).collect::<Vec<_>>(),
+            "state_hash": hex::encode(block.state_hash),
+            "snapshot_chunk_root": hex::encode(block.snapshot_chunk_root),
+            "snapshot_chunk_count": block.snapshot_chunk_count,
+            "snapshot_total_bytes": block.snapshot_total_bytes,
+            "snapshot_chunk_size": block.snapshot_chunk_size,
+            "slashes_applied": block.slashes_applied.len(),
+            "deactivated_validators": block.deactivated_validators.iter().map(hex::encode).collect::<Vec<_>>(),
+        },
+        "finalization_certs": checkpoint.finalization_certs.iter().map(hex::encode).collect::<Vec<_>>(),
+    })
+}
+
+fn manifest_with_checkpoint_json(
+    manifest: &SnapshotManifest,
+    checkpoint: &bunkerglow::snapshot::SnapshotCheckpoint,
+) -> serde_json::Value {
+    serde_json::json!({
+        "manifest": manifest_json(manifest),
+        "checkpoint": checkpoint_json(checkpoint),
+    })
+}
+
+async fn get_latest_snapshot_manifest(
+    state: axum::extract::State<SharedState>,
+) -> impl IntoResponse {
+    let Some(store) = &state.snapshot_store else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "snapshot store not configured" })),
+        )
+            .into_response();
+    };
+
+    if let Some(manifest) = store.latest_manifest() {
+        if let Some(checkpoint) = store
+            .load_checkpoint(manifest.epoch)
+            .filter(|checkpoint| checkpoint.matches_manifest(&manifest))
+        {
+            Json(manifest_with_checkpoint_json(&manifest, &checkpoint)).into_response()
+        } else {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "snapshot checkpoint not found" })),
+            )
+                .into_response()
+        }
+    } else {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no snapshot manifest available" })),
+        )
+            .into_response()
+    }
+}
+
+async fn get_snapshot_manifest(
+    Path(epoch): Path<u64>,
+    state: axum::extract::State<SharedState>,
+) -> impl IntoResponse {
+    let Some(store) = &state.snapshot_store else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "snapshot store not configured" })),
+        )
+            .into_response();
+    };
+
+    if let Some(manifest) = store.load_manifest(epoch) {
+        if let Some(checkpoint) = store
+            .load_checkpoint(epoch)
+            .filter(|checkpoint| checkpoint.matches_manifest(&manifest))
+        {
+            Json(manifest_with_checkpoint_json(&manifest, &checkpoint)).into_response()
+        } else {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "snapshot checkpoint not found" })),
+            )
+                .into_response()
+        }
+    } else {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "snapshot manifest not found" })),
+        )
+            .into_response()
+    }
+}
+
+async fn get_snapshot_chunk(
+    Path((epoch, index)): Path<(u64, usize)>,
+    state: axum::extract::State<SharedState>,
+) -> impl IntoResponse {
+    let Some(store) = &state.snapshot_store else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "snapshot store not configured" })),
+        )
+            .into_response();
+    };
+
+    let Some(manifest) = store.load_manifest(epoch) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "snapshot manifest not found" })),
+        )
+            .into_response();
+    };
+    if !store
+        .load_checkpoint(epoch)
+        .is_some_and(|checkpoint| checkpoint.matches_manifest(&manifest))
+    {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "snapshot checkpoint not found" })),
+        )
+            .into_response();
+    }
+
+    if index >= manifest.chunk_count {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("chunk index {index} out of range for {} chunks", manifest.chunk_count)
+            })),
+        )
+            .into_response();
+    }
+
+    if let Some(chunk) = store.load_chunk(epoch, index) {
+        let proof: Vec<String> = chunk
+            .proof
+            .iter()
+            .map(|hash| hex::encode(hash.as_ref()))
+            .collect();
+        Json(serde_json::json!({
+            "epoch": chunk.epoch,
+            "index": chunk.index,
+            "data": hex::encode(chunk.data),
+            "proof": proof,
+        }))
+        .into_response()
+    } else {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "snapshot chunk not found" })),
+        )
+            .into_response()
+    }
+}
+
 // -- genesis handler --
 
 async fn get_genesis(state: axum::extract::State<SharedState>) -> impl IntoResponse {
@@ -1289,10 +1507,7 @@ async fn get_genesis(state: axum::extract::State<SharedState>) -> impl IntoRespo
     let pk_hex = hex::encode(pk);
 
     let exec = state.execution_state.read().await;
-    let balance = exec
-        .get_account(&pk)
-        .map(|a| a.native_balance)
-        .unwrap_or(0);
+    let balance = exec.get_account(&pk).map(|a| a.native_balance).unwrap_or(0);
 
     Json(serde_json::json!({
         "public_key": pk_hex,
@@ -2017,6 +2232,9 @@ pub async fn run_api(state: SharedState) {
         .route("/tokens/{id}", get(get_token))
         .route("/tokens/{id}/holders", get(get_token_holders))
         .route("/staking", get(get_staking))
+        .route("/snapshots/latest", get(get_latest_snapshot_manifest))
+        .route("/snapshots/{epoch}", get(get_snapshot_manifest))
+        .route("/snapshots/{epoch}/chunks/{index}", get(get_snapshot_chunk))
         .route("/genesis", get(get_genesis))
         .route("/ws", get(websocket_handler))
         .layer(cors)

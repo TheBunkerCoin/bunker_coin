@@ -198,9 +198,12 @@ fn create_random_slice_payload_valid_txs(parent: Option<BlockId>) -> SlicePayloa
     let mut data = vec![0; MAX_TRANSACTION_SIZE];
     rand::rng().fill_bytes(&mut data);
     let tx = Transaction(data);
-    let tx = wincode::serialize(&tx).expect("serialization should not panic");
     let txs = vec![tx; NUM_TXS_PER_SLICE];
-    let txs = wincode::serialize(&txs).expect("serialization should not panic");
+    let txs = wincode::serialize(&crate::BlockPayload {
+        epoch_transition: None,
+        transactions: txs,
+    })
+    .expect("serialization should not panic");
     let payload = SlicePayload::new(parent, txs);
     let payload: Vec<u8> = payload.into();
     assert!(payload.len() <= MAX_DATA_PER_SLICE);

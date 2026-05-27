@@ -4,11 +4,11 @@ use bincode;
 use bunker_coin_radio::{
     Network as RadioNetwork, NetworkMessage, PactorRadioNode, RadioConfig, SimulatedRadioNetwork,
 };
+use bunkerglow::Slot;
 use bunkerglow::crypto::merkle::{DoubleMerkleRoot, MerkleRoot};
 use bunkerglow::crypto::signature::SecretKey;
 use bunkerglow::shredder::{RegularShredder, Shredder};
 use bunkerglow::types::slice::create_slice_with_invalid_txs;
-use bunkerglow::Slot;
 use hex;
 use rpc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -156,8 +156,8 @@ pub struct PactorMeasuredThroughputSample {
     pub degraded_retransmissions: u64,
 }
 
-pub async fn pactor_radio_proto_degradation_demo(
-) -> Result<PactorRadioProtoComparison, scs_pactor::ScsPactorError> {
+pub async fn pactor_radio_proto_degradation_demo()
+-> Result<PactorRadioProtoComparison, scs_pactor::ScsPactorError> {
     let clean_config = scs_pactor::SimulatedPactorConfig {
         packet_loss: 0.0,
         latency: std::time::Duration::ZERO,
@@ -205,8 +205,8 @@ pub fn pactor_throughput_report() -> Vec<PactorThroughputSample> {
     .collect()
 }
 
-pub async fn pactor_measured_throughput_report(
-) -> Result<Vec<PactorMeasuredThroughputSample>, scs_pactor::ScsPactorError> {
+pub async fn pactor_measured_throughput_report()
+-> Result<Vec<PactorMeasuredThroughputSample>, scs_pactor::ScsPactorError> {
     let mut samples = Vec::new();
     for speed in [
         scs_pactor::PactorSpeed::P1,
@@ -354,7 +354,9 @@ pub async fn basic_consensus_test(config: RadioConfig, num_validators: u64) {
     println!(
         "Note: Full consensus testing requires implementing proper message routing between nodes."
     );
-    println!("The current implementation demonstrates the radio constraints but doesn't route messages between validators.");
+    println!(
+        "The current implementation demonstrates the radio constraints but doesn't route messages between validators."
+    );
 }
 
 pub async fn bandwidth_test(config: RadioConfig) {
@@ -475,16 +477,16 @@ pub async fn multi_node_real_radio_simulation(num_nodes: usize) {
 }
 
 pub async fn multi_node_consensus_simulation(num_nodes: usize) {
+    use bunkerglow::Transaction;
+    use bunkerglow::ValidatorInfo;
     use bunkerglow::all2all::TrivialAll2All;
     use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
     use bunkerglow::crypto::{aggsig, signature::SecretKey};
     use bunkerglow::disseminator::Rotor;
     use bunkerglow::network::simulated::SimulatedNetworkCore;
-    use bunkerglow::network::{localhost_ip_sockaddr, SimulatedNetwork};
+    use bunkerglow::network::{SimulatedNetwork, localhost_ip_sockaddr};
     use bunkerglow::repair::{RepairRequest, RepairResponse};
     use bunkerglow::shredder::Shred;
-    use bunkerglow::Transaction;
-    use bunkerglow::ValidatorInfo;
     use std::sync::Arc;
     use tokio::time::Duration;
 
@@ -599,6 +601,9 @@ pub async fn multi_node_consensus_simulation_with_api(
             >,
         >,
     >,
+    snapshot_store_ref: std::sync::Arc<
+        tokio::sync::RwLock<Option<std::sync::Arc<bunkerglow::snapshot::SnapshotStore>>>,
+    >,
     execution_state: std::sync::Arc<tokio::sync::RwLock<bunker_coin_core::execution::State>>,
     tx_sender_slot: std::sync::Arc<
         tokio::sync::RwLock<
@@ -606,18 +611,20 @@ pub async fn multi_node_consensus_simulation_with_api(
         >,
     >,
     mempool: std::sync::Arc<tokio::sync::RwLock<Vec<rpc::MempoolEntry>>>,
-    tx_results: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, rpc::TxResult>>>,
+    tx_results: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, rpc::TxResult>>,
+    >,
 ) {
+    use bunkerglow::Transaction;
+    use bunkerglow::ValidatorInfo;
     use bunkerglow::all2all::TrivialAll2All;
     use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
     use bunkerglow::crypto::{aggsig, signature::SecretKey};
     use bunkerglow::disseminator::Rotor;
     use bunkerglow::network::simulated::SimulatedNetworkCore;
-    use bunkerglow::network::{localhost_ip_sockaddr, Network, SimulatedNetwork};
+    use bunkerglow::network::{Network, SimulatedNetwork, localhost_ip_sockaddr};
     use bunkerglow::repair::{RepairRequest, RepairResponse};
     use bunkerglow::shredder::Shred;
-    use bunkerglow::Transaction;
-    use bunkerglow::ValidatorInfo;
     use hex;
     use std::sync::Arc;
     use tokio::time::Duration;
@@ -673,7 +680,7 @@ pub async fn multi_node_consensus_simulation_with_api(
             txs_core.join_unlimited(i as u64).await;
         let all2all = TrivialAll2All::new(validators.clone(), a2a_net);
         let disseminator = Rotor::new(dis_net, epoch_info.clone());
-        let node = Alpenglow::new(
+        let mut node = Alpenglow::new(
             sks[i].clone(),
             voting_sks[i].clone(),
             all2all,
@@ -683,6 +690,12 @@ pub async fn multi_node_consensus_simulation_with_api(
             epoch_info,
             txs_net,
         );
+        if i == 0 {
+            node.set_execution_state(execution_state.clone());
+            if let Some(store) = node.snapshot_store() {
+                *snapshot_store_ref.write().await = Some(store);
+            }
+        }
         nodes_with_id.push((i, node));
     }
 
@@ -718,7 +731,7 @@ pub async fn multi_node_consensus_simulation_with_api(
         // Also periodically re-broadcasts pending mempool txs so they get picked up by block producers.
         let tx_results_for_bridge = tx_results.clone();
         tokio::spawn(async move {
-            use tokio::time::{interval, Duration};
+            use tokio::time::{Duration, interval};
 
             // Keep encoded txs for re-broadcasting until they're finalized
             let mut pending_txs: Vec<(String, Transaction)> = Vec::new();
@@ -980,10 +993,18 @@ pub async fn multi_node_consensus_simulation_with_api(
                         };
 
                         if status_rank(current_status) > status_rank(old_status) {
-                            println!("Slot {} status: {:?} -> {:?} (final={}, notar={}, notar_fb={}, skip={}, has_block={}, finalized_slot={})",
-                                slot, old_status, current_status,
-                                is_finalized, is_notarized, is_notarized_fallback, is_skip_certified, has_block,
-                                pool_guard.finalized_slot());
+                            println!(
+                                "Slot {} status: {:?} -> {:?} (final={}, notar={}, notar_fb={}, skip={}, has_block={}, finalized_slot={})",
+                                slot,
+                                old_status,
+                                current_status,
+                                is_finalized,
+                                is_notarized,
+                                is_notarized_fallback,
+                                is_skip_certified,
+                                has_block,
+                                pool_guard.finalized_slot()
+                            );
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
@@ -1011,16 +1032,28 @@ pub async fn multi_node_consensus_simulation_with_api(
                                     blocks_guard.iter().find(|b| b.slot() == verify_slot);
                                 if let Some(found) = found_in_list {
                                     if found.status() != current_status {
-                                        println!("ERROR: Block in list has wrong status! Expected {:?}, got {:?}", current_status, found.status());
+                                        println!(
+                                            "ERROR: Block in list has wrong status! Expected {:?}, got {:?}",
+                                            current_status,
+                                            found.status()
+                                        );
                                     }
                                 } else {
                                     println!("ERROR: Block not found in list after update!");
                                 }
                             }
                         } else if status_rank(current_status) < status_rank(old_status) {
-                            println!("WARNING: Slot {} apparent status regression: {:?} -> {:?} (final={}, notar={}, notar_fb={}, skip={}, has_block={})",
-                                slot, old_status, current_status,
-                                is_finalized, is_notarized, is_notarized_fallback, is_skip_certified, has_block);
+                            println!(
+                                "WARNING: Slot {} apparent status regression: {:?} -> {:?} (final={}, notar={}, notar_fb={}, skip={}, has_block={})",
+                                slot,
+                                old_status,
+                                current_status,
+                                is_finalized,
+                                is_notarized,
+                                is_notarized_fallback,
+                                is_skip_certified,
+                                has_block
+                            );
                         }
                     } else {
                         if is_skip_certified {
@@ -1143,7 +1176,9 @@ pub async fn multi_node_consensus_simulation_with_api(
                                                             bincode::config::standard(),
                                                         )
                                                     } else {
-                                                        Err(bincode::error::DecodeError::Other("too short"))
+                                                        Err(bincode::error::DecodeError::Other(
+                                                            "too short",
+                                                        ))
                                                     }
                                                 })
                                                 .ok()
@@ -1167,30 +1202,39 @@ pub async fn multi_node_consensus_simulation_with_api(
                                         let now = SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
                                             .unwrap()
-                                            .as_millis() as u64;
+                                            .as_millis()
+                                            as u64;
 
                                         // record tx results, prune mempool, send WS events
                                         let mut pool = mempool.write().await;
                                         let mut results_map = tx_results.write().await;
 
-                                        for (core_tx, exec_result) in core_txs.iter().zip(results.iter()) {
+                                        for (core_tx, exec_result) in
+                                            core_txs.iter().zip(results.iter())
+                                        {
                                             let tx_hash = hex::encode(core_tx.hash());
 
                                             let (status, error) = match exec_result {
                                                 Ok(()) => (rpc::TxFinalStatus::Finalized, None),
-                                                Err(e) => (rpc::TxFinalStatus::Failed, Some(e.to_string())),
+                                                Err(e) => (
+                                                    rpc::TxFinalStatus::Failed,
+                                                    Some(e.to_string()),
+                                                ),
                                             };
 
                                             let success = exec_result.is_ok();
 
-                                            results_map.insert(tx_hash.clone(), rpc::TxResult {
-                                                hash: tx_hash.clone(),
-                                                slot,
-                                                block_hash: blk_hash_hex.clone(),
-                                                status,
-                                                error: error.clone(),
-                                                executed_at: now,
-                                            });
+                                            results_map.insert(
+                                                tx_hash.clone(),
+                                                rpc::TxResult {
+                                                    hash: tx_hash.clone(),
+                                                    slot,
+                                                    block_hash: blk_hash_hex.clone(),
+                                                    status,
+                                                    error: error.clone(),
+                                                    executed_at: now,
+                                                },
+                                            );
 
                                             // prune from mempool
                                             pool.retain(|entry| entry.hash != tx_hash);

@@ -4,10 +4,10 @@ use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::Transaction as CoreTransaction;
 use bunker_coin_sim::scenarios;
 use ed25519_dalek::SigningKey;
-use rpc::{run_api, RadioStats, SharedState, TxResult};
+use rpc::{RadioStats, SharedState, TxResult, run_api};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task;
 
 #[tokio::main]
@@ -52,6 +52,8 @@ async fn main() {
 
     let blockstore_ref = Arc::new(RwLock::new(None));
     let blockstore_for_api = blockstore_ref.clone();
+    let snapshot_store_ref = Arc::new(RwLock::new(None));
+    let snapshot_store_for_api = snapshot_store_ref.clone();
 
     // deterministic genesis keypair from a fixed seed
     let genesis_seed: [u8; 32] = [1u8; 32];
@@ -73,8 +75,7 @@ async fn main() {
         Arc::new(RwLock::new(None));
     let tx_sender_for_api = tx_sender_slot.clone();
     let mempool: Arc<RwLock<Vec<rpc::MempoolEntry>>> = Arc::new(RwLock::new(Vec::new()));
-    let tx_results: Arc<RwLock<HashMap<String, TxResult>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let tx_results: Arc<RwLock<HashMap<String, TxResult>>> = Arc::new(RwLock::new(HashMap::new()));
 
     let state = SharedState {
         blocks: blocks.clone(),
@@ -87,6 +88,7 @@ async fn main() {
         execution_state: execution_state.clone(),
         tx_results: tx_results.clone(),
         genesis_signing_key: Some(genesis_signing_key),
+        snapshot_store: None,
     };
 
     // api in dedicated task
@@ -94,9 +96,11 @@ async fn main() {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         let bs = blockstore_for_api.read().await.clone();
+        let snapshot_store = snapshot_store_for_api.read().await.clone();
         let tx_sender = tx_sender_for_api.read().await.clone();
         let mut state = state;
         state.blockstore = bs;
+        state.snapshot_store = snapshot_store;
         state.tx_sender = tx_sender;
 
         run_api(state).await;
@@ -109,6 +113,7 @@ async fn main() {
         radio_stats,
         updates_tx,
         blockstore_ref,
+        snapshot_store_ref,
         execution_state,
         tx_sender_slot,
         mempool,

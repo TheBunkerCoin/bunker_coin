@@ -39,6 +39,13 @@ use crate::{BlockId, Slot, ValidatorId};
 pub struct EpochBoundaryEvent {
     pub epoch: u64,
     pub finalized_slot: Slot,
+    pub finalization_certs: Vec<Cert>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FinalizedSlotEvent {
+    pub slot: Slot,
+    pub finalization_certs: Vec<Cert>,
 }
 
 #[derive(Clone, Debug)]
@@ -138,6 +145,7 @@ pub struct PoolImpl {
     blockstore: Option<Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>>,
     /// Channel for signaling epoch boundary crossings.
     epoch_boundary_channel: Option<Sender<EpochBoundaryEvent>>,
+    finalized_slot_channel: Option<Sender<FinalizedSlotEvent>>,
     /// Channel for reporting slashable offences to execution layer.
     slashing_channel: Option<Sender<SlashingReport>>,
 
@@ -172,6 +180,7 @@ impl PoolImpl {
             db,
             blockstore: None,
             epoch_boundary_channel: None,
+            finalized_slot_channel: None,
             slashing_channel: None,
             highest_finalized_slot: Slot::genesis(),
             highest_notarized_fallback_slot: Slot::genesis(),
@@ -185,6 +194,10 @@ impl PoolImpl {
         self.epoch_boundary_channel = Some(tx);
     }
 
+    pub fn set_finalized_slot_channel(&mut self, tx: Sender<FinalizedSlotEvent>) {
+        self.finalized_slot_channel = Some(tx);
+    }
+
     pub fn set_slashing_channel(&mut self, tx: Sender<SlashingReport>) {
         self.slashing_channel = Some(tx);
     }
@@ -195,9 +208,29 @@ impl PoolImpl {
                 let event = EpochBoundaryEvent {
                     epoch: slot.epoch(),
                     finalized_slot: slot,
+                    finalization_certs: self.get_final_certs(slot),
                 };
                 let _ = tx.send(event).await;
             }
+        }
+    }
+
+    async fn notify_finalized_slot(&self, slot: Slot) {
+        if let Some(ref tx) = self.finalized_slot_channel {
+            let event = FinalizedSlotEvent {
+                slot,
+                finalization_certs: self.get_final_certs(slot),
+            };
+            let _ = tx.send(event).await;
+        }
+    }
+
+    async fn notify_finalization_event(&self, event: &FinalizationEvent) {
+        if let Some((slot, _)) = &event.finalized {
+            self.notify_finalized_slot(*slot).await;
+        }
+        for (slot, _) in &event.implicitly_finalized {
+            self.notify_finalized_slot(*slot).await;
         }
     }
 
@@ -245,6 +278,7 @@ impl PoolImpl {
                     let finalization_event = self
                         .finality_tracker
                         .mark_notarized(slot, block_hash.clone());
+                    self.notify_finalization_event(&finalization_event).await;
                     self.handle_finalization(finalization_event).await;
                 }
 
@@ -284,6 +318,7 @@ impl PoolImpl {
                     let finalization_event = self
                         .finality_tracker
                         .mark_fast_finalized(slot, hash.clone());
+                    self.notify_finalization_event(&finalization_event).await;
                     self.handle_finalization(finalization_event).await;
                 }
 
@@ -306,6 +341,7 @@ impl PoolImpl {
                 info!("slow finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
                 let finalization_event = self.finality_tracker.mark_finalized(slot);
+                self.notify_finalization_event(&finalization_event).await;
                 self.handle_finalization(finalization_event).await;
 
                 if let Some(ref blockstore) = self.blockstore {
@@ -598,6 +634,7 @@ impl Pool for PoolImpl {
         let finalization_event = self
             .finality_tracker
             .add_parent(block_id.clone(), parent_id.clone());
+        self.notify_finalization_event(&finalization_event).await;
         let new_parents_ready = self
             .parent_ready_tracker
             .handle_finalization(finalization_event);

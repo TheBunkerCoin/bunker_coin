@@ -19,7 +19,7 @@ use crate::shredder::{
     DeshredError, RegularShredder, Shred, ShredVerifyError, Shredder, TOTAL_SHREDS, ValidatedShred,
 };
 use crate::types::{Slice, SliceIndex};
-use crate::{Block, Slot};
+use crate::{Block, BlockPayload, Slot};
 
 /// Errors that may be encountered when adding a shred.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -322,6 +322,7 @@ impl BlockData {
         let mut parent = first_slice.parent.clone().unwrap();
         let mut parent_switched = false;
 
+        let mut epoch_transition = None;
         let mut transactions = vec![];
         for (ind, slice) in &self.slices {
             // handle optimistic handover
@@ -340,14 +341,33 @@ impl BlockData {
                 parent = new_parent;
             }
 
-            let mut txs = match wincode::deserialize(&slice.data) {
+            let payload: BlockPayload = match wincode::deserialize(&slice.data) {
                 Ok(r) => r,
                 Err(err) => {
                     warn!("decoding slice {ind} failed with {err:?}");
                     return ReconstructBlockResult::Error;
                 }
             };
-            transactions.append(&mut txs);
+            if let Some(encoded_transition) = payload.epoch_transition {
+                if epoch_transition.is_some() {
+                    warn!("multiple epoch transition payloads in slot {}", self.slot);
+                    return ReconstructBlockResult::Error;
+                }
+                let decoded = bincode::serde::decode_from_slice::<
+                    bunker_coin_core::epoch_transition::EpochTransitionBlock,
+                    _,
+                >(&encoded_transition, bincode::config::standard());
+                match decoded {
+                    Ok((transition_block, _)) => {
+                        epoch_transition = Some(transition_block);
+                    }
+                    Err(err) => {
+                        warn!("decoding epoch transition payload failed with {err:?}");
+                        return ReconstructBlockResult::Error;
+                    }
+                }
+            }
+            transactions.extend(payload.transactions);
         }
 
         let block = Block {
@@ -355,6 +375,7 @@ impl BlockData {
             hash: block_hash.clone(),
             parent: parent.0,
             parent_hash: parent.1,
+            epoch_transition,
             transactions,
         };
         let block_info = BlockInfo::from(&block);
