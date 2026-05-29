@@ -1,10 +1,13 @@
 //! multi-node radio simulation for BunkerCoin
 
 use bunker_coin_core::execution::State as ExecutionState;
+use bunker_coin_core::transaction::Transaction as CoreTransaction;
 use bunker_coin_sim::scenarios;
-use rpc::{run_api, RadioStats, SharedState};
+use ed25519_dalek::SigningKey;
+use rpc::{run_api, RadioStats, SharedState, TxResult};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task;
 
 #[tokio::main]
@@ -49,7 +52,30 @@ async fn main() {
 
     let blockstore_ref = Arc::new(RwLock::new(None));
     let blockstore_for_api = blockstore_ref.clone();
-    let execution_state = Arc::new(RwLock::new(ExecutionState::new()));
+    let snapshot_store_ref = Arc::new(RwLock::new(None));
+    let snapshot_store_for_api = snapshot_store_ref.clone();
+
+    // deterministic genesis keypair from a fixed seed
+    let genesis_seed: [u8; 32] = [1u8; 32];
+    let genesis_sk = SigningKey::from_bytes(&genesis_seed);
+    let genesis_pk: [u8; 32] = genesis_sk.verifying_key().to_bytes();
+
+    let mut exec_state = ExecutionState::new();
+    exec_state.get_or_create_account(&genesis_pk).native_balance = 1_000_000_000;
+    let execution_state = Arc::new(RwLock::new(exec_state));
+
+    log::info!(
+        "Genesis account funded: {} with 1,000,000,000 native",
+        hex::encode(genesis_pk)
+    );
+
+    let genesis_signing_key = Arc::new(genesis_sk);
+
+    let tx_sender_slot: Arc<RwLock<Option<mpsc::UnboundedSender<CoreTransaction>>>> =
+        Arc::new(RwLock::new(None));
+    let tx_sender_for_api = tx_sender_slot.clone();
+    let mempool: Arc<RwLock<Vec<rpc::MempoolEntry>>> = Arc::new(RwLock::new(Vec::new()));
+    let tx_results: Arc<RwLock<HashMap<String, TxResult>>> = Arc::new(RwLock::new(HashMap::new()));
 
     let state = SharedState {
         blocks: blocks.clone(),
@@ -57,9 +83,12 @@ async fn main() {
         radio_stats: radio_stats.clone(),
         updates: updates_tx.clone(),
         blockstore: None,
-        mempool: Arc::new(RwLock::new(Vec::new())),
+        mempool: mempool.clone(),
         tx_sender: None,
         execution_state: execution_state.clone(),
+        tx_results: tx_results.clone(),
+        genesis_signing_key: Some(genesis_signing_key),
+        snapshot_store: None,
     };
 
     // api in dedicated task
@@ -67,8 +96,12 @@ async fn main() {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         let bs = blockstore_for_api.read().await.clone();
+        let snapshot_store = snapshot_store_for_api.read().await.clone();
+        let tx_sender = tx_sender_for_api.read().await.clone();
         let mut state = state;
         state.blockstore = bs;
+        state.snapshot_store = snapshot_store;
+        state.tx_sender = tx_sender;
 
         run_api(state).await;
     });
@@ -80,7 +113,11 @@ async fn main() {
         radio_stats,
         updates_tx,
         blockstore_ref,
+        snapshot_store_ref,
         execution_state,
+        tx_sender_slot,
+        mempool,
+        tx_results,
     )
     .await;
 

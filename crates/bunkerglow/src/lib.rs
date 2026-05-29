@@ -66,6 +66,7 @@ pub struct Block {
     hash: BlockHash,
     parent: Slot,
     parent_hash: BlockHash,
+    epoch_transition: Option<bunker_coin_core::epoch_transition::EpochTransitionBlock>,
     transactions: Vec<Transaction>,
 }
 
@@ -89,6 +90,18 @@ impl Block {
     pub fn transactions(&self) -> &[Transaction] {
         &self.transactions
     }
+
+    pub fn epoch_transition(
+        &self,
+    ) -> Option<&bunker_coin_core::epoch_transition::EpochTransitionBlock> {
+        self.epoch_transition.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, SchemaRead, SchemaWrite)]
+pub(crate) struct BlockPayload {
+    pub epoch_transition: Option<Vec<u8>>,
+    pub transactions: Vec<Transaction>,
 }
 
 /// Dummy transaction containing payload bytes.

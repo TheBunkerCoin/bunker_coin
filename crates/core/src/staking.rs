@@ -49,6 +49,8 @@ pub struct StakingLedger {
     pub self_bonds: HashMap<PublicKey, Amount>,
     pub commission_rates: HashMap<PublicKey, u16>,
     pub pending_commission_changes: Vec<(PublicKey, u16)>,
+    /// Per-delegator stakes: (delegator, validator) → amount
+    pub delegator_stakes: HashMap<(PublicKey, PublicKey), Amount>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +95,7 @@ impl StakingLedger {
             self_bonds: HashMap::new(),
             commission_rates: HashMap::new(),
             pending_commission_changes: Vec::new(),
+            delegator_stakes: HashMap::new(),
         }
     }
 
@@ -140,6 +143,10 @@ impl StakingLedger {
             if bond.delegator == bond.validator {
                 *self.self_bonds.entry(bond.validator).or_insert(0) += bond.amount;
             }
+            *self
+                .delegator_stakes
+                .entry((bond.delegator, bond.validator))
+                .or_insert(0) += bond.amount;
         }
 
         activate
@@ -167,6 +174,13 @@ impl StakingLedger {
                     if *sb == 0 {
                         self.self_bonds.remove(&retire.validator);
                     }
+                }
+            }
+            let key = (retire.delegator, retire.validator);
+            if let Some(ds) = self.delegator_stakes.get_mut(&key) {
+                *ds = ds.saturating_sub(retire.amount);
+                if *ds == 0 {
+                    self.delegator_stakes.remove(&key);
                 }
             }
             self.completed_retires.push(CompletedRetire {
@@ -293,6 +307,15 @@ impl StakingLedger {
         for (validator, rate) in self.pending_commission_changes.drain(..) {
             self.commission_rates.insert(validator, rate);
         }
+    }
+
+    /// Returns all (delegator, amount) pairs for a given validator
+    pub fn delegators_of(&self, validator: &PublicKey) -> Vec<(PublicKey, Amount)> {
+        self.delegator_stakes
+            .iter()
+            .filter(|((_, v), amt)| v == validator && **amt > 0)
+            .map(|((d, _), amt)| (*d, *amt))
+            .collect()
     }
 
     pub fn validators_below_min_self_stake(&self) -> Vec<PublicKey> {

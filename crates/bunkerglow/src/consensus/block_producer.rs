@@ -3,6 +3,7 @@
 
 //! Block production, leader-side of the consensus protocol.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,8 +22,8 @@ use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH, MerkleRoot};
 use crate::crypto::signature;
 use crate::network::{Network, TransactionNetwork};
 use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder};
-use crate::types::{SLOTS_PER_EPOCH, Slice, SliceHeader, SliceIndex, SlicePayload, Slot};
-use crate::{BlockId, Disseminator, MAX_TRANSACTION_SIZE};
+use crate::types::{Slice, SliceHeader, SliceIndex, SlicePayload, Slot};
+use crate::{BlockId, BlockPayload, Disseminator, MAX_TRANSACTION_SIZE};
 
 /// Produces blocks from transactions and dissminates them.
 ///
@@ -59,6 +60,8 @@ pub(super) struct BlockProducer<D: Disseminator, T: Network> {
 
     /// watch channel for receiving epoch info updates at epoch boundaries
     epoch_info_rx: watch::Receiver<Arc<EpochInfo>>,
+    /// epoch transition payloads waiting to be embedded in the first block of an epoch
+    pending_epoch_transitions: Arc<RwLock<BTreeMap<u64, Vec<u8>>>>,
 }
 
 impl<D, T> BlockProducer<D, T>
@@ -78,6 +81,7 @@ where
         delta_block: Duration,
         delta_first_slice: Duration,
         epoch_info_rx: watch::Receiver<Arc<EpochInfo>>,
+        pending_epoch_transitions: Arc<RwLock<BTreeMap<u64, Vec<u8>>>>,
     ) -> Self {
         assert!(delta_block >= delta_first_slice);
         Self {
@@ -91,6 +95,7 @@ where
             delta_block,
             delta_first_slice,
             epoch_info_rx,
+            pending_epoch_transitions,
         }
     }
 
@@ -108,18 +113,18 @@ where
             }
 
             // pause at epoch boundaries and wait for the new epoch info
-            let window_epoch = first_slot_in_window.inner() / SLOTS_PER_EPOCH;
-            if window_epoch > current_epoch {
+            let slot_epoch = first_slot_in_window.epoch();
+            if slot_epoch > current_epoch {
                 info!(
                     "[val {}] waiting for epoch {} transition before producing window {}",
-                    self.epoch_info.own_id, window_epoch, first_slot_in_window
+                    self.epoch_info.own_id, slot_epoch, first_slot_in_window
                 );
-                while epoch_info_rx.borrow().epoch() < window_epoch {
+                while epoch_info_rx.borrow().epoch() < slot_epoch {
                     if epoch_info_rx.changed().await.is_err() {
                         return Ok(());
                     }
                 }
-                current_epoch = window_epoch;
+                current_epoch = slot_epoch;
                 info!(
                     "[val {}] epoch {} ready, resuming block production",
                     self.epoch_info.own_id, current_epoch
@@ -177,6 +182,24 @@ where
 
             // produce remaining blocks
             for slot in first_slot_in_window.slots_in_window().skip(1) {
+                let slot_epoch = slot.epoch();
+                if slot_epoch > current_epoch {
+                    info!(
+                        "[val {}] waiting for epoch {} transition before producing slot {}",
+                        self.epoch_info.own_id, slot_epoch, slot
+                    );
+                    while epoch_info_rx.borrow().epoch() < slot_epoch {
+                        if epoch_info_rx.changed().await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    current_epoch = slot_epoch;
+                    info!(
+                        "[val {}] epoch {} ready, resuming block production",
+                        self.epoch_info.own_id, current_epoch
+                    );
+                }
+
                 let start = Instant::now();
                 block_id = self.produce_block_parent_ready(slot, block_id).await?;
                 debug!(
@@ -232,7 +255,7 @@ where
                 duration_left.min(self.delta_block)
             };
             let produce_slice_future =
-                produce_slice_payload(&self.txs_receiver, parent, time_for_slice);
+                produce_slice_payload(&self.txs_receiver, parent, time_for_slice, None);
 
             // If we have not yet received the ParentReady event, wait for it concurrently while producing the next slice.
             let (mut payload, new_duration_left) = if parent_ready_receiver.is_terminated() {
@@ -330,10 +353,12 @@ where
             let (payload, new_duration_left) = if slice_index.is_first() {
                 // make sure first slice is produced quickly enough so that other nodes do not generate the [`TimeoutCrashedLeader`] event
                 let time_for_slice = self.delta_first_slice;
+                let epoch_transition = self.epoch_transition_payload(slot).await;
                 let (payload, slice_duration_left) = produce_slice_payload(
                     &self.txs_receiver,
                     Some(parent_block_id.clone()),
                     time_for_slice,
+                    epoch_transition,
                 )
                 .await;
                 let elapsed = self.delta_first_slice - slice_duration_left;
@@ -341,7 +366,7 @@ where
 
                 (payload, left)
             } else {
-                produce_slice_payload(&self.txs_receiver, None, duration_left).await
+                produce_slice_payload(&self.txs_receiver, None, duration_left, None).await
             };
             let is_last = slice_index.is_max() || new_duration_left.is_zero();
             let header = SliceHeader {
@@ -404,6 +429,16 @@ where
             Ok(None)
         }
     }
+
+    async fn epoch_transition_payload(&self, slot: Slot) -> Option<Vec<u8>> {
+        if !slot.is_first_in_epoch() || slot.is_genesis() {
+            return None;
+        }
+        self.pending_epoch_transitions
+            .write()
+            .await
+            .remove(&slot.epoch())
+    }
 }
 
 // TODO: extend docstring
@@ -412,6 +447,7 @@ async fn produce_slice_payload<T>(
     txs_receiver: &T,
     parent: Option<BlockId>,
     duration_left: Duration,
+    epoch_transition: Option<Vec<u8>>,
 ) -> (SlicePayload, Duration)
 where
     T: TransactionNetwork,
@@ -422,10 +458,15 @@ where
     // need 8 bytes to encode number of txs + 8 bytes to encode the length of the tx payload
     const_assert!(MAX_DATA_PER_SLICE >= MAX_TRANSACTION_SIZE + 8 + 8);
 
-    // reserve space for parent and 8 bytes to encode number of txs
+    // reserve space for parent and block payload overhead
     let parent_encoded_len = <Option<BlockId> as wincode::SchemaWrite>::size_of(&parent).unwrap();
+    let fixed_payload_len = <BlockPayload as wincode::SchemaWrite>::size_of(&BlockPayload {
+        epoch_transition: epoch_transition.clone(),
+        transactions: Vec::new(),
+    })
+    .unwrap_or(8);
     let mut slice_capacity_left = MAX_DATA_PER_SLICE
-        .checked_sub(parent_encoded_len + 8)
+        .checked_sub(parent_encoded_len + fixed_payload_len)
         .unwrap();
     let mut txs = Vec::new();
 
@@ -440,8 +481,10 @@ where
             }
         };
         let tx = res.expect("receiving tx");
-        let tx = wincode::serialize(&tx).expect("serialization should not panic");
-        slice_capacity_left = slice_capacity_left.checked_sub(tx.len()).unwrap();
+        let tx_len = wincode::serialize(&tx)
+            .expect("serialization should not panic")
+            .len();
+        slice_capacity_left = slice_capacity_left.checked_sub(tx_len).unwrap();
         txs.push(tx);
 
         // if there is not enough space for another tx, break
@@ -452,7 +495,11 @@ where
     };
 
     // TODO: not accounting for this potentially expensive operation in duration_left calculation above.
-    let txs = wincode::serialize(&txs).expect("serialization should not panic");
+    let txs = wincode::serialize(&BlockPayload {
+        epoch_transition,
+        transactions: txs,
+    })
+    .expect("serialization should not panic");
     let payload = SlicePayload::new(parent, txs);
     (payload, ret)
 }
@@ -556,19 +603,21 @@ mod tests {
 
         let parent = None;
         let (payload, maybe_duration) =
-            produce_slice_payload(&txs_receiver, parent.clone(), duration_left).await;
+            produce_slice_payload(&txs_receiver, parent.clone(), duration_left, None).await;
         assert_eq!(maybe_duration, Duration::ZERO);
         assert_eq!(payload.parent, parent);
-        // bin encoding an empty Vec takes 8 bytes
-        assert_eq!(payload.data.len(), 8);
+        let block_payload: BlockPayload = wincode::deserialize(&payload.data).unwrap();
+        assert!(block_payload.epoch_transition.is_none());
+        assert!(block_payload.transactions.is_empty());
 
         let parent = Some((Slot::genesis(), GENESIS_BLOCK_HASH));
         let (payload, maybe_duration) =
-            produce_slice_payload(&txs_receiver, parent.clone(), duration_left).await;
+            produce_slice_payload(&txs_receiver, parent.clone(), duration_left, None).await;
         assert_eq!(maybe_duration, Duration::ZERO);
         assert_eq!(payload.parent, parent);
-        // bin encoding an empty Vec takes 8 bytes
-        assert_eq!(payload.data.len(), 8);
+        let block_payload: BlockPayload = wincode::deserialize(&payload.data).unwrap();
+        assert!(block_payload.epoch_transition.is_none());
+        assert!(block_payload.transactions.is_empty());
     }
 
     #[tokio::test]
@@ -589,7 +638,7 @@ mod tests {
 
         let parent = None;
         let (payload, maybe_duration) =
-            produce_slice_payload(&txs_receiver, parent.clone(), duration_left).await;
+            produce_slice_payload(&txs_receiver, parent.clone(), duration_left, None).await;
         assert!(maybe_duration > Duration::ZERO);
         assert_eq!(payload.parent, parent);
         assert!(payload.data.len() <= MAX_DATA_PER_SLICE);
@@ -684,6 +733,7 @@ mod tests {
             delta_block,
             delta_first_slice,
             epoch_info_rx,
+            Arc::new(RwLock::new(BTreeMap::new())),
         )
     }
 

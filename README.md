@@ -43,7 +43,7 @@ The radio layer right now simulates realistic HF (shortwave) conditions:
 
 ## API
 
-- [Explorer API Spec](docs/api_spec.md)
+- [Explorer API Spec](docs/rpc_spec.md)
 
 ## Next Steps
 

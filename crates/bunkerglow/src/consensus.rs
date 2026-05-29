@@ -37,7 +37,9 @@ pub use epoch_info::EpochInfo;
 use fastrace::Span;
 use fastrace::future::FutureExt;
 use log::{info, trace, warn};
-pub use pool::{AddVoteError, EpochBoundaryEvent, Pool, PoolError, PoolImpl, SlashingReport};
+pub use pool::{
+    AddVoteError, EpochBoundaryEvent, FinalizedSlotEvent, Pool, PoolError, PoolImpl, SlashingReport,
+};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 pub use vote::Vote;
@@ -48,7 +50,7 @@ use crate::crypto::{aggsig, signature};
 use crate::network::{RepairNetwork, RepairRequestNetwork, TransactionNetwork};
 use crate::repair::{Repair, RepairRequestHandler};
 use crate::shredder::Shred;
-use crate::snapshot::SnapshotStore;
+use crate::snapshot::{SnapshotCheckpoint, SnapshotStore};
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
 
 /// Time bound assumed on network transmission delays during periods of synchrony.
@@ -117,12 +119,16 @@ where
     epoch_info_rx: watch::Receiver<Arc<EpochInfo>>,
     /// receiver for epoch boundary events from the pool
     epoch_boundary_rx: mpsc::Receiver<EpochBoundaryEvent>,
+    /// receiver for finalized slot events from the pool
+    finalized_slot_rx: mpsc::Receiver<FinalizedSlotEvent>,
     /// receiver for slashing reports from the pool
     slashing_rx: mpsc::Receiver<SlashingReport>,
     /// optional execution state for epoch transitions
     execution_state: Option<Arc<RwLock<bunker_coin_core::execution::State>>>,
     /// optional snapshot store for persisting state at epoch boundaries
-    snapshot_store: Option<SnapshotStore>,
+    snapshot_store: Option<Arc<SnapshotStore>>,
+    /// epoch transition payloads waiting to be embedded in the first block of an epoch
+    pending_epoch_transitions: Arc<RwLock<std::collections::BTreeMap<u64, Vec<u8>>>>,
 }
 
 impl<A, D, T> Alpenglow<A, D, T>
@@ -155,8 +161,10 @@ where
         let (votor_tx, votor_rx) = mpsc::channel(1024);
         let (repair_tx, repair_rx) = mpsc::channel(1024);
         let (epoch_boundary_tx, epoch_boundary_rx) = mpsc::channel(16);
+        let (finalized_slot_tx, finalized_slot_rx) = mpsc::channel(1024);
         let (slashing_tx, slashing_rx) = mpsc::channel(256);
         let (epoch_info_tx, epoch_info_rx) = watch::channel(epoch_info.clone());
+        let pending_epoch_transitions = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
         let all2all = Arc::new(all2all);
 
         let blockstore: Box<dyn Blockstore + Send + Sync> =
@@ -165,6 +173,7 @@ where
         let mut pool = PoolImpl::new(epoch_info.clone(), votor_tx.clone(), repair_tx.clone());
         pool.set_blockstore(Arc::clone(&blockstore));
         pool.set_epoch_boundary_channel(epoch_boundary_tx);
+        pool.set_finalized_slot_channel(finalized_slot_tx);
         pool.set_slashing_channel(slashing_tx);
         let pool: Box<dyn Pool + Send + Sync> = Box::new(pool);
         let pool = Arc::new(RwLock::new(pool));
@@ -214,9 +223,10 @@ where
             DELTA_BLOCK,
             DELTA_FIRST_SLICE,
             epoch_info_rx.clone(),
+            pending_epoch_transitions.clone(),
         ));
 
-        let snapshot_store = SnapshotStore::new(epoch_info.own_id);
+        let snapshot_store = Arc::new(SnapshotStore::new(epoch_info.own_id));
 
         Self {
             epoch_info,
@@ -230,9 +240,11 @@ where
             epoch_info_tx,
             epoch_info_rx,
             epoch_boundary_rx,
+            finalized_slot_rx,
             slashing_rx,
             execution_state: None,
             snapshot_store: Some(snapshot_store),
+            pending_epoch_transitions,
         }
     }
 
@@ -256,11 +268,15 @@ where
 
         // take the epoch boundary receiver out so we can move it into the task
         let epoch_boundary_rx = std::mem::replace(&mut self.epoch_boundary_rx, mpsc::channel(1).1);
+        let finalized_slot_rx = std::mem::replace(&mut self.finalized_slot_rx, mpsc::channel(1).1);
         let slashing_rx = std::mem::replace(&mut self.slashing_rx, mpsc::channel(1).1);
         let snapshot_store = self.snapshot_store.take();
+        let snapshot_store_for_checkpoint = snapshot_store.clone();
         let epoch_info_tx = self.epoch_info_tx.clone();
         let execution_state = self.execution_state.clone();
         let epoch_info_clone = self.epoch_info.clone();
+        let blockstore = self.blockstore.clone();
+        let pending_epoch_transitions = self.pending_epoch_transitions.clone();
         let epoch_transition_span = Span::enter_with_local_parent("epoch transition loop");
         let epoch_loop = tokio::spawn(
             async move {
@@ -269,12 +285,26 @@ where
                     epoch_info_tx,
                     execution_state,
                     slashing_rx,
-                    snapshot_store,
+                    snapshot_store.clone(),
+                    pending_epoch_transitions,
                     epoch_info_clone,
                 )
                 .await;
             }
             .in_span(epoch_transition_span),
+        );
+        let finalized_checkpoint_loop = tokio::spawn(
+            async move {
+                finalized_checkpoint_loop(
+                    finalized_slot_rx,
+                    blockstore,
+                    snapshot_store_for_checkpoint,
+                )
+                .await;
+            }
+            .in_span(Span::enter_with_local_parent(
+                "snapshot checkpoint finality loop",
+            )),
         );
 
         let msg_loop_span = Span::enter_with_local_parent("message loop");
@@ -300,6 +330,7 @@ where
         standstill_loop.abort();
         prod_loop.abort();
         epoch_loop.abort();
+        finalized_checkpoint_loop.abort();
 
         let (msg_res, prod_res) = tokio::join!(msg_loop, prod_loop);
         msg_res??;
@@ -411,6 +442,10 @@ where
     pub fn set_execution_state(&mut self, state: Arc<RwLock<bunker_coin_core::execution::State>>) {
         self.execution_state = Some(state);
     }
+
+    pub fn snapshot_store(&self) -> Option<Arc<SnapshotStore>> {
+        self.snapshot_store.clone()
+    }
 }
 
 async fn epoch_transition_loop(
@@ -418,7 +453,8 @@ async fn epoch_transition_loop(
     epoch_info_tx: watch::Sender<Arc<EpochInfo>>,
     execution_state: Option<Arc<RwLock<bunker_coin_core::execution::State>>>,
     mut slashing_rx: mpsc::Receiver<SlashingReport>,
-    snapshot_store: Option<SnapshotStore>,
+    snapshot_store: Option<Arc<SnapshotStore>>,
+    pending_epoch_transitions: Arc<RwLock<std::collections::BTreeMap<u64, Vec<u8>>>>,
     epoch_info: Arc<EpochInfo>,
 ) {
     while let Some(event) = epoch_boundary_rx.recv().await {
@@ -470,6 +506,66 @@ async fn epoch_transition_loop(
             // save snapshot
             if let Some(ref store) = snapshot_store {
                 store.save_snapshot(new_epoch, &state_guard);
+                if let Some(manifest) = store.load_manifest(new_epoch) {
+                    if manifest.state_hash != result.state_hash {
+                        warn!(
+                            "epoch transition snapshot hash mismatch: epoch {}, transition_state_hash={:x?}, snapshot_state_hash={:x?}",
+                            new_epoch,
+                            &result.state_hash[..8],
+                            &manifest.state_hash[..8],
+                        );
+                    } else {
+                        let transition_block =
+                            bunker_coin_core::epoch_transition::EpochTransitionBlock {
+                                epoch: new_epoch,
+                                last_slot: event.finalized_slot.inner(),
+                                fees_distributed: result.fees_distributed,
+                                bonds_activated: result.bonds_activated.clone(),
+                                retires_completed: result.retires_completed.clone(),
+                                new_validator_set: result.new_validators.clone(),
+                                state_hash: result.state_hash,
+                                snapshot_chunk_root: manifest
+                                    .chunk_root
+                                    .as_ref()
+                                    .try_into()
+                                    .expect("snapshot chunk root is 32 bytes"),
+                                snapshot_chunk_count: manifest.chunk_count,
+                                snapshot_total_bytes: manifest.total_bytes,
+                                snapshot_chunk_size: manifest.chunk_size,
+                                slashes_applied: result.slashes_applied.clone(),
+                                deactivated_validators: result.deactivated.clone(),
+                            };
+                        match bincode::serde::encode_to_vec(
+                            &transition_block,
+                            bincode::config::standard(),
+                        ) {
+                            Ok(encoded) => {
+                                pending_epoch_transitions
+                                    .write()
+                                    .await
+                                    .insert(new_epoch, encoded);
+                            }
+                            Err(e) => warn!(
+                                "failed to encode epoch transition block for epoch {}: {}",
+                                new_epoch, e
+                            ),
+                        }
+                        info!(
+                            "epoch transition snapshot checkpoint: epoch {}, state_hash={:x?}, chunk_root={:x?}, chunks={}, chunk_size={}, total_bytes={}",
+                            manifest.epoch,
+                            &manifest.state_hash[..8],
+                            &manifest.chunk_root.as_ref()[..8],
+                            manifest.chunk_count,
+                            manifest.chunk_size,
+                            manifest.total_bytes,
+                        );
+                    }
+                } else {
+                    warn!(
+                        "epoch transition snapshot manifest unavailable after save: epoch {}",
+                        new_epoch
+                    );
+                }
                 store.prune_old_snapshots(5);
             }
         }
@@ -485,5 +581,63 @@ async fn epoch_transition_loop(
         // unblock block production with the new epoch info
         let _ = epoch_info_tx.send(new_epoch_info);
         info!("epoch {} started", new_epoch);
+    }
+}
+
+async fn finalized_checkpoint_loop(
+    mut finalized_slot_rx: mpsc::Receiver<FinalizedSlotEvent>,
+    blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
+    snapshot_store: Option<Arc<SnapshotStore>>,
+) {
+    let Some(snapshot_store) = snapshot_store else {
+        return;
+    };
+
+    while let Some(event) = finalized_slot_rx.recv().await {
+        let block_hash = event
+            .finalization_certs
+            .iter()
+            .find_map(|cert| cert.block_hash().cloned());
+        let Some(block_hash) = block_hash else {
+            continue;
+        };
+        let block_id = (event.slot, block_hash);
+        let Some(block) = blockstore.read().await.get_block(&block_id) else {
+            continue;
+        };
+        let Some(transition_block) = block.epoch_transition().cloned() else {
+            continue;
+        };
+        let Some(manifest) = snapshot_store.load_manifest(transition_block.epoch) else {
+            warn!(
+                "finalized epoch transition block has no snapshot manifest: epoch {}",
+                transition_block.epoch
+            );
+            continue;
+        };
+        let finalization_certs: Vec<Vec<u8>> = event
+            .finalization_certs
+            .iter()
+            .filter_map(|cert| wincode::serialize(cert).ok())
+            .collect();
+        let checkpoint = SnapshotCheckpoint {
+            epoch: transition_block.epoch,
+            finalized_slot: event.slot.inner(),
+            transition_block,
+            finalization_certs,
+        };
+        if !checkpoint.matches_manifest(&manifest) {
+            warn!(
+                "finalized epoch transition block does not match snapshot manifest: epoch {}",
+                checkpoint.epoch
+            );
+            continue;
+        }
+        if let Err(e) = snapshot_store.save_checkpoint(checkpoint) {
+            warn!(
+                "failed to save finalized epoch transition checkpoint for slot {}: {}",
+                event.slot, e
+            );
+        }
     }
 }
