@@ -6,13 +6,17 @@ use crate::types::{Amount, PublicKey, MIN_SELF_STAKE};
 
 pub const ACTIVATION_DELAY_EPOCHS: u64 = 1;
 pub const UNBONDING_PERIOD_EPOCHS: u64 = 2;
-pub const SLASH_FRACTION_PERCENT: u64 = 10;
-pub const JAIL_PERIOD_EPOCHS: u64 = 4;
+/// Downtime jail lasts 1 epoch; double-vote jail is indefinite (unjail requires re-stake).
+pub const DOWNTIME_JAIL_PERIOD_EPOCHS: u64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlashOffenceKind {
+    /// Signing two different blocks at the same slot — 100% stake slash, indefinite jail.
     DoubleVote,
+    /// Signing conflicting votes (e.g. notar + skip) — 100% stake slash, indefinite jail.
     ConflictingVote,
+    /// Missing >20% of votes in an epoch — 0% slash, 1-epoch jail.
+    Downtime,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,7 +216,11 @@ impl StakingLedger {
         self.pending_slashes.push(event);
     }
 
-    /// drain pending slashes, deduct SLASH_FRACTION_PERCENT, jail offenders
+    /// Drain pending slashes, apply per-offence slash fraction, and jail offenders.
+    ///
+    /// - `DoubleVote` / `ConflictingVote`: 100% stake burned, indefinite jail (unjail requires
+    ///   operator tx + min self-stake satisfied).
+    /// - `Downtime`: 0% slash, `DOWNTIME_JAIL_PERIOD_EPOCHS` jail.
     pub fn process_slashes(&mut self, current_epoch: u64) -> Vec<JailRecord> {
         let events: Vec<SlashingEvent> = self.pending_slashes.drain(..).collect();
         let mut records = Vec::new();
@@ -223,18 +231,30 @@ impl StakingLedger {
             }
 
             let stake = self.delegations.get(&event.validator).copied().unwrap_or(0);
-            let slash_amount = stake * SLASH_FRACTION_PERCENT / 100;
 
-            if let Some(s) = self.delegations.get_mut(&event.validator) {
-                *s = s.saturating_sub(slash_amount);
-            }
+            let slash_amount = match event.offence {
+                SlashOffenceKind::DoubleVote | SlashOffenceKind::ConflictingVote => stake,
+                SlashOffenceKind::Downtime => 0,
+            };
 
-            let self_stake = self.self_bonds.get(&event.validator).copied().unwrap_or(0);
-            if self_stake > 0 && stake > 0 {
-                let self_slash =
-                    (slash_amount as u128 * self_stake as u128 / stake as u128) as Amount;
-                if let Some(sb) = self.self_bonds.get_mut(&event.validator) {
-                    *sb = sb.saturating_sub(self_slash);
+            if slash_amount > 0 {
+                if let Some(s) = self.delegations.get_mut(&event.validator) {
+                    *s = s.saturating_sub(slash_amount);
+                    if *s == 0 {
+                        self.delegations.remove(&event.validator);
+                    }
+                }
+
+                let self_stake = self.self_bonds.get(&event.validator).copied().unwrap_or(0);
+                if self_stake > 0 && stake > 0 {
+                    let self_slash =
+                        (slash_amount as u128 * self_stake as u128 / stake as u128) as Amount;
+                    if let Some(sb) = self.self_bonds.get_mut(&event.validator) {
+                        *sb = sb.saturating_sub(self_slash);
+                        if *sb == 0 {
+                            self.self_bonds.remove(&event.validator);
+                        }
+                    }
                 }
             }
 
@@ -254,7 +274,17 @@ impl StakingLedger {
     pub fn unjail(&mut self, validator: &PublicKey, current_epoch: u64) -> Result<(), UnjailError> {
         let record = self.jailed.get(validator).ok_or(UnjailError::NotJailed)?;
 
-        if current_epoch < record.epoch_jailed + JAIL_PERIOD_EPOCHS {
+        let jail_period = match record.offence {
+            // Downtime: 1-epoch jail, then unjail is automatic via operator tx.
+            SlashOffenceKind::Downtime => DOWNTIME_JAIL_PERIOD_EPOCHS,
+            // Equivocation: indefinite — operator must re-stake before unjailing.
+            // We model "indefinite" as requiring the jail period to elapse (0 epochs, i.e.
+            // any epoch ≥ epoch_jailed) BUT also requiring MIN_SELF_STAKE to be satisfied
+            // (which is impossible after a 100% slash without a new bond).
+            SlashOffenceKind::DoubleVote | SlashOffenceKind::ConflictingVote => 0,
+        };
+
+        if current_epoch < record.epoch_jailed + jail_period {
             return Err(UnjailError::JailPeriodNotElapsed);
         }
 
@@ -406,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_reduces_stake() {
+    fn double_vote_slash_burns_all_stake() {
         let mut ledger = StakingLedger::new();
         let validator = pk(1);
         ledger.delegations.insert(validator, 1000);
@@ -419,8 +449,27 @@ mod tests {
 
         let records = ledger.process_slashes(5);
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].amount_slashed, 100); // 10% of 1000
-        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 900);
+        assert_eq!(records[0].amount_slashed, 1000); // 100% of 1000
+        assert!(!ledger.delegations.contains_key(&validator)); // fully burned
+    }
+
+    #[test]
+    fn downtime_slash_burns_nothing() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 1000);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::Downtime,
+            epoch: 5,
+        });
+
+        let records = ledger.process_slashes(5);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].amount_slashed, 0);
+        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 1000); // stake intact
+        assert!(ledger.jailed.contains_key(&validator)); // still jailed
     }
 
     #[test]
@@ -453,9 +502,10 @@ mod tests {
             epoch: 5,
         });
         ledger.process_slashes(5);
-        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 900);
+        // 100% burned
+        assert!(!ledger.delegations.contains_key(&validator));
 
-        // second slash should be skipped
+        // second slash should be skipped (already jailed)
         ledger.report_offence(SlashingEvent {
             validator,
             offence: SlashOffenceKind::DoubleVote,
@@ -463,11 +513,55 @@ mod tests {
         });
         let records = ledger.process_slashes(5);
         assert!(records.is_empty());
-        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 900);
     }
 
     #[test]
-    fn unjail_success() {
+    fn unjail_downtime_success_after_one_epoch() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
+        ledger.self_bonds.insert(validator, 2 * MIN_SELF_STAKE);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::Downtime,
+            epoch: 0,
+        });
+        ledger.process_slashes(0);
+        assert!(ledger.jailed.contains_key(&validator));
+        // stake intact after downtime
+        assert_eq!(
+            ledger.delegations.get(&validator).copied().unwrap(),
+            2 * MIN_SELF_STAKE
+        );
+
+        // epoch 1: jail period elapsed (DOWNTIME_JAIL_PERIOD_EPOCHS = 1)
+        let result = ledger.unjail(&validator, 1);
+        assert!(result.is_ok());
+        assert!(!ledger.jailed.contains_key(&validator));
+    }
+
+    #[test]
+    fn unjail_downtime_too_early() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
+        ledger.self_bonds.insert(validator, 2 * MIN_SELF_STAKE);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::Downtime,
+            epoch: 5,
+        });
+        ledger.process_slashes(5);
+
+        // epoch 5: same epoch as jailed — not yet elapsed
+        let result = ledger.unjail(&validator, 5);
+        assert_eq!(result, Err(UnjailError::JailPeriodNotElapsed));
+    }
+
+    #[test]
+    fn unjail_double_vote_requires_restake() {
         let mut ledger = StakingLedger::new();
         let validator = pk(1);
         ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
@@ -480,18 +574,20 @@ mod tests {
         });
         ledger.process_slashes(0);
         assert!(ledger.jailed.contains_key(&validator));
+        // 100% burned — no stake left
+        assert!(!ledger.delegations.contains_key(&validator));
 
-        // after 10% slash: self_bonds = 1_800_000, still >= MIN_SELF_STAKE
-        let result = ledger.unjail(&validator, 4);
-        assert!(result.is_ok());
-        assert!(!ledger.jailed.contains_key(&validator));
+        // Even many epochs later, cannot unjail without stake
+        let result = ledger.unjail(&validator, 100);
+        assert_eq!(result, Err(UnjailError::NoStake));
     }
 
     #[test]
-    fn unjail_too_early() {
+    fn unjail_double_vote_after_restake() {
         let mut ledger = StakingLedger::new();
         let validator = pk(1);
-        ledger.delegations.insert(validator, 1000);
+        ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
+        ledger.self_bonds.insert(validator, 2 * MIN_SELF_STAKE);
 
         ledger.report_offence(SlashingEvent {
             validator,
@@ -500,8 +596,14 @@ mod tests {
         });
         ledger.process_slashes(0);
 
-        let result = ledger.unjail(&validator, 3);
-        assert_eq!(result, Err(UnjailError::JailPeriodNotElapsed));
+        // Operator re-bonds sufficient self-stake (simulating bond activation)
+        ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
+        ledger.self_bonds.insert(validator, 2 * MIN_SELF_STAKE);
+
+        // Can now unjail at any epoch (jail_period = 0 for equivocation)
+        let result = ledger.unjail(&validator, 1);
+        assert!(result.is_ok());
+        assert!(!ledger.jailed.contains_key(&validator));
     }
 
     #[test]
@@ -572,13 +674,14 @@ mod tests {
         ledger.self_bonds.insert(v3, MIN_SELF_STAKE);
         // v2 has no self_bond -> excluded
 
+        // Use Downtime so v1's stake isn't burned (makes total_active_stake check cleaner)
         ledger.report_offence(SlashingEvent {
             validator: v1,
-            offence: SlashOffenceKind::DoubleVote,
+            offence: SlashOffenceKind::Downtime,
             epoch: 0,
         });
         ledger.process_slashes(0);
-        // v1 jailed -> excluded
+        // v1 jailed -> excluded from active stake
 
         assert_eq!(ledger.total_active_stake(), 3000);
     }
@@ -621,12 +724,13 @@ mod tests {
     fn unjail_insufficient_self_stake() {
         let mut ledger = StakingLedger::new();
         let v = pk(1);
+        // Use Downtime so stake is preserved, but self_bond is below minimum
         ledger.delegations.insert(v, 1000);
         ledger.self_bonds.insert(v, MIN_SELF_STAKE - 1);
 
         ledger.report_offence(SlashingEvent {
             validator: v,
-            offence: SlashOffenceKind::DoubleVote,
+            offence: SlashOffenceKind::Downtime,
             epoch: 0,
         });
         ledger.process_slashes(0);
@@ -639,16 +743,18 @@ mod tests {
     fn unjail_no_stake() {
         let mut ledger = StakingLedger::new();
         let v = pk(1);
+        // Use Downtime so we can control stake removal manually
         ledger.delegations.insert(v, 100);
+        ledger.self_bonds.insert(v, MIN_SELF_STAKE);
 
         ledger.report_offence(SlashingEvent {
             validator: v,
-            offence: SlashOffenceKind::DoubleVote,
+            offence: SlashOffenceKind::Downtime,
             epoch: 0,
         });
         ledger.process_slashes(0);
 
-        // remove all stake
+        // remove all stake manually
         ledger.delegations.remove(&v);
         let result = ledger.unjail(&v, 10);
         assert_eq!(result, Err(UnjailError::NoStake));
@@ -707,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_reduces_self_bonds_proportionally() {
+    fn double_vote_slash_burns_self_bonds_proportionally() {
         let mut ledger = StakingLedger::new();
         let v = pk(1);
         ledger.delegations.insert(v, 3000);
@@ -720,10 +826,9 @@ mod tests {
         });
         ledger.process_slashes(0);
 
-        // total slash = 10% of 3000 = 300
-        // self_slash = 300 * 1000/3000 = 100
-        assert_eq!(ledger.self_bonds.get(&v).copied().unwrap(), 900);
-        assert_eq!(ledger.delegations.get(&v).copied().unwrap(), 2700);
+        // 100% slash: all 3000 delegation burned, all 1000 self-bond burned
+        assert!(!ledger.delegations.contains_key(&v));
+        assert!(!ledger.self_bonds.contains_key(&v));
     }
 
     #[test]
@@ -761,9 +866,10 @@ mod tests {
         ledger.self_bonds.insert(v1, MIN_SELF_STAKE);
         ledger.self_bonds.insert(v2, MIN_SELF_STAKE);
 
+        // Use Downtime so v1 remains jailed but stake is intact (cleaner set-membership test)
         ledger.report_offence(SlashingEvent {
             validator: v1,
-            offence: SlashOffenceKind::DoubleVote,
+            offence: SlashOffenceKind::Downtime,
             epoch: 0,
         });
         ledger.process_slashes(0);

@@ -994,8 +994,9 @@ mod tests {
 
         let result = state.process_epoch_transition(0);
         assert_eq!(result.slashes_applied.len(), 1);
-        assert_eq!(result.slashes_applied[0].amount_slashed, 100);
-        assert_eq!(*state.staking.delegations.get(&validator).unwrap(), 900);
+        // 100% slash: all 1000 burned
+        assert_eq!(result.slashes_applied[0].amount_slashed, 1000);
+        assert!(!state.staking.delegations.contains_key(&validator));
         assert!(state.staking.jailed.contains_key(&validator));
     }
 
@@ -1009,16 +1010,17 @@ mod tests {
         state.staking.delegations.insert(pk, 2 * MIN_SELF_STAKE);
         state.staking.self_bonds.insert(pk, 2 * MIN_SELF_STAKE);
 
+        // Use Downtime: 0% slash, 1-epoch jail
         state.staking.report_offence(SlashingEvent {
             validator: pk,
-            offence: SlashOffenceKind::DoubleVote,
+            offence: SlashOffenceKind::Downtime,
             epoch: 0,
         });
         state.staking.process_slashes(0);
         assert!(state.staking.jailed.contains_key(&pk));
 
-        // unjail too early — current_epoch=3, need 4
-        state.current_epoch = 3;
+        // unjail too early — jailed at epoch 0, need epoch >= 1
+        state.current_epoch = 0;
         let mut tx = Transaction {
             sender: pk,
             nonce: 0,
@@ -1030,8 +1032,8 @@ mod tests {
         let err = state.execute_tx(&tx).unwrap_err();
         assert!(matches!(err, ExecutionError::JailPeriodNotElapsed));
 
-        // unjail succeeds at epoch 4
-        state.current_epoch = 4;
+        // unjail succeeds at epoch 1
+        state.current_epoch = 1;
         let mut tx = Transaction {
             sender: pk,
             nonce: 1,
@@ -1214,10 +1216,10 @@ mod tests {
 
         let records = ledger.process_slashes(0);
         assert_eq!(records.len(), 1);
-        // total slash = 10% of 2000 = 200
-        // self_slash = 200 * 1000/2000 = 100
-        assert_eq!(ledger.self_bonds.get(&validator).copied().unwrap(), 900);
-        assert_eq!(ledger.delegations.get(&validator).copied().unwrap(), 1800);
+        // 100% slash: all 2000 delegation and all 1000 self-bond burned
+        assert_eq!(records[0].amount_slashed, 2000);
+        assert!(!ledger.self_bonds.contains_key(&validator));
+        assert!(!ledger.delegations.contains_key(&validator));
     }
 
     #[test]
