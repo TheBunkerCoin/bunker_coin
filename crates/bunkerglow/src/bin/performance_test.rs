@@ -97,6 +97,7 @@ async fn create_test_nodes(count: u64) -> Vec<TestNode> {
             disseminator_address,
             repair_request_address,
             repair_response_address,
+            location: None,
         });
     }
 

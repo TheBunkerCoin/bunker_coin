@@ -27,6 +27,7 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 
 use crate::disseminator::turbine::DEFAULT_FANOUT;
+use crate::sherpa::SherpaHandle;
 use crate::{Stake, ValidatorId, ValidatorInfo};
 
 /// Sampling strategies involving rejection sampling may panic after rejecting this many samples.
@@ -692,6 +693,78 @@ impl Clone for FaitAccompli2Sampler {
     }
 }
 
+// ----- GeoAwareSampler -------------------------------------------------------
+
+/// A sampling strategy that selects relay validators using geographic diversity.
+///
+/// For each sample, [`GeoAwareSampler`] delegates to the Sherpa service to pick
+/// from the `top_k` geographically diverse candidates (excluding the leader),
+/// then samples uniformly among them weighted by stake. This ensures that
+/// Rotor relay selection maximises the use of distinct HF propagation paths
+/// as required by the Radiotor specification (§2.4).
+///
+/// Falls back to [`StakeWeightedSampler`] for validators without location data.
+pub struct GeoAwareSampler {
+    sherpa: SherpaHandle,
+    /// Number of diverse relay candidates to pre-select before stake-weighted sampling.
+    top_k: usize,
+    /// Validator IDs to exclude from relay selection (typically the block leader).
+    exclude: Vec<ValidatorId>,
+    /// Fallback for when not enough location data is available.
+    fallback: StakeWeightedSampler,
+    /// Full validator list (kept for fallback construction).
+    validators: Vec<ValidatorInfo>,
+}
+
+impl GeoAwareSampler {
+    /// Create a new `GeoAwareSampler`.
+    ///
+    /// - `sherpa`: shared Sherpa routing service.
+    /// - `validators`: the full validator set for the current epoch.
+    /// - `top_k`: how many geographically diverse candidates to consider per sample.
+    /// - `exclude`: validator IDs that must never be selected as relay (e.g. leader).
+    pub fn new(
+        sherpa: SherpaHandle,
+        validators: Vec<ValidatorInfo>,
+        top_k: usize,
+        exclude: Vec<ValidatorId>,
+    ) -> Self {
+        let fallback = StakeWeightedSampler::new(validators.clone());
+        Self {
+            sherpa,
+            top_k,
+            exclude,
+            fallback,
+            validators,
+        }
+    }
+}
+
+impl SamplingStrategy for GeoAwareSampler {
+    fn sample_info<R: RngCore>(&self, rng: &mut R) -> &ValidatorInfo {
+        let candidates = self.sherpa.diverse_relays(self.top_k, &self.exclude);
+
+        if candidates.is_empty() {
+            return self.fallback.sample_info(rng);
+        }
+
+        // Stake-weighted sample among the diverse candidates.
+        let stakes: Vec<Stake> = candidates.iter().map(|v| v.stake.max(1)).collect();
+        match WeightedIndex::new(&stakes) {
+            Ok(dist) => {
+                let idx = dist.sample(rng);
+                let chosen_id = candidates[idx].id;
+                // Return the reference from our own validators slice (lifetime safety).
+                self.validators
+                    .iter()
+                    .find(|v| v.id == chosen_id)
+                    .unwrap_or_else(|| self.fallback.sample_info(rng))
+            }
+            Err(_) => self.fallback.sample_info(rng),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -719,6 +792,7 @@ mod tests {
                 disseminator_address: dontcare_sockaddr(),
                 repair_request_address: dontcare_sockaddr(),
                 repair_response_address: dontcare_sockaddr(),
+                location: None,
             });
         }
         validators

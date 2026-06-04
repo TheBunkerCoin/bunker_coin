@@ -169,6 +169,7 @@ async fn create_node_configs(
             disseminator_address: SocketAddr::new(sockaddr.ip(), sockaddr.port() + 1),
             repair_request_address: SocketAddr::new(sockaddr.ip(), sockaddr.port() + 2),
             repair_response_address: SocketAddr::new(sockaddr.ip(), sockaddr.port() + 3),
+            location: None,
         });
     }
 

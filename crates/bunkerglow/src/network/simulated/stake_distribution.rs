@@ -212,6 +212,7 @@ pub fn validators_from_validator_data(
                 disseminator_address: dontcare_sockaddr(),
                 repair_request_address: dontcare_sockaddr(),
                 repair_response_address: dontcare_sockaddr(),
+                location: None,
             });
         }
     }
@@ -241,6 +242,7 @@ pub fn validators_from_validator_data(
                 disseminator_address: dontcare_sockaddr(),
                 repair_request_address: dontcare_sockaddr(),
                 repair_response_address: dontcare_sockaddr(),
+                location: None,
             },
             ping_server,
         ));

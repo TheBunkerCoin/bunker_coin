@@ -252,6 +252,7 @@ mod tests {
                 disseminator_address: dontcare_sockaddr(),
                 repair_request_address: dontcare_sockaddr(),
                 repair_response_address: dontcare_sockaddr(),
+                location: None,
             });
         }
         (sks, validators)

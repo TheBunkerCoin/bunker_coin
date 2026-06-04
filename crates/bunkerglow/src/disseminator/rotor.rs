@@ -20,7 +20,9 @@ use async_trait::async_trait;
 use rand::prelude::*;
 
 use self::sampling_strategy::PartitionSampler;
-pub use self::sampling_strategy::{FaitAccompli1Sampler, SamplingStrategy, StakeWeightedSampler};
+pub use self::sampling_strategy::{
+    FaitAccompli1Sampler, GeoAwareSampler, SamplingStrategy, StakeWeightedSampler,
+};
 use super::Disseminator;
 use crate::consensus::EpochInfo;
 use crate::network::{Network, ShredNetwork};
@@ -170,6 +172,7 @@ mod tests {
                 disseminator_address: localhost_ip_sockaddr(base_port + i as u16),
                 repair_request_address: dontcare_sockaddr(),
                 repair_response_address: dontcare_sockaddr(),
+                location: None,
             });
         }
 

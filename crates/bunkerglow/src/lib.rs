@@ -14,6 +14,7 @@ pub mod disseminator;
 pub mod logging;
 pub mod network;
 pub mod repair;
+pub mod sherpa;
 pub mod shredder;
 pub mod snapshot;
 #[cfg(test)]
@@ -110,6 +111,29 @@ pub(crate) struct BlockPayload {
 #[derive(Clone, Debug, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Transaction(pub Vec<u8>);
 
+/// Approximate geographic location of a validator (WGS-84, ~50 km precision per whitepaper).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GeoLocation {
+    /// Latitude in decimal degrees (−90 to +90).
+    pub lat: f64,
+    /// Longitude in decimal degrees (−180 to +180).
+    pub lon: f64,
+}
+
+impl GeoLocation {
+    pub fn new(lat: f64, lon: f64) -> Self {
+        Self { lat, lon }
+    }
+
+    /// Great-circle distance to `other` in kilometres (Haversine formula).
+    pub fn distance_km(&self, other: &GeoLocation) -> f64 {
+        use geo::{Distance, Haversine, Point};
+        let a = Point::new(self.lon, self.lat);
+        let b = Point::new(other.lon, other.lat);
+        Haversine.distance(a, b) / 1_000.0
+    }
+}
+
 /// Validator information as known about other validators.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorInfo {
@@ -124,6 +148,9 @@ pub struct ValidatorInfo {
     pub repair_request_address: SocketAddr,
     /// Send [`RepairResponse`] messages to this address when replying to a node's [`RepairRequest`] message.
     pub repair_response_address: SocketAddr,
+    /// Approximate geographic location for Sherpa routing (~50 km precision).
+    /// `None` for validators that have not yet submitted a proof-of-location claim.
+    pub location: Option<GeoLocation>,
 }
 
 type TestNode = Alpenglow<
@@ -182,6 +209,7 @@ pub fn create_test_nodes(count: u64) -> Vec<TestNode> {
             disseminator_address,
             repair_request_address,
             repair_response_address,
+            location: None,
         });
     }
 
