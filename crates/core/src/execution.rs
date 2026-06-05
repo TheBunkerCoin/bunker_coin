@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::account::{Account, TokenMeta};
-use crate::staking::{JailRecord, PendingBond, PendingRetire, StakingLedger, UnjailError};
+use crate::staking::{JailRecord, LocationClaimError, PendingBond, PendingRetire, StakingLedger, UnjailError};
 use crate::transaction::{Transaction, TransactionBody};
+use crate::staking::LocationAttestation;
 use crate::types::{
     Amount, PublicKey, TokenId, DUST_THRESHOLD, MAX_COMMISSION_BPS, MAX_TICKER_LEN, MIN_TICKER_LEN,
 };
@@ -31,6 +32,9 @@ pub enum ExecutionError {
     NotValidator,
     BurnExceedsSupply,
     NotTokenCreator,
+    InsufficientAttestations { required: usize, provided: usize },
+    AttesterNotEligible(PublicKey),
+    LocationOutOfBounds,
 }
 
 impl std::fmt::Display for ExecutionError {
@@ -74,6 +78,11 @@ impl std::fmt::Display for ExecutionError {
             Self::NotValidator => write!(f, "sender is not a validator"),
             Self::BurnExceedsSupply => write!(f, "burn amount exceeds current supply"),
             Self::NotTokenCreator => write!(f, "only the token creator can update metadata"),
+            Self::InsufficientAttestations { required, provided } => {
+                write!(f, "insufficient attestations: need {required}, got {provided}")
+            }
+            Self::AttesterNotEligible(pk) => write!(f, "attester not eligible: {:?}", pk),
+            Self::LocationOutOfBounds => write!(f, "location coordinates out of bounds"),
         }
     }
 }
@@ -100,6 +109,7 @@ pub struct EpochTransitionResult {
     pub retires_completed: Vec<PendingRetire>,
     pub slashes_applied: Vec<JailRecord>,
     pub deactivated: Vec<PublicKey>,
+    pub location_claims_validated: Vec<PublicKey>,
     pub state_hash: [u8; 32],
 }
 
@@ -385,6 +395,42 @@ impl State {
                 self.tokens.get_mut(token_id).unwrap().metadata_hash = *metadata_hash;
                 Ok(())
             }
+
+            TransactionBody::LocationClaim {
+                lat,
+                lon,
+                attestations,
+            } => {
+                let staking_attestations: Vec<LocationAttestation> = attestations
+                    .iter()
+                    .map(|a| LocationAttestation {
+                        attester: a.attester,
+                        propagation_delay_ms: a.propagation_delay_ms,
+                        signature: a.signature,
+                    })
+                    .collect();
+
+                self.staking
+                    .submit_location_claim(
+                        sender,
+                        *lat,
+                        *lon,
+                        staking_attestations,
+                        self.current_epoch,
+                    )
+                    .map_err(|e| match e {
+                        LocationClaimError::InsufficientAttestations { required, provided } => {
+                            ExecutionError::InsufficientAttestations { required, provided }
+                        }
+                        LocationClaimError::AttesterNotEligible(pk) => {
+                            ExecutionError::AttesterNotEligible(pk)
+                        }
+                        LocationClaimError::NotStaked => ExecutionError::NotValidator,
+                        LocationClaimError::LocationOutOfBounds => {
+                            ExecutionError::LocationOutOfBounds
+                        }
+                    })
+            }
         }
     }
 
@@ -403,6 +449,9 @@ impl State {
 
         // 4. apply pending commission changes
         self.staking.apply_commission_changes();
+
+        // 4b. process location claims
+        let location_claims_validated = self.staking.process_location_claims(current_epoch);
 
         // 5. distribute fee pools with commission
         let total_stake = self.staking.total_active_stake();
@@ -486,6 +535,7 @@ impl State {
             retires_completed,
             slashes_applied,
             deactivated,
+            location_claims_validated,
             state_hash,
         }
     }
@@ -565,6 +615,30 @@ impl State {
             hasher.update(delegator);
             hasher.update(validator);
             hasher.update(amount.to_le_bytes());
+        }
+
+        // validated_locations — sort by key
+        let mut locations: Vec<_> = self.staking.validated_locations.iter().collect();
+        locations.sort_by_key(|(k, _)| *k);
+        for (pk, loc) in &locations {
+            hasher.update(*pk);
+            hasher.update(loc.lat.to_le_bytes());
+            hasher.update(loc.lon.to_le_bytes());
+            hasher.update(loc.epoch_validated.to_le_bytes());
+            hasher.update(loc.attestation_count.to_le_bytes());
+        }
+
+        // pending_location_claims
+        for (claim, attestations) in &self.staking.pending_location_claims {
+            hasher.update(claim.validator);
+            hasher.update(claim.lat.to_le_bytes());
+            hasher.update(claim.lon.to_le_bytes());
+            hasher.update(claim.epoch_claimed.to_le_bytes());
+            for att in attestations {
+                hasher.update(att.attester);
+                hasher.update(att.propagation_delay_ms.to_le_bytes());
+                hasher.update(att.signature);
+            }
         }
 
         // pending commission changes
@@ -2251,5 +2325,188 @@ mod tests {
                 .unwrap(),
             500
         );
+    }
+
+    // ── Location claim transaction tests ──
+
+    fn state_with_validators(n: u8) -> (State, Vec<(SigningKey, PublicKey)>) {
+        let mut state = State::new();
+        state.current_epoch = 1; // so attesters have mature stake
+        let mut keys = Vec::new();
+        for _ in 0..n {
+            let (sk, pk) = make_keypair();
+            state.get_or_create_account(&pk).native_balance = 10_000_000;
+            state.staking.delegations.insert(pk, MIN_SELF_STAKE);
+            state.staking.self_bonds.insert(pk, MIN_SELF_STAKE);
+            keys.push((sk, pk));
+        }
+        (state, keys)
+    }
+
+    #[test]
+    fn location_claim_tx_success() {
+        let (mut state, keys) = state_with_validators(4);
+        let (ref sk, sender) = keys[0];
+
+        let attestations: Vec<_> = keys[1..]
+            .iter()
+            .map(|(_, pk)| crate::transaction::LocationAttestationData {
+                attester: *pk,
+                propagation_delay_ms: 50,
+                signature: [0u8; 64], // sig verification delegated to staking layer
+            })
+            .collect();
+
+        let mut tx = Transaction {
+            sender,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::LocationClaim {
+                lat: 48_856,
+                lon: 2_352,
+                attestations,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+
+        assert_eq!(state.staking.pending_location_claims.len(), 1);
+    }
+
+    #[test]
+    fn location_claim_tx_insufficient_attestations() {
+        let (mut state, keys) = state_with_validators(4);
+        let (ref sk, sender) = keys[0];
+
+        // Only 2 attestations when 3 are required
+        let attestations: Vec<_> = keys[1..3]
+            .iter()
+            .map(|(_, pk)| crate::transaction::LocationAttestationData {
+                attester: *pk,
+                propagation_delay_ms: 50,
+                signature: [0u8; 64],
+            })
+            .collect();
+
+        let mut tx = Transaction {
+            sender,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::LocationClaim {
+                lat: 48_856,
+                lon: 2_352,
+                attestations,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::InsufficientAttestations { required: 3, provided: 2 }
+        ));
+    }
+
+    #[test]
+    fn location_claim_tx_not_validator() {
+        let (mut state, keys) = state_with_validators(4);
+        // Create a non-validator sender
+        let (sk, pk) = make_keypair();
+        state.get_or_create_account(&pk).native_balance = 10_000_000;
+
+        let attestations: Vec<_> = keys[1..4]
+            .iter()
+            .map(|(_, pk)| crate::transaction::LocationAttestationData {
+                attester: *pk,
+                propagation_delay_ms: 50,
+                signature: [0u8; 64],
+            })
+            .collect();
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::LocationClaim {
+                lat: 48_856,
+                lon: 2_352,
+                attestations,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::NotValidator));
+    }
+
+    #[test]
+    fn location_claim_tx_out_of_bounds() {
+        let (mut state, keys) = state_with_validators(4);
+        let (ref sk, sender) = keys[0];
+
+        let attestations: Vec<_> = keys[1..]
+            .iter()
+            .map(|(_, pk)| crate::transaction::LocationAttestationData {
+                attester: *pk,
+                propagation_delay_ms: 50,
+                signature: [0u8; 64],
+            })
+            .collect();
+
+        let mut tx = Transaction {
+            sender,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::LocationClaim {
+                lat: 91_000, // out of bounds
+                lon: 0,
+                attestations,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(err, ExecutionError::LocationOutOfBounds));
+    }
+
+    #[test]
+    fn location_claim_epoch_transition() {
+        let (mut state, keys) = state_with_validators(4);
+        let (ref sk, sender) = keys[0];
+
+        let attestations: Vec<_> = keys[1..]
+            .iter()
+            .map(|(_, pk)| crate::transaction::LocationAttestationData {
+                attester: *pk,
+                propagation_delay_ms: 50,
+                signature: [0u8; 64],
+            })
+            .collect();
+
+        let mut tx = Transaction {
+            sender,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::LocationClaim {
+                lat: 48_856,
+                lon: 2_352,
+                attestations,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+
+        // Process epoch transition
+        let result = state.process_epoch_transition(1);
+        assert_eq!(result.location_claims_validated.len(), 1);
+        assert_eq!(result.location_claims_validated[0], sender);
+
+        // Location should now be validated
+        let loc = state.staking.get_location(&sender).unwrap();
+        assert_eq!(loc.lat, 48_856);
+        assert_eq!(loc.lon, 2_352);
+        assert!(state.staking.pending_location_claims.is_empty());
     }
 }

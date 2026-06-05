@@ -10,6 +10,8 @@ pub const MIN_TICKER_LEN: usize = 3;
 pub const MIN_SELF_STAKE: Amount = 1_000_000;
 pub const DUST_THRESHOLD: Amount = 1;
 pub const MAX_COMMISSION_BPS: u16 = 2000;
+pub const MIN_LOCATION_ATTESTERS: usize = 3;
+pub const ATTESTER_MIN_STAKE_AGE_EPOCHS: u64 = 1;
 
 pub mod serde_signature {
     use serde::{Deserialize, Deserializer, Serializer};

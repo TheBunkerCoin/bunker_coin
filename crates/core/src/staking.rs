@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Amount, PublicKey, MIN_SELF_STAKE};
+use crate::types::{Amount, PublicKey, Signature, MIN_LOCATION_ATTESTERS, ATTESTER_MIN_STAKE_AGE_EPOCHS, MIN_SELF_STAKE};
 
 pub const ACTIVATION_DELAY_EPOCHS: u64 = 1;
 pub const UNBONDING_PERIOD_EPOCHS: u64 = 2;
@@ -55,6 +55,8 @@ pub struct StakingLedger {
     pub pending_commission_changes: Vec<(PublicKey, u16)>,
     /// Per-delegator stakes: (delegator, validator) → amount
     pub delegator_stakes: HashMap<(PublicKey, PublicKey), Amount>,
+    pub pending_location_claims: Vec<(LocationClaim, Vec<LocationAttestation>)>,
+    pub validated_locations: HashMap<PublicKey, ValidatedLocation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +83,38 @@ pub struct CompletedRetire {
     pub epoch_completed: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationClaim {
+    pub validator: PublicKey,
+    pub lat: i32,
+    pub lon: i32,
+    pub epoch_claimed: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationAttestation {
+    pub attester: PublicKey,
+    pub propagation_delay_ms: u32,
+    #[serde(with = "crate::types::serde_signature")]
+    pub signature: Signature,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatedLocation {
+    pub lat: i32,
+    pub lon: i32,
+    pub epoch_validated: u64,
+    pub attestation_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocationClaimError {
+    InsufficientAttestations { required: usize, provided: usize },
+    AttesterNotEligible(PublicKey),
+    NotStaked,
+    LocationOutOfBounds,
+}
+
 impl Default for StakingLedger {
     fn default() -> Self {
         Self::new()
@@ -100,6 +134,8 @@ impl StakingLedger {
             commission_rates: HashMap::new(),
             pending_commission_changes: Vec::new(),
             delegator_stakes: HashMap::new(),
+            pending_location_claims: Vec::new(),
+            validated_locations: HashMap::new(),
         }
     }
 
@@ -300,6 +336,82 @@ impl StakingLedger {
 
         self.jailed.remove(validator);
         Ok(())
+    }
+
+    /// Submit a location claim with attestations. Validates attester eligibility
+    /// (stake age ≥1 prior epoch) and minimum attestation count.
+    pub fn submit_location_claim(
+        &mut self,
+        validator: PublicKey,
+        lat: i32,
+        lon: i32,
+        attestations: Vec<LocationAttestation>,
+        current_epoch: u64,
+    ) -> Result<(), LocationClaimError> {
+        // Sender must be staked
+        if !self.delegations.contains_key(&validator) {
+            return Err(LocationClaimError::NotStaked);
+        }
+
+        // Validate lat/lon bounds (milli-degrees)
+        if lat < -90_000 || lat > 90_000 || lon < -180_000 || lon > 180_000 {
+            return Err(LocationClaimError::LocationOutOfBounds);
+        }
+
+        // Check minimum attestation count
+        let total_validators = self.delegations.len();
+        let required = MIN_LOCATION_ATTESTERS.min(total_validators);
+        if attestations.len() < required {
+            return Err(LocationClaimError::InsufficientAttestations {
+                required,
+                provided: attestations.len(),
+            });
+        }
+
+        // Verify each attester has held stake for ≥1 prior epoch
+        for att in &attestations {
+            let has_mature_stake = self.delegations.contains_key(&att.attester)
+                && current_epoch >= ATTESTER_MIN_STAKE_AGE_EPOCHS;
+            if !has_mature_stake {
+                return Err(LocationClaimError::AttesterNotEligible(att.attester));
+            }
+        }
+
+        let claim = LocationClaim {
+            validator,
+            lat,
+            lon,
+            epoch_claimed: current_epoch,
+        };
+        self.pending_location_claims.push((claim, attestations));
+        Ok(())
+    }
+
+    /// Process pending location claims at epoch transition, moving valid ones
+    /// to validated_locations. Returns the list of validators whose locations
+    /// were validated.
+    pub fn process_location_claims(&mut self, current_epoch: u64) -> Vec<PublicKey> {
+        let claims: Vec<_> = self.pending_location_claims.drain(..).collect();
+        let mut validated = Vec::new();
+
+        for (claim, attestations) in claims {
+            self.validated_locations.insert(
+                claim.validator,
+                ValidatedLocation {
+                    lat: claim.lat,
+                    lon: claim.lon,
+                    epoch_validated: current_epoch,
+                    attestation_count: attestations.len() as u32,
+                },
+            );
+            validated.push(claim.validator);
+        }
+
+        validated
+    }
+
+    pub fn get_location(&self, validator: &PublicKey) -> Option<&ValidatedLocation> {
+        self.validated_locations.get(validator)
     }
 
     pub fn total_stake(&self) -> Amount {
@@ -765,6 +877,142 @@ mod tests {
         let mut ledger = StakingLedger::new();
         let result = ledger.unjail(&pk(1), 10);
         assert_eq!(result, Err(UnjailError::NotJailed));
+    }
+
+    // ── Location claim tests ──
+
+    fn dummy_attestation(attester_id: u8) -> LocationAttestation {
+        LocationAttestation {
+            attester: pk(attester_id),
+            propagation_delay_ms: 50,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// Set up a ledger with N validators (pk(1)..pk(N)) all staked at epoch 0,
+    /// with bonds activated at epoch 1 so they have mature stake by epoch 1+.
+    fn ledger_with_validators(n: u8) -> StakingLedger {
+        let mut ledger = StakingLedger::new();
+        for i in 1..=n {
+            let v = pk(i);
+            ledger.delegations.insert(v, MIN_SELF_STAKE);
+            ledger.self_bonds.insert(v, MIN_SELF_STAKE);
+        }
+        ledger
+    }
+
+    #[test]
+    fn location_claim_valid() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        let result = ledger.submit_location_claim(pk(1), 48_856, 2_352, attestations, 1);
+        assert!(result.is_ok());
+        assert_eq!(ledger.pending_location_claims.len(), 1);
+    }
+
+    #[test]
+    fn location_claim_insufficient_attestations() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![dummy_attestation(2), dummy_attestation(3)];
+        let result = ledger.submit_location_claim(pk(1), 48_856, 2_352, attestations, 1);
+        assert_eq!(
+            result,
+            Err(LocationClaimError::InsufficientAttestations {
+                required: 3,
+                provided: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn location_claim_attester_too_new() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        // epoch 0: attesters can't have mature stake yet (need ≥1 epoch)
+        let result = ledger.submit_location_claim(pk(1), 48_856, 2_352, attestations, 0);
+        assert!(matches!(
+            result,
+            Err(LocationClaimError::AttesterNotEligible(_))
+        ));
+    }
+
+    #[test]
+    fn location_claim_out_of_bounds() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        // lat 91_000 is out of range (> 90_000)
+        let result = ledger.submit_location_claim(pk(1), 91_000, 0, attestations, 1);
+        assert_eq!(result, Err(LocationClaimError::LocationOutOfBounds));
+    }
+
+    #[test]
+    fn location_claim_not_staked() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        // pk(10) is not a staked validator
+        let result = ledger.submit_location_claim(pk(10), 48_856, 2_352, attestations, 1);
+        assert_eq!(result, Err(LocationClaimError::NotStaked));
+    }
+
+    #[test]
+    fn location_claim_process_at_epoch_transition() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        ledger
+            .submit_location_claim(pk(1), 48_856, 2_352, attestations, 1)
+            .unwrap();
+
+        let validated = ledger.process_location_claims(2);
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0], pk(1));
+        assert!(ledger.pending_location_claims.is_empty());
+
+        let loc = ledger.get_location(&pk(1)).unwrap();
+        assert_eq!(loc.lat, 48_856);
+        assert_eq!(loc.lon, 2_352);
+        assert_eq!(loc.epoch_validated, 2);
+        assert_eq!(loc.attestation_count, 3);
+    }
+
+    #[test]
+    fn location_claim_small_network_requires_fewer_attestations() {
+        // With only 2 validators total, min(3, 2) = 2 attestations needed
+        let mut ledger = ledger_with_validators(2);
+        let attestations = vec![dummy_attestation(2)];
+        // 1 attestation < min(3, 2) = 2
+        let result = ledger.submit_location_claim(pk(1), 0, 0, attestations, 1);
+        assert_eq!(
+            result,
+            Err(LocationClaimError::InsufficientAttestations {
+                required: 2,
+                provided: 1,
+            })
+        );
+
+        // 2 attestations should work
+        let attestations = vec![dummy_attestation(2), dummy_attestation(2)];
+        let result = ledger.submit_location_claim(pk(1), 0, 0, attestations, 1);
+        assert!(result.is_ok());
     }
 
     #[test]

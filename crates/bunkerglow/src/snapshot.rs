@@ -684,6 +684,7 @@ mod tests {
                 snapshot_chunk_size: manifest.chunk_size,
                 slashes_applied: Vec::new(),
                 deactivated_validators: Vec::new(),
+                location_claims_validated: Vec::new(),
             },
             finalization_certs: vec![vec![1, 2, 3]],
         };

@@ -534,6 +534,7 @@ async fn epoch_transition_loop(
                                 snapshot_chunk_size: manifest.chunk_size,
                                 slashes_applied: result.slashes_applied.clone(),
                                 deactivated_validators: result.deactivated.clone(),
+                                location_claims_validated: result.location_claims_validated.clone(),
                             };
                         match bincode::serde::encode_to_vec(
                             &transition_block,

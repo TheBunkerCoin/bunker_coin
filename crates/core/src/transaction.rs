@@ -4,6 +4,14 @@ use sha2::{Digest, Sha256};
 use crate::types::{Amount, Nonce, PublicKey, Signature, TokenId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationAttestationData {
+    pub attester: PublicKey,
+    pub propagation_delay_ms: u32,
+    #[serde(with = "crate::types::serde_signature")]
+    pub signature: Signature,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub sender: PublicKey,
     pub nonce: Nonce,
@@ -91,6 +99,20 @@ impl Transaction {
                 hasher.update(token_id);
                 hasher.update(metadata_hash);
             }
+            TransactionBody::LocationClaim {
+                lat,
+                lon,
+                attestations,
+            } => {
+                hasher.update([10u8]);
+                hasher.update(lat.to_le_bytes());
+                hasher.update(lon.to_le_bytes());
+                for att in attestations {
+                    hasher.update(att.attester);
+                    hasher.update(att.propagation_delay_ms.to_le_bytes());
+                    hasher.update(att.signature);
+                }
+            }
         }
 
         hasher.finalize().into()
@@ -135,6 +157,11 @@ pub enum TransactionBody {
     UpdateMetadata {
         token_id: TokenId,
         metadata_hash: [u8; 32],
+    },
+    LocationClaim {
+        lat: i32,
+        lon: i32,
+        attestations: Vec<LocationAttestationData>,
     },
 }
 
@@ -320,6 +347,15 @@ mod tests {
                 token_id: [0, 0, 0, 1],
                 metadata_hash: [0xCD; 32],
             },
+            TransactionBody::LocationClaim {
+                lat: 48_856,
+                lon: 2_352,
+                attestations: vec![LocationAttestationData {
+                    attester: pk(3),
+                    propagation_delay_ms: 50,
+                    signature: [0xEE; 64],
+                }],
+            },
         ];
 
         let hashes: Vec<[u8; 32]> = variants
@@ -384,6 +420,15 @@ mod tests {
             TransactionBody::UpdateMetadata {
                 token_id: [0, 0, 0, 1],
                 metadata_hash: [0xCD; 32],
+            },
+            TransactionBody::LocationClaim {
+                lat: 48_856,
+                lon: 2_352,
+                attestations: vec![LocationAttestationData {
+                    attester: pk(3),
+                    propagation_delay_ms: 50,
+                    signature: [0xEE; 64],
+                }],
             },
         ];
 
