@@ -274,6 +274,17 @@ pub enum TransactionBodyResponse {
         token_id: String,
         metadata_hash: String,
     },
+    LocationClaim {
+        lat: i32,
+        lon: i32,
+    },
+    MessageAnchor {
+        destination: String,
+        deposit: u64,
+    },
+    DeliveryWrapup {
+        anchor_hash: String,
+    },
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -463,6 +474,9 @@ fn body_type_name(body: &TransactionBody) -> &'static str {
         TransactionBody::SetCommission { .. } => "SetCommission",
         TransactionBody::Burn { .. } => "Burn",
         TransactionBody::UpdateMetadata { .. } => "UpdateMetadata",
+        TransactionBody::LocationClaim { .. } => "LocationClaim",
+        TransactionBody::MessageAnchor { .. } => "MessageAnchor",
+        TransactionBody::DeliveryWrapup { .. } => "DeliveryWrapup",
     }
 }
 
@@ -534,6 +548,25 @@ fn core_tx_to_body_response(body: &TransactionBody) -> TransactionBodyResponse {
             token_id: hex::encode(token_id),
             metadata_hash: hex::encode(metadata_hash),
         },
+        TransactionBody::LocationClaim { lat, lon, .. } => {
+            TransactionBodyResponse::LocationClaim {
+                lat: *lat,
+                lon: *lon,
+            }
+        }
+        TransactionBody::MessageAnchor {
+            destination,
+            deposit,
+            ..
+        } => TransactionBodyResponse::MessageAnchor {
+            destination: hex::encode(destination),
+            deposit: *deposit,
+        },
+        TransactionBody::DeliveryWrapup { anchor_hash, .. } => {
+            TransactionBodyResponse::DeliveryWrapup {
+                anchor_hash: hex::encode(anchor_hash),
+            }
+        }
     }
 }
 

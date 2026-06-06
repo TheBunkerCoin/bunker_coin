@@ -517,6 +517,7 @@ pub async fn multi_node_consensus_simulation(num_nodes: usize) {
             disseminator_address: localhost_ip_sockaddr(dis_port),
             repair_request_address: localhost_ip_sockaddr(rep_req_port),
             repair_response_address: localhost_ip_sockaddr(rep_port),
+            location: None,
         });
     }
 
@@ -658,6 +659,7 @@ pub async fn multi_node_consensus_simulation_with_api(
             disseminator_address: localhost_ip_sockaddr(dis_port),
             repair_request_address: localhost_ip_sockaddr(rep_req_port),
             repair_response_address: localhost_ip_sockaddr(rep_port),
+            location: None,
         });
     }
 
