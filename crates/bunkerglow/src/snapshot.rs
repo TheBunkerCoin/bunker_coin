@@ -685,6 +685,8 @@ mod tests {
                 slashes_applied: Vec::new(),
                 deactivated_validators: Vec::new(),
                 location_claims_validated: Vec::new(),
+                messages_anchored: 0,
+                deliveries_completed: 0,
             },
             finalization_certs: vec![vec![1, 2, 3]],
         };

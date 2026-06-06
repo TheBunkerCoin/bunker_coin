@@ -9,7 +9,8 @@ use crate::staking::{JailRecord, LocationClaimError, PendingBond, PendingRetire,
 use crate::transaction::{Transaction, TransactionBody};
 use crate::staking::LocationAttestation;
 use crate::types::{
-    Amount, PublicKey, TokenId, DUST_THRESHOLD, MAX_COMMISSION_BPS, MAX_TICKER_LEN, MIN_TICKER_LEN,
+    Amount, PublicKey, TokenId, DUST_THRESHOLD, MAX_COMMISSION_BPS, MAX_TICKER_LEN,
+    MIN_TICKER_LEN, MSG_MIN_FEE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,8 @@ pub enum ExecutionError {
     InsufficientAttestations { required: usize, provided: usize },
     AttesterNotEligible(PublicKey),
     LocationOutOfBounds,
+    InsufficientMessageDeposit { required: Amount, provided: Amount },
+    InvalidAnchorHash,
 }
 
 impl std::fmt::Display for ExecutionError {
@@ -83,6 +86,10 @@ impl std::fmt::Display for ExecutionError {
             }
             Self::AttesterNotEligible(pk) => write!(f, "attester not eligible: {:?}", pk),
             Self::LocationOutOfBounds => write!(f, "location coordinates out of bounds"),
+            Self::InsufficientMessageDeposit { required, provided } => {
+                write!(f, "insufficient message deposit: need {required}, got {provided}")
+            }
+            Self::InvalidAnchorHash => write!(f, "invalid anchor hash"),
         }
     }
 }
@@ -99,6 +106,10 @@ pub struct State {
     pub bridge_fee_pool: Amount,
     pub staking: StakingLedger,
     pub current_epoch: u64,
+    #[serde(default)]
+    pub epoch_messages_anchored: u64,
+    #[serde(default)]
+    pub epoch_deliveries_completed: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,6 +121,8 @@ pub struct EpochTransitionResult {
     pub slashes_applied: Vec<JailRecord>,
     pub deactivated: Vec<PublicKey>,
     pub location_claims_validated: Vec<PublicKey>,
+    pub messages_anchored: u64,
+    pub deliveries_completed: u64,
     pub state_hash: [u8; 32],
 }
 
@@ -130,6 +143,8 @@ impl State {
             bridge_fee_pool: 0,
             staking: StakingLedger::new(),
             current_epoch: 0,
+            epoch_messages_anchored: 0,
+            epoch_deliveries_completed: 0,
         }
     }
 
@@ -431,6 +446,47 @@ impl State {
                         }
                     })
             }
+
+            TransactionBody::MessageAnchor {
+                destination: _,
+                length_proof: _,
+                deposit,
+            } => {
+                if *deposit < MSG_MIN_FEE {
+                    return Err(ExecutionError::InsufficientMessageDeposit {
+                        required: MSG_MIN_FEE,
+                        provided: *deposit,
+                    });
+                }
+                let acc = self.accounts.get_mut(&sender).unwrap();
+                if acc.native_balance < *deposit {
+                    return Err(ExecutionError::InsufficientBalance {
+                        required: *deposit,
+                        available: acc.native_balance,
+                    });
+                }
+                acc.native_balance -= deposit;
+                self.msg_fee_pool += deposit;
+                self.epoch_messages_anchored += 1;
+                Ok(())
+            }
+
+            TransactionBody::DeliveryWrapup {
+                anchor_hash: _,
+                relay_receipts,
+                destination_ack: _,
+            } => {
+                for receipt in relay_receipts {
+                    if self.staking.delegations.contains_key(&receipt.relay_node) {
+                        self.staking.record_relay_participation(receipt.relay_node);
+                    }
+                }
+                if self.staking.delegations.contains_key(&sender) {
+                    self.staking.record_relay_participation(sender);
+                }
+                self.epoch_deliveries_completed += 1;
+                Ok(())
+            }
         }
     }
 
@@ -453,29 +509,45 @@ impl State {
         // 4b. process location claims
         let location_claims_validated = self.staking.process_location_claims(current_epoch);
 
-        // 5. distribute fee pools with commission
+        // 5. drain relay participants before distribution
+        let relay_participants = self.staking.drain_relay_participants();
+
+        // 5a. capture and reset epoch counters
+        let messages_anchored = self.epoch_messages_anchored;
+        let deliveries_completed = self.epoch_deliveries_completed;
+        self.epoch_messages_anchored = 0;
+        self.epoch_deliveries_completed = 0;
+
+        // 5b. distribute fee pools with commission
         let total_stake = self.staking.total_active_stake();
-        let pools_to_distribute = [self.tx_fee_pool, self.msg_fee_pool, self.bridge_fee_pool];
         let mut pool_distributed = [0u64; 3];
 
         if total_stake > 0 {
             let active_validators: Vec<(PublicKey, Amount)> =
                 self.staking.validator_set().into_iter().collect();
 
-            for (pool_idx, &pool_amount) in pools_to_distribute.iter().enumerate() {
-                if pool_amount == 0 {
-                    continue;
+            // Helper closure to distribute a pool to a set of eligible validators
+            let distribute_pool = |state_accounts: &mut HashMap<PublicKey, Account>,
+                                   staking: &StakingLedger,
+                                   pool_amount: Amount,
+                                   eligible: &[(PublicKey, Amount)]|
+             -> Amount {
+                if pool_amount == 0 || eligible.is_empty() {
+                    return 0;
                 }
-
-                for (validator, stake) in &active_validators {
+                let eligible_stake: Amount = eligible.iter().map(|(_, s)| *s).sum();
+                if eligible_stake == 0 {
+                    return 0;
+                }
+                let mut distributed = 0u64;
+                for (validator, stake) in eligible {
                     let gross_share =
-                        (pool_amount as u128 * *stake as u128 / total_stake as u128) as Amount;
+                        (pool_amount as u128 * *stake as u128 / eligible_stake as u128) as Amount;
                     if gross_share < DUST_THRESHOLD {
                         continue;
                     }
 
-                    let commission_rate = self
-                        .staking
+                    let commission_rate = staking
                         .commission_rates
                         .get(validator)
                         .copied()
@@ -484,14 +556,19 @@ impl State {
                         (gross_share as u128 * commission_rate / 10000) as Amount;
                     let delegator_pool = gross_share - commission_amount;
 
-                    // credit commission to validator
                     if commission_amount >= DUST_THRESHOLD {
-                        self.get_or_create_account(validator).native_balance += commission_amount;
-                        pool_distributed[pool_idx] += commission_amount;
+                        state_accounts
+                            .entry(*validator)
+                            .or_insert_with(|| Account {
+                                native_balance: 0,
+                                token_balances: Default::default(),
+                                nonce: 0,
+                            })
+                            .native_balance += commission_amount;
+                        distributed += commission_amount;
                     }
 
-                    // distribute remainder to delegators pro-rata
-                    let delegators = self.staking.delegators_of(validator);
+                    let delegators = staking.delegators_of(validator);
                     let validator_total_delegated: Amount =
                         delegators.iter().map(|(_, a)| *a).sum();
 
@@ -501,17 +578,60 @@ impl State {
                                 / validator_total_delegated as u128)
                                 as Amount;
                             if del_share >= DUST_THRESHOLD {
-                                self.get_or_create_account(delegator).native_balance += del_share;
-                                pool_distributed[pool_idx] += del_share;
+                                state_accounts
+                                    .entry(*delegator)
+                                    .or_insert_with(|| Account {
+                                        native_balance: 0,
+                                        token_balances: Default::default(),
+                                        nonce: 0,
+                                    })
+                                    .native_balance += del_share;
+                                distributed += del_share;
                             }
                         }
                     } else if delegator_pool >= DUST_THRESHOLD {
-                        // no delegator_stakes tracked yet (legacy), credit to validator
-                        self.get_or_create_account(validator).native_balance += delegator_pool;
-                        pool_distributed[pool_idx] += delegator_pool;
+                        state_accounts
+                            .entry(*validator)
+                            .or_insert_with(|| Account {
+                                native_balance: 0,
+                                token_balances: Default::default(),
+                                nonce: 0,
+                            })
+                            .native_balance += delegator_pool;
+                        distributed += delegator_pool;
                     }
                 }
-            }
+                distributed
+            };
+
+            // tx_fee_pool: all active validators
+            pool_distributed[0] = distribute_pool(
+                &mut self.accounts,
+                &self.staking,
+                self.tx_fee_pool,
+                &active_validators,
+            );
+
+            // msg_fee_pool: only active validators who participated in relays
+            let msg_eligible: Vec<(PublicKey, Amount)> = active_validators
+                .iter()
+                .filter(|(pk, _)| relay_participants.contains(pk))
+                .copied()
+                .collect();
+            pool_distributed[1] = distribute_pool(
+                &mut self.accounts,
+                &self.staking,
+                self.msg_fee_pool,
+                &msg_eligible,
+            );
+
+            // bridge_fee_pool: all active validators (bridge eligibility deferred to BCert impl)
+            pool_distributed[2] = distribute_pool(
+                &mut self.accounts,
+                &self.staking,
+                self.bridge_fee_pool,
+                &active_validators,
+            );
         }
 
         let distributed = pool_distributed[0];
@@ -536,6 +656,8 @@ impl State {
             slashes_applied,
             deactivated,
             location_claims_validated,
+            messages_anchored,
+            deliveries_completed,
             state_hash,
         }
     }
@@ -640,6 +762,17 @@ impl State {
                 hasher.update(att.signature);
             }
         }
+
+        // msg_relay_participants — sort for determinism
+        let mut relay_parts: Vec<_> = self.staking.msg_relay_participants.iter().copied().collect();
+        relay_parts.sort();
+        for pk in &relay_parts {
+            hasher.update(pk);
+        }
+
+        // epoch messaging counters
+        hasher.update(self.epoch_messages_anchored.to_le_bytes());
+        hasher.update(self.epoch_deliveries_completed.to_le_bytes());
 
         // pending commission changes
         for (pk, rate) in &self.staking.pending_commission_changes {
@@ -1379,6 +1512,8 @@ mod tests {
         state.tx_fee_pool = 100;
         state.msg_fee_pool = 200;
         state.bridge_fee_pool = 300;
+        // validator must have relay participation to receive msg_fee_pool
+        state.staking.record_relay_participation(validator);
 
         let result = state.process_epoch_transition(0);
 
@@ -2260,6 +2395,8 @@ mod tests {
         state.tx_fee_pool = 100;
         state.msg_fee_pool = 200;
         state.bridge_fee_pool = 300;
+        // validator must have relay participation to receive msg_fee_pool
+        state.staking.record_relay_participation(validator);
 
         state.process_epoch_transition(0);
 
@@ -2508,5 +2645,148 @@ mod tests {
         assert_eq!(loc.lat, 48_856);
         assert_eq!(loc.lon, 2_352);
         assert!(state.staking.pending_location_claims.is_empty());
+    }
+
+    // ── Verified Offline Messaging tests ──
+
+    #[test]
+    fn message_anchor_routes_deposit_to_msg_fee_pool() {
+        let (sk, pk) = make_keypair();
+        let (_, dest) = make_keypair();
+        let mut state = funded_state(&pk, 100_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::MessageAnchor {
+                destination: dest,
+                length_proof: [0u8; 288],
+                deposit: 5_000,
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+
+        assert_eq!(state.msg_fee_pool, 5_000);
+        assert_eq!(state.tx_fee_pool, 10);
+        // balance = 100_000 - 10 (fee) - 5_000 (deposit)
+        assert_eq!(state.get_account(&pk).unwrap().native_balance, 94_990);
+        assert_eq!(state.epoch_messages_anchored, 1);
+    }
+
+    #[test]
+    fn message_anchor_rejects_below_min_deposit() {
+        let (sk, pk) = make_keypair();
+        let (_, dest) = make_keypair();
+        let mut state = funded_state(&pk, 100_000);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::MessageAnchor {
+                destination: dest,
+                length_proof: [0u8; 288],
+                deposit: 500, // below MSG_MIN_FEE (1_000)
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        let err = state.execute_tx(&tx).unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::InsufficientMessageDeposit { .. }
+        ));
+    }
+
+    #[test]
+    fn delivery_wrapup_records_relay_participants() {
+        let (sk, pk) = make_keypair();
+        let mut state = funded_state(&pk, 100_000);
+
+        // Set up two validators as staked
+        let v1: PublicKey = [10u8; 32];
+        let v2: PublicKey = [20u8; 32];
+        state.staking.delegations.insert(v1, MIN_SELF_STAKE);
+        state.staking.delegations.insert(v2, MIN_SELF_STAKE);
+
+        let mut tx = Transaction {
+            sender: pk,
+            nonce: 0,
+            fee: 10,
+            body: TransactionBody::DeliveryWrapup {
+                anchor_hash: [0xAA; 32],
+                relay_receipts: vec![
+                    crate::transaction::RelayReceiptData {
+                        relay_node: v1,
+                        hop_index: 0,
+                        signature: [0u8; 64],
+                    },
+                    crate::transaction::RelayReceiptData {
+                        relay_node: v2,
+                        hop_index: 1,
+                        signature: [0u8; 64],
+                    },
+                ],
+                destination_ack: [0u8; 64],
+            },
+            signature: [0u8; 64],
+        };
+        sign_tx(&sk, &mut tx);
+        state.execute_tx(&tx).unwrap();
+
+        assert!(state.staking.msg_relay_participants.contains(&v1));
+        assert!(state.staking.msg_relay_participants.contains(&v2));
+        assert_eq!(state.epoch_deliveries_completed, 1);
+    }
+
+    #[test]
+    fn msg_fee_pool_only_distributed_to_relay_participants() {
+        let mut state = State::new();
+        let v1: PublicKey = [1u8; 32];
+        let v2: PublicKey = [2u8; 32];
+
+        state.staking.delegations.insert(v1, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
+        state.staking.delegator_stakes.insert((v1, v1), MIN_SELF_STAKE);
+
+        state.staking.delegations.insert(v2, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(v2, MIN_SELF_STAKE);
+        state.staking.delegator_stakes.insert((v2, v2), MIN_SELF_STAKE);
+
+        state.msg_fee_pool = 1_000;
+
+        // Only v1 participated in relays
+        state.staking.record_relay_participation(v1);
+
+        state.process_epoch_transition(0);
+
+        // v1 should get all msg_fee_pool rewards
+        assert!(state.get_account(&v1).unwrap().native_balance > 0);
+        // v2 should get nothing from msg_fee_pool
+        assert!(state.get_account(&v2).is_none() || state.get_account(&v2).unwrap().native_balance == 0);
+        assert_eq!(state.msg_fee_pool, 0);
+    }
+
+    #[test]
+    fn msg_fee_pool_rolls_over_when_no_participants() {
+        let mut state = State::new();
+        let v1: PublicKey = [1u8; 32];
+
+        state.staking.delegations.insert(v1, MIN_SELF_STAKE);
+        state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
+        state.staking.delegator_stakes.insert((v1, v1), MIN_SELF_STAKE);
+
+        state.msg_fee_pool = 500;
+        // No relay participants
+
+        state.process_epoch_transition(0);
+
+        // msg_fee_pool should roll over (no distribution)
+        assert_eq!(state.msg_fee_pool, 500);
+        // v1 should have received nothing from msg pool
+        assert!(state.get_account(&v1).is_none() || state.get_account(&v1).unwrap().native_balance == 0);
     }
 }

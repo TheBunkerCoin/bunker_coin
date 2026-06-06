@@ -12,6 +12,24 @@ pub const DUST_THRESHOLD: Amount = 1;
 pub const MAX_COMMISSION_BPS: u16 = 2000;
 pub const MIN_LOCATION_ATTESTERS: usize = 3;
 pub const ATTESTER_MIN_STAKE_AGE_EPOCHS: u64 = 1;
+pub const MSG_FEE_PER_BYTE: Amount = 10;
+pub const MSG_PROOF_SIZE: usize = 288;
+pub const MSG_MIN_FEE: Amount = 1_000;
+pub const MSG_DUST_THRESHOLD: Amount = 1;
+
+pub mod serde_proof288 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 288], s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(bytes.as_slice(), s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 288], D::Error> {
+        let v: Vec<u8> = Deserialize::deserialize(d)?;
+        v.try_into()
+            .map_err(|_| serde::de::Error::custom("expected 288 bytes"))
+    }
+}
 
 pub mod serde_signature {
     use serde::{Deserialize, Deserializer, Serializer};

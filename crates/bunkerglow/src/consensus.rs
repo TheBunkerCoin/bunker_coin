@@ -535,6 +535,8 @@ async fn epoch_transition_loop(
                                 slashes_applied: result.slashes_applied.clone(),
                                 deactivated_validators: result.deactivated.clone(),
                                 location_claims_validated: result.location_claims_validated.clone(),
+                                messages_anchored: result.messages_anchored,
+                                deliveries_completed: result.deliveries_completed,
                             };
                         match bincode::serde::encode_to_vec(
                             &transition_block,

@@ -4,6 +4,14 @@ use sha2::{Digest, Sha256};
 use crate::types::{Amount, Nonce, PublicKey, Signature, TokenId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayReceiptData {
+    pub relay_node: PublicKey,
+    pub hop_index: u8,
+    #[serde(with = "crate::types::serde_signature")]
+    pub signature: Signature,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocationAttestationData {
     pub attester: PublicKey,
     pub propagation_delay_ms: u32,
@@ -113,6 +121,30 @@ impl Transaction {
                     hasher.update(att.signature);
                 }
             }
+            TransactionBody::MessageAnchor {
+                destination,
+                length_proof,
+                deposit,
+            } => {
+                hasher.update([11u8]);
+                hasher.update(destination);
+                hasher.update(length_proof.as_slice());
+                hasher.update(deposit.to_le_bytes());
+            }
+            TransactionBody::DeliveryWrapup {
+                anchor_hash,
+                relay_receipts,
+                destination_ack,
+            } => {
+                hasher.update([12u8]);
+                hasher.update(anchor_hash);
+                for receipt in relay_receipts {
+                    hasher.update(receipt.relay_node);
+                    hasher.update([receipt.hop_index]);
+                    hasher.update(receipt.signature);
+                }
+                hasher.update(destination_ack);
+            }
         }
 
         hasher.finalize().into()
@@ -162,6 +194,18 @@ pub enum TransactionBody {
         lat: i32,
         lon: i32,
         attestations: Vec<LocationAttestationData>,
+    },
+    MessageAnchor {
+        destination: PublicKey,
+        #[serde(with = "crate::types::serde_proof288")]
+        length_proof: [u8; 288],
+        deposit: Amount,
+    },
+    DeliveryWrapup {
+        anchor_hash: [u8; 32],
+        relay_receipts: Vec<RelayReceiptData>,
+        #[serde(with = "crate::types::serde_signature")]
+        destination_ack: Signature,
     },
 }
 
@@ -356,6 +400,20 @@ mod tests {
                     signature: [0xEE; 64],
                 }],
             },
+            TransactionBody::MessageAnchor {
+                destination: pk(4),
+                length_proof: [0xAA; 288],
+                deposit: 5_000,
+            },
+            TransactionBody::DeliveryWrapup {
+                anchor_hash: [0xBB; 32],
+                relay_receipts: vec![RelayReceiptData {
+                    relay_node: pk(5),
+                    hop_index: 0,
+                    signature: [0xCC; 64],
+                }],
+                destination_ack: [0xDD; 64],
+            },
         ];
 
         let hashes: Vec<[u8; 32]> = variants
@@ -429,6 +487,20 @@ mod tests {
                     propagation_delay_ms: 50,
                     signature: [0xEE; 64],
                 }],
+            },
+            TransactionBody::MessageAnchor {
+                destination: pk(4),
+                length_proof: [0xAA; 288],
+                deposit: 5_000,
+            },
+            TransactionBody::DeliveryWrapup {
+                anchor_hash: [0xBB; 32],
+                relay_receipts: vec![RelayReceiptData {
+                    relay_node: pk(5),
+                    hop_index: 0,
+                    signature: [0xCC; 64],
+                }],
+                destination_ack: [0xDD; 64],
             },
         ];
 

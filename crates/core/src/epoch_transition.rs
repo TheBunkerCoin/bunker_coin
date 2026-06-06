@@ -18,4 +18,6 @@ pub struct EpochTransitionBlock {
     pub slashes_applied: Vec<JailRecord>,
     pub deactivated_validators: Vec<PublicKey>,
     pub location_claims_validated: Vec<PublicKey>,
+    pub messages_anchored: u64,
+    pub deliveries_completed: u64,
 }

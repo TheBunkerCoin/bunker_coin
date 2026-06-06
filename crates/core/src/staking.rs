@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,8 @@ pub struct StakingLedger {
     pub delegator_stakes: HashMap<(PublicKey, PublicKey), Amount>,
     pub pending_location_claims: Vec<(LocationClaim, Vec<LocationAttestation>)>,
     pub validated_locations: HashMap<PublicKey, ValidatedLocation>,
+    #[serde(default)]
+    pub msg_relay_participants: HashSet<PublicKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +138,7 @@ impl StakingLedger {
             delegator_stakes: HashMap::new(),
             pending_location_claims: Vec::new(),
             validated_locations: HashMap::new(),
+            msg_relay_participants: HashSet::new(),
         }
     }
 
@@ -412,6 +415,14 @@ impl StakingLedger {
 
     pub fn get_location(&self, validator: &PublicKey) -> Option<&ValidatedLocation> {
         self.validated_locations.get(validator)
+    }
+
+    pub fn record_relay_participation(&mut self, validator: PublicKey) {
+        self.msg_relay_participants.insert(validator);
+    }
+
+    pub fn drain_relay_participants(&mut self) -> HashSet<PublicKey> {
+        std::mem::take(&mut self.msg_relay_participants)
     }
 
     pub fn total_stake(&self) -> Amount {
@@ -1125,5 +1136,27 @@ mod tests {
         let set = ledger.validator_set();
         assert_eq!(set.len(), 1);
         assert_eq!(set[0].0, v2);
+    }
+
+    #[test]
+    fn relay_participation_recorded_and_drained() {
+        let mut ledger = StakingLedger::new();
+        ledger.record_relay_participation(pk(1));
+        ledger.record_relay_participation(pk(2));
+        assert_eq!(ledger.msg_relay_participants.len(), 2);
+
+        let drained = ledger.drain_relay_participants();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.contains(&pk(1)));
+        assert!(drained.contains(&pk(2)));
+        assert!(ledger.msg_relay_participants.is_empty());
+    }
+
+    #[test]
+    fn relay_participation_idempotent() {
+        let mut ledger = StakingLedger::new();
+        ledger.record_relay_participation(pk(1));
+        ledger.record_relay_participation(pk(1));
+        assert_eq!(ledger.msg_relay_participants.len(), 1);
     }
 }
