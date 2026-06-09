@@ -460,6 +460,8 @@ mod tests {
             bridge_fee_pool: 0,
             staking: StakingLedger::new(),
             current_epoch: 0,
+            epoch_messages_anchored: 0,
+            epoch_deliveries_completed: 0,
         }
     }
 

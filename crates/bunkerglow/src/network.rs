@@ -67,7 +67,21 @@ pub trait Network: Send + Sync {
     /// Sends the `message` to `addr`.
     async fn send(&self, message: &Self::Send, addr: SocketAddr) -> std::io::Result<()>;
 
-    // TODO: implement brodcast at `Network` level?
+    /// Broadcasts the `message` to all the given addresses.
+    ///
+    /// The default implementation falls back to [`send_to_many`](Network::send_to_many).
+    /// Network implementations backed by FEC/unproto radio (e.g., VARA HF, LoRa)
+    /// should override this with a true broadcast primitive.
+    async fn broadcast(
+        &self,
+        message: &Self::Send,
+        addrs: impl Iterator<Item = SocketAddr> + Send,
+    ) -> std::io::Result<()>
+    where
+        Self::Send: Sync,
+    {
+        self.send_to_many(message, addrs).await
+    }
 
     async fn receive(&self) -> std::io::Result<Self::Recv>;
 }

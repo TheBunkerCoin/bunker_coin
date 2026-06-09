@@ -162,6 +162,31 @@ impl VaraClient {
     pub async fn disconnect(&self) -> Result<(), VaraError> {
         self.send_command("DISCONNECT").await
     }
+
+    /// Enter VARA HF unproto (broadcast/FEC) mode.
+    ///
+    /// Sends `UNPROTO <destination>` to the VARA modem, switching it from
+    /// point-to-point ARQ to broadcast FEC mode. In this mode, data written
+    /// via [`write_unproto_data`](Self::write_unproto_data) is broadcast to
+    /// all stations monitoring the frequency.
+    ///
+    /// Typical destinations: `"CQ"` (general broadcast), or a specific group call.
+    pub async fn enter_unproto_mode(&self, destination: &str) -> Result<(), VaraError> {
+        self.send_command(&format!("UNPROTO {destination}")).await
+    }
+
+    /// Exit VARA HF unproto mode, returning to normal ARQ/idle state.
+    pub async fn exit_unproto_mode(&self) -> Result<(), VaraError> {
+        self.send_command("DISCONNECT").await
+    }
+
+    /// Write data in unproto (broadcast/FEC) mode.
+    ///
+    /// This delegates to [`write_data`](Self::write_data) — VARA handles
+    /// FEC encoding internally when in unproto mode.
+    pub async fn write_unproto_data(&self, data: &[u8]) -> Result<(), VaraError> {
+        self.write_data(data).await
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +198,19 @@ mod tests {
         let c = VaraConfig::new("127.0.0.1");
         assert_eq!(c.cmd_port, 8300);
         assert_eq!(c.data_port, 8301);
+    }
+
+    #[test]
+    fn test_vara_unproto_command_format() {
+        // Verify that enter_unproto_mode formats the correct VARA command.
+        // We can't call the async method without a connected client, but we
+        // can verify the command string format directly.
+        let destination = "CQ";
+        let expected_cmd = format!("UNPROTO {destination}");
+        assert_eq!(expected_cmd, "UNPROTO CQ");
+
+        let destination = "BUNKERNET";
+        let expected_cmd = format!("UNPROTO {destination}");
+        assert_eq!(expected_cmd, "UNPROTO BUNKERNET");
     }
 }

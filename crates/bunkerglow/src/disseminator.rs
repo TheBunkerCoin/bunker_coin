@@ -10,6 +10,7 @@
 //! - [`Rotor`] implements Alpenglow's Rotor, which is an evolution of Turbine.
 //! - [`Turbine`] implements Solana's basic Turbine protocol.
 
+pub mod opportunistic;
 pub mod rotor;
 pub mod trivial;
 pub mod turbine;
@@ -17,6 +18,7 @@ pub mod turbine;
 use async_trait::async_trait;
 use mockall::automock;
 
+pub use self::opportunistic::OpportunisticDisseminator;
 pub use self::rotor::Rotor;
 pub use self::trivial::TrivialDisseminator;
 pub use self::turbine::Turbine;
