@@ -548,12 +548,10 @@ fn core_tx_to_body_response(body: &TransactionBody) -> TransactionBodyResponse {
             token_id: hex::encode(token_id),
             metadata_hash: hex::encode(metadata_hash),
         },
-        TransactionBody::LocationClaim { lat, lon, .. } => {
-            TransactionBodyResponse::LocationClaim {
-                lat: *lat,
-                lon: *lon,
-            }
-        }
+        TransactionBody::LocationClaim { lat, lon, .. } => TransactionBodyResponse::LocationClaim {
+            lat: *lat,
+            lon: *lon,
+        },
         TransactionBody::MessageAnchor {
             destination,
             deposit,

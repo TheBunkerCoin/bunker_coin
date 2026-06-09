@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::account::{Account, TokenMeta};
-use crate::staking::{JailRecord, LocationClaimError, PendingBond, PendingRetire, StakingLedger, UnjailError};
-use crate::transaction::{Transaction, TransactionBody};
 use crate::staking::LocationAttestation;
+use crate::staking::{
+    JailRecord, LocationClaimError, PendingBond, PendingRetire, StakingLedger, UnjailError,
+};
+use crate::transaction::{Transaction, TransactionBody};
 use crate::types::{
-    Amount, PublicKey, TokenId, DUST_THRESHOLD, MAX_COMMISSION_BPS, MAX_TICKER_LEN,
-    MIN_TICKER_LEN, MSG_MIN_FEE,
+    Amount, PublicKey, TokenId, DUST_THRESHOLD, MAX_COMMISSION_BPS, MAX_TICKER_LEN, MIN_TICKER_LEN,
+    MSG_MIN_FEE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,12 +84,18 @@ impl std::fmt::Display for ExecutionError {
             Self::BurnExceedsSupply => write!(f, "burn amount exceeds current supply"),
             Self::NotTokenCreator => write!(f, "only the token creator can update metadata"),
             Self::InsufficientAttestations { required, provided } => {
-                write!(f, "insufficient attestations: need {required}, got {provided}")
+                write!(
+                    f,
+                    "insufficient attestations: need {required}, got {provided}"
+                )
             }
             Self::AttesterNotEligible(pk) => write!(f, "attester not eligible: {:?}", pk),
             Self::LocationOutOfBounds => write!(f, "location coordinates out of bounds"),
             Self::InsufficientMessageDeposit { required, provided } => {
-                write!(f, "insufficient message deposit: need {required}, got {provided}")
+                write!(
+                    f,
+                    "insufficient message deposit: need {required}, got {provided}"
+                )
             }
             Self::InvalidAnchorHash => write!(f, "invalid anchor hash"),
         }
@@ -764,7 +772,12 @@ impl State {
         }
 
         // msg_relay_participants — sort for determinism
-        let mut relay_parts: Vec<_> = self.staking.msg_relay_participants.iter().copied().collect();
+        let mut relay_parts: Vec<_> = self
+            .staking
+            .msg_relay_participants
+            .iter()
+            .copied()
+            .collect();
         relay_parts.sort();
         for pk in &relay_parts {
             hasher.update(pk);
@@ -2541,7 +2554,10 @@ mod tests {
         let err = state.execute_tx(&tx).unwrap_err();
         assert!(matches!(
             err,
-            ExecutionError::InsufficientAttestations { required: 3, provided: 2 }
+            ExecutionError::InsufficientAttestations {
+                required: 3,
+                provided: 2
+            }
         ));
     }
 
@@ -2750,11 +2766,17 @@ mod tests {
 
         state.staking.delegations.insert(v1, MIN_SELF_STAKE);
         state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
-        state.staking.delegator_stakes.insert((v1, v1), MIN_SELF_STAKE);
+        state
+            .staking
+            .delegator_stakes
+            .insert((v1, v1), MIN_SELF_STAKE);
 
         state.staking.delegations.insert(v2, MIN_SELF_STAKE);
         state.staking.self_bonds.insert(v2, MIN_SELF_STAKE);
-        state.staking.delegator_stakes.insert((v2, v2), MIN_SELF_STAKE);
+        state
+            .staking
+            .delegator_stakes
+            .insert((v2, v2), MIN_SELF_STAKE);
 
         state.msg_fee_pool = 1_000;
 
@@ -2766,7 +2788,9 @@ mod tests {
         // v1 should get all msg_fee_pool rewards
         assert!(state.get_account(&v1).unwrap().native_balance > 0);
         // v2 should get nothing from msg_fee_pool
-        assert!(state.get_account(&v2).is_none() || state.get_account(&v2).unwrap().native_balance == 0);
+        assert!(
+            state.get_account(&v2).is_none() || state.get_account(&v2).unwrap().native_balance == 0
+        );
         assert_eq!(state.msg_fee_pool, 0);
     }
 
@@ -2777,7 +2801,10 @@ mod tests {
 
         state.staking.delegations.insert(v1, MIN_SELF_STAKE);
         state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
-        state.staking.delegator_stakes.insert((v1, v1), MIN_SELF_STAKE);
+        state
+            .staking
+            .delegator_stakes
+            .insert((v1, v1), MIN_SELF_STAKE);
 
         state.msg_fee_pool = 500;
         // No relay participants
@@ -2787,6 +2814,8 @@ mod tests {
         // msg_fee_pool should roll over (no distribution)
         assert_eq!(state.msg_fee_pool, 500);
         // v1 should have received nothing from msg pool
-        assert!(state.get_account(&v1).is_none() || state.get_account(&v1).unwrap().native_balance == 0);
+        assert!(
+            state.get_account(&v1).is_none() || state.get_account(&v1).unwrap().native_balance == 0
+        );
     }
 }

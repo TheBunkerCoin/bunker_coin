@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Amount, PublicKey, Signature, MIN_LOCATION_ATTESTERS, ATTESTER_MIN_STAKE_AGE_EPOCHS, MIN_SELF_STAKE};
+use crate::types::{
+    Amount, PublicKey, Signature, ATTESTER_MIN_STAKE_AGE_EPOCHS, MIN_LOCATION_ATTESTERS,
+    MIN_SELF_STAKE,
+};
 
 pub const ACTIVATION_DELAY_EPOCHS: u64 = 1;
 pub const UNBONDING_PERIOD_EPOCHS: u64 = 2;

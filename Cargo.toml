@@ -3,6 +3,7 @@ members = [
     "crates/bunkerglow",
     "crates/core",
     "crates/gateway",
+    "crates/lora_gateway",
     "crates/radio",
     "crates/rpc",
     "crates/scs_pactor",

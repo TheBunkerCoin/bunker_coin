@@ -48,10 +48,7 @@ async fn read_response(serial: &mut tokio_serial::SerialStream, timeout_ms: u64)
     all
 }
 
-async fn send_cmd(
-    serial: &mut tokio_serial::SerialStream,
-    cmd: &str,
-) -> anyhow::Result<String> {
+async fn send_cmd(serial: &mut tokio_serial::SerialStream, cmd: &str) -> anyhow::Result<String> {
     let label = if cmd.is_empty() { "CR" } else { cmd };
     println!("  >> {label}");
     serial.write_all(cmd.as_bytes()).await?;
@@ -120,11 +117,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Attempt frequency change
     println!("\n--- Frequency change: {} kHz ---", args.frequency);
-    let freq_resp = send_cmd(
-        &mut serial,
-        &format!("TRX Frequency {}", args.frequency),
-    )
-    .await?;
+    let freq_resp = send_cmd(&mut serial, &format!("TRX Frequency {}", args.frequency)).await?;
 
     // Give the radio a bit more time to respond
     tokio::time::sleep(Duration::from_millis(2000)).await;
