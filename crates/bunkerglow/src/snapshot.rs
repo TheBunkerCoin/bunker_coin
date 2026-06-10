@@ -1,3 +1,5 @@
+pub mod compression;
+
 use std::collections::BTreeMap;
 
 use bunker_coin_core::epoch_transition::EpochTransitionBlock;
@@ -38,6 +40,8 @@ pub enum BootstrapError {
     DuplicateChunk(usize),
     MissingChunk(usize),
     InvalidChunkProof(usize),
+    InvalidCompressedProof,
+    UnsupportedProofScheme,
     TotalSizeMismatch { expected: usize, got: usize },
     DecodeFailed,
     StateHashMismatch { expected: [u8; 32], got: [u8; 32] },
@@ -57,6 +61,10 @@ impl std::fmt::Display for BootstrapError {
             Self::DuplicateChunk(index) => write!(f, "duplicate snapshot chunk {index}"),
             Self::MissingChunk(index) => write!(f, "missing snapshot chunk {index}"),
             Self::InvalidChunkProof(index) => write!(f, "invalid proof for snapshot chunk {index}"),
+            Self::InvalidCompressedProof => write!(f, "invalid compressed snapshot proof"),
+            Self::UnsupportedProofScheme => {
+                write!(f, "snapshot proof scheme not supported by this node")
+            }
             Self::TotalSizeMismatch { expected, got } => {
                 write!(
                     f,
