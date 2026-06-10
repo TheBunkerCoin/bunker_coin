@@ -360,7 +360,7 @@ impl StakingLedger {
         }
 
         // Validate lat/lon bounds (milli-degrees)
-        if lat < -90_000 || lat > 90_000 || lon < -180_000 || lon > 180_000 {
+        if !(-90_000..=90_000).contains(&lat) || !(-180_000..=180_000).contains(&lon) {
             return Err(LocationClaimError::LocationOutOfBounds);
         }
 

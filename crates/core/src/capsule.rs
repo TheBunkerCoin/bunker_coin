@@ -120,11 +120,7 @@ pub fn encode_fragmented(
     // Calculate how many continuation frames we need after the first
     let first_chunk_len = CAPSULE_FRAG_FIRST_BODY_BUDGET.min(body.len());
     let remaining = body.len() - first_chunk_len;
-    let cont_count = if remaining == 0 {
-        0
-    } else {
-        (remaining + CAPSULE_FRAG_CONT_BODY_BUDGET - 1) / CAPSULE_FRAG_CONT_BODY_BUDGET
-    };
+    let cont_count = remaining.div_ceil(CAPSULE_FRAG_CONT_BODY_BUDGET);
     let total_frags = (1 + cont_count) as u8;
 
     let mut frames = Vec::with_capacity(total_frags as usize);

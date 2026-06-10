@@ -198,7 +198,7 @@ pub enum TransactionBody {
     MessageAnchor {
         destination: PublicKey,
         #[serde(with = "crate::types::serde_proof288")]
-        length_proof: [u8; 288],
+        length_proof: Box<[u8; 288]>,
         deposit: Amount,
     },
     DeliveryWrapup {
@@ -402,7 +402,7 @@ mod tests {
             },
             TransactionBody::MessageAnchor {
                 destination: pk(4),
-                length_proof: [0xAA; 288],
+                length_proof: Box::new([0xAA; 288]),
                 deposit: 5_000,
             },
             TransactionBody::DeliveryWrapup {
@@ -490,7 +490,7 @@ mod tests {
             },
             TransactionBody::MessageAnchor {
                 destination: pk(4),
-                length_proof: [0xAA; 288],
+                length_proof: Box::new([0xAA; 288]),
                 deposit: 5_000,
             },
             TransactionBody::DeliveryWrapup {

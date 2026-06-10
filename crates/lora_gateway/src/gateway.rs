@@ -314,7 +314,7 @@ mod tests {
         use bunker_coin_core::transaction::TransactionBody;
         let body = TransactionBody::MessageAnchor {
             destination: [0x02; 32],
-            length_proof: [0xAA; 288],
+            length_proof: Box::new([0xAA; 288]),
             deposit: 5_000,
         };
         let body_bytes = bincode::serde::encode_to_vec(&body, bincode::config::standard()).unwrap();

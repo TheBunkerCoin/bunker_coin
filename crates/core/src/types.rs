@@ -24,9 +24,10 @@ pub mod serde_proof288 {
         serde::Serialize::serialize(bytes.as_slice(), s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 288], D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Box<[u8; 288]>, D::Error> {
         let v: Vec<u8> = Deserialize::deserialize(d)?;
         v.try_into()
+            .map(Box::new)
             .map_err(|_| serde::de::Error::custom("expected 288 bytes"))
     }
 }

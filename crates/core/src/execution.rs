@@ -2677,7 +2677,7 @@ mod tests {
             fee: 10,
             body: TransactionBody::MessageAnchor {
                 destination: dest,
-                length_proof: [0u8; 288],
+                length_proof: Box::new([0u8; 288]),
                 deposit: 5_000,
             },
             signature: [0u8; 64],
@@ -2704,7 +2704,7 @@ mod tests {
             fee: 10,
             body: TransactionBody::MessageAnchor {
                 destination: dest,
-                length_proof: [0u8; 288],
+                length_proof: Box::new([0u8; 288]),
                 deposit: 500, // below MSG_MIN_FEE (1_000)
             },
             signature: [0u8; 64],
