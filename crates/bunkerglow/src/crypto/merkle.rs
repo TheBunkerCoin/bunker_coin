@@ -694,7 +694,9 @@ mod tests {
     }
 
     fn multiproof_test_data(count: usize) -> Vec<Vec<u8>> {
-        (0..count).map(|i| format!("leaf-{i}").into_bytes()).collect()
+        (0..count)
+            .map(|i| format!("leaf-{i}").into_bytes())
+            .collect()
     }
 
     #[test]
@@ -781,7 +783,9 @@ mod tests {
 
         // tampered leaf
         let bad = vec![(2, &tampered), (5, &data[5])];
-        assert!(!PlainMerkleTree::check_multiproof(&bad, 8, &root, &siblings));
+        assert!(!PlainMerkleTree::check_multiproof(
+            &bad, 8, &root, &siblings
+        ));
 
         // wrong root
         let wrong_root = Hash([0xAB; 32]);
@@ -803,15 +807,21 @@ mod tests {
         // extra sibling
         let mut extra = siblings.clone();
         extra.push(Hash([0xCD; 32]));
-        assert!(!PlainMerkleTree::check_multiproof(&leaves, 8, &root, &extra));
+        assert!(!PlainMerkleTree::check_multiproof(
+            &leaves, 8, &root, &extra
+        ));
 
         // duplicate leaf index
         let dup = vec![(2, &data[2]), (2, &data[2])];
-        assert!(!PlainMerkleTree::check_multiproof(&dup, 8, &root, &siblings));
+        assert!(!PlainMerkleTree::check_multiproof(
+            &dup, 8, &root, &siblings
+        ));
 
         // out-of-range index
         let oob = vec![(8, &data[2])];
-        assert!(!PlainMerkleTree::check_multiproof(&oob, 8, &root, &siblings));
+        assert!(!PlainMerkleTree::check_multiproof(
+            &oob, 8, &root, &siblings
+        ));
 
         // empty leaves
         let empty: Vec<(usize, &Vec<u8>)> = Vec::new();

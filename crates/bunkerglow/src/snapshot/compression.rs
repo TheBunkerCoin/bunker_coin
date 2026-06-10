@@ -122,8 +122,7 @@ pub fn restore_state_from_compressed(
 
     match &compressed.proof {
         CompressedSnapshotProof::MerkleMultiproof { siblings } => {
-            let leaves: Vec<(usize, &Vec<u8>)> =
-                compressed.chunk_data.iter().enumerate().collect();
+            let leaves: Vec<(usize, &Vec<u8>)> = compressed.chunk_data.iter().enumerate().collect();
             if !PlainMerkleTree::check_multiproof(
                 &leaves,
                 manifest.chunk_count,
@@ -374,7 +373,8 @@ mod tests {
         assert_eq!(err, BootstrapError::UnsupportedProofScheme);
 
         let chunks: Vec<(usize, &Vec<u8>)> = vec![(0, &compressed.chunk_data[0])];
-        let err = verify_chunk_subset(&compressed.manifest, &chunks, &compressed.proof).unwrap_err();
+        let err =
+            verify_chunk_subset(&compressed.manifest, &chunks, &compressed.proof).unwrap_err();
         assert_eq!(err, BootstrapError::UnsupportedProofScheme);
     }
 }
