@@ -260,9 +260,10 @@ pub type SherpaHandle = Arc<Sherpa>;
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
     use crate::GeoLocation;
-    use std::net::SocketAddr;
 
     fn make_validator(id: u64, lat: f64, lon: f64, stake: u64) -> ValidatorInfo {
         use crate::crypto::{aggsig, signature};

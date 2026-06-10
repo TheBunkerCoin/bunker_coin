@@ -464,8 +464,8 @@ mod tests {
     // --- OpportunisticDisseminator integration tests ---
     // These require SimulatedNetwork + Rotor setup, tested below.
 
-    use crate::GeoLocation;
-    use crate::ValidatorInfo;
+    use std::sync::Arc;
+
     use crate::consensus::EpochInfo;
     use crate::crypto::{aggsig, signature};
     use crate::network::localhost_ip_sockaddr;
@@ -473,7 +473,7 @@ mod tests {
     use crate::sherpa::Sherpa;
     use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shred, Shredder};
     use crate::types::slice::create_slice_with_invalid_txs;
-    use std::sync::Arc;
+    use crate::{GeoLocation, ValidatorInfo};
 
     fn make_test_validators(count: u64) -> Vec<ValidatorInfo> {
         let mut validators = Vec::new();
