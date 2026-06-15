@@ -33,11 +33,13 @@
 //! [`Network`]: crate::network::Network
 
 mod robust;
+mod sherpa;
 mod trivial;
 
 use async_trait::async_trait;
 
 pub use self::robust::RobustAll2All;
+pub use self::sherpa::SherpaAll2All;
 pub use self::trivial::TrivialAll2All;
 use crate::consensus::ConsensusMessage;
 

@@ -68,4 +68,34 @@ pub trait PactorTransport: Send + Sync {
         &self,
         timeout_after: Option<Duration>,
     ) -> Result<PactorLinkEvent, ScsPactorError>;
+
+    /// Broadcast data via PACTOR FEC mode.
+    ///
+    /// This is a stub for future implementation. PACTOR FEC broadcast
+    /// may not be viable at PACTOR-IV speeds, so this returns an error
+    /// by default. Implementations that support FEC broadcast can override.
+    async fn broadcast_fec(&self, _data: &[u8]) -> Result<(), ScsPactorError> {
+        Err(ScsPactorError::Protocol(
+            "PACTOR FEC broadcast not yet implemented".to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pactor_broadcast_fec_stub_returns_error() {
+        let (station_a, _station_b) = SimulatedPactorPair::new(SimulatedPactorConfig::default());
+        let result = station_a.broadcast_fec(b"hello").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ScsPactorError::Protocol(msg) => {
+                assert!(msg.contains("not yet implemented"), "got: {msg}");
+            }
+            other => panic!("expected Protocol error, got: {other:?}"),
+        }
+    }
 }

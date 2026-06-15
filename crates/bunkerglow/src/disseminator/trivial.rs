@@ -86,6 +86,7 @@ mod tests {
                 disseminator_address: localhost_ip_sockaddr(base_port + i as u16),
                 repair_request_address: dontcare_sockaddr(),
                 repair_response_address: dontcare_sockaddr(),
+                location: None,
             });
         }
 

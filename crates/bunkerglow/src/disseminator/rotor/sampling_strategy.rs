@@ -27,7 +27,8 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 
 use crate::disseminator::turbine::DEFAULT_FANOUT;
-use crate::{Stake, ValidatorId, ValidatorInfo};
+use crate::sherpa::SherpaHandle;
+use crate::{Slot, Stake, ValidatorId, ValidatorInfo};
 
 /// Sampling strategies involving rejection sampling may panic after rejecting this many samples.
 const MAX_TRIES_PER_SAMPLE: usize = 100_000;
@@ -63,6 +64,28 @@ pub trait SamplingStrategy {
     /// Panics if any of the `k` calls to [`SamplingStrategy::sample`] panics.
     fn sample_multiple<R: RngCore>(&self, k: usize, rng: &mut R) -> Vec<ValidatorId> {
         (0..k).map(|_| self.sample(rng)).collect()
+    }
+
+    /// Deterministically samples the relay validator for a given shred.
+    ///
+    /// Every node independently computes the relay assignment to decide
+    /// whether it is the designated relay, so all nodes must arrive at the
+    /// same answer for the same `(slot, shred_index)`.
+    ///
+    /// The default implementation seeds an RNG from `(slot, shred_index)`
+    /// and draws a single sample. Samplers may override this to coordinate
+    /// relay assignments across the shreds of a slice (e.g. for geographic
+    /// path diversity).
+    fn sample_shred_relay(&self, slot: Slot, shred_index: usize) -> ValidatorId {
+        let seed = [
+            slot.inner().to_be_bytes(),
+            shred_index.to_be_bytes(),
+            [0; 8],
+            [0; 8],
+        ]
+        .concat();
+        let mut rng = StdRng::from_seed(seed.try_into().unwrap());
+        self.sample(&mut rng)
     }
 
     /// Returns a printable name of the sampling strategy.
@@ -692,6 +715,112 @@ impl Clone for FaitAccompli2Sampler {
     }
 }
 
+// ----- GeoAwareSampler -------------------------------------------------------
+
+/// A sampling strategy that selects relay validators using geographic diversity.
+///
+/// For each sample, [`GeoAwareSampler`] delegates to the Sherpa service to pick
+/// from the `top_k` geographically diverse candidates (excluding the leader),
+/// then samples uniformly among them weighted by stake. This ensures that
+/// Rotor relay selection maximises the use of distinct HF propagation paths
+/// as required by the Radiotor specification (§2.4).
+///
+/// Falls back to [`StakeWeightedSampler`] for validators without location data.
+pub struct GeoAwareSampler {
+    sherpa: SherpaHandle,
+    /// Number of diverse relay candidates to pre-select before stake-weighted sampling.
+    top_k: usize,
+    /// Validator IDs to exclude from relay selection (typically the block leader).
+    exclude: Vec<ValidatorId>,
+    /// Fallback for when not enough location data is available.
+    fallback: StakeWeightedSampler,
+    /// Full validator list (kept for fallback construction).
+    validators: Vec<ValidatorInfo>,
+}
+
+impl GeoAwareSampler {
+    /// Create a new `GeoAwareSampler`.
+    ///
+    /// - `sherpa`: shared Sherpa routing service.
+    /// - `validators`: the full validator set for the current epoch.
+    /// - `top_k`: how many geographically diverse candidates to consider per sample.
+    /// - `exclude`: validator IDs that must never be selected as relay (e.g. leader).
+    pub fn new(
+        sherpa: SherpaHandle,
+        validators: Vec<ValidatorInfo>,
+        top_k: usize,
+        exclude: Vec<ValidatorId>,
+    ) -> Self {
+        let fallback = StakeWeightedSampler::new(validators.clone());
+        Self {
+            sherpa,
+            top_k,
+            exclude,
+            fallback,
+            validators,
+        }
+    }
+}
+
+impl SamplingStrategy for GeoAwareSampler {
+    fn sample_info<R: RngCore>(&self, rng: &mut R) -> &ValidatorInfo {
+        let candidates = self.sherpa.diverse_relays(self.top_k, &self.exclude);
+
+        if candidates.is_empty() {
+            return self.fallback.sample_info(rng);
+        }
+
+        // Stake-weighted sample among the diverse candidates.
+        let stakes: Vec<Stake> = candidates.iter().map(|v| v.stake.max(1)).collect();
+        match WeightedIndex::new(&stakes) {
+            Ok(dist) => {
+                let idx = dist.sample(rng);
+                let chosen_id = candidates[idx].id;
+                // Return the reference from our own validators slice (lifetime safety).
+                self.validators
+                    .iter()
+                    .find(|v| v.id == chosen_id)
+                    .unwrap_or_else(|| self.fallback.sample_info(rng))
+            }
+            Err(_) => self.fallback.sample_info(rng),
+        }
+    }
+
+    /// Assigns relays round-robin over the geographically diverse candidate list.
+    ///
+    /// `diverse_relays()` orders candidates by greedy farthest-point selection,
+    /// so walking the list assigns consecutive shreds to relays in distinct
+    /// geographic regions. This spreads the shreds of a slice across parallel
+    /// HF propagation paths and avoids routing them all through the same
+    /// geographic bottleneck (Radiotor spec §2.4).
+    ///
+    /// The assignment only depends on the validator set and `(slot, shred_index)`,
+    /// so all nodes compute the same relay. Distances are f64 Haversine values;
+    /// platform differences in libm could in principle reorder near-equidistant
+    /// candidates, which degrades to duplicate/missed relaying (repair recovers),
+    /// never to a safety violation.
+    fn sample_shred_relay(&self, slot: Slot, shred_index: usize) -> ValidatorId {
+        let candidates = self.sherpa.diverse_relays(self.top_k, &self.exclude);
+
+        if candidates.is_empty() {
+            // Degenerate case (everything excluded): seeded stake-weighted draw.
+            let seed = [
+                slot.inner().to_be_bytes(),
+                shred_index.to_be_bytes(),
+                [0; 8],
+                [0; 8],
+            ]
+            .concat();
+            let mut rng = StdRng::from_seed(seed.try_into().unwrap());
+            return self.fallback.sample(&mut rng);
+        }
+
+        // Offset by slot so relay duty rotates across slots as well.
+        let idx = (slot.inner() as usize).wrapping_add(shred_index) % candidates.len();
+        candidates[idx].id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -719,6 +848,7 @@ mod tests {
                 disseminator_address: dontcare_sockaddr(),
                 repair_request_address: dontcare_sockaddr(),
                 repair_response_address: dontcare_sockaddr(),
+                location: None,
             });
         }
         validators
@@ -1107,5 +1237,143 @@ mod tests {
             assert!(sampled1.contains(&id));
             assert!(sampled2.contains(&id));
         }
+    }
+
+    // --- GeoAwareSampler / sample_shred_relay tests --------------------------
+
+    use std::sync::Arc;
+
+    use crate::GeoLocation;
+    use crate::sherpa::Sherpa;
+
+    fn create_geo_validators(locations: &[(f64, f64)]) -> Vec<ValidatorInfo> {
+        let mut validators = create_validator_info(locations.len() as ValidatorId);
+        for (v, (lat, lon)) in validators.iter_mut().zip(locations) {
+            v.location = Some(GeoLocation::new(*lat, *lon));
+        }
+        validators
+    }
+
+    /// Five validators spread around the globe.
+    fn spread_locations() -> Vec<(f64, f64)> {
+        vec![
+            (51.5, -0.1),   // London
+            (40.7, -74.0),  // New York
+            (35.7, 139.7),  // Tokyo
+            (-33.9, 151.2), // Sydney
+            (-23.5, -46.6), // São Paulo
+        ]
+    }
+
+    #[test]
+    fn default_sample_shred_relay_is_deterministic() {
+        let validators = create_validator_info(10);
+        let sampler = StakeWeightedSampler::new(validators);
+        for shred in 0..20 {
+            let a = sampler.sample_shred_relay(Slot::new(7), shred);
+            let b = sampler.sample_shred_relay(Slot::new(7), shred);
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn geo_aware_relay_round_robin_distinct() {
+        let validators = create_geo_validators(&spread_locations());
+        let sherpa = Arc::new(Sherpa::new(0, validators.clone()));
+        let sampler = GeoAwareSampler::new(sherpa, validators, 5, Vec::new());
+
+        // 5 candidates, 5 consecutive shreds: every shred gets a distinct relay
+        let relays: HashSet<ValidatorId> = (0..5)
+            .map(|i| sampler.sample_shred_relay(Slot::new(0), i))
+            .collect();
+        assert_eq!(relays.len(), 5);
+
+        // consecutive shreds never share a relay
+        for i in 0..10 {
+            let a = sampler.sample_shred_relay(Slot::new(0), i);
+            let b = sampler.sample_shred_relay(Slot::new(0), i + 1);
+            assert_ne!(a, b);
+        }
+    }
+
+    #[test]
+    fn geo_aware_relay_deterministic_across_instances() {
+        let validators = create_geo_validators(&spread_locations());
+        // two independent instances, as on two different nodes
+        let sampler1 = GeoAwareSampler::new(
+            Arc::new(Sherpa::new(0, validators.clone())),
+            validators.clone(),
+            5,
+            Vec::new(),
+        );
+        let sampler2 = GeoAwareSampler::new(
+            Arc::new(Sherpa::new(3, validators.clone())),
+            validators,
+            5,
+            Vec::new(),
+        );
+
+        for slot in 0..4 {
+            for shred in 0..20 {
+                assert_eq!(
+                    sampler1.sample_shred_relay(Slot::new(slot), shred),
+                    sampler2.sample_shred_relay(Slot::new(slot), shred),
+                    "relay assignment diverged at slot {slot} shred {shred}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn geo_aware_relay_respects_exclude() {
+        let validators = create_geo_validators(&spread_locations());
+        let sherpa = Arc::new(Sherpa::new(0, validators.clone()));
+        let sampler = GeoAwareSampler::new(sherpa, validators, 5, vec![2]);
+
+        for slot in 0..4 {
+            for shred in 0..20 {
+                assert_ne!(sampler.sample_shred_relay(Slot::new(slot), shred), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn geo_aware_relay_fallback_when_all_excluded() {
+        let validators = create_geo_validators(&spread_locations());
+        let n = validators.len() as ValidatorId;
+        let sherpa = Arc::new(Sherpa::new(0, validators.clone()));
+        let sampler = GeoAwareSampler::new(sherpa, validators, 5, (0..n).collect());
+
+        // degenerate case: no candidates left, falls back to seeded sampling
+        let relay = sampler.sample_shred_relay(Slot::new(0), 0);
+        assert!(relay < n);
+        // still deterministic
+        assert_eq!(relay, sampler.sample_shred_relay(Slot::new(0), 0));
+    }
+
+    #[test]
+    fn geo_aware_relay_avoids_geographic_bottleneck() {
+        // three validators clustered around London, one in New York, one in Tokyo
+        let validators = create_geo_validators(&[
+            (51.5, -0.1),  // London
+            (51.6, 0.0),   // London cluster
+            (51.4, -0.2),  // London cluster
+            (40.7, -74.0), // New York
+            (35.7, 139.7), // Tokyo
+        ]);
+        let sherpa = Arc::new(Sherpa::new(0, validators.clone()));
+        let sampler = GeoAwareSampler::new(sherpa, validators, 3, Vec::new());
+
+        // with top_k = 3 the diverse candidates span the three regions,
+        // so 3 consecutive shreds must include NY, Tokyo and at most one London node
+        let relays: Vec<ValidatorId> = (0..3)
+            .map(|i| sampler.sample_shred_relay(Slot::new(0), i))
+            .collect();
+        let relay_set: HashSet<ValidatorId> = relays.iter().copied().collect();
+        assert_eq!(relay_set.len(), 3);
+        assert!(relay_set.contains(&3), "New York must be a relay");
+        assert!(relay_set.contains(&4), "Tokyo must be a relay");
+        let london_relays = relay_set.iter().filter(|id| **id <= 2).count();
+        assert_eq!(london_relays, 1, "only one London-cluster relay allowed");
     }
 }

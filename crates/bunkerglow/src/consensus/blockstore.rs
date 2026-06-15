@@ -515,6 +515,7 @@ mod tests {
             disseminator_address: dontcare_sockaddr(),
             repair_request_address: dontcare_sockaddr(),
             repair_response_address: dontcare_sockaddr(),
+            location: None,
         };
         let validators = vec![info];
         let epoch_info = EpochInfo::new(0, 0, validators);

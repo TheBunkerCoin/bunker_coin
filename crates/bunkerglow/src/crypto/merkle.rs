@@ -418,6 +418,111 @@ impl<Leaf: MerkleLeaf, Root: MerkleRoot, Proof: MerkleProof> MerkleTree<Leaf, Ro
         node == *root.as_hash()
     }
 
+    /// Generates a combined proof of membership for all the given leaf `indices`.
+    ///
+    /// The proof contains only the sibling hashes that the verifier cannot
+    /// derive itself: siblings that are ancestors of proven leaves are computed
+    /// during verification, and empty-padding siblings come from a static table.
+    /// In particular, a multiproof over *all* leaves is empty.
+    ///
+    /// Verify with [`MerkleTree::check_multiproof`], which consumes the sibling
+    /// hashes in the same deterministic (bottom-up, left-to-right) order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `indices` is empty or contains an out-of-range index.
+    #[must_use]
+    pub fn create_multiproof(&self, indices: &[usize]) -> Vec<Hash> {
+        let mut known: Vec<usize> = indices.to_vec();
+        known.sort_unstable();
+        known.dedup();
+        assert!(!known.is_empty());
+        assert!(known.iter().all(|i| *i < self.levels[0].1 as usize));
+
+        let mut siblings = Vec::new();
+        for (offset, len) in self.levels.iter().take(self.height()) {
+            let mut next = Vec::with_capacity(known.len());
+            let mut iter = known.iter().peekable();
+            while let Some(&i) = iter.next() {
+                let sib = i ^ 1;
+                if iter.peek() == Some(&&sib) {
+                    // sibling is itself proven, verifier derives it
+                    iter.next();
+                } else if sib < *len as usize {
+                    siblings.push(self.nodes[*offset as usize + sib].clone());
+                }
+                // sib >= len: empty-padding sibling, verifier derives it
+                next.push(i / 2);
+            }
+            known = next;
+        }
+        siblings
+    }
+
+    /// Checks a combined Merkle multiproof against multiple leaves' data.
+    ///
+    /// `leaves` holds `(index, data)` pairs in any order, `leaf_count` is the
+    /// total number of leaves in the tree (needed to derive empty-padding
+    /// siblings), and `siblings` is the proof from [`MerkleTree::create_multiproof`].
+    ///
+    /// Returns `true` iff all leaves are members of the tree with the given
+    /// `root` and the proof contains exactly the required sibling hashes.
+    #[must_use]
+    pub fn check_multiproof(
+        leaves: &[(usize, &Leaf)],
+        leaf_count: usize,
+        root: &Root,
+        siblings: &[Hash],
+    ) -> bool {
+        if leaves.is_empty() || leaf_count == 0 {
+            return false;
+        }
+        let mut known: Vec<(usize, Hash)> = leaves
+            .iter()
+            .map(|(i, leaf)| (*i, Self::hash_leaf(leaf)))
+            .collect();
+        known.sort_unstable_by_key(|(i, _)| *i);
+        if known.windows(2).any(|w| w[0].0 == w[1].0) {
+            return false;
+        }
+        if known.last().unwrap().0 >= leaf_count {
+            return false;
+        }
+
+        let mut sib_iter = siblings.iter();
+        let mut len = leaf_count;
+        let mut h = 0;
+        while len > 1 {
+            if h >= MAX_MERKLE_TREE_HEIGHT {
+                return false;
+            }
+            let mut next = Vec::with_capacity(known.len());
+            let mut iter = known.into_iter().peekable();
+            while let Some((i, hash)) = iter.next() {
+                let sib = i ^ 1;
+                let sib_hash = if matches!(iter.peek(), Some((j, _)) if *j == sib) {
+                    iter.next().unwrap().1
+                } else if sib >= len {
+                    EMPTY_ROOTS[h].clone()
+                } else {
+                    match sib_iter.next() {
+                        Some(s) => s.clone(),
+                        None => return false,
+                    }
+                };
+                let parent = match i % 2 {
+                    0 => Self::hash_pair(&hash, &sib_hash),
+                    _ => Self::hash_pair(&sib_hash, &hash),
+                };
+                next.push((i / 2, parent));
+            }
+            known = next;
+            len = len.div_ceil(2);
+            h += 1;
+        }
+        sib_iter.next().is_none() && known.len() == 1 && known[0].1 == *root.as_hash()
+    }
+
     /// Hashes some leaf data with a label into a leaf node.
     ///
     /// The label prevents the possibility to claim an intermediate node was a leaf.
@@ -586,5 +691,142 @@ mod tests {
             assert_eq!(node, *empty_root);
             println!("{}", hex::encode(node));
         }
+    }
+
+    fn multiproof_test_data(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|i| format!("leaf-{i}").into_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn multiproof_full_set_is_empty() {
+        for count in 1..=16 {
+            let data = multiproof_test_data(count);
+            let tree = PlainMerkleTree::new(data.iter());
+            let root = tree.get_root();
+            let indices: Vec<usize> = (0..count).collect();
+
+            let siblings = tree.create_multiproof(&indices);
+            assert!(siblings.is_empty(), "full multiproof for {count} leaves");
+
+            let leaves: Vec<(usize, &Vec<u8>)> = data.iter().enumerate().collect();
+            assert!(PlainMerkleTree::check_multiproof(
+                &leaves, count, &root, &siblings
+            ));
+        }
+    }
+
+    #[test]
+    fn multiproof_subsets_verify() {
+        let mut rng = rand::rng();
+        for count in 1..=17 {
+            let data = multiproof_test_data(count);
+            let tree = PlainMerkleTree::new(data.iter());
+            let root = tree.get_root();
+
+            // every single index
+            for index in 0..count {
+                let siblings = tree.create_multiproof(&[index]);
+                let leaves = vec![(index, &data[index])];
+                assert!(PlainMerkleTree::check_multiproof(
+                    &leaves, count, &root, &siblings
+                ));
+                // single-leaf multiproof carries the same hashes as a regular proof
+                // minus the empty-padding siblings
+                let regular = tree.create_proof(index);
+                assert!(siblings.len() <= regular.len());
+            }
+
+            // random subsets
+            for _ in 0..5 {
+                let indices: Vec<usize> = (0..count).filter(|_| rng.random_bool(0.5)).collect();
+                if indices.is_empty() {
+                    continue;
+                }
+                let siblings = tree.create_multiproof(&indices);
+                let leaves: Vec<(usize, &Vec<u8>)> =
+                    indices.iter().map(|i| (*i, &data[*i])).collect();
+                assert!(PlainMerkleTree::check_multiproof(
+                    &leaves, count, &root, &siblings
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn multiproof_leaf_order_does_not_matter() {
+        let data = multiproof_test_data(8);
+        let tree = PlainMerkleTree::new(data.iter());
+        let root = tree.get_root();
+        let siblings = tree.create_multiproof(&[1, 4, 6]);
+
+        let leaves = vec![(6, &data[6]), (1, &data[1]), (4, &data[4])];
+        assert!(PlainMerkleTree::check_multiproof(
+            &leaves, 8, &root, &siblings
+        ));
+    }
+
+    #[test]
+    fn multiproof_rejects_invalid() {
+        let data = multiproof_test_data(8);
+        let tree = PlainMerkleTree::new(data.iter());
+        let root = tree.get_root();
+        let siblings = tree.create_multiproof(&[2, 5]);
+        let tampered = b"tampered".to_vec();
+
+        // valid baseline
+        let leaves = vec![(2, &data[2]), (5, &data[5])];
+        assert!(PlainMerkleTree::check_multiproof(
+            &leaves, 8, &root, &siblings
+        ));
+
+        // tampered leaf
+        let bad = vec![(2, &tampered), (5, &data[5])];
+        assert!(!PlainMerkleTree::check_multiproof(
+            &bad, 8, &root, &siblings
+        ));
+
+        // wrong root
+        let wrong_root = Hash([0xAB; 32]);
+        assert!(!PlainMerkleTree::check_multiproof(
+            &leaves,
+            8,
+            &wrong_root,
+            &siblings
+        ));
+
+        // missing sibling
+        assert!(!PlainMerkleTree::check_multiproof(
+            &leaves,
+            8,
+            &root,
+            &siblings[..siblings.len() - 1]
+        ));
+
+        // extra sibling
+        let mut extra = siblings.clone();
+        extra.push(Hash([0xCD; 32]));
+        assert!(!PlainMerkleTree::check_multiproof(
+            &leaves, 8, &root, &extra
+        ));
+
+        // duplicate leaf index
+        let dup = vec![(2, &data[2]), (2, &data[2])];
+        assert!(!PlainMerkleTree::check_multiproof(
+            &dup, 8, &root, &siblings
+        ));
+
+        // out-of-range index
+        let oob = vec![(8, &data[2])];
+        assert!(!PlainMerkleTree::check_multiproof(
+            &oob, 8, &root, &siblings
+        ));
+
+        // empty leaves
+        let empty: Vec<(usize, &Vec<u8>)> = Vec::new();
+        assert!(!PlainMerkleTree::check_multiproof(
+            &empty, 8, &root, &siblings
+        ));
     }
 }

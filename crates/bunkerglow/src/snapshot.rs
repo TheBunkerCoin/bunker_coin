@@ -1,3 +1,5 @@
+pub mod compression;
+
 use std::collections::BTreeMap;
 
 use bunker_coin_core::epoch_transition::EpochTransitionBlock;
@@ -38,6 +40,8 @@ pub enum BootstrapError {
     DuplicateChunk(usize),
     MissingChunk(usize),
     InvalidChunkProof(usize),
+    InvalidCompressedProof,
+    UnsupportedProofScheme,
     TotalSizeMismatch { expected: usize, got: usize },
     DecodeFailed,
     StateHashMismatch { expected: [u8; 32], got: [u8; 32] },
@@ -57,6 +61,10 @@ impl std::fmt::Display for BootstrapError {
             Self::DuplicateChunk(index) => write!(f, "duplicate snapshot chunk {index}"),
             Self::MissingChunk(index) => write!(f, "missing snapshot chunk {index}"),
             Self::InvalidChunkProof(index) => write!(f, "invalid proof for snapshot chunk {index}"),
+            Self::InvalidCompressedProof => write!(f, "invalid compressed snapshot proof"),
+            Self::UnsupportedProofScheme => {
+                write!(f, "snapshot proof scheme not supported by this node")
+            }
             Self::TotalSizeMismatch { expected, got } => {
                 write!(
                     f,
@@ -460,6 +468,8 @@ mod tests {
             bridge_fee_pool: 0,
             staking: StakingLedger::new(),
             current_epoch: 0,
+            epoch_messages_anchored: 0,
+            epoch_deliveries_completed: 0,
         }
     }
 
@@ -684,6 +694,9 @@ mod tests {
                 snapshot_chunk_size: manifest.chunk_size,
                 slashes_applied: Vec::new(),
                 deactivated_validators: Vec::new(),
+                location_claims_validated: Vec::new(),
+                messages_anchored: 0,
+                deliveries_completed: 0,
             },
             finalization_certs: vec![vec![1, 2, 3]],
         };

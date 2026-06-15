@@ -17,13 +17,15 @@ pub mod sampling_strategy;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rand::prelude::*;
 
 use self::sampling_strategy::PartitionSampler;
-pub use self::sampling_strategy::{FaitAccompli1Sampler, SamplingStrategy, StakeWeightedSampler};
+pub use self::sampling_strategy::{
+    FaitAccompli1Sampler, GeoAwareSampler, SamplingStrategy, StakeWeightedSampler,
+};
 use super::Disseminator;
 use crate::consensus::EpochInfo;
 use crate::network::{Network, ShredNetwork};
+use crate::sherpa::SherpaHandle;
 use crate::shredder::{Shred, TOTAL_SHREDS};
 use crate::{Slot, ValidatorId};
 
@@ -59,6 +61,27 @@ impl<N: Network> Rotor<N, FaitAccompli1Sampler<PartitionSampler>> {
         let validators = epoch_info.validators.clone();
         let sampler =
             FaitAccompli1Sampler::new_with_partition_fallback(validators, TOTAL_SHREDS as u64);
+        Self {
+            network,
+            sampler,
+            epoch_info,
+        }
+    }
+}
+
+impl<N: Network> Rotor<N, GeoAwareSampler> {
+    /// Creates a new Rotor instance with location-aware (Sherpa) relay sampling.
+    ///
+    /// Shreds of a slice are assigned round-robin to geographically diverse
+    /// relays, so parallel HF links in distinct propagation regions are used
+    /// and no single geographic bottleneck carries all shreds (Radiotor §2.4).
+    ///
+    /// The exclude list is left empty so relay assignment stays identical on
+    /// every node; per-node exclusions would make nodes disagree about who
+    /// the relay is.
+    pub fn new_geo_aware(network: N, epoch_info: Arc<EpochInfo>, sherpa: SherpaHandle) -> Self {
+        let validators = epoch_info.validators.clone();
+        let sampler = GeoAwareSampler::new(sherpa, validators, TOTAL_SHREDS, Vec::new());
         Self {
             network,
             sampler,
@@ -105,15 +128,7 @@ where
     }
 
     fn sample_relay(&self, slot: Slot, shred: usize) -> ValidatorId {
-        let seed = [
-            slot.inner().to_be_bytes(),
-            shred.to_be_bytes(),
-            [0; 8],
-            [0; 8],
-        ]
-        .concat();
-        let mut rng = StdRng::from_seed(seed.try_into().unwrap());
-        self.sampler.sample(&mut rng)
+        self.sampler.sample_shred_relay(slot, shred)
     }
 }
 
@@ -145,22 +160,40 @@ mod tests {
     use tokio::task;
 
     use super::*;
-    use crate::ValidatorInfo;
     use crate::crypto::aggsig;
     use crate::crypto::signature::SecretKey;
     use crate::network::{UdpNetwork, dontcare_sockaddr, localhost_ip_sockaddr};
+    use crate::sherpa::Sherpa;
     use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder, TOTAL_SHREDS};
     use crate::types::slice::create_slice_with_invalid_txs;
+    use crate::{GeoLocation, ValidatorInfo};
 
     type MyRotor = Rotor<UdpNetwork<Shred, Shred>, StakeWeightedSampler>;
+    type GeoRotor = Rotor<UdpNetwork<Shred, Shred>, GeoAwareSampler>;
 
-    fn create_rotor_instances(count: u64, base_port: u16) -> (Vec<SecretKey>, Vec<MyRotor>) {
+    fn create_test_validators(
+        count: u64,
+        base_port: u16,
+        with_locations: bool,
+    ) -> (Vec<SecretKey>, Vec<ValidatorInfo>) {
+        // locations spread around the globe, reused cyclically
+        let locations = [
+            (51.5, -0.1),   // London
+            (40.7, -74.0),  // New York
+            (35.7, 139.7),  // Tokyo
+            (-33.9, 151.2), // Sydney
+            (-23.5, -46.6), // São Paulo
+        ];
         let mut sks = Vec::new();
         let mut voting_sks = Vec::new();
         let mut validators = Vec::new();
         for i in 0..count {
             sks.push(SecretKey::new(&mut rand::rng()));
             voting_sks.push(aggsig::SecretKey::new(&mut rand::rng()));
+            let location = with_locations.then(|| {
+                let (lat, lon) = locations[i as usize % locations.len()];
+                GeoLocation::new(lat, lon)
+            });
             validators.push(ValidatorInfo {
                 id: i,
                 stake: 1,
@@ -170,9 +203,14 @@ mod tests {
                 disseminator_address: localhost_ip_sockaddr(base_port + i as u16),
                 repair_request_address: dontcare_sockaddr(),
                 repair_response_address: dontcare_sockaddr(),
+                location,
             });
         }
+        (sks, validators)
+    }
 
+    fn create_rotor_instances(count: u64, base_port: u16) -> (Vec<SecretKey>, Vec<MyRotor>) {
+        let (sks, validators) = create_test_validators(count, base_port, false);
         let mut rotors = Vec::new();
         for i in 0..count {
             let epoch_info = Arc::new(EpochInfo::new(0, i, validators.clone()));
@@ -182,8 +220,23 @@ mod tests {
         (sks, rotors)
     }
 
-    async fn test_rotor_dissemination(count: u64, base_port: u16) {
-        let (sks, mut rotors) = create_rotor_instances(count, base_port);
+    fn create_geo_rotor_instances(count: u64, base_port: u16) -> (Vec<SecretKey>, Vec<GeoRotor>) {
+        let (sks, validators) = create_test_validators(count, base_port, true);
+        let mut rotors = Vec::new();
+        for i in 0..count {
+            let epoch_info = Arc::new(EpochInfo::new(0, i, validators.clone()));
+            let network = UdpNetwork::new(base_port + i as u16);
+            let sherpa = Arc::new(Sherpa::new(i, validators.clone()));
+            rotors.push(Rotor::new_geo_aware(network, epoch_info, sherpa));
+        }
+        (sks, rotors)
+    }
+
+    async fn run_rotor_dissemination<S: SamplingStrategy + Send + Sync + 'static>(
+        sks: Vec<SecretKey>,
+        mut rotors: Vec<Rotor<UdpNetwork<Shred, Shred>, S>>,
+        count: u64,
+    ) {
         let slice = create_slice_with_invalid_txs(MAX_DATA_PER_SLICE);
         let shreds = RegularShredder::default().shred(slice, &sks[0]).unwrap();
 
@@ -244,11 +297,34 @@ mod tests {
 
     #[tokio::test]
     async fn two_instances() {
-        test_rotor_dissemination(2, 3000).await
+        let (sks, rotors) = create_rotor_instances(2, 3000);
+        run_rotor_dissemination(sks, rotors, 2).await
     }
 
     #[tokio::test]
     async fn many_instances() {
-        test_rotor_dissemination(10, 3100).await
+        let (sks, rotors) = create_rotor_instances(10, 3100);
+        run_rotor_dissemination(sks, rotors, 10).await
+    }
+
+    #[tokio::test]
+    async fn geo_aware_instances() {
+        let (sks, rotors) = create_geo_rotor_instances(5, 3200);
+        run_rotor_dissemination(sks, rotors, 5).await
+    }
+
+    #[tokio::test]
+    async fn geo_aware_rotor_spreads_relays() {
+        let (_sks, validators) = create_test_validators(5, 3300, true);
+        let epoch_info = Arc::new(EpochInfo::new(0, 0, validators.clone()));
+        let sherpa = Arc::new(Sherpa::new(0, validators));
+        let network: UdpNetwork<Shred, Shred> = UdpNetwork::new_with_any_port();
+        let rotor = Rotor::new_geo_aware(network, epoch_info, sherpa);
+
+        // consecutive shreds of a slot must be assigned to distinct relays
+        let relays: std::collections::HashSet<ValidatorId> = (0..5)
+            .map(|shred| rotor.sample_relay(Slot::new(0), shred))
+            .collect();
+        assert_eq!(relays.len(), 5, "relays not geographically spread");
     }
 }

@@ -12,8 +12,9 @@ use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
 use bunkerglow::crypto::aggsig;
 use bunkerglow::crypto::signature::SecretKey;
 use bunkerglow::disseminator::Rotor;
-use bunkerglow::disseminator::rotor::StakeWeightedSampler;
+use bunkerglow::disseminator::rotor::GeoAwareSampler;
 use bunkerglow::network::UdpNetwork;
+use bunkerglow::sherpa::Sherpa;
 use bunkerglow::shredder::Shred;
 use bunkerglow::{Transaction, ValidatorInfo, logging};
 use clap::Parser;
@@ -111,7 +112,7 @@ async fn main() -> Result<()> {
 
 type Node = Alpenglow<
     TrivialAll2All<UdpNetwork<ConsensusMessage, ConsensusMessage>>,
-    Rotor<UdpNetwork<Shred, Shred>, StakeWeightedSampler>,
+    Rotor<UdpNetwork<Shred, Shred>, GeoAwareSampler>,
     UdpNetwork<Transaction, Transaction>,
 >;
 
@@ -120,9 +121,10 @@ fn create_node(config: ConfigFile) -> Node {
     let epoch_info = Arc::new(EpochInfo::new(0, config.id, config.gossip.clone()));
     let start_port = config.port;
     let network = UdpNetwork::new(start_port);
+    let sherpa = Arc::new(Sherpa::new(config.id, config.gossip.clone()));
     let all2all = TrivialAll2All::new(config.gossip, network);
     let network = UdpNetwork::new(start_port + 1);
-    let disseminator = Rotor::new(network, epoch_info.clone());
+    let disseminator = Rotor::new_geo_aware(network, epoch_info.clone(), sherpa);
     let repair_network = UdpNetwork::new(start_port + 2);
     let repair_request_network = UdpNetwork::new(start_port + 3);
     let txs_receiver = UdpNetwork::new(start_port + 4);
@@ -169,6 +171,7 @@ async fn create_node_configs(
             disseminator_address: SocketAddr::new(sockaddr.ip(), sockaddr.port() + 1),
             repair_request_address: SocketAddr::new(sockaddr.ip(), sockaddr.port() + 2),
             repair_response_address: SocketAddr::new(sockaddr.ip(), sockaddr.port() + 3),
+            location: None,
         });
     }
 

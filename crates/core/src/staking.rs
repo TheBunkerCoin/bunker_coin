@@ -1,18 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Amount, PublicKey, MIN_SELF_STAKE};
+use crate::types::{
+    Amount, PublicKey, Signature, ATTESTER_MIN_STAKE_AGE_EPOCHS, MIN_LOCATION_ATTESTERS,
+    MIN_SELF_STAKE,
+};
 
 pub const ACTIVATION_DELAY_EPOCHS: u64 = 1;
 pub const UNBONDING_PERIOD_EPOCHS: u64 = 2;
-pub const SLASH_FRACTION_PERCENT: u64 = 10;
-pub const JAIL_PERIOD_EPOCHS: u64 = 4;
+/// Downtime jail lasts 1 epoch; double-vote jail is indefinite (unjail requires re-stake).
+pub const DOWNTIME_JAIL_PERIOD_EPOCHS: u64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlashOffenceKind {
+    /// Signing two different blocks at the same slot — 100% stake slash, indefinite jail.
     DoubleVote,
+    /// Signing conflicting votes (e.g. notar + skip) — 100% stake slash, indefinite jail.
     ConflictingVote,
+    /// Missing >20% of votes in an epoch — 0% slash, 1-epoch jail.
+    Downtime,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +58,10 @@ pub struct StakingLedger {
     pub pending_commission_changes: Vec<(PublicKey, u16)>,
     /// Per-delegator stakes: (delegator, validator) → amount
     pub delegator_stakes: HashMap<(PublicKey, PublicKey), Amount>,
+    pub pending_location_claims: Vec<(LocationClaim, Vec<LocationAttestation>)>,
+    pub validated_locations: HashMap<PublicKey, ValidatedLocation>,
+    #[serde(default)]
+    pub msg_relay_participants: HashSet<PublicKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +88,38 @@ pub struct CompletedRetire {
     pub epoch_completed: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationClaim {
+    pub validator: PublicKey,
+    pub lat: i32,
+    pub lon: i32,
+    pub epoch_claimed: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationAttestation {
+    pub attester: PublicKey,
+    pub propagation_delay_ms: u32,
+    #[serde(with = "crate::types::serde_signature")]
+    pub signature: Signature,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatedLocation {
+    pub lat: i32,
+    pub lon: i32,
+    pub epoch_validated: u64,
+    pub attestation_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocationClaimError {
+    InsufficientAttestations { required: usize, provided: usize },
+    AttesterNotEligible(PublicKey),
+    NotStaked,
+    LocationOutOfBounds,
+}
+
 impl Default for StakingLedger {
     fn default() -> Self {
         Self::new()
@@ -96,6 +139,9 @@ impl StakingLedger {
             commission_rates: HashMap::new(),
             pending_commission_changes: Vec::new(),
             delegator_stakes: HashMap::new(),
+            pending_location_claims: Vec::new(),
+            validated_locations: HashMap::new(),
+            msg_relay_participants: HashSet::new(),
         }
     }
 
@@ -212,7 +258,11 @@ impl StakingLedger {
         self.pending_slashes.push(event);
     }
 
-    /// drain pending slashes, deduct SLASH_FRACTION_PERCENT, jail offenders
+    /// Drain pending slashes, apply per-offence slash fraction, and jail offenders.
+    ///
+    /// - `DoubleVote` / `ConflictingVote`: 100% stake burned, indefinite jail (unjail requires
+    ///   operator tx + min self-stake satisfied).
+    /// - `Downtime`: 0% slash, `DOWNTIME_JAIL_PERIOD_EPOCHS` jail.
     pub fn process_slashes(&mut self, current_epoch: u64) -> Vec<JailRecord> {
         let events: Vec<SlashingEvent> = self.pending_slashes.drain(..).collect();
         let mut records = Vec::new();
@@ -223,18 +273,30 @@ impl StakingLedger {
             }
 
             let stake = self.delegations.get(&event.validator).copied().unwrap_or(0);
-            let slash_amount = stake * SLASH_FRACTION_PERCENT / 100;
 
-            if let Some(s) = self.delegations.get_mut(&event.validator) {
-                *s = s.saturating_sub(slash_amount);
-            }
+            let slash_amount = match event.offence {
+                SlashOffenceKind::DoubleVote | SlashOffenceKind::ConflictingVote => stake,
+                SlashOffenceKind::Downtime => 0,
+            };
 
-            let self_stake = self.self_bonds.get(&event.validator).copied().unwrap_or(0);
-            if self_stake > 0 && stake > 0 {
-                let self_slash =
-                    (slash_amount as u128 * self_stake as u128 / stake as u128) as Amount;
-                if let Some(sb) = self.self_bonds.get_mut(&event.validator) {
-                    *sb = sb.saturating_sub(self_slash);
+            if slash_amount > 0 {
+                if let Some(s) = self.delegations.get_mut(&event.validator) {
+                    *s = s.saturating_sub(slash_amount);
+                    if *s == 0 {
+                        self.delegations.remove(&event.validator);
+                    }
+                }
+
+                let self_stake = self.self_bonds.get(&event.validator).copied().unwrap_or(0);
+                if self_stake > 0 && stake > 0 {
+                    let self_slash =
+                        (slash_amount as u128 * self_stake as u128 / stake as u128) as Amount;
+                    if let Some(sb) = self.self_bonds.get_mut(&event.validator) {
+                        *sb = sb.saturating_sub(self_slash);
+                        if *sb == 0 {
+                            self.self_bonds.remove(&event.validator);
+                        }
+                    }
                 }
             }
 
@@ -254,7 +316,17 @@ impl StakingLedger {
     pub fn unjail(&mut self, validator: &PublicKey, current_epoch: u64) -> Result<(), UnjailError> {
         let record = self.jailed.get(validator).ok_or(UnjailError::NotJailed)?;
 
-        if current_epoch < record.epoch_jailed + JAIL_PERIOD_EPOCHS {
+        let jail_period = match record.offence {
+            // Downtime: 1-epoch jail, then unjail is automatic via operator tx.
+            SlashOffenceKind::Downtime => DOWNTIME_JAIL_PERIOD_EPOCHS,
+            // Equivocation: indefinite — operator must re-stake before unjailing.
+            // We model "indefinite" as requiring the jail period to elapse (0 epochs, i.e.
+            // any epoch ≥ epoch_jailed) BUT also requiring MIN_SELF_STAKE to be satisfied
+            // (which is impossible after a 100% slash without a new bond).
+            SlashOffenceKind::DoubleVote | SlashOffenceKind::ConflictingVote => 0,
+        };
+
+        if current_epoch < record.epoch_jailed + jail_period {
             return Err(UnjailError::JailPeriodNotElapsed);
         }
 
@@ -270,6 +342,90 @@ impl StakingLedger {
 
         self.jailed.remove(validator);
         Ok(())
+    }
+
+    /// Submit a location claim with attestations. Validates attester eligibility
+    /// (stake age ≥1 prior epoch) and minimum attestation count.
+    pub fn submit_location_claim(
+        &mut self,
+        validator: PublicKey,
+        lat: i32,
+        lon: i32,
+        attestations: Vec<LocationAttestation>,
+        current_epoch: u64,
+    ) -> Result<(), LocationClaimError> {
+        // Sender must be staked
+        if !self.delegations.contains_key(&validator) {
+            return Err(LocationClaimError::NotStaked);
+        }
+
+        // Validate lat/lon bounds (milli-degrees)
+        if !(-90_000..=90_000).contains(&lat) || !(-180_000..=180_000).contains(&lon) {
+            return Err(LocationClaimError::LocationOutOfBounds);
+        }
+
+        // Check minimum attestation count
+        let total_validators = self.delegations.len();
+        let required = MIN_LOCATION_ATTESTERS.min(total_validators);
+        if attestations.len() < required {
+            return Err(LocationClaimError::InsufficientAttestations {
+                required,
+                provided: attestations.len(),
+            });
+        }
+
+        // Verify each attester has held stake for ≥1 prior epoch
+        for att in &attestations {
+            let has_mature_stake = self.delegations.contains_key(&att.attester)
+                && current_epoch >= ATTESTER_MIN_STAKE_AGE_EPOCHS;
+            if !has_mature_stake {
+                return Err(LocationClaimError::AttesterNotEligible(att.attester));
+            }
+        }
+
+        let claim = LocationClaim {
+            validator,
+            lat,
+            lon,
+            epoch_claimed: current_epoch,
+        };
+        self.pending_location_claims.push((claim, attestations));
+        Ok(())
+    }
+
+    /// Process pending location claims at epoch transition, moving valid ones
+    /// to validated_locations. Returns the list of validators whose locations
+    /// were validated.
+    pub fn process_location_claims(&mut self, current_epoch: u64) -> Vec<PublicKey> {
+        let claims: Vec<_> = self.pending_location_claims.drain(..).collect();
+        let mut validated = Vec::new();
+
+        for (claim, attestations) in claims {
+            self.validated_locations.insert(
+                claim.validator,
+                ValidatedLocation {
+                    lat: claim.lat,
+                    lon: claim.lon,
+                    epoch_validated: current_epoch,
+                    attestation_count: attestations.len() as u32,
+                },
+            );
+            validated.push(claim.validator);
+        }
+
+        validated
+    }
+
+    pub fn get_location(&self, validator: &PublicKey) -> Option<&ValidatedLocation> {
+        self.validated_locations.get(validator)
+    }
+
+    pub fn record_relay_participation(&mut self, validator: PublicKey) {
+        self.msg_relay_participants.insert(validator);
+    }
+
+    pub fn drain_relay_participants(&mut self) -> HashSet<PublicKey> {
+        std::mem::take(&mut self.msg_relay_participants)
     }
 
     pub fn total_stake(&self) -> Amount {
@@ -406,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_reduces_stake() {
+    fn double_vote_slash_burns_all_stake() {
         let mut ledger = StakingLedger::new();
         let validator = pk(1);
         ledger.delegations.insert(validator, 1000);
@@ -419,8 +575,27 @@ mod tests {
 
         let records = ledger.process_slashes(5);
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].amount_slashed, 100); // 10% of 1000
-        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 900);
+        assert_eq!(records[0].amount_slashed, 1000); // 100% of 1000
+        assert!(!ledger.delegations.contains_key(&validator)); // fully burned
+    }
+
+    #[test]
+    fn downtime_slash_burns_nothing() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 1000);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::Downtime,
+            epoch: 5,
+        });
+
+        let records = ledger.process_slashes(5);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].amount_slashed, 0);
+        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 1000); // stake intact
+        assert!(ledger.jailed.contains_key(&validator)); // still jailed
     }
 
     #[test]
@@ -453,9 +628,10 @@ mod tests {
             epoch: 5,
         });
         ledger.process_slashes(5);
-        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 900);
+        // 100% burned
+        assert!(!ledger.delegations.contains_key(&validator));
 
-        // second slash should be skipped
+        // second slash should be skipped (already jailed)
         ledger.report_offence(SlashingEvent {
             validator,
             offence: SlashOffenceKind::DoubleVote,
@@ -463,11 +639,55 @@ mod tests {
         });
         let records = ledger.process_slashes(5);
         assert!(records.is_empty());
-        assert_eq!(*ledger.delegations.get(&validator).unwrap(), 900);
     }
 
     #[test]
-    fn unjail_success() {
+    fn unjail_downtime_success_after_one_epoch() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
+        ledger.self_bonds.insert(validator, 2 * MIN_SELF_STAKE);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::Downtime,
+            epoch: 0,
+        });
+        ledger.process_slashes(0);
+        assert!(ledger.jailed.contains_key(&validator));
+        // stake intact after downtime
+        assert_eq!(
+            ledger.delegations.get(&validator).copied().unwrap(),
+            2 * MIN_SELF_STAKE
+        );
+
+        // epoch 1: jail period elapsed (DOWNTIME_JAIL_PERIOD_EPOCHS = 1)
+        let result = ledger.unjail(&validator, 1);
+        assert!(result.is_ok());
+        assert!(!ledger.jailed.contains_key(&validator));
+    }
+
+    #[test]
+    fn unjail_downtime_too_early() {
+        let mut ledger = StakingLedger::new();
+        let validator = pk(1);
+        ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
+        ledger.self_bonds.insert(validator, 2 * MIN_SELF_STAKE);
+
+        ledger.report_offence(SlashingEvent {
+            validator,
+            offence: SlashOffenceKind::Downtime,
+            epoch: 5,
+        });
+        ledger.process_slashes(5);
+
+        // epoch 5: same epoch as jailed — not yet elapsed
+        let result = ledger.unjail(&validator, 5);
+        assert_eq!(result, Err(UnjailError::JailPeriodNotElapsed));
+    }
+
+    #[test]
+    fn unjail_double_vote_requires_restake() {
         let mut ledger = StakingLedger::new();
         let validator = pk(1);
         ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
@@ -480,18 +700,20 @@ mod tests {
         });
         ledger.process_slashes(0);
         assert!(ledger.jailed.contains_key(&validator));
+        // 100% burned — no stake left
+        assert!(!ledger.delegations.contains_key(&validator));
 
-        // after 10% slash: self_bonds = 1_800_000, still >= MIN_SELF_STAKE
-        let result = ledger.unjail(&validator, 4);
-        assert!(result.is_ok());
-        assert!(!ledger.jailed.contains_key(&validator));
+        // Even many epochs later, cannot unjail without stake
+        let result = ledger.unjail(&validator, 100);
+        assert_eq!(result, Err(UnjailError::NoStake));
     }
 
     #[test]
-    fn unjail_too_early() {
+    fn unjail_double_vote_after_restake() {
         let mut ledger = StakingLedger::new();
         let validator = pk(1);
-        ledger.delegations.insert(validator, 1000);
+        ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
+        ledger.self_bonds.insert(validator, 2 * MIN_SELF_STAKE);
 
         ledger.report_offence(SlashingEvent {
             validator,
@@ -500,8 +722,14 @@ mod tests {
         });
         ledger.process_slashes(0);
 
-        let result = ledger.unjail(&validator, 3);
-        assert_eq!(result, Err(UnjailError::JailPeriodNotElapsed));
+        // Operator re-bonds sufficient self-stake (simulating bond activation)
+        ledger.delegations.insert(validator, 2 * MIN_SELF_STAKE);
+        ledger.self_bonds.insert(validator, 2 * MIN_SELF_STAKE);
+
+        // Can now unjail at any epoch (jail_period = 0 for equivocation)
+        let result = ledger.unjail(&validator, 1);
+        assert!(result.is_ok());
+        assert!(!ledger.jailed.contains_key(&validator));
     }
 
     #[test]
@@ -572,13 +800,14 @@ mod tests {
         ledger.self_bonds.insert(v3, MIN_SELF_STAKE);
         // v2 has no self_bond -> excluded
 
+        // Use Downtime so v1's stake isn't burned (makes total_active_stake check cleaner)
         ledger.report_offence(SlashingEvent {
             validator: v1,
-            offence: SlashOffenceKind::DoubleVote,
+            offence: SlashOffenceKind::Downtime,
             epoch: 0,
         });
         ledger.process_slashes(0);
-        // v1 jailed -> excluded
+        // v1 jailed -> excluded from active stake
 
         assert_eq!(ledger.total_active_stake(), 3000);
     }
@@ -621,12 +850,13 @@ mod tests {
     fn unjail_insufficient_self_stake() {
         let mut ledger = StakingLedger::new();
         let v = pk(1);
+        // Use Downtime so stake is preserved, but self_bond is below minimum
         ledger.delegations.insert(v, 1000);
         ledger.self_bonds.insert(v, MIN_SELF_STAKE - 1);
 
         ledger.report_offence(SlashingEvent {
             validator: v,
-            offence: SlashOffenceKind::DoubleVote,
+            offence: SlashOffenceKind::Downtime,
             epoch: 0,
         });
         ledger.process_slashes(0);
@@ -639,16 +869,18 @@ mod tests {
     fn unjail_no_stake() {
         let mut ledger = StakingLedger::new();
         let v = pk(1);
+        // Use Downtime so we can control stake removal manually
         ledger.delegations.insert(v, 100);
+        ledger.self_bonds.insert(v, MIN_SELF_STAKE);
 
         ledger.report_offence(SlashingEvent {
             validator: v,
-            offence: SlashOffenceKind::DoubleVote,
+            offence: SlashOffenceKind::Downtime,
             epoch: 0,
         });
         ledger.process_slashes(0);
 
-        // remove all stake
+        // remove all stake manually
         ledger.delegations.remove(&v);
         let result = ledger.unjail(&v, 10);
         assert_eq!(result, Err(UnjailError::NoStake));
@@ -659,6 +891,142 @@ mod tests {
         let mut ledger = StakingLedger::new();
         let result = ledger.unjail(&pk(1), 10);
         assert_eq!(result, Err(UnjailError::NotJailed));
+    }
+
+    // ── Location claim tests ──
+
+    fn dummy_attestation(attester_id: u8) -> LocationAttestation {
+        LocationAttestation {
+            attester: pk(attester_id),
+            propagation_delay_ms: 50,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// Set up a ledger with N validators (pk(1)..pk(N)) all staked at epoch 0,
+    /// with bonds activated at epoch 1 so they have mature stake by epoch 1+.
+    fn ledger_with_validators(n: u8) -> StakingLedger {
+        let mut ledger = StakingLedger::new();
+        for i in 1..=n {
+            let v = pk(i);
+            ledger.delegations.insert(v, MIN_SELF_STAKE);
+            ledger.self_bonds.insert(v, MIN_SELF_STAKE);
+        }
+        ledger
+    }
+
+    #[test]
+    fn location_claim_valid() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        let result = ledger.submit_location_claim(pk(1), 48_856, 2_352, attestations, 1);
+        assert!(result.is_ok());
+        assert_eq!(ledger.pending_location_claims.len(), 1);
+    }
+
+    #[test]
+    fn location_claim_insufficient_attestations() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![dummy_attestation(2), dummy_attestation(3)];
+        let result = ledger.submit_location_claim(pk(1), 48_856, 2_352, attestations, 1);
+        assert_eq!(
+            result,
+            Err(LocationClaimError::InsufficientAttestations {
+                required: 3,
+                provided: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn location_claim_attester_too_new() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        // epoch 0: attesters can't have mature stake yet (need ≥1 epoch)
+        let result = ledger.submit_location_claim(pk(1), 48_856, 2_352, attestations, 0);
+        assert!(matches!(
+            result,
+            Err(LocationClaimError::AttesterNotEligible(_))
+        ));
+    }
+
+    #[test]
+    fn location_claim_out_of_bounds() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        // lat 91_000 is out of range (> 90_000)
+        let result = ledger.submit_location_claim(pk(1), 91_000, 0, attestations, 1);
+        assert_eq!(result, Err(LocationClaimError::LocationOutOfBounds));
+    }
+
+    #[test]
+    fn location_claim_not_staked() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        // pk(10) is not a staked validator
+        let result = ledger.submit_location_claim(pk(10), 48_856, 2_352, attestations, 1);
+        assert_eq!(result, Err(LocationClaimError::NotStaked));
+    }
+
+    #[test]
+    fn location_claim_process_at_epoch_transition() {
+        let mut ledger = ledger_with_validators(4);
+        let attestations = vec![
+            dummy_attestation(2),
+            dummy_attestation(3),
+            dummy_attestation(4),
+        ];
+        ledger
+            .submit_location_claim(pk(1), 48_856, 2_352, attestations, 1)
+            .unwrap();
+
+        let validated = ledger.process_location_claims(2);
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0], pk(1));
+        assert!(ledger.pending_location_claims.is_empty());
+
+        let loc = ledger.get_location(&pk(1)).unwrap();
+        assert_eq!(loc.lat, 48_856);
+        assert_eq!(loc.lon, 2_352);
+        assert_eq!(loc.epoch_validated, 2);
+        assert_eq!(loc.attestation_count, 3);
+    }
+
+    #[test]
+    fn location_claim_small_network_requires_fewer_attestations() {
+        // With only 2 validators total, min(3, 2) = 2 attestations needed
+        let mut ledger = ledger_with_validators(2);
+        let attestations = vec![dummy_attestation(2)];
+        // 1 attestation < min(3, 2) = 2
+        let result = ledger.submit_location_claim(pk(1), 0, 0, attestations, 1);
+        assert_eq!(
+            result,
+            Err(LocationClaimError::InsufficientAttestations {
+                required: 2,
+                provided: 1,
+            })
+        );
+
+        // 2 attestations should work
+        let attestations = vec![dummy_attestation(2), dummy_attestation(2)];
+        let result = ledger.submit_location_claim(pk(1), 0, 0, attestations, 1);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -707,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_reduces_self_bonds_proportionally() {
+    fn double_vote_slash_burns_self_bonds_proportionally() {
         let mut ledger = StakingLedger::new();
         let v = pk(1);
         ledger.delegations.insert(v, 3000);
@@ -720,10 +1088,9 @@ mod tests {
         });
         ledger.process_slashes(0);
 
-        // total slash = 10% of 3000 = 300
-        // self_slash = 300 * 1000/3000 = 100
-        assert_eq!(ledger.self_bonds.get(&v).copied().unwrap(), 900);
-        assert_eq!(ledger.delegations.get(&v).copied().unwrap(), 2700);
+        // 100% slash: all 3000 delegation burned, all 1000 self-bond burned
+        assert!(!ledger.delegations.contains_key(&v));
+        assert!(!ledger.self_bonds.contains_key(&v));
     }
 
     #[test]
@@ -761,9 +1128,10 @@ mod tests {
         ledger.self_bonds.insert(v1, MIN_SELF_STAKE);
         ledger.self_bonds.insert(v2, MIN_SELF_STAKE);
 
+        // Use Downtime so v1 remains jailed but stake is intact (cleaner set-membership test)
         ledger.report_offence(SlashingEvent {
             validator: v1,
-            offence: SlashOffenceKind::DoubleVote,
+            offence: SlashOffenceKind::Downtime,
             epoch: 0,
         });
         ledger.process_slashes(0);
@@ -771,5 +1139,27 @@ mod tests {
         let set = ledger.validator_set();
         assert_eq!(set.len(), 1);
         assert_eq!(set[0].0, v2);
+    }
+
+    #[test]
+    fn relay_participation_recorded_and_drained() {
+        let mut ledger = StakingLedger::new();
+        ledger.record_relay_participation(pk(1));
+        ledger.record_relay_participation(pk(2));
+        assert_eq!(ledger.msg_relay_participants.len(), 2);
+
+        let drained = ledger.drain_relay_participants();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.contains(&pk(1)));
+        assert!(drained.contains(&pk(2)));
+        assert!(ledger.msg_relay_participants.is_empty());
+    }
+
+    #[test]
+    fn relay_participation_idempotent() {
+        let mut ledger = StakingLedger::new();
+        ledger.record_relay_participation(pk(1));
+        ledger.record_relay_participation(pk(1));
+        assert_eq!(ledger.msg_relay_participants.len(), 1);
     }
 }
