@@ -314,6 +314,7 @@ async fn init_hostmode(
     frequency: Option<f64>,
     trx_baud: Option<u32>,
     trx_addr: Option<&str>,
+    listen: bool,
 ) -> anyhow::Result<UsbPactorTransport> {
     let mut serial = open_serial(port, baud)?;
 
@@ -360,6 +361,13 @@ async fn init_hostmode(
     ];
     for command in &commands {
         send_ascii(&mut serial, command).await?;
+    }
+
+    // The answering modem must be in listen mode to accept an incoming PACTOR
+    // connect request; without it the originator's `C <CALL>` never links.
+    if listen {
+        println!("  enabling listen mode (LISTEN 1) ...");
+        send_ascii(&mut serial, "LISTEN 1").await?;
     }
 
     // === Step 2b: TRX CI-V frequency control ===
@@ -465,6 +473,7 @@ async fn main() -> anyhow::Result<()> {
         freq_a,
         trx_baud_a,
         trx_addr_a,
+        false,
     )
     .await?;
 
@@ -480,6 +489,7 @@ async fn main() -> anyhow::Result<()> {
         freq_b,
         trx_baud_b,
         trx_addr_b,
+        true,
     )
     .await?;
 
