@@ -230,14 +230,23 @@ impl UsbPactorTransport {
         ack_timeout: Duration,
     ) -> Result<Option<HostmodeFrame>, ScsPactorError> {
         let _lock = self.transaction_lock.lock().await;
-        let encoded = self.encode_outbound_frame(frame).await?;
+        let encoded = self.encode_outbound_frame(frame.clone()).await?;
+        eprintln!(
+            "[tx] best_effort_ack: ch={} code=0x{:02x} payload={:02x?} encoded={:02x?}",
+            frame.channel, frame.code, &frame.payload, &encoded
+        );
         self.write_encoded_frame(&encoded).await?;
         match self.recv_hostmode_packet(ack_timeout).await {
             Ok(HostmodePacket::Frame(resp)) => {
+                eprintln!(
+                    "[tx] best_effort_ack response: ch={} code=0x{:02x} payload={:02x?}",
+                    resp.channel, resp.code, &resp.payload
+                );
                 self.packet_counter.lock().await.advance();
                 Ok(Some(resp))
             }
             _ => {
+                eprintln!("[tx] best_effort_ack: no ack within {ack_timeout:?}, counter advanced");
                 self.packet_counter.lock().await.advance();
                 Ok(None)
             }
@@ -592,6 +601,26 @@ impl PactorTransport for UsbPactorTransport {
             }
 
             poll_count += 1;
+
+            // Diagnostic: probe the extended-poll channel (255) to learn which
+            // channels the modem reports as pending. SCS hostmode answers the
+            // G poll on 255 even while a data channel is busy with an ARQ
+            // connect, so this tells us whether the modem is alive and which
+            // channel to read — vs. the L poll on 31 going silent.
+            let g_probe = HostmodeFrame::command(EXTENDED_POLL_CHANNEL, b"G".to_vec());
+            match self
+                .send_command_best_effort_ack(g_probe, poll_timeout)
+                .await?
+            {
+                Some(resp) => eprintln!(
+                    "[connect] poll {poll_count}: ch255 G probe -> ch={} payload={:02x?} ascii={:?}",
+                    resp.channel,
+                    resp.payload,
+                    String::from_utf8_lossy(&resp.payload)
+                ),
+                None => eprintln!("[connect] poll {poll_count}: ch255 G probe -> no response"),
+            }
+
             let l_frame = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
             let l_resp = self
                 .send_command_best_effort_ack(l_frame, poll_timeout)
