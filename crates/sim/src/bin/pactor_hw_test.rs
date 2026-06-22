@@ -266,6 +266,19 @@ async fn diagnose_connect(
         ),
         None => println!("  C sent (no ACK within 3s, counter advanced)"),
     }
+
+    // DECISIVE PROBE: is the modem still in hostmode after C, or did it drop to
+    // terminal mode? Send a bare CR (raw terminal byte). If the modem replies
+    // with a "cmd:" prompt (visible in the reader's "[reader] got" log), it has
+    // LEFT hostmode. If it stays silent, it is still in hostmode (busy/TX) and
+    // simply not answering polls.
+    println!("  >> raw-probe: sending bare CR to detect terminal-mode fallback ...");
+    if let Err(e) = modem.write_raw(b"\r").await {
+        println!("  raw-probe write error: {e}");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("  (if a 'cmd:' prompt appeared above, the modem left hostmode)");
+
     let deadline = Instant::now() + duration;
     let mut attempt = 0;
 

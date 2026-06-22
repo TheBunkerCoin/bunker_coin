@@ -277,6 +277,15 @@ impl UsbPactorTransport {
         }
     }
 
+    /// Write raw bytes directly to the serial port (no hostmode framing).
+    ///
+    /// Diagnostic helper: lets a caller poke the modem with terminal-mode bytes
+    /// (e.g. a bare `\r`) to discover whether it has fallen out of hostmode.
+    /// Any reply is surfaced by the background reader's `[reader] got` log.
+    pub async fn write_raw(&self, bytes: &[u8]) -> Result<(), ScsPactorError> {
+        self.write_encoded_frame(bytes).await
+    }
+
     async fn encode_outbound_frame(&self, frame: HostmodeFrame) -> Result<Vec<u8>, ScsPactorError> {
         let counter = self.packet_counter.lock().await;
         let code_with_counter = counter.apply(frame.code);
