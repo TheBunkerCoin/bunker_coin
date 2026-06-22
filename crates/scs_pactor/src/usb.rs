@@ -596,11 +596,6 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
-        // ptc-go issues the connect as the first parity-0 channel command after
-        // init. Any prior hostmode poll (e.g. the post-init verify) leaves our
-        // toggle advanced, so reset it here so the modem accepts the connect.
-        self.packet_counter.lock().await.reset();
-
         let mut payload = b"C ".to_vec();
         payload.extend_from_slice(remote_call.as_bytes());
         let frame = HostmodeFrame::command(PACTOR_CHANNEL, payload);
