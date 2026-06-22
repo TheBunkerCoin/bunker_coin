@@ -17,6 +17,42 @@ const STATUS_CHANNEL: u8 = 254;
 const EXTENDED_POLL_CHANNEL: u8 = 255;
 const MAX_HOSTMODE_RETRIES: u8 = 3;
 
+/// Marker prefixing a data frame sent over the connected terminal-mode link.
+///
+/// After the firmware reverts to terminal mode on connect, payload bytes are
+/// carried as a hex-encoded line `#<hex>\r`. Hex keeps the payload printable so
+/// it survives the text-oriented PACTOR terminal link, and the `#` marker lets
+/// the reader tell data lines apart from `*** ...` status banners.
+const DATA_LINE_MARKER: &str = "#";
+
+/// Hex-encode bytes (lowercase, no separators).
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// Decode a hex line back to bytes, returning None on malformed input.
+fn decode_hex_line(hex: &str) -> Option<Vec<u8>> {
+    let hex = hex.trim();
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PactorChannelState {
     status_messages_pending: u32,
@@ -179,11 +215,21 @@ impl UsbPactorTransport {
                         if !term_line.is_empty() {
                             let line = String::from_utf8_lossy(&term_line).trim().to_string();
                             if !line.is_empty() {
-                                route_terminal_line(&line, &command_tx, &event_tx).await;
+                                // Data frames are sent over the connected terminal
+                                // link as a hex line prefixed with DATA_LINE_MARKER
+                                // ('#'). Decode and route those to the data stream;
+                                // everything else is treated as status text.
+                                if let Some(hex) = line.strip_prefix(DATA_LINE_MARKER) {
+                                    if let Some(bytes) = decode_hex_line(hex) {
+                                        let _ = data_tx.send(bytes).await;
+                                    }
+                                } else {
+                                    route_terminal_line(&line, &command_tx, &event_tx).await;
+                                }
                             }
                             term_line.clear();
                         }
-                    } else if (b.is_ascii_graphic() || b == b' ') && term_line.len() < 256 {
+                    } else if (b.is_ascii_graphic() || b == b' ') && term_line.len() < 4096 {
                         term_line.push(b);
                     } else {
                         // Non-printable (likely hostmode framing) — drop the
@@ -752,7 +798,12 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
-        self.send_data_frame(PACTOR_CHANNEL, data).await
+        // After a terminal-mode connect the modem carries payload as raw serial
+        // bytes over the link. Send each message as a hex-encoded line
+        // ("#<hex>\r") so it stays printable on the text-oriented PACTOR link and
+        // is delimited for the receiver (see DATA_LINE_MARKER / the reader).
+        let line = format!("{DATA_LINE_MARKER}{}\r", encode_hex(data));
+        self.write_raw(line.as_bytes()).await
     }
 
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, ScsPactorError> {
@@ -1115,18 +1166,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usb_transport_writes_data_on_pactor_channel() {
+    async fn usb_transport_writes_data_as_hex_line() {
         let (transport_side, mut modem_side) = duplex(1024);
         let transport = UsbPactorTransport::from_stream(transport_side, test_config());
 
         transport.write_data(b"hello").await.unwrap();
 
+        // Data is sent over the connected terminal link as "#<hex>\r".
         let mut buf = [0u8; 1024];
         let n = modem_side.read(&mut buf).await.unwrap();
-        let frame = decode_frame(&buf[..n]).unwrap();
-        assert_eq!(frame.channel, PACTOR_CHANNEL);
-        assert_eq!(base_code(frame.code), TYPE_DATA);
-        assert_eq!(frame.payload, b"hello");
+        assert_eq!(&buf[..n], b"#68656c6c6f\r");
+    }
+
+    #[tokio::test]
+    async fn usb_transport_reads_data_from_hex_line() {
+        let (transport_side, mut modem_side) = duplex(1024);
+        let transport = UsbPactorTransport::from_stream(transport_side, test_config());
+
+        // Modem delivers received data as a hex line; status banners are ignored.
+        modem_side
+            .write_all(b"\r\n*** CONNECTED TO NODE\r\n")
+            .await
+            .unwrap();
+        modem_side.write_all(b"#68656c6c6f\r").await.unwrap();
+
+        let data = transport.read_data(1024).await.unwrap();
+        assert_eq!(data, b"hello");
     }
 
     #[tokio::test]
