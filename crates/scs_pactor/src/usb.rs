@@ -648,7 +648,11 @@ async fn route_terminal_line(
     } else if body.starts_with("LINK FAILURE")
         || body.starts_with("CONNECT FAILED")
         || body.starts_with("NO CONNECT")
+        || body.starts_with("STBY")
     {
+        // STBY (standby) after a call attempt means the modem gave up — the link
+        // setup failed. (It also follows a normal disconnect, which connect_peer
+        // only treats as a failure once a call was actually in progress.)
         let _ = event_tx
             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
             .await;
@@ -676,27 +680,24 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
-        // On this SCS Dragon firmware, issuing the connect causes the modem to
-        // revert from JHOST4 hostmode to terminal mode and report link state as
-        // plain ASCII lines ("*** NOW CALLING X", "*** CONNECTED TO X",
-        // "*** DISCONNECTED ..."). The background reader parses those lines into
-        // PactorLinkEvents (see route_terminal_line), so we issue the connect
-        // fire-and-forget and then wait on the event stream rather than polling
-        // hostmode L frames the modem will no longer answer.
-        let mut payload = b"C ".to_vec();
-        payload.extend_from_slice(remote_call.as_bytes());
-        let frame = HostmodeFrame::command(PACTOR_CHANNEL, payload);
-        self.send_command_best_effort_ack(frame, Duration::from_secs(2))
-            .await?;
+        // On this SCS Dragon firmware the connect runs in TERMINAL mode, not
+        // hostmode: a framed hostmode `C` command is parsed as literal typed
+        // characters, and its trailing CRC bytes leak into the callsign (e.g.
+        // "C NODE" + CRC 0x73('s') was dialed as "NODES"). So issue the connect
+        // as a clean terminal command ("C <CALL>\r"), exactly as the manual
+        // (picocom) flow does. The modem then reports link state as plain ASCII
+        // lines ("*** NOW CALLING X" / "*** CONNECTED TO X" / "*** DISCONNECTED"),
+        // which the background reader parses into PactorLinkEvents (see
+        // route_terminal_line); we wait on that event stream.
+        // Ensure we are in terminal mode: leave JHOST hostmode first. The modem
+        // ignores a stray JHOST0 if already in terminal mode (harmless), and a
+        // short settle lets it switch before we type the connect.
+        let _ = self.write_raw(b"JHOST0\r").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // After the framed C command, the firmware switches to terminal mode but
-        // does not emit its status banner until it receives a terminal newline.
-        // Send a bare CR to flush the "*** NOW CALLING ..." / "*** CONNECTED ..."
-        // lines (without it the modem stays silent on the serial port). Nudge
-        // writes are best-effort — a failure here must not abort a link that may
-        // already be coming up via the event stream.
-        let _ = self.write_raw(b"\r").await;
-        eprintln!("[connect] C {remote_call} sent; waiting for link status ...");
+        let cmd = format!("C {remote_call}\r");
+        self.write_raw(cmd.as_bytes()).await?;
+        eprintln!("[connect] C {remote_call} sent (terminal); waiting for link status ...");
 
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
@@ -828,6 +829,20 @@ mod tests {
         }
     }
 
+    /// Drain the terminal-mode connect bytes connect_peer writes and assert the
+    /// "C NODE" command appears (it sends "JHOST0\r" then "C NODE\r").
+    async fn read_terminal_connect<R: AsyncRead + Unpin>(reader: &mut R) {
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            let n = reader.read(&mut buf).await.unwrap();
+            acc.extend_from_slice(&buf[..n]);
+            if acc.windows(b"C NODE".len()).any(|w| w == b"C NODE") {
+                return;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn usb_transport_writes_commands_as_hostmode_frames() {
         let (transport_side, mut modem_side) = duplex(4096);
@@ -892,16 +907,10 @@ mod tests {
         let transport = UsbPactorTransport::from_stream(transport_side, config);
 
         let modem = tokio::spawn(async move {
-            let mut decoder = HostmodeDecoder::new();
-            let mut buf = [0u8; 1024];
-
-            // Modem receives the hostmode C command, then (as the real Dragon
-            // firmware does) reverts to terminal mode and reports link state as
-            // plain ASCII lines.
-            let c_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(c_frame.channel, PACTOR_CHANNEL);
-            assert_eq!(c_frame.code, TYPE_COMMAND);
-            assert_eq!(c_frame.payload, b"C NODE");
+            // The connect is issued in terminal mode: the modem receives the
+            // raw "JHOST0\r" + "C NODE\r" text, then reports link state as plain
+            // ASCII lines.
+            read_terminal_connect(&mut modem_side).await;
 
             modem_side
                 .write_all(b"\r\n*** NOW CALLING NODE\r\n")
@@ -911,6 +920,8 @@ mod tests {
                 .write_all(b"\r\n*** CONNECTED TO NODE\r\n")
                 .await
                 .unwrap();
+            // Keep the pipe open so connect_peer's CR nudges don't BrokenPipe.
+            tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
         transport.connect_peer("NODE").await.unwrap();
@@ -925,11 +936,7 @@ mod tests {
         let transport = UsbPactorTransport::from_stream(transport_side, config);
 
         let modem = tokio::spawn(async move {
-            let mut decoder = HostmodeDecoder::new();
-            let mut buf = [0u8; 1024];
-
-            let c_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(c_frame.payload, b"C NODE");
+            read_terminal_connect(&mut modem_side).await;
 
             // Call starts, then fails (disconnect after NOW CALLING).
             modem_side
@@ -940,6 +947,7 @@ mod tests {
                 .write_all(b"\r\n*** DISCONNECTED AT - 00:00:00\r\n")
                 .await
                 .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
         let err = transport.connect_peer("NODE").await.unwrap_err();
@@ -955,11 +963,7 @@ mod tests {
         let transport = UsbPactorTransport::from_stream(transport_side, config);
 
         let modem = tokio::spawn(async move {
-            let mut decoder = HostmodeDecoder::new();
-            let mut buf = [0u8; 1024];
-
-            let c_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(c_frame.payload, b"C NODE");
+            read_terminal_connect(&mut modem_side).await;
 
             // Stale disconnect from a prior session arrives first — must be
             // ignored — then the real call proceeds to CONNECTED.
@@ -975,6 +979,7 @@ mod tests {
                 .write_all(b"\r\n*** CONNECTED TO NODE\r\n")
                 .await
                 .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
         transport.connect_peer("NODE").await.unwrap();
