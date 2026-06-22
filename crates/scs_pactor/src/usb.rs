@@ -221,9 +221,12 @@ impl UsbPactorTransport {
 
     /// Send a command with the proper packet counter and try to read an ACK.
     ///
-    /// If the modem ACKs within `ack_timeout`, the counter advances normally.
-    /// Otherwise the counter is advanced manually (the modem accepted the
-    /// counter-correct frame but chose not to respond).
+    /// The hostmode toggle bit (0x80) is a sequence number the modem uses to
+    /// detect retransmissions: it only flips once the modem has *acknowledged*
+    /// the frame. If the modem does not respond, the frame was not consumed, so
+    /// the counter must NOT advance — otherwise every subsequent frame lands on
+    /// the wrong toggle and the modem silently discards all of them (observed
+    /// on real hardware: a no-ACK `C` connect desynced the whole session).
     pub async fn send_command_best_effort_ack(
         &self,
         frame: HostmodeFrame,
@@ -246,8 +249,9 @@ impl UsbPactorTransport {
                 Ok(Some(resp))
             }
             _ => {
-                eprintln!("[tx] best_effort_ack: no ack within {ack_timeout:?}, counter advanced");
-                self.packet_counter.lock().await.advance();
+                eprintln!(
+                    "[tx] best_effort_ack: no ack within {ack_timeout:?}, counter held (frame not consumed)"
+                );
                 Ok(None)
             }
         }
@@ -583,7 +587,7 @@ impl PactorTransport for UsbPactorTransport {
                 "[connect] C {remote_call} ACKed: payload={:?}",
                 String::from_utf8_lossy(&resp.payload)
             ),
-            None => eprintln!("[connect] C {remote_call} sent (no ACK, counter advanced)"),
+            None => eprintln!("[connect] C {remote_call} sent (no ACK, counter held — will resend)"),
         }
 
         let deadline = Instant::now() + self.command_timeout;
@@ -601,25 +605,6 @@ impl PactorTransport for UsbPactorTransport {
             }
 
             poll_count += 1;
-
-            // Diagnostic: probe the extended-poll channel (255) to learn which
-            // channels the modem reports as pending. SCS hostmode answers the
-            // G poll on 255 even while a data channel is busy with an ARQ
-            // connect, so this tells us whether the modem is alive and which
-            // channel to read — vs. the L poll on 31 going silent.
-            let g_probe = HostmodeFrame::command(EXTENDED_POLL_CHANNEL, b"G".to_vec());
-            match self
-                .send_command_best_effort_ack(g_probe, poll_timeout)
-                .await?
-            {
-                Some(resp) => eprintln!(
-                    "[connect] poll {poll_count}: ch255 G probe -> ch={} payload={:02x?} ascii={:?}",
-                    resp.channel,
-                    resp.payload,
-                    String::from_utf8_lossy(&resp.payload)
-                ),
-                None => eprintln!("[connect] poll {poll_count}: ch255 G probe -> no response"),
-            }
 
             let l_frame = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
             let l_resp = self
