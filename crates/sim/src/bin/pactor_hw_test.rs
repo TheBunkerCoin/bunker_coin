@@ -264,20 +264,43 @@ async fn diagnose_connect(
     let deadline = Instant::now() + duration;
     let mut attempt = 0;
 
+    let poll_timeout = Duration::from_secs(5);
     while Instant::now() < deadline {
         attempt += 1;
+
+        // Probe the extended-poll channel (255). SCS hostmode answers the G
+        // poll on 255 even while a data channel is busy with an ARQ connect,
+        // so this reveals whether the modem is alive and which channel has
+        // activity, vs. the L poll on 31 going silent during connect.
+        let g_probe = HostmodeFrame::command(255, b"G".to_vec());
+        match modem
+            .send_command_best_effort_ack(g_probe, poll_timeout)
+            .await
+        {
+            Ok(Some(resp)) => println!(
+                "  poll {attempt}: ch255 G -> ch={} payload_hex={:02x?} ascii={:?}",
+                resp.channel,
+                resp.payload,
+                String::from_utf8_lossy(&resp.payload)
+            ),
+            Ok(None) => println!("  poll {attempt}: ch255 G -> no response"),
+            Err(err) => println!("  poll {attempt}: ch255 G -> error {err}"),
+        }
+
         let frame = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
-        match modem.hostmode_transaction(frame).await {
-            Ok(response) => {
-                println!(
-                    "  L poll {attempt}: ch={} code=0x{:02x} payload_hex={:02x?} payload_ascii={:?}",
-                    response.channel,
-                    response.code,
-                    response.payload,
-                    String::from_utf8_lossy(&response.payload)
-                );
-            }
-            Err(err) => println!("  L poll {attempt}: error {err}"),
+        match modem
+            .send_command_best_effort_ack(frame, poll_timeout)
+            .await
+        {
+            Ok(Some(response)) => println!(
+                "  poll {attempt}: ch31 L -> ch={} code=0x{:02x} payload_hex={:02x?} ascii={:?}",
+                response.channel,
+                response.code,
+                response.payload,
+                String::from_utf8_lossy(&response.payload)
+            ),
+            Ok(None) => println!("  poll {attempt}: ch31 L -> no response (modem busy with RF)"),
+            Err(err) => println!("  poll {attempt}: ch31 L -> error {err}"),
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
