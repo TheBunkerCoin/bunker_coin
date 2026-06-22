@@ -96,6 +96,17 @@ impl PacketCounter {
     fn advance(&mut self) {
         self.toggle = !self.toggle;
     }
+
+    /// Reset the toggle to the initial (parity-0) state.
+    ///
+    /// ptc-go enters its connect with `packetcounter = false` (its init
+    /// commands use raw ASCII writes that never toggle), so the modem expects
+    /// the connect to be the first parity-0 channel command. Any prior
+    /// hostmode poll (e.g. a verify) leaves us toggled, so reset before
+    /// connecting to match the modem's expectation.
+    fn reset(&mut self) {
+        self.toggle = false;
+    }
 }
 
 impl UsbPactorTransport {
@@ -210,6 +221,15 @@ impl UsbPactorTransport {
     async fn send_hostmode_frame(&self, frame: HostmodeFrame) -> Result<(), ScsPactorError> {
         let encoded = self.encode_outbound_frame(frame).await?;
         self.write_encoded_frame(&encoded).await
+    }
+
+    /// Reset the hostmode packet-counter toggle to parity 0.
+    ///
+    /// Call this before issuing a connect if a prior hostmode poll (e.g. a
+    /// post-init verify) has advanced the toggle — the modem expects the
+    /// connect to be the first parity-0 channel command (matches ptc-go).
+    pub async fn reset_packet_counter(&self) {
+        self.packet_counter.lock().await.reset();
     }
 
     pub async fn send_hostmode_frame_no_response(
@@ -576,6 +596,11 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
+        // ptc-go issues the connect as the first parity-0 channel command after
+        // init. Any prior hostmode poll (e.g. the post-init verify) leaves our
+        // toggle advanced, so reset it here so the modem accepts the connect.
+        self.packet_counter.lock().await.reset();
+
         let mut payload = b"C ".to_vec();
         payload.extend_from_slice(remote_call.as_bytes());
         let frame = HostmodeFrame::command(PACTOR_CHANNEL, payload);

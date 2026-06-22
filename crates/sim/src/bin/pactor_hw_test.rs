@@ -243,6 +243,11 @@ async fn diagnose_connect(
             "  note: --diagnose-connect-reset is ignored; transport-managed counters are required"
         );
     }
+    // The post-init verify advanced the packet-counter toggle; reset it so the
+    // connect goes out at parity 0 (the modem expects the connect to be the
+    // first parity-0 channel command — matches ptc-go and connect_peer).
+    modem.reset_packet_counter().await;
+
     let connect_frame =
         HostmodeFrame::command(PACTOR_CHANNEL, format!("C {remote_call}").into_bytes());
     println!(
