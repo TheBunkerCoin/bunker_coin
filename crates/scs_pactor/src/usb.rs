@@ -142,6 +142,7 @@ impl UsbPactorTransport {
 
         let read_task = tokio::spawn(async move {
             let mut decoder = HostmodeDecoder::new();
+            let mut term_line: Vec<u8> = Vec::new();
             let mut buf = [0u8; 1024];
             eprintln!("[reader] task started");
 
@@ -165,6 +166,33 @@ impl UsbPactorTransport {
                 };
 
                 eprintln!("[reader] got {} bytes: {:02x?}", n, &buf[..n]);
+
+                // This SCS Dragon firmware reverts to terminal mode when it
+                // processes a connect command, then reports link state as plain
+                // ASCII lines (e.g. "*** CONNECTED TO NODE", "*** DISCONNECTED")
+                // rather than hostmode frames. Accumulate those lines and route
+                // them as status so connect/disconnect can be observed. Hostmode
+                // frame bytes (0xAA-framed, with control/CRC bytes) never form a
+                // clean "*** "/"cmd:" line, so this won't misfire on framed data.
+                for &b in &buf[..n] {
+                    if b == b'\r' || b == b'\n' {
+                        if !term_line.is_empty() {
+                            let line = String::from_utf8_lossy(&term_line).trim().to_string();
+                            if !line.is_empty() {
+                                route_terminal_line(&line, &command_tx, &event_tx).await;
+                            }
+                            term_line.clear();
+                        }
+                    } else if (b.is_ascii_graphic() || b == b' ') && term_line.len() < 256 {
+                        term_line.push(b);
+                    } else {
+                        // Non-printable (likely hostmode framing) — drop the
+                        // partial terminal line so framed bytes aren't parsed
+                        // as text.
+                        term_line.clear();
+                    }
+                }
+
                 decoder.push(&buf[..n]);
                 loop {
                     match decoder.next_packet() {
@@ -587,6 +615,49 @@ async fn route_frame(
     Ok(())
 }
 
+/// Parse a terminal-mode status line emitted by the modem after it reverts from
+/// hostmode on connect, and route it to the command stream and link events.
+///
+/// Handles the SCS terminal phrasing: lines are prefixed with `*** ` and use
+/// `CONNECTED TO <call>` / `DISCONNECTED ...` / `NOW CALLING <call>` rather than
+/// the hostmode `CONNECTED <call>` form parsed by [`parse_status_line`].
+async fn route_terminal_line(
+    line: &str,
+    command_tx: &mpsc::Sender<String>,
+    event_tx: &mpsc::Sender<PactorLinkEvent>,
+) {
+    // Strip the leading "*** " banner marker if present.
+    let body = line.trim_start_matches('*').trim();
+
+    if let Some(rest) = body.strip_prefix("CONNECTED TO ") {
+        let _ = event_tx
+            .send(PactorLinkEvent::Status(PactorLinkStatus::Connected {
+                remote_call: rest.trim().to_owned(),
+            }))
+            .await;
+    } else if let Some(rest) = body.strip_prefix("NOW CALLING ") {
+        let _ = event_tx
+            .send(PactorLinkEvent::Status(PactorLinkStatus::Connecting {
+                remote_call: rest.trim().to_owned(),
+            }))
+            .await;
+    } else if body.starts_with("DISCONNECTED") {
+        let _ = event_tx
+            .send(PactorLinkEvent::Status(PactorLinkStatus::Disconnected))
+            .await;
+    } else if body.starts_with("LINK FAILURE")
+        || body.starts_with("CONNECT FAILED")
+        || body.starts_with("NO CONNECT")
+    {
+        let _ = event_tx
+            .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
+            .await;
+    }
+
+    // Always forward the raw line so callers polling read_status_line() see it.
+    let _ = command_tx.send(body.to_owned()).await;
+}
+
 #[async_trait]
 impl PactorTransport for UsbPactorTransport {
     async fn set_mycall(&self, callsign: &str) -> Result<(), ScsPactorError> {
@@ -605,119 +676,61 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
+        // On this SCS Dragon firmware, issuing the connect causes the modem to
+        // revert from JHOST4 hostmode to terminal mode and report link state as
+        // plain ASCII lines ("*** NOW CALLING X", "*** CONNECTED TO X",
+        // "*** DISCONNECTED ..."). The background reader parses those lines into
+        // PactorLinkEvents (see route_terminal_line), so we issue the connect
+        // fire-and-forget and then wait on the event stream rather than polling
+        // hostmode L frames the modem will no longer answer.
         let mut payload = b"C ".to_vec();
         payload.extend_from_slice(remote_call.as_bytes());
         let frame = HostmodeFrame::command(PACTOR_CHANNEL, payload);
-        let ack = self
-            .send_command_best_effort_ack(frame, Duration::from_secs(2))
+        self.send_command_best_effort_ack(frame, Duration::from_secs(2))
             .await?;
-        match &ack {
-            Some(resp) => eprintln!(
-                "[connect] C {remote_call} ACKed: payload={:?}",
-                String::from_utf8_lossy(&resp.payload)
-            ),
-            None => eprintln!("[connect] C {remote_call} sent (no ACK, counter held — will resend)"),
-        }
+        eprintln!("[connect] C {remote_call} sent; waiting for link status ...");
 
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
-        let mut poll_count = 0u32;
-        // The modem may not respond to polls while it is busy with an RF
-        // connect attempt. Use a short per-poll timeout and keep retrying
-        // until the overall deadline. The modem will resume responding
-        // once its internal connect attempt completes or times out.
-        let poll_timeout = Duration::from_secs(5);
+        let mut rx = self.event_rx.lock().await;
 
         loop {
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(ScsPactorError::Timeout);
             }
 
-            poll_count += 1;
-
-            let l_frame = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
-            let l_resp = self
-                .send_command_best_effort_ack(l_frame, poll_timeout)
-                .await?;
-            let state = match l_resp {
-                Some(resp) => {
-                    eprintln!(
-                        "[connect] poll {poll_count}: raw={:?}",
-                        String::from_utf8_lossy(&resp.payload)
-                    );
-                    match parse_pactor_channel_state(&resp.payload) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("[connect] poll {poll_count}: parse error: {e}");
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            continue;
-                        }
+            match timeout(remaining, rx.recv()).await {
+                Ok(Some(event)) => match event {
+                    PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
+                        eprintln!("[connect] link established (CONNECTED TO {remote_call})");
+                        return Ok(());
                     }
-                }
-                None => {
-                    eprintln!("[connect] poll {poll_count}: no response (modem busy with RF)");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            };
-
-            eprintln!(
-                "[connect] poll {poll_count}: link_state={} status_pending={} rx_pending={} retries={}",
-                state.link_state,
-                state.status_messages_pending,
-                state.frames_received_pending,
-                state.retries,
-            );
-
-            match state.link_state {
-                1 => saw_link_setup = true,
-                2 | 4 | 5 | 6 => {
-                    eprintln!("[connect] link established (state={})", state.link_state);
-                    return Ok(());
-                }
-                0 if saw_link_setup => {
-                    return Err(ScsPactorError::Io(std::io::Error::other(
-                        "PACTOR link setup failed (returned to idle after connecting)",
-                    )))
-                }
-                _ => {}
-            }
-
-            // Also check if there are status messages we should read
-            if state.status_messages_pending > 0 {
-                let g_frame = HostmodeFrame::command(PACTOR_CHANNEL, b"G".to_vec());
-                if let Some(g_resp) = self
-                    .send_command_best_effort_ack(g_frame, poll_timeout)
-                    .await?
-                {
-                    let g_text = String::from_utf8_lossy(&g_resp.payload);
-                    eprintln!("[connect] G poll: {:?}", g_text);
-                    if let Ok(event) = Self::parse_status_line(&g_text) {
-                        match event {
-                            PactorLinkEvent::Status(PactorLinkStatus::Connected { .. }) => {
-                                return Ok(())
-                            }
-                            PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
-                                return Err(ScsPactorError::Busy)
-                            }
-                            PactorLinkEvent::Status(
-                                PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
-                            ) => {
-                                return Err(ScsPactorError::Io(std::io::Error::other(
-                                    g_text.into_owned(),
-                                )))
-                            }
-                            PactorLinkEvent::Status(PactorLinkStatus::Connecting { .. }) => {
-                                saw_link_setup = true;
-                            }
-                            _ => {}
-                        }
+                    PactorLinkEvent::Status(PactorLinkStatus::Connecting { remote_call }) => {
+                        eprintln!("[connect] calling {remote_call} ...");
+                        saw_link_setup = true;
                     }
-                }
+                    PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
+                        return Err(ScsPactorError::Busy);
+                    }
+                    PactorLinkEvent::Status(
+                        PactorLinkStatus::Disconnected | PactorLinkStatus::LinkFailure,
+                    ) => {
+                        // A disconnect before we ever saw the call start is just
+                        // stale status from a prior session; ignore it and keep
+                        // waiting. After NOW CALLING, it means link setup failed.
+                        if saw_link_setup {
+                            return Err(ScsPactorError::Io(std::io::Error::other(
+                                "PACTOR link setup failed",
+                            )));
+                        }
+                        eprintln!("[connect] ignoring pre-call status (stale)");
+                    }
+                    _ => {}
+                },
+                Ok(None) => return Err(ScsPactorError::Disconnected),
+                Err(_) => return Err(ScsPactorError::Timeout),
             }
-
-            // Poll every 2 seconds (matching ptc-go's status polling rate)
-            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 
@@ -866,29 +879,22 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command with counter.
+            // Modem receives the hostmode C command, then (as the real Dragon
+            // firmware does) reverts to terminal mode and reports link state as
+            // plain ASCII lines.
             let c_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
             assert_eq!(c_frame.channel, PACTOR_CHANNEL);
             assert_eq!(c_frame.code, TYPE_COMMAND);
             assert_eq!(c_frame.payload, b"C NODE");
 
-            // ACK the C command
-            let c_ack =
-                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
-            modem_side.write_all(&c_ack).await.unwrap();
-
-            // connect_peer sends L poll — counter toggled after C ACK.
-            let l_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(l_frame.code, TYPE_COMMAND_COUNTER);
-            assert!(l_frame.payload.starts_with(b"L"));
-
-            // Respond with link_state=4 (connected)
-            let l_resp = encode_frame(&HostmodeFrame::command(
-                PACTOR_CHANNEL,
-                b"0 0 0 0 0 4".to_vec(),
-            ))
-            .unwrap();
-            modem_side.write_all(&l_resp).await.unwrap();
+            modem_side
+                .write_all(b"\r\n*** NOW CALLING NODE\r\n")
+                .await
+                .unwrap();
+            modem_side
+                .write_all(b"\r\n*** CONNECTED TO NODE\r\n")
+                .await
+                .unwrap();
         });
 
         transport.connect_peer("NODE").await.unwrap();
@@ -896,7 +902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usb_transport_connect_peer_reports_busy_status() {
+    async fn usb_transport_connect_peer_reports_link_failure() {
         let (transport_side, mut modem_side) = duplex(4096);
         let mut config = test_config();
         config.command_timeout = Duration::from_secs(10);
@@ -906,48 +912,27 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command with counter.
             let c_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(c_frame.channel, PACTOR_CHANNEL);
-            assert_eq!(c_frame.code, TYPE_COMMAND);
             assert_eq!(c_frame.payload, b"C NODE");
 
-            // ACK the C command
-            let c_ack =
-                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
-            modem_side.write_all(&c_ack).await.unwrap();
-
-            // connect_peer sends L poll — counter toggled after C ACK.
-            let l_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(l_frame.code, TYPE_COMMAND_COUNTER);
-            assert!(l_frame.payload.starts_with(b"L"));
-
-            // Respond with status_pending=1
-            let l_resp = encode_frame(&HostmodeFrame::command(
-                PACTOR_CHANNEL,
-                b"1 0 0 0 0 0".to_vec(),
-            ))
-            .unwrap();
-            modem_side.write_all(&l_resp).await.unwrap();
-
-            // connect_peer sends G poll to read status
-            let g_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(g_frame.code, TYPE_COMMAND);
-            assert!(g_frame.payload.starts_with(b"G"));
-
-            // Respond with BUSY
-            let busy =
-                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"BUSY".to_vec())).unwrap();
-            modem_side.write_all(&busy).await.unwrap();
+            // Call starts, then fails (disconnect after NOW CALLING).
+            modem_side
+                .write_all(b"\r\n*** NOW CALLING NODE\r\n")
+                .await
+                .unwrap();
+            modem_side
+                .write_all(b"\r\n*** DISCONNECTED AT - 00:00:00\r\n")
+                .await
+                .unwrap();
         });
 
         let err = transport.connect_peer("NODE").await.unwrap_err();
-        assert!(matches!(err, ScsPactorError::Busy));
+        assert!(matches!(err, ScsPactorError::Io(_)));
         modem.await.unwrap();
     }
 
     #[tokio::test]
-    async fn usb_transport_connect_peer_waits_through_queued_status() {
+    async fn usb_transport_connect_peer_ignores_stale_disconnect() {
         let (transport_side, mut modem_side) = duplex(4096);
         let mut config = test_config();
         config.command_timeout = Duration::from_secs(10);
@@ -957,38 +942,23 @@ mod tests {
             let mut decoder = HostmodeDecoder::new();
             let mut buf = [0u8; 1024];
 
-            // Modem receives C command with counter.
             let c_frame = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(c_frame.channel, PACTOR_CHANNEL);
-            assert_eq!(c_frame.code, TYPE_COMMAND);
             assert_eq!(c_frame.payload, b"C NODE");
 
-            // ACK the C command
-            let c_ack =
-                encode_frame(&HostmodeFrame::command(PACTOR_CHANNEL, b"OK".to_vec())).unwrap();
-            modem_side.write_all(&c_ack).await.unwrap();
-
-            // First L poll — counter toggled after C ACK.
-            let l1 = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(l1.code, TYPE_COMMAND_COUNTER);
-            assert!(l1.payload.starts_with(b"L"));
-            let l1_resp = encode_frame(&HostmodeFrame::command(
-                PACTOR_CHANNEL,
-                b"0 0 0 0 0 1".to_vec(),
-            ))
-            .unwrap();
-            modem_side.write_all(&l1_resp).await.unwrap();
-
-            // Second L poll — counter toggled after first L ACK.
-            let l2 = read_next_frame(&mut modem_side, &mut decoder, &mut buf).await;
-            assert_eq!(l2.code, TYPE_COMMAND);
-            assert!(l2.payload.starts_with(b"L"));
-            let l2_resp = encode_frame(&HostmodeFrame::command(
-                PACTOR_CHANNEL,
-                b"0 0 0 0 0 4".to_vec(),
-            ))
-            .unwrap();
-            modem_side.write_all(&l2_resp).await.unwrap();
+            // Stale disconnect from a prior session arrives first — must be
+            // ignored — then the real call proceeds to CONNECTED.
+            modem_side
+                .write_all(b"\r\n*** DISCONNECTED AT - 00:00:00\r\n")
+                .await
+                .unwrap();
+            modem_side
+                .write_all(b"\r\n*** NOW CALLING NODE\r\n")
+                .await
+                .unwrap();
+            modem_side
+                .write_all(b"\r\n*** CONNECTED TO NODE\r\n")
+                .await
+                .unwrap();
         });
 
         transport.connect_peer("NODE").await.unwrap();
