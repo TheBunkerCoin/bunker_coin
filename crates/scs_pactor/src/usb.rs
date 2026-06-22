@@ -688,19 +688,32 @@ impl PactorTransport for UsbPactorTransport {
         let frame = HostmodeFrame::command(PACTOR_CHANNEL, payload);
         self.send_command_best_effort_ack(frame, Duration::from_secs(2))
             .await?;
+
+        // After the framed C command, the firmware switches to terminal mode but
+        // does not emit its status banner until it receives a terminal newline.
+        // Send a bare CR to flush the "*** NOW CALLING ..." / "*** CONNECTED ..."
+        // lines (without it the modem stays silent on the serial port). Nudge
+        // writes are best-effort — a failure here must not abort a link that may
+        // already be coming up via the event stream.
+        let _ = self.write_raw(b"\r").await;
         eprintln!("[connect] C {remote_call} sent; waiting for link status ...");
 
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
         let mut rx = self.event_rx.lock().await;
 
+        // Period between CR nudges. The firmware only emits its status banner in
+        // response to a terminal newline, so we poke it periodically until the
+        // link resolves rather than blocking on a single recv.
+        let nudge_interval = Duration::from_secs(2);
+
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if Instant::now() >= deadline {
                 return Err(ScsPactorError::Timeout);
             }
+            let wait = nudge_interval.min(deadline.saturating_duration_since(Instant::now()));
 
-            match timeout(remaining, rx.recv()).await {
+            match timeout(wait, rx.recv()).await {
                 Ok(Some(event)) => match event {
                     PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
                         eprintln!("[connect] link established (CONNECTED TO {remote_call})");
@@ -729,7 +742,10 @@ impl PactorTransport for UsbPactorTransport {
                     _ => {}
                 },
                 Ok(None) => return Err(ScsPactorError::Disconnected),
-                Err(_) => return Err(ScsPactorError::Timeout),
+                Err(_) => {
+                    // No event this interval — nudge the modem to re-emit status.
+                    let _ = self.write_raw(b"\r").await;
+                }
             }
         }
     }
