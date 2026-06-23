@@ -380,7 +380,14 @@ async fn init_hostmode(
     // typically exits hostmode on any non-framed input after a timeout.
     // We avoid sending CRC-framed JHOST0 because that would consume a
     // packet-counter slot and desynchronize the transport later.
-    println!("  step 1: exit any existing hostmode ...");
+    println!("  step 1: exit any existing hostmode / converse ...");
+    // If a prior data session left the modem in CONVerse mode, terminal commands
+    // (including JHOST0) are ignored until ESC (0x1B) returns it to command mode.
+    // Send ESC first so init reliably recovers a converse-stuck modem.
+    serial.write_all(&[0x1b]).await?;
+    serial.flush().await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain_serial(&mut serial).await;
     serial.write_all(b"JHOST0\r").await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -394,7 +401,15 @@ async fn init_hostmode(
     // the answering modem would stop accepting calls. A disconnect drops any
     // stuck link while preserving config (which step 2 re-applies anyway).
     if reset {
-        println!("  step 1b: clearing stale link state (disconnect) ...");
+        println!("  step 1b: clearing stale link state (ESC + disconnect) ...");
+        // If the modem was left in CONVerse mode by a prior data session, plain
+        // terminal commands are ignored — ESC (0x1B) returns it to command mode
+        // first. Then DD force-disconnects any lingering link. Settings are
+        // preserved (re-applied in step 2 regardless).
+        serial.write_all(&[0x1b]).await?;
+        serial.flush().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drain_serial(&mut serial).await;
         send_ascii(&mut serial, "DD").await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         drain_serial(&mut serial).await;

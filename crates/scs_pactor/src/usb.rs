@@ -843,7 +843,14 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn disconnect(&self) -> Result<(), ScsPactorError> {
-        self.send_host_command(b'D', &[]).await
+        // After a data session the modem is in terminal CONVerse mode, not
+        // hostmode — so a framed hostmode `D` would be garbage and leave the
+        // modem wedged in converse for the next session. Return to command mode
+        // with ESC (0x1B) first, then issue the terminal disconnect command.
+        self.write_raw(&[0x1b]).await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.write_raw(b"D\r").await?;
+        Ok(())
     }
 
     async fn next_event(
@@ -1074,18 +1081,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usb_transport_writes_disconnect_as_hostmode_command() {
+    async fn usb_transport_writes_disconnect_as_terminal_command() {
         let (transport_side, mut modem_side) = duplex(1024);
         let transport = UsbPactorTransport::from_stream(transport_side, test_config());
 
         transport.disconnect().await.unwrap();
 
+        // Disconnect leaves converse mode with ESC (0x1B), then issues "D\r" as
+        // a terminal command (the modem is in terminal mode after a session).
+        let mut acc = Vec::new();
         let mut buf = [0u8; 1024];
-        let n = modem_side.read(&mut buf).await.unwrap();
-        let frame = decode_frame(&buf[..n]).unwrap();
-        assert_eq!(frame.channel, PACTOR_CHANNEL);
-        assert_eq!(base_code(frame.code), TYPE_COMMAND);
-        assert_eq!(frame.payload, b"D");
+        // ESC and "D\r" may arrive in separate reads.
+        while !acc.windows(2).any(|w| w == b"D\r") {
+            let n = modem_side.read(&mut buf).await.unwrap();
+            acc.extend_from_slice(&buf[..n]);
+        }
+        assert!(acc.contains(&0x1b), "expected ESC before disconnect");
+        assert!(
+            acc.windows(2).any(|w| w == b"D\r"),
+            "expected terminal D command"
+        );
     }
 
     #[tokio::test]
