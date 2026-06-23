@@ -9,7 +9,7 @@ use tokio::time::{timeout, Instant};
 use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
 
 use crate::hostmode::{
-    encode_frame, HostmodeDecoder, HostmodeFrame, HostmodePacket, PACTOR_CHANNEL, TYPE_COMMAND,
+    encode_frame, HostmodeDecoder, HostmodeFrame, HostmodePacket, PACTOR_CHANNEL,
 };
 use crate::{PactorLinkEvent, PactorLinkStatus, PactorTransport, ScsPactorError};
 
@@ -51,16 +51,6 @@ fn decode_hex_line(hex: &str) -> Option<Vec<u8>> {
         i += 2;
     }
     Some(out)
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PactorChannelState {
-    status_messages_pending: u32,
-    frames_received_pending: u32,
-    frames_not_transmitted: u32,
-    frames_not_acknowledged: u32,
-    retries: u32,
-    link_state: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -188,12 +178,12 @@ impl UsbPactorTransport {
             let mut decoder = HostmodeDecoder::new();
             let mut term_line: Vec<u8> = Vec::new();
             let mut buf = [0u8; 1024];
-            eprintln!("[reader:{label}] task started");
+            debug!("[reader:{label}] task started");
 
             loop {
                 let n = match reader.read(&mut buf).await {
                     Ok(0) => {
-                        eprintln!("[reader] EOF on serial stream");
+                        debug!("[reader:{label}] EOF on serial stream");
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::Disconnected))
                             .await;
@@ -201,7 +191,7 @@ impl UsbPactorTransport {
                     }
                     Ok(n) => n,
                     Err(e) => {
-                        eprintln!("[reader] serial read error: {e}");
+                        warn!("[reader:{label}] serial read error: {e}");
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
                             .await;
@@ -209,7 +199,7 @@ impl UsbPactorTransport {
                     }
                 };
 
-                eprintln!("[reader:{label}] got {} bytes: {:02x?}", n, &buf[..n]);
+                trace!("[reader:{label}] got {} bytes: {:02x?}", n, &buf[..n]);
 
                 // This SCS Dragon firmware reverts to terminal mode when it
                 // processes a connect command, then reports link state as plain
@@ -229,13 +219,13 @@ impl UsbPactorTransport {
                                 // everything else is treated as status text.
                                 if let Some(hex) = line.strip_prefix(DATA_LINE_MARKER) {
                                     if let Some(bytes) = decode_hex_line(hex) {
-                                        eprintln!(
+                                        debug!(
                                             "[reader:{label}] data line -> {} bytes routed",
                                             bytes.len()
                                         );
                                         let _ = data_tx.send(bytes).await;
                                     } else {
-                                        eprintln!(
+                                        warn!(
                                             "[reader:{label}] bad data line (hex decode failed): {line:?}"
                                         );
                                     }
@@ -260,8 +250,8 @@ impl UsbPactorTransport {
                     match decoder.next_packet() {
                         Ok(Some(HostmodePacket::Frame(frame))) => {
                             let ascii = String::from_utf8_lossy(&frame.payload);
-                            eprintln!(
-                                "[reader] decoded frame ch={} code=0x{:02x} payload({})={:02x?} ascii={:?}",
+                            trace!(
+                                "[reader:{label}] decoded frame ch={} code=0x{:02x} payload({})={:02x?} ascii={:?}",
                                 frame.channel,
                                 frame.code,
                                 frame.payload.len(),
@@ -277,12 +267,12 @@ impl UsbPactorTransport {
                             }
                         }
                         Ok(Some(HostmodePacket::RepeatRequest)) => {
-                            eprintln!("[reader] decoded RepeatRequest");
+                            trace!("[reader:{label}] decoded RepeatRequest");
                             let _ = packet_tx.send(HostmodePacket::RepeatRequest).await;
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            eprintln!("[reader] decode error: {e}");
+                            debug!("[reader:{label}] decode error: {e}");
                             let _ = event_tx
                                 .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
                                 .await;
@@ -344,14 +334,14 @@ impl UsbPactorTransport {
     ) -> Result<Option<HostmodeFrame>, ScsPactorError> {
         let _lock = self.transaction_lock.lock().await;
         let encoded = self.encode_outbound_frame(frame.clone()).await?;
-        eprintln!(
+        trace!(
             "[tx] best_effort_ack: ch={} code=0x{:02x} payload={:02x?} encoded={:02x?}",
             frame.channel, frame.code, &frame.payload, &encoded
         );
         self.write_encoded_frame(&encoded).await?;
         match self.recv_hostmode_packet(ack_timeout).await {
             Ok(HostmodePacket::Frame(resp)) => {
-                eprintln!(
+                trace!(
                     "[tx] best_effort_ack response: ch={} code=0x{:02x} payload={:02x?}",
                     resp.channel, resp.code, &resp.payload
                 );
@@ -359,7 +349,7 @@ impl UsbPactorTransport {
                 Ok(Some(resp))
             }
             _ => {
-                eprintln!(
+                trace!(
                     "[tx] best_effort_ack: no ack within {ack_timeout:?}, counter held (frame not consumed)"
                 );
                 Ok(None)
@@ -369,9 +359,9 @@ impl UsbPactorTransport {
 
     /// Write raw bytes directly to the serial port (no hostmode framing).
     ///
-    /// Diagnostic helper: lets a caller poke the modem with terminal-mode bytes
-    /// (e.g. a bare `\r`) to discover whether it has fallen out of hostmode.
-    /// Any reply is surfaced by the background reader's `[reader] got` log.
+    /// Used for terminal-mode interaction (connect, converse data, disconnect)
+    /// where the modem is not in hostmode and expects plain ASCII rather than
+    /// CRC-framed packets. Any reply is surfaced by the background reader.
     pub async fn write_raw(&self, bytes: &[u8]) -> Result<(), ScsPactorError> {
         self.write_encoded_frame(bytes).await
     }
@@ -403,7 +393,7 @@ impl UsbPactorTransport {
     ) -> Result<HostmodeFrame, ScsPactorError> {
         let _transaction = self.transaction_lock.lock().await;
         let encoded = self.encode_outbound_frame(frame.clone()).await?;
-        eprintln!(
+        trace!(
             "[tx] hostmode_transaction: ch={} code=0x{:02x} payload={:02x?} encoded={:02x?}",
             frame.channel, frame.code, &frame.payload, &encoded
         );
@@ -415,7 +405,7 @@ impl UsbPactorTransport {
                 HostmodePacket::Frame(response) => {
                     // Successful ACK — advance the packet counter
                     self.packet_counter.lock().await.advance();
-                    eprintln!(
+                    trace!(
                         "[tx] hostmode_transaction response: ch={} code=0x{:02x} payload={:02x?}",
                         response.channel, response.code, &response.payload
                     );
@@ -423,7 +413,7 @@ impl UsbPactorTransport {
                 }
                 HostmodePacket::RepeatRequest => {
                     retries += 1;
-                    eprintln!("[tx] repeat request (retry {retries}/{MAX_HOSTMODE_RETRIES})");
+                    debug!("[tx] repeat request (retry {retries}/{MAX_HOSTMODE_RETRIES})");
                     if retries > MAX_HOSTMODE_RETRIES {
                         return Err(ScsPactorError::Protocol(
                             "hostmode repeat request limit exceeded".to_owned(),
@@ -479,25 +469,6 @@ impl UsbPactorTransport {
             )));
         }
         Ok(response.payload)
-    }
-
-    async fn poll_pactor_channel_state(&self) -> Result<PactorChannelState, ScsPactorError> {
-        let response = self
-            .hostmode_transaction(HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec()))
-            .await?;
-        if response.channel != PACTOR_CHANNEL {
-            return Err(ScsPactorError::Protocol(format!(
-                "expected channel {PACTOR_CHANNEL} L response, got {}",
-                response.channel
-            )));
-        }
-        parse_pactor_channel_state(&response.payload)
-    }
-
-    /// Send a data frame on the given channel.
-    async fn send_data_frame(&self, channel: u8, payload: &[u8]) -> Result<(), ScsPactorError> {
-        self.send_hostmode_frame(HostmodeFrame::new(channel, payload.to_vec()))
-            .await
     }
 
     /// Send a command on the PACTOR channel.
@@ -587,31 +558,6 @@ impl UsbPactorTransport {
         }
         Err(ScsPactorError::Protocol(line.to_owned()))
     }
-}
-
-fn parse_pactor_channel_state(payload: &[u8]) -> Result<PactorChannelState, ScsPactorError> {
-    let line = String::from_utf8_lossy(payload);
-    let fields = line
-        .trim_matches(char::from(0))
-        .split_whitespace()
-        .map(str::parse::<u32>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| ScsPactorError::Protocol(format!("invalid L response {line:?}: {e}")))?;
-
-    if fields.len() < 6 {
-        return Err(ScsPactorError::Protocol(format!(
-            "short L response {line:?}"
-        )));
-    }
-
-    Ok(PactorChannelState {
-        status_messages_pending: fields[0],
-        frames_received_pending: fields[1],
-        frames_not_transmitted: fields[2],
-        frames_not_acknowledged: fields[3],
-        retries: fields[4],
-        link_state: fields[5],
-    })
 }
 
 impl Drop for UsbPactorTransport {
@@ -759,7 +705,7 @@ impl PactorTransport for UsbPactorTransport {
 
         let cmd = format!("C {remote_call}\r");
         self.write_raw(cmd.as_bytes()).await?;
-        eprintln!("[connect] C {remote_call} sent (terminal); waiting for link status ...");
+        debug!("[connect] C {remote_call} sent (terminal); waiting for link status ...");
 
         let deadline = Instant::now() + self.command_timeout;
         let mut saw_link_setup = false;
@@ -779,17 +725,17 @@ impl PactorTransport for UsbPactorTransport {
             match timeout(wait, rx.recv()).await {
                 Ok(Some(event)) => match event {
                     PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
-                        eprintln!("[connect] link established (CONNECTED TO {remote_call})");
+                        debug!("[connect] link established (CONNECTED TO {remote_call})");
                         // The connected modem sits at the command prompt, where
                         // typed text is parsed as commands, not transmitted. Enter
                         // CONVerse mode so subsequent write_data bytes are actually
                         // sent over the link to the peer.
                         let _ = self.write_raw(b"CONV\r").await;
-                        eprintln!("[connect] entered converse mode (CONV)");
+                        debug!("[connect] entered converse mode (CONV)");
                         return Ok(());
                     }
                     PactorLinkEvent::Status(PactorLinkStatus::Connecting { remote_call }) => {
-                        eprintln!("[connect] calling {remote_call} ...");
+                        debug!("[connect] calling {remote_call} ...");
                         saw_link_setup = true;
                     }
                     PactorLinkEvent::Status(PactorLinkStatus::Busy) => {
@@ -806,7 +752,7 @@ impl PactorTransport for UsbPactorTransport {
                                 "PACTOR link setup failed",
                             )));
                         }
-                        eprintln!("[connect] ignoring pre-call status (stale)");
+                        debug!("[connect] ignoring pre-call status (stale)");
                     }
                     _ => {}
                 },
@@ -825,14 +771,16 @@ impl PactorTransport for UsbPactorTransport {
         // ("#<hex>\r") so it stays printable on the text-oriented PACTOR link and
         // is delimited for the receiver (see DATA_LINE_MARKER / the reader).
         let line = format!("{DATA_LINE_MARKER}{}\r", encode_hex(data));
-        eprintln!("[data] write_data: {} bytes -> {:?}", data.len(), &line);
+        trace!("[data] write_data: {} bytes -> {:?}", data.len(), &line);
         let r = self.write_raw(line.as_bytes()).await;
-        eprintln!("[data] write_data result: {r:?}");
+        if let Err(e) = &r {
+            debug!("[data] write_data error: {e}");
+        }
         r
     }
 
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, ScsPactorError> {
-        eprintln!(
+        trace!(
             "[data] read_data: waiting (timeout={:?}) ...",
             self.read_timeout
         );
@@ -842,18 +790,18 @@ impl PactorTransport for UsbPactorTransport {
             match timeout(d, read).await {
                 Ok(Some(d)) => d,
                 Ok(None) => {
-                    eprintln!("[data] read_data: channel closed");
+                    debug!("[data] read_data: channel closed");
                     return Err(ScsPactorError::Disconnected);
                 }
                 Err(_) => {
-                    eprintln!("[data] read_data: timed out after {d:?}");
+                    debug!("[data] read_data: timed out after {d:?}");
                     return Err(ScsPactorError::Timeout);
                 }
             }
         } else {
             read.await.ok_or(ScsPactorError::Disconnected)?
         };
-        eprintln!("[data] read_data: got {} bytes", data.len());
+        trace!("[data] read_data: got {} bytes", data.len());
         data.truncate(max_len);
         Ok(data)
     }
@@ -910,19 +858,6 @@ mod tests {
         }
     }
 
-    async fn read_next_frame<R: AsyncRead + Unpin>(
-        reader: &mut R,
-        decoder: &mut HostmodeDecoder,
-        buf: &mut [u8],
-    ) -> HostmodeFrame {
-        loop {
-            if let Some(frame) = decoder.next_frame().unwrap() {
-                return frame;
-            }
-            let n = reader.read(buf).await.unwrap();
-            decoder.push(&buf[..n]);
-        }
-    }
 
     /// Drain the terminal-mode connect bytes connect_peer writes and assert the
     /// "C NODE" command appears (it sends "JHOST0\r" then "C NODE\r").
