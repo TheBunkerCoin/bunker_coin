@@ -633,6 +633,12 @@ async fn main() -> anyhow::Result<()> {
     let link_elapsed = link_start.elapsed();
     println!("Link established in {link_elapsed:.2?}");
 
+    // Let both ends settle into the connected/converse state before pushing data.
+    // The answering modem needs a moment after CONNECTED before it will reliably
+    // carry data over the ARQ link.
+    println!("Settling link before data exchange ...");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     let transport_a: Arc<dyn PactorTransport> = Arc::new(modem_a);
     let transport_b: Arc<dyn PactorTransport> = Arc::new(modem_b);
     let node_a = PactorRadioNode::from_shared(&args.call_a, Arc::clone(&transport_a));
