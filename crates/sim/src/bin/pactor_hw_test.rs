@@ -386,14 +386,17 @@ async fn init_hostmode(
     tokio::time::sleep(Duration::from_millis(1000)).await;
     drain_serial(&mut serial).await;
 
-    // === Step 1b: Optional firmware reset to clear stale link/call state ===
-    // A modem left in a degraded state after a prior session (e.g. lingering
+    // === Step 1b: Optional clear of stale link/call state ===
+    // A modem left in a degraded state after a prior session (e.g. a lingering
     // connect/standby state that makes new calls abort to STBY) is cleared by a
-    // RESTART. The modem reboots and prints its banner; wait for it to settle.
+    // force-disconnect. We deliberately do NOT use RESTART here: on this firmware
+    // RESTART reboots toward defaults and wipes settings like LISTEN/MYcall, so
+    // the answering modem would stop accepting calls. A disconnect drops any
+    // stuck link while preserving config (which step 2 re-applies anyway).
     if reset {
-        println!("  step 1b: resetting modem (RESTART) ...");
-        send_ascii(&mut serial, "RESTART").await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        println!("  step 1b: clearing stale link state (disconnect) ...");
+        send_ascii(&mut serial, "DD").await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         drain_serial(&mut serial).await;
     }
 
