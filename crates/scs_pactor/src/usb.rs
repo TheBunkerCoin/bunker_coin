@@ -764,6 +764,12 @@ impl PactorTransport for UsbPactorTransport {
                 Ok(Some(event)) => match event {
                     PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
                         eprintln!("[connect] link established (CONNECTED TO {remote_call})");
+                        // The connected modem sits at the command prompt, where
+                        // typed text is parsed as commands, not transmitted. Enter
+                        // CONVerse mode so subsequent write_data bytes are actually
+                        // sent over the link to the peer.
+                        let _ = self.write_raw(b"CONV\r").await;
+                        eprintln!("[connect] entered converse mode (CONV)");
                         return Ok(());
                     }
                     PactorLinkEvent::Status(PactorLinkStatus::Connecting { remote_call }) => {

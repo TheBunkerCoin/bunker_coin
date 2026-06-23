@@ -644,20 +644,24 @@ async fn main() -> anyhow::Result<()> {
         NetworkMessage::Pong,
     ];
 
-    println!("Sending {} messages from A -> B ...", messages.len());
+    // Interleave send -> receive per message. Over a marginal HF ARQ link,
+    // bursting all messages then reading risks the link exhausting its retry
+    // budget (MAXErr -> STBY) before everything transfers; sending one small
+    // payload and confirming it arrived before the next keeps the working set
+    // small and makes partial progress visible.
+    println!("Exchanging {} messages A -> B (interleaved) ...", messages.len());
     let send_start = Instant::now();
-    for msg in &messages {
+    let recv_start = send_start;
+    let mut received = Vec::new();
+    for (i, msg) in messages.iter().enumerate() {
+        println!("  -> sending message {}/{} ...", i + 1, messages.len());
         node_a.send(msg, &args.call_b).await?;
+        println!("  <- waiting for message {}/{} on B ...", i + 1, messages.len());
+        let got = node_b.receive().await?;
+        println!("  ok: received message {}/{}", i + 1, messages.len());
+        received.push(got);
     }
     let send_elapsed = send_start.elapsed();
-
-    println!("Receiving on B ...");
-    let recv_start = Instant::now();
-    let mut received = Vec::new();
-    for _ in 0..messages.len() {
-        let msg = node_b.receive().await?;
-        received.push(msg);
-    }
     let recv_elapsed = recv_start.elapsed();
 
     println!();
