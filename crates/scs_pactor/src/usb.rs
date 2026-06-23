@@ -810,7 +810,10 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, ScsPactorError> {
-        eprintln!("[data] read_data: waiting (timeout={:?}) ...", self.read_timeout);
+        eprintln!(
+            "[data] read_data: waiting (timeout={:?}) ...",
+            self.read_timeout
+        );
         let mut rx = self.data_rx.lock().await;
         let read = rx.recv();
         let mut data = if let Some(d) = self.read_timeout {

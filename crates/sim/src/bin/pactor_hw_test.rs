@@ -70,6 +70,10 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     connect_attempts: u32,
 
+    /// Send RESTART to both modems during init to clear stale link/call state.
+    #[arg(long)]
+    reset: bool,
+
     /// Stop after sending C <CALL> and print raw L status polls.
     #[arg(long)]
     diagnose_connect: bool,
@@ -361,6 +365,7 @@ async fn init_hostmode(
     trx_baud: Option<u32>,
     trx_addr: Option<&str>,
     listen: bool,
+    reset: bool,
 ) -> anyhow::Result<UsbPactorTransport> {
     let mut serial = open_serial(port, baud)?;
 
@@ -380,6 +385,17 @@ async fn init_hostmode(
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(1000)).await;
     drain_serial(&mut serial).await;
+
+    // === Step 1b: Optional firmware reset to clear stale link/call state ===
+    // A modem left in a degraded state after a prior session (e.g. lingering
+    // connect/standby state that makes new calls abort to STBY) is cleared by a
+    // RESTART. The modem reboots and prints its banner; wait for it to settle.
+    if reset {
+        println!("  step 1b: resetting modem (RESTART) ...");
+        send_ascii(&mut serial, "RESTART").await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        drain_serial(&mut serial).await;
+    }
 
     // === Step 2: Terminal-mode ASCII init ===
     // ptc-go sends an empty command first, then "Quit"
@@ -520,6 +536,7 @@ async fn main() -> anyhow::Result<()> {
         trx_baud_a,
         trx_addr_a,
         false,
+        args.reset,
     )
     .await?;
 
@@ -536,6 +553,7 @@ async fn main() -> anyhow::Result<()> {
         trx_baud_b,
         trx_addr_b,
         true,
+        args.reset,
     )
     .await?;
 
@@ -593,7 +611,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(e) = last_err {
         let elapsed = link_start.elapsed();
-        eprintln!("connect failed after {elapsed:.1?} ({} attempts): {e}", args.connect_attempts);
+        eprintln!(
+            "connect failed after {elapsed:.1?} ({} attempts): {e}",
+            args.connect_attempts
+        );
         eprintln!();
         eprintln!("This usually means the two modems cannot hear each other.");
         eprintln!("Check that:");
