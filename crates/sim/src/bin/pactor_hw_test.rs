@@ -74,6 +74,12 @@ struct Args {
     #[arg(long)]
     reset: bool,
 
+    /// Consensus smoke test: after connect, send one Alpenglow ConsensusMessage
+    /// A -> B over PactorNetwork (the bunkerglow Network impl) and verify it.
+    /// First increment toward running the consensus simulation over the modems.
+    #[arg(long)]
+    consensus_smoke: bool,
+
     /// Stop after sending C <CALL> and print raw L status polls.
     #[arg(long)]
     diagnose_connect: bool,
@@ -538,6 +544,68 @@ async fn init_hostmode(
     ))
 }
 
+/// First increment of running the consensus simulation over the modems: send a
+/// single Alpenglow `ConsensusMessage` from A to B via `PactorNetwork` (the
+/// `bunkerglow::network::Network` impl the simulation is generic over) and verify
+/// it deserializes correctly on the other side.
+async fn consensus_smoke_test(
+    transport_a: Arc<dyn PactorTransport>,
+    transport_b: Arc<dyn PactorTransport>,
+) -> anyhow::Result<()> {
+    use bunker_coin_radio::PactorNetwork;
+    use bunkerglow::consensus::{ConsensusMessage, Vote};
+    use bunkerglow::crypto::aggsig::SecretKey;
+    use bunkerglow::network::Network as BgNetwork;
+    use bunkerglow::Slot;
+
+    println!("=== Consensus smoke test (one ConsensusMessage A -> B over PACTOR) ===");
+
+    // A is the sender, B the receiver. PactorNetwork is point-to-point, so the
+    // SocketAddr is ignored; pass a dummy one to satisfy the trait. Keep Arc
+    // clones of the transports so we can cleanly disconnect afterwards.
+    let net_a: PactorNetwork<ConsensusMessage, ConsensusMessage> =
+        PactorNetwork::new(Arc::clone(&transport_a));
+    let net_b: PactorNetwork<ConsensusMessage, ConsensusMessage> =
+        PactorNetwork::new(Arc::clone(&transport_b));
+    let dummy_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    // Build a real, signed Skip vote — no block/slice machinery required.
+    let sk = SecretKey::new(&mut rand::rng());
+    let vote = Vote::new_skip(Slot::new(1), &sk, 0);
+    let msg = ConsensusMessage::Vote(vote);
+    println!("A -> sending ConsensusMessage: {msg:?}");
+
+    net_a
+        .send(&msg, dummy_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
+    println!("A -> sent; waiting for B to receive ...");
+
+    let received: ConsensusMessage = net_b
+        .receive()
+        .await
+        .map_err(|e| anyhow::anyhow!("receive failed: {e}"))?;
+    println!("B <- received ConsensusMessage: {received:?}");
+
+    // Both are Vote variants carrying the same signed Skip vote.
+    match (&msg, &received) {
+        (ConsensusMessage::Vote(sent), ConsensusMessage::Vote(got)) if sent == got => {
+            println!("Consensus message round-tripped correctly over PACTOR!");
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "received message did not match sent message"
+            ));
+        }
+    }
+
+    println!("Disconnecting ...");
+    let _ = transport_a.disconnect().await;
+    let _ = transport_b.disconnect().await;
+    println!("Done.");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -656,6 +724,11 @@ async fn main() -> anyhow::Result<()> {
 
     let transport_a: Arc<dyn PactorTransport> = Arc::new(modem_a);
     let transport_b: Arc<dyn PactorTransport> = Arc::new(modem_b);
+
+    if args.consensus_smoke {
+        return consensus_smoke_test(transport_a, transport_b).await;
+    }
+
     let node_a = PactorRadioNode::from_shared(&args.call_a, Arc::clone(&transport_a));
     let node_b = PactorRadioNode::from_shared(&args.call_b, Arc::clone(&transport_b));
 
