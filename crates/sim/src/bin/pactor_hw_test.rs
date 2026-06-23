@@ -65,6 +65,11 @@ struct Args {
     #[arg(long, default_value_t = 90)]
     connect_timeout_secs: u64,
 
+    /// Number of connect attempts before giving up (HF calls intermittently
+    /// abort to standby; a retry usually succeeds).
+    #[arg(long, default_value_t = 3)]
+    connect_attempts: u32,
+
     /// Stop after sending C <CALL> and print raw L status polls.
     #[arg(long)]
     diagnose_connect: bool,
@@ -564,20 +569,39 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("  Tip: use --diagnose-connect to watch L poll status during connect");
     let link_start = Instant::now();
-    match modem_a.connect_peer(&args.call_b).await {
-        Ok(()) => {}
-        Err(e) => {
-            let elapsed = link_start.elapsed();
-            eprintln!("connect_peer failed after {elapsed:.1?}: {e}");
-            eprintln!();
-            eprintln!("This usually means the two modems cannot hear each other.");
-            eprintln!("Check that:");
-            eprintln!("  - Both radios responded to TRX Frequency (look for cmd echo above)");
-            eprintln!("  - Antennas are connected and band conditions allow the link");
-            eprintln!();
-            eprintln!("To diagnose, re-run with: --diagnose-connect");
-            return Err(e.into());
+    let mut last_err = None;
+    for attempt in 1..=args.connect_attempts {
+        println!(
+            "Connect attempt {attempt}/{} to {} ...",
+            args.connect_attempts, args.call_b
+        );
+        match modem_a.connect_peer(&args.call_b).await {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                eprintln!("  attempt {attempt} failed: {e}");
+                last_err = Some(e);
+                if attempt < args.connect_attempts {
+                    // Brief pause before retrying so the modem returns to a
+                    // clean standby state before the next call.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
         }
+    }
+    if let Some(e) = last_err {
+        let elapsed = link_start.elapsed();
+        eprintln!("connect failed after {elapsed:.1?} ({} attempts): {e}", args.connect_attempts);
+        eprintln!();
+        eprintln!("This usually means the two modems cannot hear each other.");
+        eprintln!("Check that:");
+        eprintln!("  - Both radios responded to TRX Frequency (look for cmd echo above)");
+        eprintln!("  - Antennas are connected and band conditions allow the link");
+        eprintln!();
+        eprintln!("To diagnose, re-run with: --diagnose-connect");
+        return Err(e.into());
     }
     let link_elapsed = link_start.elapsed();
     println!("Link established in {link_elapsed:.2?}");
