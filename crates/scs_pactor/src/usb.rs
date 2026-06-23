@@ -176,11 +176,19 @@ impl UsbPactorTransport {
         let (event_tx, event_rx) = mpsc::channel(1024);
         let (packet_tx, packet_rx) = mpsc::channel(1024);
 
+        // Short port label so the two modems' reader logs are distinguishable.
+        let label = config
+            .port
+            .rsplit('/')
+            .next()
+            .unwrap_or(&config.port)
+            .to_string();
+
         let read_task = tokio::spawn(async move {
             let mut decoder = HostmodeDecoder::new();
             let mut term_line: Vec<u8> = Vec::new();
             let mut buf = [0u8; 1024];
-            eprintln!("[reader] task started");
+            eprintln!("[reader:{label}] task started");
 
             loop {
                 let n = match reader.read(&mut buf).await {
@@ -201,7 +209,7 @@ impl UsbPactorTransport {
                     }
                 };
 
-                eprintln!("[reader] got {} bytes: {:02x?}", n, &buf[..n]);
+                eprintln!("[reader:{label}] got {} bytes: {:02x?}", n, &buf[..n]);
 
                 // This SCS Dragon firmware reverts to terminal mode when it
                 // processes a connect command, then reports link state as plain
@@ -221,7 +229,15 @@ impl UsbPactorTransport {
                                 // everything else is treated as status text.
                                 if let Some(hex) = line.strip_prefix(DATA_LINE_MARKER) {
                                     if let Some(bytes) = decode_hex_line(hex) {
+                                        eprintln!(
+                                            "[reader:{label}] data line -> {} bytes routed",
+                                            bytes.len()
+                                        );
                                         let _ = data_tx.send(bytes).await;
+                                    } else {
+                                        eprintln!(
+                                            "[reader:{label}] bad data line (hex decode failed): {line:?}"
+                                        );
                                     }
                                 } else {
                                     route_terminal_line(&line, &command_tx, &event_tx).await;
