@@ -803,20 +803,32 @@ impl PactorTransport for UsbPactorTransport {
         // ("#<hex>\r") so it stays printable on the text-oriented PACTOR link and
         // is delimited for the receiver (see DATA_LINE_MARKER / the reader).
         let line = format!("{DATA_LINE_MARKER}{}\r", encode_hex(data));
-        self.write_raw(line.as_bytes()).await
+        eprintln!("[data] write_data: {} bytes -> {:?}", data.len(), &line);
+        let r = self.write_raw(line.as_bytes()).await;
+        eprintln!("[data] write_data result: {r:?}");
+        r
     }
 
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, ScsPactorError> {
+        eprintln!("[data] read_data: waiting (timeout={:?}) ...", self.read_timeout);
         let mut rx = self.data_rx.lock().await;
         let read = rx.recv();
         let mut data = if let Some(d) = self.read_timeout {
-            timeout(d, read)
-                .await
-                .map_err(|_| ScsPactorError::Timeout)?
-                .ok_or(ScsPactorError::Disconnected)?
+            match timeout(d, read).await {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    eprintln!("[data] read_data: channel closed");
+                    return Err(ScsPactorError::Disconnected);
+                }
+                Err(_) => {
+                    eprintln!("[data] read_data: timed out after {d:?}");
+                    return Err(ScsPactorError::Timeout);
+                }
+            }
         } else {
             read.await.ok_or(ScsPactorError::Disconnected)?
         };
+        eprintln!("[data] read_data: got {} bytes", data.len());
         data.truncate(max_len);
         Ok(data)
     }
