@@ -505,6 +505,9 @@ async fn init_hostmode(
     println!("  step 4: verifying hostmode via transport ...");
     let mut config = UsbPactorConfig::new(port);
     config.command_timeout = command_timeout;
+    // ARQ data transfer over a marginal HF link at 200 Bd can take far longer
+    // than the 10s default; give received data a generous window to arrive.
+    config.read_timeout = Some(Duration::from_secs(60));
     let transport = UsbPactorTransport::from_stream(serial, config);
 
     for attempt in 1..=5 {
