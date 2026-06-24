@@ -1,9 +1,10 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use log::{debug, trace, warn};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
@@ -85,6 +86,10 @@ pub struct UsbPactorTransport {
     /// the type byte on each successfully ACKed frame. The first frame after
     /// entering hostmode must set bit 6 (0x40) to reset the modem's counter.
     packet_counter: Mutex<PacketCounter>,
+    /// Signalled by the reader when the link drops (DISCONNECTED / STBY / link
+    /// failure), so a blocked `read_data` can fail fast instead of waiting the
+    /// full read timeout.
+    link_down: Arc<Notify>,
     read_task: JoinHandle<()>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
@@ -174,6 +179,9 @@ impl UsbPactorTransport {
             .unwrap_or(&config.port)
             .to_string();
 
+        let link_down = Arc::new(Notify::new());
+        let reader_link_down = Arc::clone(&link_down);
+
         let read_task = tokio::spawn(async move {
             let mut decoder = HostmodeDecoder::new();
             let mut term_line: Vec<u8> = Vec::new();
@@ -187,6 +195,7 @@ impl UsbPactorTransport {
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::Disconnected))
                             .await;
+                        reader_link_down.notify_waiters();
                         break;
                     }
                     Ok(n) => n,
@@ -195,6 +204,7 @@ impl UsbPactorTransport {
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
                             .await;
+                        reader_link_down.notify_waiters();
                         break;
                     }
                 };
@@ -230,7 +240,14 @@ impl UsbPactorTransport {
                                         );
                                     }
                                 } else {
-                                    route_terminal_line(&line, &command_tx, &event_tx).await;
+                                    let link_down =
+                                        route_terminal_line(&line, &command_tx, &event_tx).await;
+                                    if link_down {
+                                        // Wake any blocked read_data so it can
+                                        // fail fast instead of waiting the full
+                                        // timeout on a link that just dropped.
+                                        reader_link_down.notify_waiters();
+                                    }
                                 }
                             }
                             term_line.clear();
@@ -291,6 +308,7 @@ impl UsbPactorTransport {
             packet_rx: Mutex::new(packet_rx),
             transaction_lock: Mutex::new(()),
             packet_counter: Mutex::new(PacketCounter::new()),
+            link_down,
             read_task,
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
@@ -336,14 +354,19 @@ impl UsbPactorTransport {
         let encoded = self.encode_outbound_frame(frame.clone()).await?;
         trace!(
             "[tx] best_effort_ack: ch={} code=0x{:02x} payload={:02x?} encoded={:02x?}",
-            frame.channel, frame.code, &frame.payload, &encoded
+            frame.channel,
+            frame.code,
+            &frame.payload,
+            &encoded
         );
         self.write_encoded_frame(&encoded).await?;
         match self.recv_hostmode_packet(ack_timeout).await {
             Ok(HostmodePacket::Frame(resp)) => {
                 trace!(
                     "[tx] best_effort_ack response: ch={} code=0x{:02x} payload={:02x?}",
-                    resp.channel, resp.code, &resp.payload
+                    resp.channel,
+                    resp.code,
+                    &resp.payload
                 );
                 self.packet_counter.lock().await.advance();
                 Ok(Some(resp))
@@ -395,7 +418,10 @@ impl UsbPactorTransport {
         let encoded = self.encode_outbound_frame(frame.clone()).await?;
         trace!(
             "[tx] hostmode_transaction: ch={} code=0x{:02x} payload={:02x?} encoded={:02x?}",
-            frame.channel, frame.code, &frame.payload, &encoded
+            frame.channel,
+            frame.code,
+            &frame.payload,
+            &encoded
         );
         let mut retries = 0;
 
@@ -407,7 +433,9 @@ impl UsbPactorTransport {
                     self.packet_counter.lock().await.advance();
                     trace!(
                         "[tx] hostmode_transaction response: ch={} code=0x{:02x} payload={:02x?}",
-                        response.channel, response.code, &response.payload
+                        response.channel,
+                        response.code,
+                        &response.payload
                     );
                     return Ok(response);
                 }
@@ -629,13 +657,16 @@ async fn route_frame(
 /// Handles the SCS terminal phrasing: lines are prefixed with `*** ` and use
 /// `CONNECTED TO <call>` / `DISCONNECTED ...` / `NOW CALLING <call>` rather than
 /// the hostmode `CONNECTED <call>` form parsed by [`parse_status_line`].
+/// Returns `true` if the line indicates the link went down (DISCONNECTED / STBY
+/// / link failure), so the reader can wake any blocked `read_data`.
 async fn route_terminal_line(
     line: &str,
     command_tx: &mpsc::Sender<String>,
     event_tx: &mpsc::Sender<PactorLinkEvent>,
-) {
+) -> bool {
     // Strip the leading "*** " banner marker if present.
     let body = line.trim_start_matches('*').trim();
+    let mut link_down = false;
 
     if let Some(rest) = body.strip_prefix("CONNECTED TO ") {
         let _ = event_tx
@@ -653,6 +684,7 @@ async fn route_terminal_line(
         let _ = event_tx
             .send(PactorLinkEvent::Status(PactorLinkStatus::Disconnected))
             .await;
+        link_down = true;
     } else if body.starts_with("LINK FAILURE")
         || body.starts_with("CONNECT FAILED")
         || body.starts_with("NO CONNECT")
@@ -664,10 +696,12 @@ async fn route_terminal_line(
         let _ = event_tx
             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
             .await;
+        link_down = true;
     }
 
     // Always forward the raw line so callers polling read_status_line() see it.
     let _ = command_tx.send(body.to_owned()).await;
+    link_down
 }
 
 #[async_trait]
@@ -824,22 +858,42 @@ impl PactorTransport for UsbPactorTransport {
             self.read_timeout
         );
         let mut rx = self.data_rx.lock().await;
-        let read = rx.recv();
-        let mut data = if let Some(d) = self.read_timeout {
-            match timeout(d, read).await {
-                Ok(Some(d)) => d,
-                Ok(None) => {
-                    debug!("[data] read_data: channel closed");
-                    return Err(ScsPactorError::Disconnected);
-                }
+
+        // Wait for either a data frame, a link-down signal (fail fast instead of
+        // blocking the full timeout when the modem disconnects mid-transfer), or
+        // the read timeout.
+        let recv_with_down = async {
+            tokio::select! {
+                biased;
+                () = self.link_down.notified() => None,
+                msg = rx.recv() => Some(msg),
+            }
+        };
+
+        let recv_result = if let Some(d) = self.read_timeout {
+            match timeout(d, recv_with_down).await {
+                Ok(inner) => inner,
                 Err(_) => {
                     debug!("[data] read_data: timed out after {d:?}");
                     return Err(ScsPactorError::Timeout);
                 }
             }
         } else {
-            read.await.ok_or(ScsPactorError::Disconnected)?
+            recv_with_down.await
         };
+
+        let mut data = match recv_result {
+            Some(Some(data)) => data,
+            Some(None) => {
+                debug!("[data] read_data: channel closed");
+                return Err(ScsPactorError::Disconnected);
+            }
+            None => {
+                debug!("[data] read_data: link dropped during transfer");
+                return Err(ScsPactorError::Disconnected);
+            }
+        };
+
         trace!("[data] read_data: got {} bytes", data.len());
         data.truncate(max_len);
         Ok(data)
@@ -896,7 +950,6 @@ mod tests {
             command_timeout: Duration::from_millis(100),
         }
     }
-
 
     /// Drain the terminal-mode connect bytes connect_peer writes and assert the
     /// "C NODE" command appears (it sends "JHOST0\r" then "C NODE\r").

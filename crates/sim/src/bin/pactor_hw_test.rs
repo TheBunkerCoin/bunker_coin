@@ -748,7 +748,36 @@ async fn main() -> anyhow::Result<()> {
     let transport_b: Arc<dyn PactorTransport> = Arc::new(modem_b);
 
     if args.consensus_smoke {
-        return consensus_smoke_test(transport_a, transport_b).await;
+        // The link can drop mid-exchange on a marginal channel; retry the whole
+        // connect + exchange a few times before giving up.
+        for attempt in 1..=args.connect_attempts {
+            println!(
+                "--- consensus exchange attempt {attempt}/{} ---",
+                args.connect_attempts
+            );
+            // First attempt reuses the link established above; later attempts
+            // reconnect from scratch.
+            if attempt > 1 {
+                let _ = transport_a.disconnect().await;
+                let _ = transport_b.disconnect().await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if let Err(e) = transport_a.connect_peer(&args.call_b).await {
+                    eprintln!("  reconnect failed: {e}");
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            match consensus_smoke_test(Arc::clone(&transport_a), Arc::clone(&transport_b)).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!("  exchange attempt {attempt} failed: {e}");
+                    if attempt == args.connect_attempts {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        return Err(anyhow::anyhow!("consensus exchange failed after retries"));
     }
 
     let node_a = PactorRadioNode::from_shared(&args.call_a, Arc::clone(&transport_a));
@@ -765,14 +794,21 @@ async fn main() -> anyhow::Result<()> {
     // budget (MAXErr -> STBY) before everything transfers; sending one small
     // payload and confirming it arrived before the next keeps the working set
     // small and makes partial progress visible.
-    println!("Exchanging {} messages A -> B (interleaved) ...", messages.len());
+    println!(
+        "Exchanging {} messages A -> B (interleaved) ...",
+        messages.len()
+    );
     let send_start = Instant::now();
     let recv_start = send_start;
     let mut received = Vec::new();
     for (i, msg) in messages.iter().enumerate() {
         println!("  -> sending message {}/{} ...", i + 1, messages.len());
         node_a.send(msg, &args.call_b).await?;
-        println!("  <- waiting for message {}/{} on B ...", i + 1, messages.len());
+        println!(
+            "  <- waiting for message {}/{} on B ...",
+            i + 1,
+            messages.len()
+        );
         let got = node_b.receive().await?;
         println!("  ok: received message {}/{}", i + 1, messages.len());
         received.push(got);
