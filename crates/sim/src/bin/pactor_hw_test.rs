@@ -531,8 +531,10 @@ async fn init_hostmode(
     let mut config = UsbPactorConfig::new(port);
     config.command_timeout = command_timeout;
     // ARQ data transfer over a marginal HF link at 200 Bd can take far longer
-    // than the 10s default; give received data a generous window to arrive.
-    config.read_timeout = Some(Duration::from_secs(60));
+    // than the 10s default; give received data a generous window to arrive. The
+    // reverse (slave -> master) direction after a changeover is notably slower,
+    // so allow several minutes.
+    config.read_timeout = Some(Duration::from_secs(180));
     let transport = UsbPactorTransport::from_stream(serial, config);
 
     for attempt in 1..=5 {
@@ -619,8 +621,9 @@ async fn consensus_smoke_test(
         .send(&b_msg, dummy_addr)
         .await
         .map_err(|e| anyhow::anyhow!("B send failed: {e}"))?;
-    // B hands the turn back so A's data path (and a clean disconnect) resumes.
-    let _ = transport_b.changeover().await;
+    // Do NOT changeover B here: its data is still being transmitted over the
+    // (slow) reverse ARQ path. B's modem auto-changes-over to A once its TX
+    // buffer drains. Forcing it now would cut off B's own transmission.
     let a_got: ConsensusMessage = net_a
         .receive()
         .await
