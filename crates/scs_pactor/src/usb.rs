@@ -801,41 +801,18 @@ impl PactorTransport for UsbPactorTransport {
 
     async fn accept_incoming(
         &self,
-        timeout_after: Option<Duration>,
+        _timeout_after: Option<Duration>,
     ) -> Result<String, ScsPactorError> {
-        // The answering modem is in LISTEN mode and auto-answers an incoming
-        // call, reporting "*** CONNECTED TO <caller>" as terminal text (parsed
-        // into a Connected event by the reader). We wait for that, then enter
-        // CONVerse mode so this side can also transmit (enabling B -> A replies
-        // and full two-way data). Without CONV, the answerer can only receive.
-        let deadline = timeout_after.map(|d| Instant::now() + d);
-        let mut rx = self.event_rx.lock().await;
-        debug!("[accept] waiting for incoming connection ...");
-
-        loop {
-            let wait = match deadline {
-                Some(d) => {
-                    let remaining = d.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(ScsPactorError::Timeout);
-                    }
-                    remaining
-                }
-                None => Duration::from_secs(3600),
-            };
-
-            match timeout(wait, rx.recv()).await {
-                Ok(Some(PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }))) => {
-                    debug!("[accept] incoming connection (CONNECTED TO {remote_call})");
-                    let _ = self.write_raw(b"CONV\r").await;
-                    debug!("[accept] entered converse mode (CONV)");
-                    return Ok(remote_call);
-                }
-                Ok(Some(_)) => { /* ignore other status until connected */ }
-                Ok(None) => return Err(ScsPactorError::Disconnected),
-                Err(_) => return Err(ScsPactorError::Timeout),
-            }
-        }
+        // The answering modem is in LISTEN mode and auto-answers the incoming
+        // call at the RF level on its own — by the time the caller's connect has
+        // returned, this side is already connected. It just needs to enter
+        // CONVerse mode so it can also transmit (otherwise the answerer is
+        // receive-only). We do NOT wait for a CONNECTED event here: the modem
+        // emits it as terminal text and the timing is racy; entering converse
+        // unconditionally is simpler and reliable.
+        let _ = self.write_raw(b"CONV\r").await;
+        debug!("[accept] entered converse mode (CONV)");
+        Ok(String::new())
     }
 
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
