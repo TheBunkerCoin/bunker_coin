@@ -80,6 +80,12 @@ struct Args {
     #[arg(long)]
     consensus_smoke: bool,
 
+    /// In the consensus smoke test, also exercise the reverse B -> A direction
+    /// (requires the ARQ changeover). When false, only the proven one-way A -> B
+    /// exchange is performed (the morning-working path).
+    #[arg(long)]
+    bidirectional: bool,
+
     /// Stop after sending C <CALL> and print raw L status polls.
     #[arg(long)]
     diagnose_connect: bool,
@@ -557,6 +563,7 @@ async fn init_hostmode(
 async fn consensus_smoke_test(
     transport_a: Arc<dyn PactorTransport>,
     transport_b: Arc<dyn PactorTransport>,
+    bidirectional: bool,
 ) -> anyhow::Result<()> {
     use bunker_coin_radio::PactorNetwork;
     use bunkerglow::consensus::{ConsensusMessage, Vote};
@@ -596,6 +603,16 @@ async fn consensus_smoke_test(
             println!("  A -> B vote verified");
         }
         _ => return Err(anyhow::anyhow!("A -> B message mismatch")),
+    }
+
+    if !bidirectional {
+        // One-way A -> B only (the proven path). Skip the changeover/B->A leg.
+        println!("One-way consensus message delivered over PACTOR (A -> B)!");
+        println!("Disconnecting ...");
+        let _ = transport_a.disconnect().await;
+        let _ = transport_b.disconnect().await;
+        println!("Done.");
+        return Ok(());
     }
 
     // --- B -> A (exercises the ARQ changeover / reverse direction) ---
@@ -763,7 +780,7 @@ async fn main() -> anyhow::Result<()> {
     let transport_b: Arc<dyn PactorTransport> = Arc::new(modem_b);
 
     if args.consensus_smoke {
-        return consensus_smoke_test(transport_a, transport_b).await;
+        return consensus_smoke_test(transport_a, transport_b, args.bidirectional).await;
     }
 
     let node_a = PactorRadioNode::from_shared(&args.call_a, Arc::clone(&transport_a));
