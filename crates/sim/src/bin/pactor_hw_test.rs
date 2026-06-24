@@ -558,46 +558,68 @@ async fn consensus_smoke_test(
     use bunkerglow::network::Network as BgNetwork;
     use bunkerglow::Slot;
 
-    println!("=== Consensus smoke test (one ConsensusMessage A -> B over PACTOR) ===");
+    println!("=== Consensus smoke test (bidirectional ConsensusMessage over PACTOR) ===");
 
-    // A is the sender, B the receiver. PactorNetwork is point-to-point, so the
-    // SocketAddr is ignored; pass a dummy one to satisfy the trait. Keep Arc
-    // clones of the transports so we can cleanly disconnect afterwards.
+    // PactorNetwork is point-to-point, so the SocketAddr is ignored; pass a dummy
+    // one to satisfy the trait. Keep Arc clones so we can disconnect afterwards.
     let net_a: PactorNetwork<ConsensusMessage, ConsensusMessage> =
         PactorNetwork::new(Arc::clone(&transport_a));
     let net_b: PactorNetwork<ConsensusMessage, ConsensusMessage> =
         PactorNetwork::new(Arc::clone(&transport_b));
     let dummy_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    // Build a real, signed Skip vote — no block/slice machinery required.
-    let sk = SecretKey::new(&mut rand::rng());
-    let vote = Vote::new_skip(Slot::new(1), &sk, 0);
-    let msg = ConsensusMessage::Vote(vote);
-    println!("A -> sending ConsensusMessage: {msg:?}");
-
-    net_a
-        .send(&msg, dummy_addr)
+    // B answered the call at the RF level (LISTEN). Have B enter converse mode so
+    // it can transmit back to A (the answerer is otherwise receive-only). The
+    // CONNECTED event is already queued from B's reader, so this returns quickly.
+    println!("B: accepting incoming link (entering converse) ...");
+    let remote = transport_b
+        .accept_incoming(Some(Duration::from_secs(30)))
         .await
-        .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
-    println!("A -> sent; waiting for B to receive ...");
+        .map_err(|e| anyhow::anyhow!("B accept failed: {e}"))?;
+    println!("B: accepted link from {remote:?}");
 
-    let received: ConsensusMessage = net_b
+    let sk_a = SecretKey::new(&mut rand::rng());
+    let sk_b = SecretKey::new(&mut rand::rng());
+
+    // --- A -> B ---
+    let a_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(1), &sk_a, 0));
+    println!("A -> sending vote (slot 1) ...");
+    net_a
+        .send(&a_msg, dummy_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("A send failed: {e}"))?;
+    let b_got: ConsensusMessage = net_b
         .receive()
         .await
-        .map_err(|e| anyhow::anyhow!("receive failed: {e}"))?;
-    println!("B <- received ConsensusMessage: {received:?}");
-
-    // Both are Vote variants carrying the same signed Skip vote.
-    match (&msg, &received) {
-        (ConsensusMessage::Vote(sent), ConsensusMessage::Vote(got)) if sent == got => {
-            println!("Consensus message round-tripped correctly over PACTOR!");
+        .map_err(|e| anyhow::anyhow!("B receive failed: {e}"))?;
+    println!("B <- received: {b_got:?}");
+    match (&a_msg, &b_got) {
+        (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {
+            println!("  A -> B vote verified");
         }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "received message did not match sent message"
-            ));
-        }
+        _ => return Err(anyhow::anyhow!("A -> B message mismatch")),
     }
+
+    // --- B -> A (exercises the ARQ changeover / reverse direction) ---
+    let b_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(2), &sk_b, 1));
+    println!("B -> sending counter-vote (slot 2) ...");
+    net_b
+        .send(&b_msg, dummy_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("B send failed: {e}"))?;
+    let a_got: ConsensusMessage = net_a
+        .receive()
+        .await
+        .map_err(|e| anyhow::anyhow!("A receive failed: {e}"))?;
+    println!("A <- received: {a_got:?}");
+    match (&b_msg, &a_got) {
+        (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {
+            println!("  B -> A vote verified");
+        }
+        _ => return Err(anyhow::anyhow!("B -> A message mismatch")),
+    }
+
+    println!("Bidirectional consensus exchange succeeded over PACTOR!");
 
     println!("Disconnecting ...");
     let _ = transport_a.disconnect().await;

@@ -60,6 +60,23 @@ pub enum PactorLinkEvent {
 pub trait PactorTransport: Send + Sync {
     async fn set_mycall(&self, callsign: &str) -> Result<(), ScsPactorError>;
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError>;
+
+    /// Wait (up to `timeout_after`) for an incoming connection to be accepted by
+    /// this (listening) modem, then make the link ready for two-way data.
+    ///
+    /// The caller side uses [`connect_peer`]; the answering side uses this so it
+    /// can also transmit (e.g. enter converse mode). Returns the remote callsign
+    /// once connected.
+    ///
+    /// The default implementation assumes the underlying transport needs no
+    /// extra setup to receive or reply (e.g. TCP / simulated), and is a no-op.
+    async fn accept_incoming(
+        &self,
+        _timeout_after: Option<Duration>,
+    ) -> Result<String, ScsPactorError> {
+        Ok(String::new())
+    }
+
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError>;
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, ScsPactorError>;
     async fn disconnect(&self) -> Result<(), ScsPactorError>;

@@ -765,6 +765,45 @@ impl PactorTransport for UsbPactorTransport {
         }
     }
 
+    async fn accept_incoming(
+        &self,
+        timeout_after: Option<Duration>,
+    ) -> Result<String, ScsPactorError> {
+        // The answering modem is in LISTEN mode and auto-answers an incoming
+        // call, reporting "*** CONNECTED TO <caller>" as terminal text (parsed
+        // into a Connected event by the reader). We wait for that, then enter
+        // CONVerse mode so this side can also transmit (enabling B -> A replies
+        // and full two-way data). Without CONV, the answerer can only receive.
+        let deadline = timeout_after.map(|d| Instant::now() + d);
+        let mut rx = self.event_rx.lock().await;
+        debug!("[accept] waiting for incoming connection ...");
+
+        loop {
+            let wait = match deadline {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(ScsPactorError::Timeout);
+                    }
+                    remaining
+                }
+                None => Duration::from_secs(3600),
+            };
+
+            match timeout(wait, rx.recv()).await {
+                Ok(Some(PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }))) => {
+                    debug!("[accept] incoming connection (CONNECTED TO {remote_call})");
+                    let _ = self.write_raw(b"CONV\r").await;
+                    debug!("[accept] entered converse mode (CONV)");
+                    return Ok(remote_call);
+                }
+                Ok(Some(_)) => { /* ignore other status until connected */ }
+                Ok(None) => return Err(ScsPactorError::Disconnected),
+                Err(_) => return Err(ScsPactorError::Timeout),
+            }
+        }
+    }
+
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
         // After a terminal-mode connect the modem carries payload as raw serial
         // bytes over the link. Send each message as a hex-encoded line
