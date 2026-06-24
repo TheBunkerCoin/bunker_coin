@@ -79,6 +79,17 @@ pub trait PactorTransport: Send + Sync {
 
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError>;
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, ScsPactorError>;
+
+    /// Hand the transmit turn to the peer (PACTOR ARQ changeover).
+    ///
+    /// On a half-duplex ARQ link only the information-sending station transmits;
+    /// to receive a reply, the sender must change over so the peer becomes the
+    /// sender. The default implementation is a no-op for full-duplex transports
+    /// (TCP / simulated) where both sides can send freely.
+    async fn changeover(&self) -> Result<(), ScsPactorError> {
+        Ok(())
+    }
+
     async fn disconnect(&self) -> Result<(), ScsPactorError>;
 
     async fn next_event(

@@ -438,6 +438,10 @@ async fn init_hostmode(
         "MAXE 35".to_owned(),
         "REM 0".to_owned(),
         "CHOB 0".to_owned(),
+        // Set the CHANGEOVER character to Ctrl-Z (26). In converse mode, the ISS
+        // (master) hands the transmit turn to the peer when this char is sent —
+        // required for the answering side (slave) to transmit back (B -> A).
+        "CHO 26".to_owned(),
         "TONES 4".to_owned(),
         "MARK 1600".to_owned(),
         "SPACE 1400".to_owned(),
@@ -601,12 +605,22 @@ async fn consensus_smoke_test(
     }
 
     // --- B -> A (exercises the ARQ changeover / reverse direction) ---
+    // A is the ARQ master (it called). For B (slave) to transmit, A must hand
+    // over the transmit turn. Issue the changeover on A, then have B send.
+    println!("A: handing transmit turn to B (changeover) ...");
+    transport_a
+        .changeover()
+        .await
+        .map_err(|e| anyhow::anyhow!("A changeover failed: {e}"))?;
+
     let b_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(2), &sk_b, 1));
     println!("B -> sending counter-vote (slot 2) ...");
     net_b
         .send(&b_msg, dummy_addr)
         .await
         .map_err(|e| anyhow::anyhow!("B send failed: {e}"))?;
+    // B hands the turn back so A's data path (and a clean disconnect) resumes.
+    let _ = transport_b.changeover().await;
     let a_got: ConsensusMessage = net_a
         .receive()
         .await

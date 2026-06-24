@@ -815,6 +815,14 @@ impl PactorTransport for UsbPactorTransport {
         Ok(String::new())
     }
 
+    async fn changeover(&self) -> Result<(), ScsPactorError> {
+        // Send the CHANGEOVER character (Ctrl-Z, 0x1A, set via "CHO 26" at init)
+        // to hand the transmit turn to the peer. It is consumed locally by the
+        // modem (not sent over the air), so it never appears in the peer's data.
+        debug!("[changeover] handing transmit turn to peer (Ctrl-Z)");
+        self.write_raw(&[0x1a]).await
+    }
+
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
         // After a terminal-mode connect the modem carries payload as raw serial
         // bytes over the link. Send each message as a hex-encoded line
