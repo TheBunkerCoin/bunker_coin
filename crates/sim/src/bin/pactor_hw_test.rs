@@ -574,20 +574,12 @@ async fn consensus_smoke_test(
         PactorNetwork::new(Arc::clone(&transport_b));
     let dummy_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    // B answered the call at the RF level (LISTEN). Have B enter converse mode so
-    // it can transmit back to A (the answerer is otherwise receive-only). The
-    // CONNECTED event is already queued from B's reader, so this returns quickly.
-    println!("B: accepting incoming link (entering converse) ...");
-    let remote = transport_b
-        .accept_incoming(Some(Duration::from_secs(30)))
-        .await
-        .map_err(|e| anyhow::anyhow!("B accept failed: {e}"))?;
-    println!("B: accepted link from {remote:?}");
-
     let sk_a = SecretKey::new(&mut rand::rng());
     let sk_b = SecretKey::new(&mut rand::rng());
 
     // --- A -> B ---
+    // B stays a passive ARQ slave here (do NOT put it in converse mode yet — that
+    // disrupts its reception of A's transmission). A is the ISS and transmits.
     let a_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(1), &sk_a, 0));
     println!("A -> sending vote (slot 1) ...");
     net_a
@@ -607,9 +599,15 @@ async fn consensus_smoke_test(
     }
 
     // --- B -> A (exercises the ARQ changeover / reverse direction) ---
-    // A is the ARQ master (it called). For B (slave) to transmit, A must hand
-    // over the transmit turn. Issue the changeover on A, then have B send.
+    // Now B needs to transmit. A (ISS) hands over the transmit turn, and B enters
+    // converse mode so it can send. Entering converse only now (not before the
+    // A -> B leg) keeps B a clean receiver while A is sending.
     println!("A: handing transmit turn to B (changeover) ...");
+    println!("B: entering converse mode to reply ...");
+    transport_b
+        .accept_incoming(None)
+        .await
+        .map_err(|e| anyhow::anyhow!("B converse failed: {e}"))?;
     transport_a
         .changeover()
         .await
