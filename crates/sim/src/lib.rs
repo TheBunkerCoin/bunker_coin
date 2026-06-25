@@ -1,5 +1,6 @@
 //! simulation tools for BunkerCoin
 
+pub mod pactor_init;
 pub mod scenarios;
 
 use bunker_coin_radio::RadioConfig;

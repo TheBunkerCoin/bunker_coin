@@ -33,14 +33,15 @@
 
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bunkerglow::network::Network;
 use log::{debug, warn};
 use scs_pactor::{PactorTransport, ScsPactorError};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use wincode::{SchemaRead, SchemaWrite};
 
 use crate::pactor_framing::{fragment_message, Reassembler};
@@ -51,6 +52,34 @@ const DEFAULT_MAX_READ_LEN: usize = 8192;
 /// Bound on each channel's inbound queue (messages buffered before a slow
 /// consumer applies backpressure to the single reader task).
 const CHANNEL_QUEUE_DEPTH: usize = 1024;
+
+/// Reserved tag for the turn-grant control line (distinct from the data
+/// [`Channel`] tags 0..=4). When half-duplex turn discipline is enabled, the
+/// turn-holder sends a line with this tag to hand the transmit turn to the peer.
+const TURN_GRANT_TAG: u8 = 0xFF;
+
+/// Maximum time a side holds the transmit turn before changing over, even if it
+/// still has more to send. Bounds one-directional starvation so the peer always
+/// gets a turn to send its votes. Tuned conservatively for HF; expect on-air
+/// adjustment.
+const MAX_TURN_HOLD: Duration = Duration::from_secs(30);
+
+/// When holding the turn with an empty queue, wait at most this long for
+/// something to send before granting the turn to the peer anyway. Prevents an
+/// idle turn-holder from deadlocking the half-duplex link; when both sides are
+/// idle they gently ping-pong the turn at this cadence so either can transmit as
+/// soon as it has data. Changeover is expensive on PACTOR, so keep this modest.
+const TURN_IDLE_GRANT: Duration = Duration::from_secs(5);
+
+/// Shared half-duplex turn state between the mux reader and writer.
+///
+/// `holds_turn` is `true` while this side may transmit. The writer waits on
+/// `granted` until it holds the turn; the reader sets `holds_turn` and notifies
+/// `granted` when it sees a turn-grant line from the peer.
+struct TurnState {
+    holds_turn: AtomicBool,
+    granted: Notify,
+}
 
 /// Logical channel a multiplexed message belongs to. The discriminant is the
 /// 1-byte tag prepended to every framed message before it goes over the link.
@@ -108,12 +137,38 @@ pub struct PactorMux {
     /// Per-channel inbound receivers, handed out by [`channel`](Self::channel).
     inbound_rx: [Option<mpsc::Receiver<Vec<u8>>>; Channel::COUNT],
     message_counter: Arc<AtomicU64>,
+    /// Half-duplex turn discipline. `None` = full-duplex (write freely — for the
+    /// simulator / full-duplex transports). `Some` = enforce one transmit turn at
+    /// a time with explicit changeover (for real PACTOR).
+    turn: Option<Arc<TurnState>>,
 }
 
 impl PactorMux {
-    /// Wrap an already-connected PACTOR transport. No tasks run until
-    /// [`spawn`](Self::spawn) is called.
+    /// Wrap an already-connected **full-duplex** transport (simulator, TCP).
+    ///
+    /// No turn discipline: the writer transmits whenever it has data. No tasks
+    /// run until [`spawn`](Self::spawn) is called.
     pub fn new(transport: Arc<dyn PactorTransport>) -> Self {
+        Self::build(transport, None)
+    }
+
+    /// Wrap an already-connected **half-duplex** PACTOR transport with turn
+    /// discipline.
+    ///
+    /// Only the turn-holder transmits; when it drains its queue (or hits
+    /// [`MAX_TURN_HOLD`]) it sends a turn-grant line and `changeover()`s to hand
+    /// the link to the peer. `starts_with_turn` must be `true` on exactly one side
+    /// — the PACTOR caller (master/ISS) — and `false` on the listener (slave), so
+    /// the two sides agree on who transmits first.
+    pub fn new_half_duplex(transport: Arc<dyn PactorTransport>, starts_with_turn: bool) -> Self {
+        let turn = Arc::new(TurnState {
+            holds_turn: AtomicBool::new(starts_with_turn),
+            granted: Notify::new(),
+        });
+        Self::build(transport, Some(turn))
+    }
+
+    fn build(transport: Arc<dyn PactorTransport>, turn: Option<Arc<TurnState>>) -> Self {
         let (outbound_tx, outbound_rx) = mpsc::channel(CHANNEL_QUEUE_DEPTH);
         let mut inbound_tx: [Option<mpsc::Sender<Vec<u8>>>; Channel::COUNT] = Default::default();
         let mut inbound_rx: [Option<mpsc::Receiver<Vec<u8>>>; Channel::COUNT] = Default::default();
@@ -130,6 +185,7 @@ impl PactorMux {
             inbound_tx,
             inbound_rx,
             message_counter: Arc::new(AtomicU64::new(0)),
+            turn,
         }
     }
 
@@ -182,9 +238,12 @@ impl PactorMux {
         let inbound_tx = self.inbound_tx.clone();
         let outbound_rx = self.outbound_rx.take().expect("spawn called twice");
         let message_counter = self.message_counter.clone();
+        let turn = self.turn.clone();
 
         // Reader: read_data → reassemble → strip tag → route to channel queue.
+        // A turn-grant line (tag 0xFF) hands the transmit turn to us.
         let reader_transport = transport.clone();
+        let reader_turn = turn.clone();
         let reader = tokio::spawn(async move {
             let mut reassembler = Reassembler::new();
             loop {
@@ -207,6 +266,14 @@ impl PactorMux {
                     warn!("[mux:reader] dropping empty multiplexed message");
                     continue;
                 };
+                if tag == TURN_GRANT_TAG {
+                    // Peer handed us the transmit turn.
+                    if let Some(t) = &reader_turn {
+                        t.holds_turn.store(true, Ordering::SeqCst);
+                        t.granted.notify_one();
+                    }
+                    continue;
+                }
                 let Some(channel) = Channel::from_tag(tag) else {
                     warn!("[mux:reader] dropping message with unknown channel tag {tag}");
                     continue;
@@ -220,25 +287,119 @@ impl PactorMux {
             }
         });
 
-        // Writer: drain outbound queue → tag + fragment → write_data.
+        // Writer: when it holds the turn (or always, in full-duplex mode), drain
+        // the outbound queue and transmit. Under turn discipline it then grants
+        // the turn to the peer and waits to get it back.
         let writer_transport = transport.clone();
         let writer = tokio::spawn(async move {
             let mut outbound_rx = outbound_rx;
-            while let Some(item) = outbound_rx.recv().await {
-                // Prepend the 1-byte channel tag, then fragment tag+payload as
-                // one unit so >MTU messages still split correctly.
-                let mut tagged = Vec::with_capacity(item.payload.len() + 1);
-                tagged.push(item.channel as u8);
-                tagged.extend_from_slice(&item.payload);
-                let message_id = message_counter.fetch_add(1, Ordering::Relaxed);
+            let counter = message_counter;
+
+            // Send one logical message as tagged, fragmented lines.
+            async fn write_message(
+                transport: &Arc<dyn PactorTransport>,
+                counter: &AtomicU64,
+                tag: u8,
+                payload: &[u8],
+            ) -> Result<(), ScsPactorError> {
+                let mut tagged = Vec::with_capacity(payload.len() + 1);
+                tagged.push(tag);
+                tagged.extend_from_slice(payload);
+                let message_id = counter.fetch_add(1, Ordering::Relaxed);
                 for line in fragment_message(message_id, &tagged) {
-                    if let Err(e) = writer_transport.write_data(&line).await {
+                    transport.write_data(&line).await?;
+                }
+                Ok(())
+            }
+
+            loop {
+                // Wait until we hold the turn (immediate in full-duplex mode).
+                if let Some(t) = &turn {
+                    while !t.holds_turn.load(Ordering::SeqCst) {
+                        t.granted.notified().await;
+                    }
+                }
+
+                // Drain the queue for up to MAX_TURN_HOLD. Wait for the first
+                // item, but only briefly when under turn discipline: if nothing is
+                // queued we must still grant the turn to the peer (it may have
+                // votes to send), otherwise an idle turn-holder would deadlock the
+                // half-duplex link. In full-duplex mode block indefinitely.
+                let turn_deadline = tokio::time::Instant::now() + MAX_TURN_HOLD;
+                let first = if turn.is_some() {
+                    match tokio::time::timeout(TURN_IDLE_GRANT, outbound_rx.recv()).await {
+                        Ok(Some(item)) => Some(item),
+                        Ok(None) => {
+                            debug!("[mux:writer] outbound queue closed; writer stopping");
+                            return;
+                        }
+                        // Idle: nothing to send — fall through to grant the turn.
+                        Err(_) => None,
+                    }
+                } else {
+                    match outbound_rx.recv().await {
+                        Some(item) => Some(item),
+                        None => {
+                            debug!("[mux:writer] outbound queue closed; writer stopping");
+                            return;
+                        }
+                    }
+                };
+                if let Some(first) = first {
+                    if let Err(e) = write_message(
+                        &writer_transport,
+                        &counter,
+                        first.channel as u8,
+                        &first.payload,
+                    )
+                    .await
+                    {
                         warn!("[mux:writer] write_data failed: {e}");
                         return;
                     }
                 }
+                loop {
+                    if tokio::time::Instant::now() >= turn_deadline {
+                        break;
+                    }
+                    match outbound_rx.try_recv() {
+                        Ok(item) => {
+                            if let Err(e) = write_message(
+                                &writer_transport,
+                                &counter,
+                                item.channel as u8,
+                                &item.payload,
+                            )
+                            .await
+                            {
+                                warn!("[mux:writer] write_data failed: {e}");
+                                return;
+                            }
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            debug!("[mux:writer] outbound queue closed; writer stopping");
+                            return;
+                        }
+                    }
+                }
+
+                // Under turn discipline: hand the turn to the peer (grant line +
+                // ARQ changeover) and wait to receive it back before sending more.
+                if let Some(t) = &turn {
+                    if let Err(e) =
+                        write_message(&writer_transport, &counter, TURN_GRANT_TAG, &[]).await
+                    {
+                        warn!("[mux:writer] turn-grant write failed: {e}");
+                        return;
+                    }
+                    if let Err(e) = writer_transport.changeover().await {
+                        warn!("[mux:writer] changeover failed: {e}");
+                        return;
+                    }
+                    t.holds_turn.store(false, Ordering::SeqCst);
+                }
             }
-            debug!("[mux:writer] outbound queue closed; writer stopping");
         });
 
         PactorMuxHandle {
@@ -514,6 +675,40 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!probe.is_finished(), "idle receive returned early (queue closed?)");
         probe.abort();
+    }
+
+    #[tokio::test]
+    async fn half_duplex_turns_let_both_sides_send() {
+        // Caller (A) starts with the turn, listener (B) without. Each side sends
+        // a message; both must arrive — proving the turn ping-pongs (A drains +
+        // grants to B, B sends + grants back) without deadlock. The loopback's
+        // changeover is a no-op; the turn-grant line carries the handoff.
+        let (a, b) = LoopbackTransport::pair();
+
+        let mut mux_a = PactorMux::new_half_duplex(a, true);
+        let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
+        let _ha = mux_a.spawn();
+
+        let mut mux_b = PactorMux::new_half_duplex(b, false);
+        let b_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_b.channel(Channel::All2All);
+        let _hb = mux_b.spawn();
+
+        let addr = "127.0.0.1:1".parse().unwrap();
+        // B queues its message immediately, even though it does not yet hold the
+        // turn; it must go out once A grants the turn to B.
+        b_chan.send(&b"from-b".to_vec(), addr).await.unwrap();
+        a_chan.send(&b"from-a".to_vec(), addr).await.unwrap();
+
+        let got_at_b = tokio::time::timeout(Duration::from_secs(10), b_chan.receive())
+            .await
+            .expect("B should receive A's message before timeout")
+            .unwrap();
+        let got_at_a = tokio::time::timeout(Duration::from_secs(10), a_chan.receive())
+            .await
+            .expect("A should receive B's message before timeout (turn handed over)")
+            .unwrap();
+        assert_eq!(got_at_b, b"from-a");
+        assert_eq!(got_at_a, b"from-b");
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bunker_coin_radio::{Channel, MuxChannel, PactorMux, PactorMuxHandle};
+use bunker_coin_sim::pactor_init::{connect_with_retries, init_modem, PactorInitConfig};
 use bunkerglow::all2all::TrivialAll2All;
 use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
 use bunkerglow::crypto::aggsig;
@@ -55,13 +56,42 @@ struct Args {
     #[arg(long)]
     simulated: bool,
 
+    /// With --simulated, enable half-duplex turn discipline (exercises the
+    /// turn-grant/changeover handoff that real PACTOR needs).
+    #[arg(long)]
+    half_duplex: bool,
+
     /// Serial device for the modem (hardware mode).
     #[arg(long)]
     port: Option<String>,
 
-    /// Which validator this process runs in hardware mode: 0 or 1.
+    /// Which validator this process runs in hardware mode: 0 (caller) or 1 (listener).
     #[arg(long)]
     node: Option<u64>,
+
+    /// This modem's callsign (hardware mode).
+    #[arg(long, default_value = "NODE0")]
+    mycall: String,
+
+    /// Peer callsign to connect to (hardware mode, node 0 only).
+    #[arg(long, default_value = "NODE1")]
+    peercall: String,
+
+    /// Serial baud rate (hardware mode).
+    #[arg(long, default_value_t = 829_440)]
+    baud: u32,
+
+    /// Optional TRX CI-V tune frequency in kHz (hardware mode).
+    #[arg(long)]
+    frequency: Option<f64>,
+
+    /// Connect attempts before giving up (hardware mode, node 0).
+    #[arg(long, default_value_t = 3)]
+    connect_attempts: u32,
+
+    /// Force-disconnect any stale link before init (hardware mode).
+    #[arg(long)]
+    reset: bool,
 
     /// Seed for deterministic validator-set generation (must match on both nodes).
     #[arg(long, default_value_t = 0)]
@@ -115,12 +145,20 @@ fn build_cluster(seed: u64) -> Cluster {
 /// Wire one Alpenglow node over a connected PACTOR transport, multiplexing its
 /// five logical networks across the single link. Returns the node and the mux
 /// handle (kept alive so the reader/writer tasks run; used for shutdown).
+///
+/// `turn`: `None` for a full-duplex transport (simulator — write freely);
+/// `Some(starts_with_turn)` for a real half-duplex PACTOR link, where exactly one
+/// side (the caller/master) must start with the transmit turn.
 fn build_node(
     transport: Arc<dyn PactorTransport>,
     own_id: u64,
     cluster: &Cluster,
+    turn: Option<bool>,
 ) -> (Node, PactorMuxHandle) {
-    let mut mux = PactorMux::new(transport);
+    let mut mux = match turn {
+        None => PactorMux::new(transport),
+        Some(starts_with_turn) => PactorMux::new_half_duplex(transport, starts_with_turn),
+    };
     // All2All votes/certs are broadcast to all validators including self; over a
     // single link there is no socket loopback, so self-deliver them or a node
     // never counts its own vote toward the finalization quorum.
@@ -191,15 +229,31 @@ async fn main() -> anyhow::Result<()> {
     let duration = Duration::from_secs(args.duration);
 
     if args.simulated {
-        run_simulated(cluster, duration).await
+        run_simulated(cluster, duration, args.half_duplex).await
     } else {
         run_hardware(&args, cluster, duration).await
     }
 }
 
 /// Build both nodes over a simulated PACTOR pair and run them against each other.
-async fn run_simulated(cluster: Cluster, duration: Duration) -> anyhow::Result<()> {
-    println!("=== simulated 2-node empty-block consensus over PACTOR mux ===");
+///
+/// `half_duplex`: when true, enable the mux turn discipline (node 0 starts with
+/// the turn) even though the simulator is full-duplex underneath. This exercises
+/// the turn-grant/changeover handoff path that real PACTOR needs, catching
+/// integration bugs before going on-air.
+async fn run_simulated(
+    cluster: Cluster,
+    duration: Duration,
+    half_duplex: bool,
+) -> anyhow::Result<()> {
+    println!(
+        "=== simulated 2-node empty-block consensus over PACTOR mux ({}) ===",
+        if half_duplex {
+            "half-duplex turns"
+        } else {
+            "full-duplex"
+        }
+    );
     // Lossless link: the mux/consensus layer has no line-level retransmission of
     // its own (real PACTOR does ARQ in hardware). This increment validates the
     // consensus-over-mux wiring, not loss recovery, so model a clean link with
@@ -226,8 +280,12 @@ async fn run_simulated(cluster: Cluster, duration: Duration) -> anyhow::Result<(
     let ta: Arc<dyn PactorTransport> = Arc::new(ta);
     let tb: Arc<dyn PactorTransport> = Arc::new(tb);
 
-    let (node_a, handle_a) = build_node(ta, 0, &cluster);
-    let (node_b, handle_b) = build_node(tb, 1, &cluster);
+    // Full-duplex: no turn discipline (None). Half-duplex: node 0 starts with
+    // the turn, node 1 without.
+    let turn_a = half_duplex.then_some(true);
+    let turn_b = half_duplex.then_some(false);
+    let (node_a, handle_a) = build_node(ta, 0, &cluster, turn_a);
+    let (node_b, handle_b) = build_node(tb, 1, &cluster, turn_b);
 
     let a = tokio::spawn(run_node("node0".to_string(), node_a, handle_a, duration));
     let b = tokio::spawn(run_node("node1".to_string(), node_b, handle_b, duration));
@@ -240,15 +298,58 @@ async fn run_simulated(cluster: Cluster, duration: Duration) -> anyhow::Result<(
     Ok(())
 }
 
-/// Hardware mode placeholder. The proven modem bring-up (terminal-mode init,
-/// JHOST/converse handling, connect/listen, changeover) lives in the
-/// `pactor_hw_test` binary; the next increment factors it into a shared module so
-/// this path can construct a connected transport and call [`build_node`].
-async fn run_hardware(args: &Args, _cluster: Cluster, _duration: Duration) -> anyhow::Result<()> {
-    let _ = (&args.port, &args.node);
-    anyhow::bail!(
-        "hardware mode not yet wired: modem init/connect lives in pactor_hw_test and will be \
-         factored into a shared module next. Use --simulated to exercise the consensus-over-mux \
-         wiring now."
-    )
+/// Run one node over a real modem on this machine.
+///
+/// Node 0 is the caller (`connect_peer`); node 1 listens (`LISTEN 1` +
+/// `accept_incoming`). Both derive the same validator set from `--seed`. Uses the
+/// shared [`pactor_init`] bring-up to obtain a connected transport, then the same
+/// [`build_node`] / [`run_node`] path as the simulated mode.
+async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyhow::Result<()> {
+    let own_id = args
+        .node
+        .ok_or_else(|| anyhow::anyhow!("hardware mode requires --node 0|1"))?;
+    let port = args
+        .port
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("hardware mode requires --port <dev>"))?;
+    anyhow::ensure!(own_id < 2, "--node must be 0 or 1");
+    let is_caller = own_id == 0;
+
+    println!(
+        "=== hardware node {own_id} ({}) over {port} ===",
+        args.mycall
+    );
+
+    let mut init_cfg = PactorInitConfig::new(port, args.mycall.clone());
+    init_cfg.baud = args.baud;
+    init_cfg.frequency = args.frequency;
+    init_cfg.reset = args.reset;
+    // The listener must enable LISTEN 1 to accept the incoming connect.
+    init_cfg.listen = !is_caller;
+
+    println!("bringing up modem ...");
+    let transport = init_modem(&init_cfg).await?;
+
+    if is_caller {
+        println!("connecting to {} ...", args.peercall);
+        connect_with_retries(&transport, &args.peercall, args.connect_attempts).await?;
+    } else {
+        println!("listening for incoming connection ...");
+        transport.accept_incoming(None).await?;
+    }
+    // Let the link settle before pushing consensus traffic.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("link established; starting consensus");
+
+    let transport: Arc<dyn PactorTransport> = Arc::new(transport);
+    // Half-duplex link: the caller (node 0) starts holding the transmit turn.
+    let (node, handle) = build_node(transport, own_id, &cluster, Some(is_caller));
+    let label = format!("node{own_id}");
+    let finalized = run_node(label, node, handle, duration).await;
+
+    println!("=== done: node{own_id} finalized {finalized} ===");
+    if finalized == 0 {
+        anyhow::bail!("no slots finalized — consensus did not make progress");
+    }
+    Ok(())
 }
