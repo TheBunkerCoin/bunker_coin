@@ -92,6 +92,12 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     rounds: u32,
 
+    /// Messages per transmit turn (batch size). Each round sends this many votes
+    /// in a single transmit direction before any changeover, amortizing the
+    /// expensive half-duplex turnaround across the batch.
+    #[arg(long, default_value_t = 1)]
+    batch: u32,
+
     /// Stop after sending C <CALL> and print raw L status polls.
     #[arg(long)]
     diagnose_connect: bool,
@@ -571,6 +577,7 @@ async fn consensus_smoke_test(
     transport_b: Arc<dyn PactorTransport>,
     bidirectional: bool,
     rounds: u32,
+    batch: u32,
 ) -> anyhow::Result<()> {
     use bunker_coin_radio::PactorNetwork;
     use bunkerglow::consensus::{ConsensusMessage, Vote};
@@ -579,9 +586,11 @@ async fn consensus_smoke_test(
     use bunkerglow::Slot;
 
     let rounds = rounds.max(1);
+    let batch = batch.max(1);
     println!(
-        "=== Consensus exchange over PACTOR ({} round(s), {}) ===",
+        "=== Consensus exchange over PACTOR ({} round(s), batch {}, {}) ===",
         rounds,
+        batch,
         if bidirectional {
             "bidirectional A<->B"
         } else {
@@ -606,41 +615,57 @@ async fn consensus_smoke_test(
 
     let exchange_start = Instant::now();
     let mut messages_ok: u32 = 0;
+    let mut slot: u64 = 0;
+
+    // Receive and verify `count` votes from `net`, all expected to be in `sent`.
+    async fn recv_batch(
+        net: &PactorNetwork<ConsensusMessage, ConsensusMessage>,
+        sent: &[ConsensusMessage],
+        label: &str,
+    ) -> anyhow::Result<()> {
+        for i in 0..sent.len() {
+            let got: ConsensusMessage = net
+                .receive()
+                .await
+                .map_err(|e| anyhow::anyhow!("{label} receive {i} failed: {e}"))?;
+            // Messages within a turn arrive in order, so compare positionally.
+            match (&sent[i], &got) {
+                (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {}
+                _ => return Err(anyhow::anyhow!("{label} message {i} mismatch")),
+            }
+        }
+        Ok(())
+    }
 
     for round in 1..=rounds {
-        let slot_ab = (round as u64) * 2 - 1; // odd slots A->B
-        let slot_ba = (round as u64) * 2; // even slots B->A
-
-        // --- A -> B ---
+        // --- A -> B (one transmit turn, `batch` votes) ---
         // A is the ISS; B receives as a passive slave. Don't put B in converse
         // before this leg — it disrupts B's reception.
-        let a_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(slot_ab), &sk_a, 0));
+        let a_batch: Vec<ConsensusMessage> = (0..batch)
+            .map(|_| {
+                slot += 1;
+                ConsensusMessage::Vote(Vote::new_skip(Slot::new(slot), &sk_a, 0))
+            })
+            .collect();
         let t = Instant::now();
-        println!("[round {round}] A -> B vote (slot {slot_ab}) ...");
+        println!("[round {round}] A -> B batch of {batch} vote(s) ...");
         net_a
-            .send(&a_msg, dummy_addr)
+            .send_batch(&a_batch)
             .await
-            .map_err(|e| anyhow::anyhow!("round {round}: A send failed: {e}"))?;
-        let b_got: ConsensusMessage = net_b
-            .receive()
-            .await
-            .map_err(|e| anyhow::anyhow!("round {round}: B receive failed: {e}"))?;
-        match (&a_msg, &b_got) {
-            (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {
-                println!("[round {round}]   A -> B verified ({:.1?})", t.elapsed());
-                messages_ok += 1;
-            }
-            _ => return Err(anyhow::anyhow!("round {round}: A -> B message mismatch")),
-        }
+            .map_err(|e| anyhow::anyhow!("round {round}: A send_batch failed: {e}"))?;
+        recv_batch(&net_b, &a_batch, &format!("round {round}: A->B")).await?;
+        messages_ok += batch;
+        println!(
+            "[round {round}]   A -> B {batch} verified ({:.1?}, {:.1?}/msg)",
+            t.elapsed(),
+            t.elapsed() / batch
+        );
 
         if !bidirectional {
             continue;
         }
 
-        // --- B -> A (ARQ changeover) ---
-        // A (ISS) hands over the transmit turn; B enters converse mode (once) so
-        // it can send. B's modem auto-changes-over back to A when its TX buffer
-        // drains, so we don't force a changeover after B's send.
+        // --- B -> A (ARQ changeover, one transmit turn, `batch` votes) ---
         if !b_in_converse {
             transport_b
                 .accept_incoming(None)
@@ -649,32 +674,31 @@ async fn consensus_smoke_test(
             b_in_converse = true;
         }
         let t = Instant::now();
-        println!("[round {round}] changeover; B -> A counter-vote (slot {slot_ba}) ...");
+        println!("[round {round}] changeover; B -> A batch of {batch} vote(s) ...");
         transport_a
             .changeover()
             .await
             .map_err(|e| anyhow::anyhow!("round {round}: A changeover failed: {e}"))?;
-        let b_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(slot_ba), &sk_b, 1));
+        let b_batch: Vec<ConsensusMessage> = (0..batch)
+            .map(|_| {
+                slot += 1;
+                ConsensusMessage::Vote(Vote::new_skip(Slot::new(slot), &sk_b, 1))
+            })
+            .collect();
         net_b
-            .send(&b_msg, dummy_addr)
+            .send_batch(&b_batch)
             .await
-            .map_err(|e| anyhow::anyhow!("round {round}: B send failed: {e}"))?;
-        let a_got: ConsensusMessage = net_a
-            .receive()
-            .await
-            .map_err(|e| anyhow::anyhow!("round {round}: A receive failed: {e}"))?;
-        match (&b_msg, &a_got) {
-            (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {
-                println!("[round {round}]   B -> A verified ({:.1?})", t.elapsed());
-                messages_ok += 1;
-            }
-            _ => return Err(anyhow::anyhow!("round {round}: B -> A message mismatch")),
-        }
+            .map_err(|e| anyhow::anyhow!("round {round}: B send_batch failed: {e}"))?;
+        recv_batch(&net_a, &b_batch, &format!("round {round}: B->A")).await?;
+        messages_ok += batch;
+        println!(
+            "[round {round}]   B -> A {batch} verified ({:.1?}, {:.1?}/msg)",
+            t.elapsed(),
+            t.elapsed() / batch
+        );
 
-        // B was the ISS for the counter-vote, so it now holds the transmit turn.
-        // A already received B's data (above), so B's send is complete — hand the
-        // turn back to A now so the next round's A->B leg can transmit. (Doing
-        // this only after A's receive avoids cutting off B's own transmission.)
+        // B held the transmit turn for its batch; A has now received it, so B's
+        // send is complete — hand the turn back to A for the next round's A->B.
         if round < rounds {
             println!("[round {round}] B handing transmit turn back to A (changeover) ...");
             let _ = transport_b.changeover().await;
@@ -823,8 +847,14 @@ async fn main() -> anyhow::Result<()> {
     let transport_b: Arc<dyn PactorTransport> = Arc::new(modem_b);
 
     if args.consensus_smoke {
-        return consensus_smoke_test(transport_a, transport_b, args.bidirectional, args.rounds)
-            .await;
+        return consensus_smoke_test(
+            transport_a,
+            transport_b,
+            args.bidirectional,
+            args.rounds,
+            args.batch,
+        )
+        .await;
     }
 
     let node_a = PactorRadioNode::from_shared(&args.call_a, Arc::clone(&transport_a));

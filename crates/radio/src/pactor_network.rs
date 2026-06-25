@@ -58,6 +58,26 @@ impl<S, R> PactorNetwork<S, R> {
     }
 }
 
+impl<S, R> PactorNetwork<S, R>
+where
+    S: SchemaWrite<Src = S> + Send + Sync,
+{
+    /// Send several messages within a single transmit turn (no changeover
+    /// between them). Each message goes out as its own framed data line, but the
+    /// link stays in the sending direction throughout — amortizing the expensive
+    /// half-duplex ARQ changeover across the whole batch.
+    ///
+    /// The caller is responsible for the changeover before/after the batch.
+    pub async fn send_batch(&self, messages: &[S]) -> std::io::Result<()> {
+        for msg in messages {
+            let bytes = wincode::serialize(msg)
+                .map_err(|e| std::io::Error::other(format!("serialize failed: {e:?}")))?;
+            self.send_serialized(&bytes).await?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl<S, R> Network for PactorNetwork<S, R>
 where
