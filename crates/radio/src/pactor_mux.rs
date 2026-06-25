@@ -39,7 +39,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bunkerglow::network::Network;
 use log::{debug, warn};
-use scs_pactor::PactorTransport;
+use scs_pactor::{PactorTransport, ScsPactorError};
 use tokio::sync::{mpsc, Mutex};
 use wincode::{SchemaRead, SchemaWrite};
 
@@ -138,13 +138,37 @@ impl PactorMux {
     /// `S` is the type sent on this channel, `R` the type received. Panics if the
     /// same channel is taken twice (each channel has exactly one inbound queue).
     pub fn channel<S, R>(&mut self, channel: Channel) -> MuxChannel<S, R> {
+        self.channel_inner(channel, false)
+    }
+
+    /// Like [`channel`](Self::channel) but with **self-delivery**: every message
+    /// sent on this channel is also delivered to this node's own inbound queue
+    /// for the same channel.
+    ///
+    /// Consensus broadcasts (all2all votes/certs) target *all* validators —
+    /// including the sender itself. Over a real socket the self-addressed copy
+    /// loops back through the OS; over a single PACTOR link there is only the
+    /// peer, so without self-delivery a node would never count its own vote and
+    /// (with 2 equal-stake validators) could never reach the >60% finalization
+    /// quorum. Self-delivery replicates the loopback the network layer assumes.
+    pub fn channel_self_delivering<S, R>(&mut self, channel: Channel) -> MuxChannel<S, R> {
+        self.channel_inner(channel, true)
+    }
+
+    fn channel_inner<S, R>(&mut self, channel: Channel, self_deliver: bool) -> MuxChannel<S, R> {
         let inbound_rx = self.inbound_rx[channel as usize]
             .take()
             .unwrap_or_else(|| panic!("channel {channel:?} already taken"));
+        let self_delivery = if self_deliver {
+            self.inbound_tx[channel as usize].clone()
+        } else {
+            None
+        };
         MuxChannel {
             channel,
             outbound_tx: self.outbound_tx.clone(),
             inbound_rx: Mutex::new(inbound_rx),
+            self_delivery,
             _msg_types: PhantomData,
         }
     }
@@ -166,6 +190,11 @@ impl PactorMux {
             loop {
                 let line = match reader_transport.read_data(max_read_len).await {
                     Ok(line) => line,
+                    // A read timeout just means the link was idle (the peer holds
+                    // the transmit turn, or there is nothing to send). Keep
+                    // waiting; a long-lived node must not tear down its inbound
+                    // queues on idle.
+                    Err(ScsPactorError::Timeout) => continue,
                     Err(e) => {
                         debug!("[mux:reader] read_data ended: {e}");
                         break;
@@ -184,8 +213,8 @@ impl PactorMux {
                 };
                 if let Some(tx) = &inbound_tx[channel as usize] {
                     if tx.send(payload.to_vec()).await.is_err() {
-                        debug!("[mux:reader] channel {channel:?} closed; stopping reader");
-                        break;
+                        debug!("[mux:reader] channel {channel:?} closed; dropping message");
+                        continue;
                     }
                 }
             }
@@ -249,6 +278,9 @@ pub struct MuxChannel<S, R> {
     channel: Channel,
     outbound_tx: mpsc::Sender<Outbound>,
     inbound_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// If set, a copy of every sent message is also delivered to this node's own
+    /// inbound queue (see [`PactorMux::channel_self_delivering`]).
+    self_delivery: Option<mpsc::Sender<Vec<u8>>>,
     _msg_types: PhantomData<(S, R)>,
 }
 
@@ -259,6 +291,13 @@ where
     async fn enqueue(&self, message: &S) -> std::io::Result<()> {
         let payload = wincode::serialize(message)
             .map_err(|e| std::io::Error::other(format!("serialize failed: {e:?}")))?;
+        // Self-delivery: a broadcast targets all validators including this one, so
+        // loop a copy back to our own inbound queue (the network layer normally
+        // gets this for free via socket loopback). Best-effort; a full queue must
+        // not block the over-the-air send.
+        if let Some(self_tx) = &self.self_delivery {
+            let _ = self_tx.try_send(payload.clone());
+        }
         self.outbound_tx
             .send(Outbound {
                 channel: self.channel,
@@ -430,6 +469,51 @@ mod tests {
         ) -> Result<PactorLinkEvent, ScsPactorError> {
             Err(ScsPactorError::Timeout)
         }
+    }
+
+    #[tokio::test]
+    async fn all_five_channels_idle_stay_open() {
+        // Reproduce the consensus shape: take all five channels, spawn the mux,
+        // then spawn a long-lived receiver per channel (as the repair/all2all/
+        // shred/txs handlers do). None must see a closed queue while idle.
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new(transport);
+        let chans = [
+            Channel::All2All,
+            Channel::Disseminator,
+            Channel::Repair,
+            Channel::RepairRequest,
+            Channel::Txs,
+        ];
+        let mut probes = Vec::new();
+        for c in chans {
+            let ch: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(c);
+            probes.push(tokio::spawn(async move { ch.receive().await }));
+        }
+        let _h = mux.spawn();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for (i, p) in probes.iter().enumerate() {
+            assert!(!p.is_finished(), "channel {i} receive returned early");
+        }
+        for p in probes {
+            p.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_channel_receiver_stays_open() {
+        // Mimics consensus: a long-lived task loops receive() on a channel that
+        // gets no traffic. It must park (pend), never see a closed queue.
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new(transport);
+        let repair: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Repair);
+        let _h = mux.spawn();
+
+        let probe = tokio::spawn(async move { repair.receive().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!probe.is_finished(), "idle receive returned early (queue closed?)");
+        probe.abort();
     }
 
     #[tokio::test]
