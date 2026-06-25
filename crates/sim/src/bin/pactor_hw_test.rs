@@ -604,7 +604,6 @@ async fn consensus_smoke_test(
         PactorNetwork::new(Arc::clone(&transport_a));
     let net_b: PactorNetwork<ConsensusMessage, ConsensusMessage> =
         PactorNetwork::new(Arc::clone(&transport_b));
-    let dummy_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let sk_a = SecretKey::new(&mut rand::rng());
     let sk_b = SecretKey::new(&mut rand::rng());

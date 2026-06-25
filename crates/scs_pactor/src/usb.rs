@@ -1,10 +1,9 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use log::{debug, trace, warn};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
@@ -86,10 +85,15 @@ pub struct UsbPactorTransport {
     /// the type byte on each successfully ACKed frame. The first frame after
     /// entering hostmode must set bit 6 (0x40) to reset the modem's counter.
     packet_counter: Mutex<PacketCounter>,
-    /// Signalled by the reader when the link drops (DISCONNECTED / STBY / link
-    /// failure), so a blocked `read_data` can fail fast instead of waiting the
-    /// full read timeout.
-    link_down: Arc<Notify>,
+    /// Set to `true` by the reader when the link drops (DISCONNECTED / STBY /
+    /// link failure), so a blocked `read_data` can fail fast instead of waiting
+    /// the full read timeout. A `watch` (not a Notify) is used so a drop that
+    /// happens *between* receives is still observed by the next `read_data`
+    /// (important for batch receives, where the reader isn't always parked).
+    link_down: tokio::sync::watch::Receiver<bool>,
+    /// Sender side of `link_down`, kept so a fresh connect can clear a stale
+    /// drop flag from a previous session.
+    link_down_tx: watch::Sender<bool>,
     read_task: JoinHandle<()>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
@@ -179,8 +183,8 @@ impl UsbPactorTransport {
             .unwrap_or(&config.port)
             .to_string();
 
-        let link_down = Arc::new(Notify::new());
-        let reader_link_down = Arc::clone(&link_down);
+        let (link_down_tx, link_down) = watch::channel(false);
+        let struct_link_down_tx = link_down_tx.clone();
 
         let read_task = tokio::spawn(async move {
             let mut decoder = HostmodeDecoder::new();
@@ -195,7 +199,7 @@ impl UsbPactorTransport {
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::Disconnected))
                             .await;
-                        reader_link_down.notify_waiters();
+                        let _ = link_down_tx.send(true);
                         break;
                     }
                     Ok(n) => n,
@@ -204,7 +208,7 @@ impl UsbPactorTransport {
                         let _ = event_tx
                             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
                             .await;
-                        reader_link_down.notify_waiters();
+                        let _ = link_down_tx.send(true);
                         break;
                     }
                 };
@@ -246,7 +250,7 @@ impl UsbPactorTransport {
                                         // Wake any blocked read_data so it can
                                         // fail fast instead of waiting the full
                                         // timeout on a link that just dropped.
-                                        reader_link_down.notify_waiters();
+                                        let _ = link_down_tx.send(true);
                                     }
                                 }
                             }
@@ -309,6 +313,7 @@ impl UsbPactorTransport {
             transaction_lock: Mutex::new(()),
             packet_counter: Mutex::new(PacketCounter::new()),
             link_down,
+            link_down_tx: struct_link_down_tx,
             read_task,
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
@@ -722,6 +727,8 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
+        // Clear any stale link-down flag from a previous session.
+        let _ = self.link_down_tx.send(false);
         // On this SCS Dragon firmware the connect runs in TERMINAL mode, not
         // hostmode: a framed hostmode `C` command is parsed as literal typed
         // characters, and its trailing CRC bytes leak into the callsign (e.g.
@@ -810,6 +817,8 @@ impl PactorTransport for UsbPactorTransport {
         // receive-only). We do NOT wait for a CONNECTED event here: the modem
         // emits it as terminal text and the timing is racy; entering converse
         // unconditionally is simpler and reliable.
+        // Clear any stale link-down flag from a previous session.
+        let _ = self.link_down_tx.send(false);
         let _ = self.write_raw(b"CONV\r").await;
         debug!("[accept] entered converse mode (CONV)");
         Ok(String::new())
@@ -846,11 +855,17 @@ impl PactorTransport for UsbPactorTransport {
 
         // Wait for either a data frame, a link-down signal (fail fast instead of
         // blocking the full timeout when the modem disconnects mid-transfer), or
-        // the read timeout.
+        // the read timeout. The watch retains a drop that happened before we
+        // started waiting, so a mid-batch disconnect is never missed.
+        let mut link_down = self.link_down.clone();
+        if *link_down.borrow() {
+            debug!("[data] read_data: link already down");
+            return Err(ScsPactorError::Disconnected);
+        }
         let recv_with_down = async {
             tokio::select! {
                 biased;
-                () = self.link_down.notified() => None,
+                _ = link_down.changed() => None,
                 msg = rx.recv() => Some(msg),
             }
         };
