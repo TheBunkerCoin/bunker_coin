@@ -23,7 +23,6 @@
 //! A message that fits one line is sent as a single `total_fragments == 1`
 //! fragment, so the common case (a vote) is unchanged on the wire shape.
 
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,72 +32,13 @@ use async_trait::async_trait;
 use bunkerglow::network::Network;
 use log::warn;
 use scs_pactor::PactorTransport;
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use wincode::{SchemaRead, SchemaWrite};
 
+use crate::pactor_framing::{fragment_message, Reassembler};
+
 /// Maximum number of bytes read for a single inbound message.
 const DEFAULT_MAX_READ_LEN: usize = 8192;
-
-/// Radio MTU (bytes per `write_data` line, hex-encoded `#...\r`). One line is
-/// `1 (#) + 2*payload + 1 (\r)`, so the byte budget carried per line (header +
-/// fragment chunk) is `(MTU - 2) / 2`.
-const RADIO_MTU: usize = 300;
-
-/// Per-fragment header prepended to each `write_data` line before fragmenting a
-/// serialized message across the link. `message_id` is shared by all fragments
-/// of one message; `fragment_index` is 0-based; `total_fragments` is the count.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FragmentHeader {
-    message_id: u64,
-    fragment_index: u16,
-    total_fragments: u16,
-}
-
-/// Encoded size of a [`FragmentHeader`] — used to size the effective payload.
-fn fragment_header_len() -> usize {
-    bincode::serde::encode_to_vec(
-        &FragmentHeader {
-            message_id: u64::MAX,
-            fragment_index: u16::MAX,
-            total_fragments: u16::MAX,
-        },
-        bincode::config::standard(),
-    )
-    .expect("encoding a fixed header cannot fail")
-    .len()
-}
-
-/// Bytes of message payload carried per fragment line, after reserving room for
-/// the header and accounting for hex doubling within the MTU. At least 1.
-fn effective_chunk_len() -> usize {
-    let line_byte_budget = (RADIO_MTU - 2) / 2;
-    line_byte_budget.saturating_sub(fragment_header_len()).max(1)
-}
-
-/// Build one fragment line: bincode header followed by the raw chunk bytes.
-fn frame_fragment(header: &FragmentHeader, chunk: &[u8]) -> Vec<u8> {
-    let mut packet = bincode::serde::encode_to_vec(header, bincode::config::standard())
-        .expect("header encoding cannot fail");
-    packet.extend_from_slice(chunk);
-    packet
-}
-
-/// Split a framed fragment line back into its header and chunk bytes.
-fn parse_fragment(bytes: &[u8]) -> Option<(FragmentHeader, Vec<u8>)> {
-    let (header, consumed): (FragmentHeader, usize) =
-        bincode::serde::decode_from_slice(bytes, bincode::config::standard()).ok()?;
-    if header.total_fragments == 0 || header.fragment_index >= header.total_fragments {
-        return None;
-    }
-    Some((header, bytes[consumed..].to_vec()))
-}
-
-/// In-progress reassembly of a fragmented message.
-struct ReassemblyState {
-    fragments: HashMap<u16, Vec<u8>>,
-    total_fragments: u16,
-}
 
 /// Network abstraction over a connected PACTOR modem link.
 ///
@@ -108,9 +48,9 @@ pub struct PactorNetwork<S, R> {
     transport: Arc<dyn PactorTransport>,
     max_read_len: usize,
     message_counter: AtomicU64,
-    /// Partially-received messages, keyed by `message_id`. Reassembly is over a
-    /// single point-to-point link, so the peer's id is implicit.
-    reassembly: Mutex<HashMap<u64, ReassemblyState>>,
+    /// Partially-received messages. Reassembly is over a single point-to-point
+    /// link, so the peer's id is implicit.
+    reassembly: Mutex<Reassembler>,
     _msg_types: PhantomData<(S, R)>,
 }
 
@@ -121,7 +61,7 @@ impl<S, R> PactorNetwork<S, R> {
             transport,
             max_read_len: DEFAULT_MAX_READ_LEN,
             message_counter: AtomicU64::new(0),
-            reassembly: Mutex::new(HashMap::new()),
+            reassembly: Mutex::new(Reassembler::new()),
             _msg_types: PhantomData,
         }
     }
@@ -136,22 +76,8 @@ impl<S, R> PactorNetwork<S, R> {
     /// each line stays within the radio MTU. A message that fits one line is
     /// sent as a single `total_fragments == 1` fragment.
     async fn send_serialized(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let chunk_len = effective_chunk_len();
-        let chunks: Vec<&[u8]> = if bytes.is_empty() {
-            vec![&bytes[..]]
-        } else {
-            bytes.chunks(chunk_len).collect()
-        };
-        let total_fragments = chunks.len() as u16;
         let message_id = self.message_counter.fetch_add(1, Ordering::Relaxed);
-
-        for (index, chunk) in chunks.iter().enumerate() {
-            let header = FragmentHeader {
-                message_id,
-                fragment_index: index as u16,
-                total_fragments,
-            };
-            let line = frame_fragment(&header, chunk);
+        for line in fragment_message(message_id, bytes) {
             self.transport
                 .write_data(&line)
                 .await
@@ -170,44 +96,13 @@ impl<S, R> PactorNetwork<S, R> {
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-            let Some((header, chunk)) = parse_fragment(&line) else {
-                warn!(
-                    "PactorNetwork: dropping unparseable fragment line ({} bytes)",
-                    line.len()
-                );
-                continue;
-            };
-
-            if header.total_fragments == 1 {
-                return Ok(chunk);
-            }
-
             let mut reassembly = self.reassembly.lock().await;
-            let state = reassembly
-                .entry(header.message_id)
-                .or_insert_with(|| ReassemblyState {
-                    fragments: HashMap::new(),
-                    total_fragments: header.total_fragments,
-                });
-            state.fragments.insert(header.fragment_index, chunk);
-
-            if state.fragments.len() == state.total_fragments as usize {
-                let total = state.total_fragments;
-                let mut message = Vec::new();
-                let mut complete = true;
-                for i in 0..total {
-                    match state.fragments.get(&i) {
-                        Some(fragment) => message.extend_from_slice(fragment),
-                        None => {
-                            warn!("PactorNetwork: missing fragment {i} during reassembly");
-                            complete = false;
-                            break;
-                        }
-                    }
-                }
-                reassembly.remove(&header.message_id);
-                if complete {
-                    return Ok(message);
+            match reassembly.push_line(&line) {
+                Some(message) => return Ok(message),
+                None => {
+                    // Either a mid-message fragment, or an unparseable line.
+                    // Keep reading; reassembly tolerates both.
+                    continue;
                 }
             }
         }
@@ -281,6 +176,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pactor_framing::{parse_fragment, RADIO_MTU};
     use async_trait::async_trait;
     use scs_pactor::ScsPactorError;
     use std::collections::VecDeque;
@@ -343,16 +239,6 @@ mod tests {
         ) -> Result<scs_pactor::PactorLinkEvent, ScsPactorError> {
             Err(ScsPactorError::Timeout)
         }
-    }
-
-    #[test]
-    fn header_len_and_chunk_len_are_sane() {
-        // Header must be non-trivial and the chunk must leave real room.
-        assert!(fragment_header_len() >= 4);
-        let chunk = effective_chunk_len();
-        assert!(chunk >= 64, "chunk too small: {chunk}");
-        // A full line (# + hex(header+chunk) + \r) must fit the MTU.
-        assert!(1 + (fragment_header_len() + chunk) * 2 + 1 <= RADIO_MTU);
     }
 
     #[tokio::test]
