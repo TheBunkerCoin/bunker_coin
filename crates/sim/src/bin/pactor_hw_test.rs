@@ -671,9 +671,13 @@ async fn consensus_smoke_test(
             _ => return Err(anyhow::anyhow!("round {round}: B -> A message mismatch")),
         }
 
-        // For the next round, A must regain the transmit turn. B's modem
-        // auto-changes-over once its buffer drained; give it a moment to settle.
+        // B was the ISS for the counter-vote, so it now holds the transmit turn.
+        // A already received B's data (above), so B's send is complete — hand the
+        // turn back to A now so the next round's A->B leg can transmit. (Doing
+        // this only after A's receive avoids cutting off B's own transmission.)
         if round < rounds {
+            println!("[round {round}] B handing transmit turn back to A (changeover) ...");
+            let _ = transport_b.changeover().await;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
