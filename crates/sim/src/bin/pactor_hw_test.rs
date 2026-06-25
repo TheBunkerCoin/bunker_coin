@@ -86,6 +86,12 @@ struct Args {
     #[arg(long)]
     bidirectional: bool,
 
+    /// Number of consensus message rounds to exchange in the smoke test. Each
+    /// round is one A->B vote (plus a B->A counter-vote when --bidirectional).
+    /// Used to characterize sustained throughput/stability over the link.
+    #[arg(long, default_value_t = 1)]
+    rounds: u32,
+
     /// Stop after sending C <CALL> and print raw L status polls.
     #[arg(long)]
     diagnose_connect: bool,
@@ -564,6 +570,7 @@ async fn consensus_smoke_test(
     transport_a: Arc<dyn PactorTransport>,
     transport_b: Arc<dyn PactorTransport>,
     bidirectional: bool,
+    rounds: u32,
 ) -> anyhow::Result<()> {
     use bunker_coin_radio::PactorNetwork;
     use bunkerglow::consensus::{ConsensusMessage, Vote};
@@ -571,7 +578,16 @@ async fn consensus_smoke_test(
     use bunkerglow::network::Network as BgNetwork;
     use bunkerglow::Slot;
 
-    println!("=== Consensus smoke test (bidirectional ConsensusMessage over PACTOR) ===");
+    let rounds = rounds.max(1);
+    println!(
+        "=== Consensus exchange over PACTOR ({} round(s), {}) ===",
+        rounds,
+        if bidirectional {
+            "bidirectional A<->B"
+        } else {
+            "one-way A->B"
+        }
+    );
 
     // PactorNetwork is point-to-point, so the SocketAddr is ignored; pass a dummy
     // one to satisfy the trait. Keep Arc clones so we can disconnect afterwards.
@@ -584,74 +600,97 @@ async fn consensus_smoke_test(
     let sk_a = SecretKey::new(&mut rand::rng());
     let sk_b = SecretKey::new(&mut rand::rng());
 
-    // --- A -> B ---
-    // B stays a passive ARQ slave here (do NOT put it in converse mode yet — that
-    // disrupts its reception of A's transmission). A is the ISS and transmits.
-    let a_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(1), &sk_a, 0));
-    println!("A -> sending vote (slot 1) ...");
-    net_a
-        .send(&a_msg, dummy_addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("A send failed: {e}"))?;
-    let b_got: ConsensusMessage = net_b
-        .receive()
-        .await
-        .map_err(|e| anyhow::anyhow!("B receive failed: {e}"))?;
-    println!("B <- received: {b_got:?}");
-    match (&a_msg, &b_got) {
-        (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {
-            println!("  A -> B vote verified");
+    // B enters converse mode once, up front, only when we will need the reverse
+    // direction. (For one-way A->B, B stays a passive receiver throughout.)
+    let mut b_in_converse = false;
+
+    let exchange_start = Instant::now();
+    let mut messages_ok: u32 = 0;
+
+    for round in 1..=rounds {
+        let slot_ab = (round as u64) * 2 - 1; // odd slots A->B
+        let slot_ba = (round as u64) * 2; // even slots B->A
+
+        // --- A -> B ---
+        // A is the ISS; B receives as a passive slave. Don't put B in converse
+        // before this leg — it disrupts B's reception.
+        let a_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(slot_ab), &sk_a, 0));
+        let t = Instant::now();
+        println!("[round {round}] A -> B vote (slot {slot_ab}) ...");
+        net_a
+            .send(&a_msg, dummy_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("round {round}: A send failed: {e}"))?;
+        let b_got: ConsensusMessage = net_b
+            .receive()
+            .await
+            .map_err(|e| anyhow::anyhow!("round {round}: B receive failed: {e}"))?;
+        match (&a_msg, &b_got) {
+            (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {
+                println!("[round {round}]   A -> B verified ({:.1?})", t.elapsed());
+                messages_ok += 1;
+            }
+            _ => return Err(anyhow::anyhow!("round {round}: A -> B message mismatch")),
         }
-        _ => return Err(anyhow::anyhow!("A -> B message mismatch")),
-    }
 
-    if !bidirectional {
-        // One-way A -> B only (the proven path). Skip the changeover/B->A leg.
-        println!("One-way consensus message delivered over PACTOR (A -> B)!");
-        println!("Disconnecting ...");
-        let _ = transport_a.disconnect().await;
-        let _ = transport_b.disconnect().await;
-        println!("Done.");
-        return Ok(());
-    }
-
-    // --- B -> A (exercises the ARQ changeover / reverse direction) ---
-    // Now B needs to transmit. A (ISS) hands over the transmit turn, and B enters
-    // converse mode so it can send. Entering converse only now (not before the
-    // A -> B leg) keeps B a clean receiver while A is sending.
-    println!("A: handing transmit turn to B (changeover) ...");
-    println!("B: entering converse mode to reply ...");
-    transport_b
-        .accept_incoming(None)
-        .await
-        .map_err(|e| anyhow::anyhow!("B converse failed: {e}"))?;
-    transport_a
-        .changeover()
-        .await
-        .map_err(|e| anyhow::anyhow!("A changeover failed: {e}"))?;
-
-    let b_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(2), &sk_b, 1));
-    println!("B -> sending counter-vote (slot 2) ...");
-    net_b
-        .send(&b_msg, dummy_addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("B send failed: {e}"))?;
-    // Do NOT changeover B here: its data is still being transmitted over the
-    // (slow) reverse ARQ path. B's modem auto-changes-over to A once its TX
-    // buffer drains. Forcing it now would cut off B's own transmission.
-    let a_got: ConsensusMessage = net_a
-        .receive()
-        .await
-        .map_err(|e| anyhow::anyhow!("A receive failed: {e}"))?;
-    println!("A <- received: {a_got:?}");
-    match (&b_msg, &a_got) {
-        (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {
-            println!("  B -> A vote verified");
+        if !bidirectional {
+            continue;
         }
-        _ => return Err(anyhow::anyhow!("B -> A message mismatch")),
+
+        // --- B -> A (ARQ changeover) ---
+        // A (ISS) hands over the transmit turn; B enters converse mode (once) so
+        // it can send. B's modem auto-changes-over back to A when its TX buffer
+        // drains, so we don't force a changeover after B's send.
+        if !b_in_converse {
+            transport_b
+                .accept_incoming(None)
+                .await
+                .map_err(|e| anyhow::anyhow!("round {round}: B converse failed: {e}"))?;
+            b_in_converse = true;
+        }
+        let t = Instant::now();
+        println!("[round {round}] changeover; B -> A counter-vote (slot {slot_ba}) ...");
+        transport_a
+            .changeover()
+            .await
+            .map_err(|e| anyhow::anyhow!("round {round}: A changeover failed: {e}"))?;
+        let b_msg = ConsensusMessage::Vote(Vote::new_skip(Slot::new(slot_ba), &sk_b, 1));
+        net_b
+            .send(&b_msg, dummy_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("round {round}: B send failed: {e}"))?;
+        let a_got: ConsensusMessage = net_a
+            .receive()
+            .await
+            .map_err(|e| anyhow::anyhow!("round {round}: A receive failed: {e}"))?;
+        match (&b_msg, &a_got) {
+            (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {
+                println!("[round {round}]   B -> A verified ({:.1?})", t.elapsed());
+                messages_ok += 1;
+            }
+            _ => return Err(anyhow::anyhow!("round {round}: B -> A message mismatch")),
+        }
+
+        // For the next round, A must regain the transmit turn. B's modem
+        // auto-changes-over once its buffer drained; give it a moment to settle.
+        if round < rounds {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
-    println!("Bidirectional consensus exchange succeeded over PACTOR!");
+    let elapsed = exchange_start.elapsed();
+    println!();
+    println!("=== Consensus exchange results ===");
+    println!("Rounds:           {rounds}");
+    println!("Messages OK:      {messages_ok}");
+    println!("Total time:       {elapsed:.1?}");
+    if messages_ok > 0 {
+        println!(
+            "Avg per message:  {:.1?}",
+            elapsed / messages_ok
+        );
+    }
+    println!("Consensus exchange succeeded over PACTOR!");
 
     println!("Disconnecting ...");
     let _ = transport_a.disconnect().await;
@@ -780,7 +819,8 @@ async fn main() -> anyhow::Result<()> {
     let transport_b: Arc<dyn PactorTransport> = Arc::new(modem_b);
 
     if args.consensus_smoke {
-        return consensus_smoke_test(transport_a, transport_b, args.bidirectional).await;
+        return consensus_smoke_test(transport_a, transport_b, args.bidirectional, args.rounds)
+            .await;
     }
 
     let node_a = PactorRadioNode::from_shared(&args.call_a, Arc::clone(&transport_a));
