@@ -853,15 +853,14 @@ impl PactorTransport for UsbPactorTransport {
         );
         let mut rx = self.data_rx.lock().await;
 
-        // Wait for either a data frame, a link-down signal (fail fast instead of
-        // blocking the full timeout when the modem disconnects mid-transfer), or
-        // the read timeout. The watch retains a drop that happened before we
-        // started waiting, so a mid-batch disconnect is never missed.
+        // Wait for either a data frame, a fresh link-down signal (fail fast on a
+        // mid-transfer disconnect instead of blocking the full timeout), or the
+        // read timeout. Mark the current watch value as seen so only a *new* drop
+        // during this wait trips us — a stale latched value from earlier in the
+        // session must not false-fail this receive (e.g. A's flag latched during
+        // a long A->B leg would otherwise wrongly fail the following B->A leg).
         let mut link_down = self.link_down.clone();
-        if *link_down.borrow() {
-            debug!("[data] read_data: link already down");
-            return Err(ScsPactorError::Disconnected);
-        }
+        link_down.mark_unchanged();
         let recv_with_down = async {
             tokio::select! {
                 biased;
