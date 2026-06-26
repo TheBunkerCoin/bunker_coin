@@ -254,9 +254,35 @@ async fn run_node(
     (highest, stop)
 }
 
+/// Suppress only the expected teardown panic from orphaned consensus tasks.
+///
+/// On every reconnect, the discarded node's detached repair/consensus tasks
+/// (which loop on `receive().unwrap()` with no cancellation) terminate by
+/// panicking when the mux closes their queue — this is how they release their
+/// RocksDB handles for the next session, so it's deliberate and non-fatal. It is
+/// also noisy on a flaky link that reconnects often. Install a panic hook that
+/// drops *only* that specific message and delegates everything else to the
+/// default hook, so real panics still surface with full backtraces.
+fn install_teardown_panic_filter() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if msg.contains("mux inbound queue closed") {
+            return; // expected orphaned-task teardown; stay quiet
+        }
+        default(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
+    install_teardown_panic_filter();
     let args = Args::parse();
     let cluster = build_cluster(args.seed);
     let duration = Duration::from_secs(args.duration);
