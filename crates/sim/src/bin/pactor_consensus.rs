@@ -390,11 +390,29 @@ async fn establish_link(
             .accept_incoming(Some(Duration::from_secs(300)))
             .await?;
     }
-    // Let the link settle before pushing consensus traffic.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Post-connect health check: on a marginal band the ARQ link often forms but
+    // collapses within seconds (the modem returns to the `cmd:` prompt / STBY).
+    // Confirm the link actually holds for a short window BEFORE declaring it up
+    // and starting consensus — otherwise we'd start a node on a dead link and the
+    // run would stall/exit. If it drops here, return an error so the caller's
+    // reconnect loop retries rather than proceeding.
+    println!("verifying link holds ...");
+    let health_deadline = tokio::time::Instant::now() + LINK_HEALTH_WINDOW;
+    while tokio::time::Instant::now() < health_deadline {
+        if !transport.is_link_up() {
+            anyhow::bail!("link collapsed during post-connect health check");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     println!("link established; starting consensus");
     Ok(transport)
 }
+
+/// How long the link must stay up after connect before we trust it and start
+/// consensus. Longer than the few-seconds-to-`cmd:` collapse seen on marginal
+/// bands, short enough not to waste a good window.
+const LINK_HEALTH_WINDOW: Duration = Duration::from_secs(10);
 
 /// Run one node over a real modem on this machine, **reconnecting across link
 /// drops** until the total `--duration` budget is spent.
