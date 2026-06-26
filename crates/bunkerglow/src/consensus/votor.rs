@@ -19,8 +19,8 @@ use log::{debug, trace, warn};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::blockstore::BlockInfo;
-use super::{Cert, DELTA_BLOCK, DELTA_TIMEOUT, Vote};
-use crate::consensus::DELTA_FIRST_SLICE;
+use super::{Cert, Vote, delta_block, delta_timeout};
+use crate::consensus::delta_first_slice;
 use crate::crypto::aggsig::SecretKey;
 use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH, MerkleRoot};
 use crate::{All2All, Slot, ValidatorId};
@@ -268,15 +268,15 @@ impl<A: All2All> Votor<A> {
         );
         let sender = self.event_sender.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(DELTA_TIMEOUT + DELTA_FIRST_SLICE).await;
+            tokio::time::sleep(delta_timeout() + delta_first_slice()).await;
             // HACK: ignoring errors to prevent panic when shutting down votor
             let event = VotorEvent::TimeoutCrashedLeader(slot);
             let _ = sender.send(event).await;
             for s in slot.slots_in_window() {
                 if s.is_start_of_window() {
-                    tokio::time::sleep(DELTA_BLOCK - DELTA_FIRST_SLICE).await;
+                    tokio::time::sleep(delta_block() - delta_first_slice()).await;
                 } else {
-                    tokio::time::sleep(DELTA_BLOCK).await;
+                    tokio::time::sleep(delta_block()).await;
                 }
                 let event = VotorEvent::Timeout(s);
                 let _ = sender.send(event).await;

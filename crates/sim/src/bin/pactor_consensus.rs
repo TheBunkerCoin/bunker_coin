@@ -87,6 +87,12 @@ struct Args {
     #[arg(long)]
     frequency: Option<f64>,
 
+    /// Consensus timing multiplier (stretches block cadence / timeouts to match
+    /// a slow link). Hardware defaults to 8; override for a faster/slower link.
+    /// Sets BUNKER_DELTA_MULT before consensus starts.
+    #[arg(long)]
+    delta_mult: Option<f64>,
+
     /// Connect attempts before giving up (hardware mode, node 0).
     #[arg(long, default_value_t = 3)]
     connect_attempts: u32,
@@ -372,8 +378,17 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
     let is_caller = own_id == 0;
     let label = format!("node{own_id}");
 
+    // Stretch consensus timing to match the slow half-duplex link, BEFORE any
+    // node (and thus any timer) is built. Without this, blocks are produced
+    // faster than the link can disseminate+vote+certify them, so consensus times
+    // out past the first slot. Default 8x for radio; --delta-mult overrides.
+    let delta_mult = args.delta_mult.unwrap_or(8.0);
+    // SAFETY: set at startup before any consensus task / timer reads it.
+    unsafe {
+        std::env::set_var("BUNKER_DELTA_MULT", delta_mult.to_string());
+    }
     println!(
-        "=== hardware node {own_id} ({}) over {port} ===",
+        "=== hardware node {own_id} ({}) over {port} | delta_mult={delta_mult} ===",
         args.mycall
     );
 

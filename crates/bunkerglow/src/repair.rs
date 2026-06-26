@@ -18,7 +18,7 @@ use log::{debug, trace, warn};
 use tokio::sync::RwLock;
 use wincode::{SchemaRead, SchemaWrite};
 
-use crate::consensus::{Blockstore, DELTA, EpochInfo, Pool};
+use crate::consensus::{Blockstore, EpochInfo, Pool, delta};
 use crate::crypto::merkle::{DoubleMerkleProof, DoubleMerkleTree, MerkleRoot, SliceRoot};
 use crate::crypto::{Hash, hash};
 use crate::disseminator::rotor::{SamplingStrategy, StakeWeightedSampler};
@@ -30,7 +30,9 @@ use crate::{BlockId, ValidatorId};
 /// Maximum time to wait for a response to a repair request.
 ///
 /// After a request times out we retry it from another node.
-const REPAIR_TIMEOUT: Duration = DELTA.checked_mul(2).unwrap();
+fn repair_timeout() -> Duration {
+    delta() * 2
+}
 
 /// Different types of [`RepairRequest`] messages.
 #[derive(Clone, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
@@ -389,7 +391,7 @@ where
     async fn send_request(&mut self, req_type: RepairRequestType) -> std::io::Result<()> {
         let hash = req_type.hash();
 
-        let expiry = Instant::now() + REPAIR_TIMEOUT;
+        let expiry = Instant::now() + repair_timeout();
         self.outstanding_requests
             .insert(hash.clone(), req_type.clone());
         self.request_timeouts.retain(|(_, h)| h != &hash);

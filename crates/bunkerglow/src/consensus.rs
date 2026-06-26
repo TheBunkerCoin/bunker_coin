@@ -53,22 +53,48 @@ use crate::shredder::Shred;
 use crate::snapshot::{SnapshotCheckpoint, SnapshotStore};
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
 
+/// Multiplier applied to every consensus timing delta, read once from the
+/// `BUNKER_DELTA_MULT` environment variable (default `1.0`).
+///
+/// The default deltas assume an internet-speed network. Over a slow half-duplex
+/// PACTOR HF link a single block's disseminate → vote → certify round-trip takes
+/// far longer than the default ~120s block cadence, so consensus falls behind
+/// and times out. Setting `BUNKER_DELTA_MULT` (e.g. `8`) stretches all timers to
+/// match the link so each slot can finalize before the next block is produced.
+/// Sim/tests leave it unset (multiplier 1.0).
+static DELTA_MULT: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+    std::env::var("BUNKER_DELTA_MULT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|m| *m > 0.0)
+        .unwrap_or(1.0)
+});
+
+/// Scale a base duration by [`DELTA_MULT`].
+fn scaled(base_ms: u64) -> Duration {
+    Duration::from_millis((base_ms as f64 * *DELTA_MULT) as u64)
+}
+
 /// Time bound assumed on network transmission delays during periods of synchrony.
-pub(crate) const DELTA: Duration = Duration::from_millis(8_000);
-/// Target time for block production (slot length)
-const TARGET_BLOCK_TIME: Duration = Duration::from_millis(60_000);
+pub(crate) fn delta() -> Duration {
+    scaled(8_000)
+}
 /// Time the leader has for producing and sending the block.
-const DELTA_BLOCK: Duration = Duration::from_millis(120_000);
-/// Timeout to use when we haven't seen any shred from the leader's block.
-const DELTA_EARLY_TIMEOUT: Duration = Duration::from_millis(180_000);
-// const DELTA_EARLY_TIMEOUT: Duration = DELTA.checked_mul(2).unwrap();
+fn delta_block() -> Duration {
+    scaled(120_000)
+}
 /// Timeout to use when we have seen at least one shred from the leader's block.
-const DELTA_TIMEOUT: Duration = Duration::from_millis(240_000);
-// const DELTA_TIMEOUT: Duration = DELTA_EARLY_TIMEOUT.checked_add(DELTA_BLOCK).unwrap();
+fn delta_timeout() -> Duration {
+    scaled(240_000)
+}
 /// Timeout for standstill detection mechanism.
-const DELTA_STANDSTILL: Duration = Duration::from_millis(300_000);
+fn delta_standstill() -> Duration {
+    scaled(300_000)
+}
 /// Max time to produce and send the first slice of a block.
-pub(crate) const DELTA_FIRST_SLICE: Duration = Duration::from_millis(30_000);
+pub(crate) fn delta_first_slice() -> Duration {
+    scaled(30_000)
+}
 
 #[derive(Clone, Debug, SchemaRead, SchemaWrite)]
 pub enum ConsensusMessage {
@@ -220,8 +246,8 @@ where
             blockstore.clone(),
             pool.clone(),
             cancel_token.clone(),
-            DELTA_BLOCK,
-            DELTA_FIRST_SLICE,
+            delta_block(),
+            delta_first_slice(),
             epoch_info_rx.clone(),
             pending_epoch_transitions.clone(),
         ));
@@ -379,11 +405,11 @@ where
             if slot > finalized_slot {
                 finalized_slot = slot;
                 last_progress = Instant::now();
-            } else if last_progress.elapsed() > DELTA_STANDSTILL {
+            } else if last_progress.elapsed() > delta_standstill() {
                 self.pool.read().await.recover_from_standstill().await;
                 last_progress = Instant::now();
             }
-            tokio::time::sleep(DELTA_BLOCK).await;
+            tokio::time::sleep(delta_block()).await;
         }
     }
 
