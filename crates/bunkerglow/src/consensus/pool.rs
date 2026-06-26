@@ -167,7 +167,8 @@ impl PoolImpl {
         std::fs::create_dir_all(&db_path).ok();
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = DB::open(&opts, db_path).expect("open RocksDB pool db");
+        let db = super::blockstore::open_db_with_retry(&opts, &db_path)
+            .expect("open RocksDB pool db");
 
         let mut s = Self {
             slot_states: BTreeMap::new(),

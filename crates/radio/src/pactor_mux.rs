@@ -423,6 +423,7 @@ impl PactorMux {
             transport,
             reader,
             writer,
+            inbound_tx: self.inbound_tx.clone(),
         }
     }
 }
@@ -432,6 +433,9 @@ pub struct PactorMuxHandle {
     transport: Arc<dyn PactorTransport>,
     reader: tokio::task::JoinHandle<()>,
     writer: tokio::task::JoinHandle<()>,
+    /// Inbound senders, retained so [`shutdown`](Self::shutdown) can keep the
+    /// channels open after aborting the reader (see there).
+    inbound_tx: [Option<mpsc::Sender<Vec<u8>>>; Channel::COUNT],
 }
 
 impl PactorMuxHandle {
@@ -443,10 +447,24 @@ impl PactorMuxHandle {
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
-    /// Abort the reader and writer tasks.
-    pub fn shutdown(&self) {
+    /// Shut the mux down for a clean teardown (e.g. before a reconnect).
+    ///
+    /// Aborts the reader and writer tasks and closes the inbound channels (by
+    /// dropping the retained senders). This is deliberate: a node being discarded
+    /// has detached repair tasks looping on `receive()` with no cancellation —
+    /// they only terminate (and release their `Blockstore`/`Pool` handles, which
+    /// hold the RocksDB locks the *next* session must re-open) once their queue
+    /// closes. Closing the queues lets them unwind and free those DBs. The
+    /// resulting `receive().unwrap()` is logged as a panic in those detached
+    /// tasks but is non-fatal to the process.
+    pub fn shutdown(&mut self) {
         self.reader.abort();
         self.writer.abort();
+        // Drop the retained inbound senders so the channels close and orphaned
+        // receivers terminate (freeing the RocksDB handles for the next session).
+        for slot in &mut self.inbound_tx {
+            *slot = None;
+        }
     }
 }
 

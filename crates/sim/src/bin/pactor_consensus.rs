@@ -205,7 +205,7 @@ enum RunStop {
 async fn run_node(
     label: &str,
     node: Node,
-    handle: PactorMuxHandle,
+    mut handle: PactorMuxHandle,
     until: tokio::time::Instant,
     link: Option<Arc<dyn PactorTransport>>,
 ) -> (u64, RunStop) {

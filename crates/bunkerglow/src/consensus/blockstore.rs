@@ -25,6 +25,30 @@ use crate::shredder::{RegularShredder, Shred, ShredIndex, ShredderPool, Validate
 use crate::types::SliceIndex;
 use crate::{Block, BlockId, Slot};
 
+/// Open a RocksDB database, retrying briefly if the lock is still held.
+///
+/// On a reconnect (e.g. consensus over a radio link that dropped) a fresh node
+/// re-opens the same DB paths while the previous node's detached tasks may not
+/// have released their handles yet. RocksDB allows only one handle per path, so
+/// the open can transiently fail with a LOCK error; retry with backoff so the
+/// prior handle has time to drop instead of panicking immediately.
+pub(crate) fn open_db_with_retry(opts: &Options, path: &str) -> Result<DB, rocksdb::Error> {
+    const ATTEMPTS: u32 = 30;
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match DB::open(opts, path) {
+            Ok(db) => return Ok(db),
+            Err(e) => {
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt"))
+}
+
 /// additional metadata (might need refactor @e)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockMetadata {
@@ -85,7 +109,7 @@ impl BlockstoreImpl {
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = DB::open(&opts, db_path).expect("open RocksDB");
+        let db = open_db_with_retry(&opts, &db_path).expect("open RocksDB");
 
         Self {
             block_data: BTreeMap::new(),
