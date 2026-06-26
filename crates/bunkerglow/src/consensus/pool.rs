@@ -669,7 +669,14 @@ impl Pool for PoolImpl {
     async fn recover_from_standstill(&self) {
         let slot = self.finalized_slot();
         let mut certs = self.get_final_certs(slot);
-        assert!(!certs.is_empty(), "no final cert");
+        // If nothing has been finalized yet (finalized slot is genesis with no
+        // cert), there is no final cert to re-broadcast. This is reachable over a
+        // slow/marginal link where consensus can stall at slot 0 before the first
+        // finalization; treat it as a no-op recovery rather than asserting.
+        if certs.is_empty() {
+            warn!("standstill recovery at slot {slot} with no final cert yet; nothing to re-broadcast");
+            return;
+        }
         certs.extend(self.get_certs(slot.next()..));
         let votes = self.get_own_votes(slot.next()..);
 
