@@ -232,14 +232,18 @@ async fn run_node(
         tokio::time::sleep(Duration::from_secs(2)).await;
     };
 
-    // Stop consensus. We deliberately do NOT abort the mux reader/writer here:
-    // aborting the reader drops its inbound senders, which would make the
-    // (still-running) repair tasks' `receive().unwrap()` see a closed queue and
-    // panic on the way out. Cancelling consensus and letting the runtime drop
-    // the mux tasks on process exit is a clean shutdown. `handle` is held until
-    // here so the reader's senders stay alive for the lifetime of the node.
+    // Stop consensus, then tear the mux down so the transport (and its serial
+    // fd) can be released for a reconnect.
+    //
+    // Order matters: cancel consensus and give it a moment to wind down BEFORE
+    // aborting the mux reader. Aborting the reader drops its inbound senders; a
+    // still-running repair task's `receive().unwrap()` would then see a closed
+    // queue and panic (isolated to that task, but noisy). After shutdown +
+    // dropping the handle, the mux reader/writer tasks release their transport
+    // clones, so the caller dropping the last transport Arc frees the modem port.
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(2), run_task).await;
+    handle.shutdown();
     drop(handle);
     (highest, stop)
 }
@@ -415,13 +419,18 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
             run_node(&label, node, handle, overall_deadline, Some(transport.clone())).await;
         highest = highest.max(slot);
 
+        // Tell the modem to drop the link, then release the transport so its
+        // serial port is freed before the next session re-opens it. Dropping the
+        // last `Arc<UsbPactorTransport>` aborts its reader task and closes the fd;
+        // the brief sleep gives the OS time to release the device (otherwise the
+        // re-open hits "Device or resource busy").
+        let _ = transport.disconnect().await;
+        drop(transport);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
         match stop {
             RunStop::Deadline => break,
-            RunStop::LinkDown => {
-                // Clean up the dropped link before reconnecting.
-                let _ = transport.disconnect().await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+            RunStop::LinkDown => {}
         }
     }
 
