@@ -334,8 +334,13 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
         println!("connecting to {} ...", args.peercall);
         connect_with_retries(&transport, &args.peercall, args.connect_attempts).await?;
     } else {
-        println!("listening for incoming connection ...");
-        transport.accept_incoming(None).await?;
+        // Wait generously so there's ample time to start the caller after this
+        // listener is ready, and so a slow first connect on a marginal band does
+        // not time out prematurely.
+        println!("listening for incoming connection (up to 300s) ...");
+        transport
+            .accept_incoming(Some(Duration::from_secs(300)))
+            .await?;
     }
     // Let the link settle before pushing consensus traffic.
     tokio::time::sleep(Duration::from_secs(3)).await;

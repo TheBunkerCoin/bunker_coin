@@ -808,20 +808,56 @@ impl PactorTransport for UsbPactorTransport {
 
     async fn accept_incoming(
         &self,
-        _timeout_after: Option<Duration>,
+        timeout_after: Option<Duration>,
     ) -> Result<String, ScsPactorError> {
-        // The answering modem is in LISTEN mode and auto-answers the incoming
-        // call at the RF level on its own — by the time the caller's connect has
-        // returned, this side is already connected. It just needs to enter
-        // CONVerse mode so it can also transmit (otherwise the answerer is
-        // receive-only). We do NOT wait for a CONNECTED event here: the modem
-        // emits it as terminal text and the timing is racy; entering converse
-        // unconditionally is simpler and reliable.
-        // Clear any stale link-down flag from a previous session.
+        // The answering modem is in LISTEN mode. It must stay in terminal/command
+        // mode and let the firmware auto-answer the incoming call at the RF level;
+        // it must NOT enter CONVerse until the link is actually up. Entering
+        // converse early (the old behaviour) only worked when a single process
+        // choreographed both modems — across two independent processes it makes
+        // the answerer leave command mode before the caller's `C` lands, so the
+        // call finds no listener and drops back to the `cmd:` prompt.
+        //
+        // So wait for the real "*** CONNECTED TO <call>" status (parsed by the
+        // background reader into a Connected event), nudging with CR periodically
+        // so the firmware re-emits its banner, then enter CONVerse so this side
+        // can also transmit.
         let _ = self.link_down_tx.send(false);
-        let _ = self.write_raw(b"CONV\r").await;
-        debug!("[accept] entered converse mode (CONV)");
-        Ok(String::new())
+        // Leave JHOST hostmode so the listener is in terminal mode: it auto-
+        // answers the incoming call and reports link state as the plain ASCII
+        // "*** CONNECTED TO X" banner the reader parses (same as the caller side).
+        let _ = self.write_raw(b"JHOST0\r").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        debug!("[accept] listening; waiting for incoming CONNECTED ...");
+
+        let deadline = Instant::now() + timeout_after.unwrap_or(self.command_timeout);
+        let nudge_interval = Duration::from_secs(2);
+        let mut rx = self.event_rx.lock().await;
+
+        loop {
+            if Instant::now() >= deadline {
+                return Err(ScsPactorError::Timeout);
+            }
+            let wait = nudge_interval.min(deadline.saturating_duration_since(Instant::now()));
+            match timeout(wait, rx.recv()).await {
+                Ok(Some(PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }))) => {
+                    debug!("[accept] incoming link established (CONNECTED TO {remote_call})");
+                    let _ = self.write_raw(b"CONV\r").await;
+                    debug!("[accept] entered converse mode (CONV)");
+                    return Ok(remote_call);
+                }
+                Ok(Some(PactorLinkEvent::Status(PactorLinkStatus::Connecting { remote_call }))) => {
+                    debug!("[accept] incoming call from {remote_call} ...");
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(ScsPactorError::Disconnected),
+                Err(_) => {
+                    // No event this interval — nudge so the firmware re-emits its
+                    // status banner (it only prints in response to a newline).
+                    let _ = self.write_raw(b"\r").await;
+                }
+            }
+        }
     }
 
     async fn changeover(&self) -> Result<(), ScsPactorError> {
