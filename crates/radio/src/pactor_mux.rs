@@ -75,13 +75,18 @@ const MAX_TURN_HOLD: Duration = Duration::from_secs(30);
 /// of fragmenting across changeovers. Short, so we don't waste the turn idling.
 const TURN_DRAIN_GRACE: Duration = Duration::from_secs(3);
 
-/// While holding the turn with an empty queue, wait at most this long for
-/// something to send before granting the turn to the peer. Kept short so voting
-/// stays responsive: a node that just received a block must be able to get the
-/// turn quickly to send its vote, or quorum is never reached in time. A short
-/// keepalive is sent before granting so the brief silent window does not let the
-/// ARQ link drop to STBY.
-const TURN_IDLE_GRANT: Duration = Duration::from_secs(4);
+/// How often the turn-holder sends a keepalive line while idle, to keep the
+/// PACTOR ARQ link from timing out to STBY during quiet periods. Must be
+/// comfortably shorter than the modem's inactivity timeout (~40s observed).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a turn-holder keeps the turn while idle — sending keepalives every
+/// [`KEEPALIVE_INTERVAL`] throughout — before granting it to the peer so the peer
+/// can send anything queued. Must be long enough that the link stays busy with
+/// keepalives across quiet periods, but short enough that a peer with a vote to
+/// send does not wait too long for a turn. The turn still flips immediately when
+/// real data arrives, so voting stays responsive.
+const IDLE_TURN_GRANT: Duration = Duration::from_secs(20);
 
 /// Shared half-duplex turn state between the mux reader and writer.
 ///
@@ -363,31 +368,50 @@ impl PactorMux {
                 }
 
                 let turn_deadline = tokio::time::Instant::now() + MAX_TURN_HOLD;
-                // Wait briefly for the first item; if none arrives, keepalive and
-                // grant so the peer can send.
-                match tokio::time::timeout(TURN_IDLE_GRANT, outbound_rx.recv()).await {
-                    Ok(Some(item)) => {
-                        if let Err(e) = write_message(
-                            &writer_transport,
-                            &counter,
-                            item.channel as u8,
-                            &item.payload,
-                        )
-                        .await
-                        {
-                            warn!("[mux:writer] write_data failed: {e}");
-                            return;
+                // Wait for the first item to send. While idle, send keepalives
+                // every KEEPALIVE_INTERVAL to keep the ARQ link alive, and KEEP
+                // HOLDING the turn for up to IDLE_TURN_GRANT before granting it to
+                // the peer. This is the key fix: a turn-holder must keep emitting
+                // keepalives throughout a long quiet period (e.g. the multi-minute
+                // wait for the next block) — not send one keepalive and immediately
+                // grant the turn away, after which neither side transmits and the
+                // link drops to STBY.
+                let mut first_item = None;
+                let idle_until = tokio::time::Instant::now() + IDLE_TURN_GRANT;
+                loop {
+                    let wait = KEEPALIVE_INTERVAL
+                        .min(idle_until.saturating_duration_since(tokio::time::Instant::now()));
+                    match tokio::time::timeout(wait, outbound_rx.recv()).await {
+                        Ok(Some(item)) => {
+                            first_item = Some(item);
+                            break;
+                        }
+                        Ok(None) => return, // outbound closed
+                        Err(_) => {
+                            if tokio::time::Instant::now() >= idle_until {
+                                break; // idle long enough — grant the turn
+                            }
+                            // Still idle: keepalive and keep holding the turn.
+                            if let Err(e) =
+                                write_message(&writer_transport, &counter, KEEPALIVE_TAG, &[]).await
+                            {
+                                warn!("[mux:writer] keepalive write failed: {e}");
+                                return;
+                            }
                         }
                     }
-                    Ok(None) => return, // outbound closed
-                    Err(_) => {
-                        // Idle: keep the link alive across the changeover gap.
-                        if let Err(e) =
-                            write_message(&writer_transport, &counter, KEEPALIVE_TAG, &[]).await
-                        {
-                            warn!("[mux:writer] keepalive write failed: {e}");
-                            return;
-                        }
+                }
+                if let Some(item) = first_item {
+                    if let Err(e) = write_message(
+                        &writer_transport,
+                        &counter,
+                        item.channel as u8,
+                        &item.payload,
+                    )
+                    .await
+                    {
+                        warn!("[mux:writer] write_data failed: {e}");
+                        return;
                     }
                 }
                 // Keep draining while we hold the turn. Consensus enqueues a

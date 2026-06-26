@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bunker_coin_radio::{Channel, MuxChannel, PactorMux, PactorMuxHandle};
-use bunker_coin_sim::pactor_init::{connect_with_retries, init_modem, PactorInitConfig};
+use bunker_coin_sim::pactor_init::{
+    connect_with_retries, init_modem, light_init_modem, PactorInitConfig,
+};
 use bunkerglow::all2all::TrivialAll2All;
 use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
 use bunkerglow::crypto::aggsig;
@@ -368,9 +370,17 @@ async fn establish_link(
     is_caller: bool,
     peercall: &str,
     connect_attempts: u32,
+    full_init: bool,
 ) -> anyhow::Result<UsbPactorTransport> {
-    println!("bringing up modem ...");
-    let transport = init_modem(init_cfg).await?;
+    // First session does the full bring-up; reconnects use the fast path (modem
+    // config persists across a STBY drop), reclaiming most of each band window.
+    let transport = if full_init {
+        println!("bringing up modem (full init) ...");
+        init_modem(init_cfg).await?
+    } else {
+        println!("bringing up modem (fast reconnect) ...");
+        light_init_modem(init_cfg).await?
+    };
     if is_caller {
         println!("connecting to {peercall} ...");
         connect_with_retries(&transport, peercall, connect_attempts).await?;
@@ -440,12 +450,14 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
             init_cfg.frequency = None;
         }
 
-        // Establish (or re-establish) the link for this session.
+        // Establish (or re-establish) the link for this session. Full init only
+        // on the first session; reconnects use the fast path.
         let transport = match establish_link(
             &init_cfg,
             is_caller,
             &args.peercall,
             args.connect_attempts,
+            session == 1,
         )
         .await
         {

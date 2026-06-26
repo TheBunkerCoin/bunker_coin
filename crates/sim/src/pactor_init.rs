@@ -240,6 +240,41 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
     ))
 }
 
+/// Fast re-init for a reconnect: re-open the modem WITHOUT the full bring-up.
+///
+/// The modem's stored configuration (MYcall, PTCH, CHO, tones, LISTEN, TRX
+/// frequency, …) survives a STBY drop, so after the first [`init_modem`] a
+/// reconnect only needs to return the modem to a clean terminal command prompt
+/// and re-open the transport — skipping the ~30-60s of drain/config/JHOST4/verify
+/// that dominate full init. On a flaky band that drops every minute this reclaims
+/// most of each good-band window for actual consensus.
+///
+/// `listen` re-asserts `LISTEN 1` (cheap insurance) on the answering modem.
+pub async fn light_init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTransport> {
+    let port = cfg.port.as_str();
+    let mut serial = open_serial(port, cfg.baud)?;
+
+    // Return to a clean command prompt: ESC out of any lingering converse mode,
+    // drain, force-disconnect any stale link (preserves config), drain again.
+    serial.write_all(&[0x1b]).await?;
+    serial.flush().await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain_serial(&mut serial).await;
+    send_ascii(&mut serial, "DD").await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain_serial(&mut serial).await;
+
+    // Re-assert LISTEN on the answerer (config persists, but cheap to be safe).
+    if cfg.listen {
+        send_ascii(&mut serial, "LISTEN 1").await?;
+    }
+
+    let mut config = UsbPactorConfig::new(port);
+    config.command_timeout = cfg.command_timeout;
+    config.read_timeout = Some(Duration::from_secs(180));
+    Ok(UsbPactorTransport::from_stream(serial, config))
+}
+
 /// Establish the PACTOR link from the caller side, retrying a few times.
 ///
 /// On a marginal HF link a single connect can abort to STBY; retrying after a
