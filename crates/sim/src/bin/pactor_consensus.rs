@@ -397,13 +397,21 @@ async fn establish_link(
     // and starting consensus — otherwise we'd start a node on a dead link and the
     // run would stall/exit. If it drops here, return an error so the caller's
     // reconnect loop retries rather than proceeding.
+    //
+    // Crucially this is an ACTIVE check: it sends keepalive lines throughout. The
+    // ARQ link drops to STBY after ~43s of no traffic, and right after connect
+    // neither side has consensus data yet (mid inter-block window), so a passive
+    // wait would let the very link we're verifying time out. The keepalive byte
+    // (0xFE) is the same tag the peer's mux reader ignores.
     println!("verifying link holds ...");
     let health_deadline = tokio::time::Instant::now() + LINK_HEALTH_WINDOW;
     while tokio::time::Instant::now() < health_deadline {
         if !transport.is_link_up() {
             anyhow::bail!("link collapsed during post-connect health check");
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // `#<msgid:00000001><tag:fe>\r` — a minimal keepalive line the peer drops.
+        let _ = transport.write_data(&[0x00, 0x00, 0x00, 0x01, 0xFE]).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
     println!("link established; starting consensus");
     Ok(transport)
