@@ -69,6 +69,12 @@ const KEEPALIVE_TAG: u8 = 0xFE;
 /// adjustment.
 const MAX_TURN_HOLD: Duration = Duration::from_secs(30);
 
+/// While holding the turn, how long to wait for a follow-up message after the
+/// queue momentarily empties before granting the turn to the peer. Lets a slot's
+/// asynchronously-produced burst (shreds, then cert) go out in one turn instead
+/// of fragmenting across changeovers. Short, so we don't waste the turn idling.
+const TURN_DRAIN_GRACE: Duration = Duration::from_secs(3);
+
 /// While holding the turn with an empty queue, wait at most this long for
 /// something to send before granting the turn to the peer. Kept short so voting
 /// stays responsive: a node that just received a block must be able to get the
@@ -384,10 +390,18 @@ impl PactorMux {
                         }
                     }
                 }
-                // Drain anything else already queued (bounded by MAX_TURN_HOLD).
-                while tokio::time::Instant::now() < turn_deadline {
-                    match outbound_rx.try_recv() {
-                        Ok(item) => {
+                // Keep draining while we hold the turn. Consensus enqueues a
+                // slot's messages asynchronously (shreds, then the cert moments
+                // later), so don't grant the instant the queue momentarily empties
+                // — wait a short grace period for follow-up messages so a whole
+                // slot goes out in ONE transmit turn instead of fragmenting across
+                // many expensive changeovers. Bounded by MAX_TURN_HOLD.
+                loop {
+                    if tokio::time::Instant::now() >= turn_deadline {
+                        break;
+                    }
+                    match tokio::time::timeout(TURN_DRAIN_GRACE, outbound_rx.recv()).await {
+                        Ok(Some(item)) => {
                             if let Err(e) = write_message(
                                 &writer_transport,
                                 &counter,
@@ -400,8 +414,10 @@ impl PactorMux {
                                 return;
                             }
                         }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => return,
+                        Ok(None) => return,
+                        // No follow-up within the grace window: the slot's burst is
+                        // done — grant the turn so the peer can respond/vote.
+                        Err(_) => break,
                     }
                 }
 
