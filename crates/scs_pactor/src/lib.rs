@@ -92,6 +92,17 @@ pub trait PactorTransport: Send + Sync {
 
     async fn disconnect(&self) -> Result<(), ScsPactorError>;
 
+    /// Whether the link is currently up.
+    ///
+    /// Returns `false` once the modem has reported a disconnect / STBY / link
+    /// failure for the current session. Lets long-running callers (e.g. a
+    /// consensus node) detect a mid-session drop and reconnect. The default is
+    /// `true` for transports without an explicit link-down signal (TCP /
+    /// simulated), which are considered up until a read/write errors.
+    fn is_link_up(&self) -> bool {
+        true
+    }
+
     async fn next_event(
         &self,
         timeout_after: Option<Duration>,

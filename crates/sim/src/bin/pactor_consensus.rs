@@ -37,7 +37,9 @@ use bunkerglow::{Transaction, ValidatorInfo};
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use scs_pactor::{PactorTransport, SimulatedPactorConfig, SimulatedPactorPair};
+use scs_pactor::{
+    PactorTransport, SimulatedPactorConfig, SimulatedPactorPair, UsbPactorTransport,
+};
 
 /// The five logical networks, each a [`MuxChannel`] sharing one PACTOR link.
 type MuxAll2All = MuxChannel<ConsensusMessage, ConsensusMessage>;
@@ -186,25 +188,46 @@ fn build_node(
     (node, handle)
 }
 
-/// Drive a node for `duration`, polling its finalized slot for progress.
+/// Why [`run_node`] stopped.
+enum RunStop {
+    /// The `until` deadline elapsed.
+    Deadline,
+    /// The PACTOR link dropped mid-session (caller may reconnect).
+    LinkDown,
+}
+
+/// Drive a node until `until`, polling its finalized slot for progress and (if
+/// `link` is given) watching for a mid-session link drop.
 ///
 /// `Alpenglow::run` consumes the node, so we grab the pool handle (a cheap `Arc`
-/// clone) *before* moving the node into the run task, then poll it.
-async fn run_node(label: String, node: Node, handle: PactorMuxHandle, duration: Duration) -> u64 {
+/// clone) *before* moving the node into the run task, then poll it. Returns the
+/// highest finalized slot reached and why it stopped.
+async fn run_node(
+    label: &str,
+    node: Node,
+    handle: PactorMuxHandle,
+    until: tokio::time::Instant,
+    link: Option<Arc<dyn PactorTransport>>,
+) -> (u64, RunStop) {
     let pool = node.get_pool();
     let cancel = node.get_cancel_token();
     let run_task = tokio::spawn(node.run());
 
-    let deadline = tokio::time::Instant::now() + duration;
     let mut last = 0u64;
-    let highest = loop {
+    let (highest, stop) = loop {
         let finalized = pool.read().await.finalized_slot().inner();
         if finalized != last {
             println!("[{label}] finalized slot {finalized}");
             last = finalized;
         }
-        if tokio::time::Instant::now() >= deadline {
-            break finalized;
+        if tokio::time::Instant::now() >= until {
+            break (finalized, RunStop::Deadline);
+        }
+        if let Some(link) = &link {
+            if !link.is_link_up() {
+                println!("[{label}] link dropped (finalized {finalized} so far)");
+                break (finalized, RunStop::LinkDown);
+            }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     };
@@ -218,7 +241,7 @@ async fn run_node(label: String, node: Node, handle: PactorMuxHandle, duration: 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(2), run_task).await;
     drop(handle);
-    highest
+    (highest, stop)
 }
 
 #[tokio::main]
@@ -287,10 +310,12 @@ async fn run_simulated(
     let (node_a, handle_a) = build_node(ta, 0, &cluster, turn_a);
     let (node_b, handle_b) = build_node(tb, 1, &cluster, turn_b);
 
-    let a = tokio::spawn(run_node("node0".to_string(), node_a, handle_a, duration));
-    let b = tokio::spawn(run_node("node1".to_string(), node_b, handle_b, duration));
+    let until = tokio::time::Instant::now() + duration;
+    // Simulated link never "drops" (full-duplex), so no link watch / reconnect.
+    let a = tokio::spawn(async move { run_node("node0", node_a, handle_a, until, None).await });
+    let b = tokio::spawn(async move { run_node("node1", node_b, handle_b, until, None).await });
 
-    let (slot_a, slot_b) = (a.await?, b.await?);
+    let (slot_a, slot_b) = (a.await?.0, b.await?.0);
     println!("=== done: node0 finalized {slot_a}, node1 finalized {slot_b} ===");
     if slot_a == 0 && slot_b == 0 {
         anyhow::bail!("no slots finalized — consensus did not make progress");
@@ -298,12 +323,39 @@ async fn run_simulated(
     Ok(())
 }
 
-/// Run one node over a real modem on this machine.
+/// Bring the modem up and establish the PACTOR link for one session.
 ///
-/// Node 0 is the caller (`connect_peer`); node 1 listens (`LISTEN 1` +
-/// `accept_incoming`). Both derive the same validator set from `--seed`. Uses the
-/// shared [`pactor_init`] bring-up to obtain a connected transport, then the same
-/// [`build_node`] / [`run_node`] path as the simulated mode.
+/// Node 0 calls (`connect_peer`); node 1 listens (`LISTEN 1` + `accept_incoming`).
+/// Returns a connected transport ready for consensus.
+async fn establish_link(
+    init_cfg: &PactorInitConfig,
+    is_caller: bool,
+    peercall: &str,
+    connect_attempts: u32,
+) -> anyhow::Result<UsbPactorTransport> {
+    println!("bringing up modem ...");
+    let transport = init_modem(init_cfg).await?;
+    if is_caller {
+        println!("connecting to {peercall} ...");
+        connect_with_retries(&transport, peercall, connect_attempts).await?;
+    } else {
+        println!("listening for incoming connection (up to 300s) ...");
+        transport
+            .accept_incoming(Some(Duration::from_secs(300)))
+            .await?;
+    }
+    // Let the link settle before pushing consensus traffic.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("link established; starting consensus");
+    Ok(transport)
+}
+
+/// Run one node over a real modem on this machine, **reconnecting across link
+/// drops** until the total `--duration` budget is spent.
+///
+/// Consensus state (finalized slot, blocks) persists in the on-disk RocksDB pool
+/// / blockstore, so a node rebuilt after a reconnect resumes from where it left
+/// off — a marginal-band drop becomes a recoverable pause, not a restart.
 async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyhow::Result<()> {
     let own_id = args
         .node
@@ -314,6 +366,7 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
         .ok_or_else(|| anyhow::anyhow!("hardware mode requires --port <dev>"))?;
     anyhow::ensure!(own_id < 2, "--node must be 0 or 1");
     let is_caller = own_id == 0;
+    let label = format!("node{own_id}");
 
     println!(
         "=== hardware node {own_id} ({}) over {port} ===",
@@ -323,37 +376,57 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
     let mut init_cfg = PactorInitConfig::new(port, args.mycall.clone());
     init_cfg.baud = args.baud;
     init_cfg.frequency = args.frequency;
+    // Force-disconnect stale link state on every (re)connect attempt.
     init_cfg.reset = args.reset;
     // The listener must enable LISTEN 1 to accept the incoming connect.
     init_cfg.listen = !is_caller;
 
-    println!("bringing up modem ...");
-    let transport = init_modem(&init_cfg).await?;
+    let overall_deadline = tokio::time::Instant::now() + duration;
+    let mut highest = 0u64;
+    let mut session = 0u32;
 
-    if is_caller {
-        println!("connecting to {} ...", args.peercall);
-        connect_with_retries(&transport, &args.peercall, args.connect_attempts).await?;
-    } else {
-        // Wait generously so there's ample time to start the caller after this
-        // listener is ready, and so a slow first connect on a marginal band does
-        // not time out prematurely.
-        println!("listening for incoming connection (up to 300s) ...");
-        transport
-            .accept_incoming(Some(Duration::from_secs(300)))
-            .await?;
+    while tokio::time::Instant::now() < overall_deadline {
+        session += 1;
+        if session > 1 {
+            println!("[{label}] reconnecting (session {session}) ...");
+        }
+
+        // Establish (or re-establish) the link for this session.
+        let transport = match establish_link(
+            &init_cfg,
+            is_caller,
+            &args.peercall,
+            args.connect_attempts,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[{label}] link bring-up failed: {e}; retrying ...");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        let transport: Arc<dyn PactorTransport> = Arc::new(transport);
+        // Half-duplex link: the caller (node 0) starts holding the transmit turn.
+        let (node, handle) = build_node(transport.clone(), own_id, &cluster, Some(is_caller));
+        let (slot, stop) =
+            run_node(&label, node, handle, overall_deadline, Some(transport.clone())).await;
+        highest = highest.max(slot);
+
+        match stop {
+            RunStop::Deadline => break,
+            RunStop::LinkDown => {
+                // Clean up the dropped link before reconnecting.
+                let _ = transport.disconnect().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
     }
-    // Let the link settle before pushing consensus traffic.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    println!("link established; starting consensus");
 
-    let transport: Arc<dyn PactorTransport> = Arc::new(transport);
-    // Half-duplex link: the caller (node 0) starts holding the transmit turn.
-    let (node, handle) = build_node(transport, own_id, &cluster, Some(is_caller));
-    let label = format!("node{own_id}");
-    let finalized = run_node(label, node, handle, duration).await;
-
-    println!("=== done: node{own_id} finalized {finalized} ===");
-    if finalized == 0 {
+    println!("=== done: node{own_id} finalized {highest} (after {session} session(s)) ===");
+    if highest == 0 {
         anyhow::bail!("no slots finalized — consensus did not make progress");
     }
     Ok(())

@@ -945,6 +945,12 @@ impl PactorTransport for UsbPactorTransport {
         Ok(())
     }
 
+    fn is_link_up(&self) -> bool {
+        // The reader sets link_down=true on DISCONNECTED / STBY / LINK FAILURE /
+        // EOF; connect/accept reset it to false. So "up" == not flagged down.
+        !*self.link_down.borrow()
+    }
+
     async fn next_event(
         &self,
         timeout_after: Option<Duration>,
