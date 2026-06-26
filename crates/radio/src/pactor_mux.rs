@@ -58,18 +58,24 @@ const CHANNEL_QUEUE_DEPTH: usize = 1024;
 /// turn-holder sends a line with this tag to hand the transmit turn to the peer.
 const TURN_GRANT_TAG: u8 = 0xFF;
 
+/// Reserved tag for a keepalive line. The turn-holder sends these during quiet
+/// periods so the PACTOR ARQ link keeps seeing traffic and does not time out to
+/// STBY. The reader ignores them.
+const KEEPALIVE_TAG: u8 = 0xFE;
+
 /// Maximum time a side holds the transmit turn before changing over, even if it
 /// still has more to send. Bounds one-directional starvation so the peer always
 /// gets a turn to send its votes. Tuned conservatively for HF; expect on-air
 /// adjustment.
 const MAX_TURN_HOLD: Duration = Duration::from_secs(30);
 
-/// When holding the turn with an empty queue, wait at most this long for
-/// something to send before granting the turn to the peer anyway. Prevents an
-/// idle turn-holder from deadlocking the half-duplex link; when both sides are
-/// idle they gently ping-pong the turn at this cadence so either can transmit as
-/// soon as it has data. Changeover is expensive on PACTOR, so keep this modest.
-const TURN_IDLE_GRANT: Duration = Duration::from_secs(5);
+/// While holding the turn with an empty queue, wait at most this long for
+/// something to send before granting the turn to the peer. Kept short so voting
+/// stays responsive: a node that just received a block must be able to get the
+/// turn quickly to send its vote, or quorum is never reached in time. A short
+/// keepalive is sent before granting so the brief silent window does not let the
+/// ARQ link drop to STBY.
+const TURN_IDLE_GRANT: Duration = Duration::from_secs(4);
 
 /// Shared half-duplex turn state between the mux reader and writer.
 ///
@@ -255,8 +261,14 @@ impl PactorMux {
                     // queues on idle.
                     Err(ScsPactorError::Timeout) => continue,
                     Err(e) => {
-                        debug!("[mux:reader] read_data ended: {e}");
-                        break;
+                        // Link error (e.g. mid-transfer disconnect / STBY). Do NOT
+                        // drop the inbound senders by exiting: that would make the
+                        // consensus tasks' receive().unwrap() panic. Keep the
+                        // reader (and its senders) alive so consensus stalls
+                        // cleanly until the run ends; back off to avoid a hot loop.
+                        debug!("[mux:reader] read error ({e}); link likely down, backing off");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
                 };
                 let Some(message) = reassembler.push_line(&line) else {
@@ -274,6 +286,9 @@ impl PactorMux {
                     }
                     continue;
                 }
+                if tag == KEEPALIVE_TAG {
+                    continue; // link-keepalive from the turn-holder; ignore
+                }
                 let Some(channel) = Channel::from_tag(tag) else {
                     warn!("[mux:reader] dropping message with unknown channel tag {tag}");
                     continue;
@@ -288,8 +303,11 @@ impl PactorMux {
         });
 
         // Writer: when it holds the turn (or always, in full-duplex mode), drain
-        // the outbound queue and transmit. Under turn discipline it then grants
-        // the turn to the peer and waits to get it back.
+        // the outbound queue and transmit. Under turn discipline it keeps the
+        // link alive with keepalives during quiet periods and only hands the turn
+        // to the peer after sending data, or after a long fully-idle stretch, so
+        // the expensive changeover is used sparingly and the ARQ link does not
+        // time out to STBY.
         let writer_transport = transport.clone();
         let writer = tokio::spawn(async move {
             let mut outbound_rx = outbound_rx;
@@ -312,56 +330,62 @@ impl PactorMux {
                 Ok(())
             }
 
-            loop {
-                // Wait until we hold the turn (immediate in full-duplex mode).
-                if let Some(t) = &turn {
-                    while !t.holds_turn.load(Ordering::SeqCst) {
-                        t.granted.notified().await;
-                    }
-                }
-
-                // Drain the queue for up to MAX_TURN_HOLD. Wait for the first
-                // item, but only briefly when under turn discipline: if nothing is
-                // queued we must still grant the turn to the peer (it may have
-                // votes to send), otherwise an idle turn-holder would deadlock the
-                // half-duplex link. In full-duplex mode block indefinitely.
-                let turn_deadline = tokio::time::Instant::now() + MAX_TURN_HOLD;
-                let first = if turn.is_some() {
-                    match tokio::time::timeout(TURN_IDLE_GRANT, outbound_rx.recv()).await {
-                        Ok(Some(item)) => Some(item),
-                        Ok(None) => {
-                            debug!("[mux:writer] outbound queue closed; writer stopping");
-                            return;
-                        }
-                        // Idle: nothing to send — fall through to grant the turn.
-                        Err(_) => None,
-                    }
-                } else {
-                    match outbound_rx.recv().await {
-                        Some(item) => Some(item),
-                        None => {
-                            debug!("[mux:writer] outbound queue closed; writer stopping");
-                            return;
-                        }
-                    }
-                };
-                if let Some(first) = first {
-                    if let Err(e) = write_message(
-                        &writer_transport,
-                        &counter,
-                        first.channel as u8,
-                        &first.payload,
-                    )
-                    .await
+            // Full-duplex mode: no turn discipline, transmit whenever we have
+            // data. (Simulator / TCP — both sides write freely.)
+            let Some(turn) = turn else {
+                while let Some(item) = outbound_rx.recv().await {
+                    if let Err(e) =
+                        write_message(&writer_transport, &counter, item.channel as u8, &item.payload)
+                            .await
                     {
                         warn!("[mux:writer] write_data failed: {e}");
                         return;
                     }
                 }
-                loop {
-                    if tokio::time::Instant::now() >= turn_deadline {
-                        break;
+                debug!("[mux:writer] outbound queue closed; writer stopping");
+                return;
+            };
+
+            // Half-duplex mode. Hold the turn only briefly: drain whatever is
+            // queued, then grant to the peer so voting stays responsive. Before
+            // an idle grant, send a keepalive so the silent changeover window does
+            // not let the ARQ link time out to STBY.
+            loop {
+                // Wait until we hold the turn.
+                while !turn.holds_turn.load(Ordering::SeqCst) {
+                    turn.granted.notified().await;
+                }
+
+                let turn_deadline = tokio::time::Instant::now() + MAX_TURN_HOLD;
+                // Wait briefly for the first item; if none arrives, keepalive and
+                // grant so the peer can send.
+                match tokio::time::timeout(TURN_IDLE_GRANT, outbound_rx.recv()).await {
+                    Ok(Some(item)) => {
+                        if let Err(e) = write_message(
+                            &writer_transport,
+                            &counter,
+                            item.channel as u8,
+                            &item.payload,
+                        )
+                        .await
+                        {
+                            warn!("[mux:writer] write_data failed: {e}");
+                            return;
+                        }
                     }
+                    Ok(None) => return, // outbound closed
+                    Err(_) => {
+                        // Idle: keep the link alive across the changeover gap.
+                        if let Err(e) =
+                            write_message(&writer_transport, &counter, KEEPALIVE_TAG, &[]).await
+                        {
+                            warn!("[mux:writer] keepalive write failed: {e}");
+                            return;
+                        }
+                    }
+                }
+                // Drain anything else already queued (bounded by MAX_TURN_HOLD).
+                while tokio::time::Instant::now() < turn_deadline {
                     match outbound_rx.try_recv() {
                         Ok(item) => {
                             if let Err(e) = write_message(
@@ -377,28 +401,21 @@ impl PactorMux {
                             }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            debug!("[mux:writer] outbound queue closed; writer stopping");
-                            return;
-                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => return,
                     }
                 }
 
-                // Under turn discipline: hand the turn to the peer (grant line +
-                // ARQ changeover) and wait to receive it back before sending more.
-                if let Some(t) = &turn {
-                    if let Err(e) =
-                        write_message(&writer_transport, &counter, TURN_GRANT_TAG, &[]).await
-                    {
-                        warn!("[mux:writer] turn-grant write failed: {e}");
-                        return;
-                    }
-                    if let Err(e) = writer_transport.changeover().await {
-                        warn!("[mux:writer] changeover failed: {e}");
-                        return;
-                    }
-                    t.holds_turn.store(false, Ordering::SeqCst);
+                // Hand the turn to the peer.
+                if let Err(e) = write_message(&writer_transport, &counter, TURN_GRANT_TAG, &[]).await
+                {
+                    warn!("[mux:writer] turn-grant write failed: {e}");
+                    return;
                 }
+                if let Err(e) = writer_transport.changeover().await {
+                    warn!("[mux:writer] changeover failed: {e}");
+                    return;
+                }
+                turn.holds_turn.store(false, Ordering::SeqCst);
             }
         });
 
