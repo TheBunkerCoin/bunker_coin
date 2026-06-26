@@ -382,7 +382,7 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
     // node (and thus any timer) is built. Without this, blocks are produced
     // faster than the link can disseminate+vote+certify them, so consensus times
     // out past the first slot. Default 8x for radio; --delta-mult overrides.
-    let delta_mult = args.delta_mult.unwrap_or(8.0);
+    let delta_mult = args.delta_mult.unwrap_or(4.0);
     // SAFETY: set at startup before any consensus task / timer reads it.
     unsafe {
         std::env::set_var("BUNKER_DELTA_MULT", delta_mult.to_string());
@@ -408,6 +408,10 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
         session += 1;
         if session > 1 {
             println!("[{label}] reconnecting (session {session}) ...");
+            // Only tune the radio on the first bring-up. The TRX is already on
+            // frequency for later sessions, and re-tuning right after a STBY drop
+            // often returns no confirmation and (wrongly) aborts the reconnect.
+            init_cfg.frequency = None;
         }
 
         // Establish (or re-establish) the link for this session.
