@@ -16,7 +16,7 @@ pub mod simulated;
 pub use framing::{RadioFrame, RadioFramer};
 pub use network_core::RadioNetworkCore;
 pub use pactor::PactorRadioNode;
-pub use pactor_mux::{Channel, MuxChannel, PactorMux, PactorMuxHandle};
+pub use pactor_mux::{Channel, MuxChannel, MuxLiveness, PactorMux, PactorMuxHandle};
 pub use pactor_network::PactorNetwork;
 pub use scheduler::RadioScheduler;
 pub use simulated::SimulatedRadioNetwork;

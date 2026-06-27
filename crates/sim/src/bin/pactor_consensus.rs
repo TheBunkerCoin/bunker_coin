@@ -90,7 +90,7 @@ struct Args {
     frequency: Option<f64>,
 
     /// Consensus timing multiplier (stretches block cadence / timeouts to match
-    /// a slow link). Hardware defaults to 8; override for a faster/slower link.
+    /// a slow link). Hardware defaults to 6; override for a faster/slower link.
     /// Sets BUNKER_DELTA_MULT before consensus starts.
     #[arg(long)]
     delta_mult: Option<f64>,
@@ -242,6 +242,16 @@ fn build_node(
         epoch_info,
         txs_net,
     );
+
+    // On a real half-duplex link, feed Votor the mux's keepalive-driven liveness
+    // so its crashed-leader timeout PAUSES (re-arms) while the link is up but the
+    // reverse path is slow, instead of irreversibly skipping the window and
+    // jumping ahead. The full-duplex simulator keeps the default always-alive
+    // behavior (turn is None), so simulated runs are unchanged.
+    if turn.is_some() {
+        node.set_link_liveness(handle.liveness());
+    }
+
     (node, handle)
 }
 
@@ -498,8 +508,11 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
     // Stretch consensus timing to match the slow half-duplex link, BEFORE any
     // node (and thus any timer) is built. Without this, blocks are produced
     // faster than the link can disseminate+vote+certify them, so consensus times
-    // out past the first slot. Default 8x for radio; --delta-mult overrides.
-    let delta_mult = args.delta_mult.unwrap_or(4.0);
+    // out past the first slot. Default 6x for radio (delta_first_slice = 180s,
+    // at/above the ~180s reverse-path read stall, so the crashed-leader timeout
+    // does not fire before a stalled first shred can arrive); the pause-on-alive
+    // logic rides out longer quiets. --delta-mult overrides.
+    let delta_mult = args.delta_mult.unwrap_or(6.0);
     // SAFETY: set at startup before any consensus task / timer reads it.
     unsafe {
         std::env::set_var("BUNKER_DELTA_MULT", delta_mult.to_string());

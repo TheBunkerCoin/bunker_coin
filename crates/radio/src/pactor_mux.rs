@@ -34,8 +34,18 @@
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+
+use bunkerglow::consensus::LinkLiveness;
+
+/// Process-start reference instant for the millis-based activity clock.
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Millis since process start (monotonic; used for the activity timestamp).
+fn now_ms() -> u64 {
+    START.elapsed().as_millis() as u64
+}
 
 use async_trait::async_trait;
 use bunkerglow::network::Network;
@@ -168,6 +178,9 @@ pub struct PactorMux {
     /// Per-channel inbound receivers, handed out by [`channel`](Self::channel).
     inbound_rx: [Option<mpsc::Receiver<Vec<u8>>>; Channel::COUNT],
     message_counter: Arc<AtomicU64>,
+    /// Millis-since-process-start of the last inbound line (data, keepalive, or
+    /// turn-grant). Drives [`MuxLiveness`]: recent activity ⇒ the peer/link is up.
+    last_activity_ms: Arc<AtomicU64>,
     /// Half-duplex turn discipline. `None` = full-duplex (write freely — for the
     /// simulator / full-duplex transports). `Some` = enforce one transmit turn at
     /// a time with explicit changeover (for real PACTOR).
@@ -216,6 +229,7 @@ impl PactorMux {
             inbound_tx,
             inbound_rx,
             message_counter: Arc::new(AtomicU64::new(0)),
+            last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
             turn,
         }
     }
@@ -270,16 +284,24 @@ impl PactorMux {
         let outbound_rx = self.outbound_rx.take().expect("spawn called twice");
         let message_counter = self.message_counter.clone();
         let turn = self.turn.clone();
+        let last_activity_ms = self.last_activity_ms.clone();
 
         // Reader: read_data → reassemble → strip tag → route to channel queue.
         // A turn-grant line (tag 0xFF) hands the transmit turn to us.
         let reader_transport = transport.clone();
         let reader_turn = turn.clone();
+        let reader_activity = last_activity_ms.clone();
         let reader = tokio::spawn(async move {
             let mut reassembler = Reassembler::new();
             loop {
                 let line = match reader_transport.read_data(max_read_len).await {
-                    Ok(line) => line,
+                    Ok(line) => {
+                        // Any inbound bytes — data, keepalive, or turn-grant — are
+                        // evidence the peer/link is alive. Stamp the activity clock
+                        // before routing so MuxLiveness reflects it immediately.
+                        reader_activity.store(now_ms(), Ordering::Relaxed);
+                        line
+                    }
                     // A read timeout just means the link was idle (the peer holds
                     // the transmit turn, or there is nothing to send). Keep
                     // waiting; a long-lived node must not tear down its inbound
@@ -496,7 +518,31 @@ impl PactorMux {
             reader,
             writer,
             inbound_tx: self.inbound_tx.clone(),
+            last_activity_ms,
         }
+    }
+}
+
+/// Keepalive-driven [`LinkLiveness`] for the consensus crashed-leader timeout.
+///
+/// The link is "alive" if the mux reader saw any inbound line (data, keepalive,
+/// or turn-grant) within [`LIVENESS_WINDOW`]. On a half-duplex PACTOR link the
+/// turn-holder emits keepalives every `KEEPALIVE_INTERVAL`, so a healthy link
+/// produces inbound activity well within the window even during quiet periods.
+pub struct MuxLiveness {
+    last_activity_ms: Arc<AtomicU64>,
+}
+
+/// How recently inbound activity must have been seen for the link to count as
+/// alive. Comfortably larger than `KEEPALIVE_INTERVAL` (so an in-flight keepalive
+/// gap does not flap it) but small enough that a genuinely dead link is detected
+/// within a couple of keepalive periods.
+const LIVENESS_WINDOW: Duration = Duration::from_secs(30);
+
+impl LinkLiveness for MuxLiveness {
+    fn is_link_alive(&self) -> bool {
+        let last = self.last_activity_ms.load(Ordering::Relaxed);
+        now_ms().saturating_sub(last) < LIVENESS_WINDOW.as_millis() as u64
     }
 }
 
@@ -508,9 +554,20 @@ pub struct PactorMuxHandle {
     /// Inbound senders, retained so [`shutdown`](Self::shutdown) can keep the
     /// channels open after aborting the reader (see there).
     inbound_tx: [Option<mpsc::Sender<Vec<u8>>>; Channel::COUNT],
+    /// Shared inbound-activity clock, surfaced via [`liveness`](Self::liveness).
+    last_activity_ms: Arc<AtomicU64>,
 }
 
 impl PactorMuxHandle {
+    /// A [`LinkLiveness`] backed by this mux's inbound-activity clock, to inject
+    /// into the consensus node (`Alpenglow::set_link_liveness`) so a slow-but-
+    /// alive link pauses the crashed-leader timeout instead of skipping.
+    pub fn liveness(&self) -> Arc<MuxLiveness> {
+        Arc::new(MuxLiveness {
+            last_activity_ms: self.last_activity_ms.clone(),
+        })
+    }
+
     /// Hand the transmit turn to the peer (PACTOR ARQ changeover).
     pub async fn changeover(&self) -> std::io::Result<()> {
         self.transport

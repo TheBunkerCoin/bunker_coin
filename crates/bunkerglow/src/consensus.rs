@@ -21,6 +21,7 @@ mod block_producer;
 mod blockstore;
 mod cert;
 mod epoch_info;
+mod link_liveness;
 mod pool;
 mod vote;
 pub(crate) mod votor;
@@ -34,6 +35,7 @@ pub use blockstore::{BlockInfo, BlockMetadata, Blockstore, BlockstoreImpl};
 pub use cert::Cert;
 use color_eyre::Result;
 pub use epoch_info::EpochInfo;
+pub use link_liveness::{LinkLiveness, NoLiveness, SwappableLiveness};
 use fastrace::Span;
 use fastrace::future::FutureExt;
 use log::{info, trace, warn};
@@ -155,6 +157,8 @@ where
     snapshot_store: Option<Arc<SnapshotStore>>,
     /// epoch transition payloads waiting to be embedded in the first block of an epoch
     pending_epoch_transitions: Arc<RwLock<std::collections::BTreeMap<u64, Vec<u8>>>>,
+    /// swappable link-liveness source consulted by Votor's crashed-leader timeout
+    link_liveness: Arc<SwappableLiveness>,
 }
 
 impl<A, D, T> Alpenglow<A, D, T>
@@ -231,6 +235,12 @@ where
             votor_rx,
             all2all.clone(),
         );
+        // Shared, swappable link-liveness source. Defaults to always-alive (no
+        // behavior change for sim/UDP); the radio path swaps in a keepalive-driven
+        // source via `Alpenglow::set_link_liveness` after the transport is wired,
+        // so a crashed-leader timeout on a slow-but-alive link pauses, not skips.
+        let link_liveness = Arc::new(SwappableLiveness::new());
+        votor.set_link_liveness(link_liveness.clone());
         let votor_handle = tokio::spawn(
             async move { votor.voting_loop().await.unwrap() }
                 .in_span(Span::enter_with_local_parent("voting loop")),
@@ -271,7 +281,17 @@ where
             execution_state: None,
             snapshot_store: Some(snapshot_store),
             pending_epoch_transitions,
+            link_liveness,
         }
+    }
+
+    /// Swap in a link-liveness source for Votor's crashed-leader timeout.
+    ///
+    /// Defaults to always-alive; radio transports inject a keepalive-driven impl
+    /// so a slow-but-alive half-duplex link pauses (re-arms the timeout) instead
+    /// of irreversibly skipping the window. No-op effect for sim/UDP nodes.
+    pub fn set_link_liveness(&self, liveness: Arc<dyn LinkLiveness>) {
+        self.link_liveness.set(liveness);
     }
 
     /// Starts the different tasks of the Alpenglow node.

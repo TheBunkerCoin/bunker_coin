@@ -19,6 +19,7 @@ use log::{debug, trace, warn};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::blockstore::BlockInfo;
+use super::link_liveness::{LinkLiveness, NoLiveness};
 use super::{Cert, Vote, delta_block, delta_timeout};
 use crate::consensus::delta_first_slice;
 use crate::crypto::aggsig::SecretKey;
@@ -78,6 +79,10 @@ pub struct Votor<A: All2All> {
     voted_notar: BTreeMap<Slot, BlockHash>,
     /// Indicates for which slots we set the 'bad window' flag.
     bad_window: BTreeSet<Slot>,
+    /// How many times each window's crashed-leader timeout has been re-armed
+    /// (paused) because the link was alive but the leader's block had not yet
+    /// crawled across. Bounds the pause so a genuinely gone peer is still skipped.
+    crashed_leader_rearms: BTreeMap<Slot, u32>,
     /// Blocks that have a notarization certificate (not notar-fallback).
     block_notarized: BTreeMap<Slot, BlockHash>,
     /// Indicates for which slots the given (slot, hash) pair is a valid parent.
@@ -99,6 +104,10 @@ pub struct Votor<A: All2All> {
     event_sender: Sender<VotorEvent>,
     /// [`All2All`] instance used to broadcast votes.
     all2all: Arc<A>,
+    /// Reports whether the link to peers is up, so a crashed-leader timeout on a
+    /// merely-slow (but alive) link pauses instead of skipping. Defaults to
+    /// [`NoLiveness`] (sim/UDP); the radio path injects a keepalive-driven impl.
+    link_liveness: Arc<dyn LinkLiveness>,
 }
 
 impl<A: All2All> Votor<A> {
@@ -127,6 +136,7 @@ impl<A: All2All> Votor<A> {
             voted,
             voted_notar,
             bad_window: BTreeSet::new(),
+            crashed_leader_rearms: BTreeMap::new(),
             block_notarized,
             parents_ready,
             received_shred: BTreeSet::new(),
@@ -137,10 +147,26 @@ impl<A: All2All> Votor<A> {
             event_receiver,
             event_sender,
             all2all,
+            link_liveness: Arc::new(NoLiveness),
         };
         votor.set_timeouts(Slot::new(0));
         votor
     }
+
+    /// Inject a link-liveness signal (defaults to [`NoLiveness`]).
+    ///
+    /// Radio transports pass a keepalive-driven impl so a crashed-leader timeout
+    /// on a slow-but-alive link pauses instead of skipping the window.
+    pub fn set_link_liveness(&mut self, liveness: Arc<dyn LinkLiveness>) {
+        self.link_liveness = liveness;
+    }
+
+    /// Max times a window's crashed-leader timeout may be re-armed (paused) while
+    /// the link is alive before we skip anyway. Bounds the pause so a genuinely
+    /// gone peer (whose transport still reports "up") is eventually skipped,
+    /// preserving liveness. With `delta_timeout` per re-arm this is a generous
+    /// multi-window wait on a slow link.
+    const MAX_CRASHED_LEADER_REARMS: u32 = 5;
 
     /// Handles the voting (leader and non-leader) side of consensus protocol.
     ///
@@ -242,10 +268,39 @@ impl<A: All2All> Votor<A> {
                     }
                 }
                 VotorEvent::TimeoutCrashedLeader(slot) => {
-                    println!("[Votor {}] EARLY_TIMEOUT slot {}", self.validator_id, slot);
                     trace!("timeout (crashed leader) for slot {slot}");
                     if !self.received_shred.contains(&slot) && !self.voted.contains(&slot) {
-                        self.try_skip_window(slot).await;
+                        // The leader's first shred has not arrived. Normally this
+                        // means the leader crashed → skip the window. But over a
+                        // half-duplex link that has merely gone quiet (the slow
+                        // reverse ARQ path), the leader is alive and its block is
+                        // still crawling across; skipping would gap the chain
+                        // irreversibly. If the link is alive and we have not
+                        // exhausted the re-arm budget, PAUSE: re-arm the timeout
+                        // and wait, rather than skip.
+                        let rearms = self.crashed_leader_rearms.entry(slot).or_insert(0);
+                        if self.link_liveness.is_link_alive()
+                            && *rearms < Self::MAX_CRASHED_LEADER_REARMS
+                        {
+                            *rearms += 1;
+                            println!(
+                                "[Votor {}] EARLY_TIMEOUT slot {} — link alive, pausing (re-arm {}/{})",
+                                self.validator_id, slot, *rearms, Self::MAX_CRASHED_LEADER_REARMS
+                            );
+                            let sender = self.event_sender.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delta_timeout()).await;
+                                let _ = sender.send(VotorEvent::TimeoutCrashedLeader(slot)).await;
+                            });
+                        } else {
+                            // Link is down (peer gone) or we have paused long
+                            // enough — treat as a genuine crashed leader and skip.
+                            println!(
+                                "[Votor {}] EARLY_TIMEOUT slot {} — skipping window",
+                                self.validator_id, slot
+                            );
+                            self.try_skip_window(slot).await;
+                        }
                     }
                 }
             }
@@ -383,16 +438,76 @@ mod tests {
     type A2A = TrivialAll2All<SimulatedNetwork<ConsensusMessage, ConsensusMessage>>;
 
     async fn start_votor() -> (A2A, mpsc::Sender<VotorEvent>, Arc<EpochInfo>) {
+        start_votor_with_liveness(None).await
+    }
+
+    /// Fixed-value [`LinkLiveness`] for tests.
+    struct TestLiveness(bool);
+    impl LinkLiveness for TestLiveness {
+        fn is_link_alive(&self) -> bool {
+            self.0
+        }
+    }
+
+    /// Start a votor; if `liveness` is given, inject it (else default NoLiveness).
+    async fn start_votor_with_liveness(
+        liveness: Option<Arc<dyn LinkLiveness>>,
+    ) -> (A2A, mpsc::Sender<VotorEvent>, Arc<EpochInfo>) {
         let (sks, epoch_info) = generate_validators(2);
         let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
         let (tx, rx) = mpsc::channel(100);
         let other_a2a = a2a.pop().unwrap();
         let votor_a2a = a2a.pop().unwrap();
         let mut votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+        if let Some(l) = liveness {
+            votor.set_link_liveness(l);
+        }
         tokio::spawn(async move {
             votor.voting_loop().await.unwrap();
         });
         (other_a2a, tx, epoch_info)
+    }
+
+    /// A crashed-leader timeout with the link reported DOWN must skip the window
+    /// (the leader is presumed gone — original behavior, liveness = false).
+    #[tokio::test]
+    async fn crashed_leader_skips_when_link_down() {
+        let (other_a2a, tx, _) =
+            start_votor_with_liveness(Some(Arc::new(TestLiveness(false)))).await;
+
+        // Start of a non-genesis window (slot 4; SLOTS_PER_WINDOW=4) we have not
+        // voted on / seen a shred for; the genesis window is pre-seeded as voted.
+        let slot = Slot::new(4);
+        assert!(slot.is_start_of_window());
+        tx.send(VotorEvent::TimeoutCrashedLeader(slot)).await.unwrap();
+
+        // Should skip the whole window.
+        match tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await {
+            Ok(Ok(ConsensusMessage::Vote(v))) => {
+                assert!(v.is_skip(), "expected skip vote, got {v:?}");
+            }
+            other => panic!("expected a skip vote, got {other:?}"),
+        }
+    }
+
+    /// A crashed-leader timeout with the link reported ALIVE must NOT skip — it
+    /// pauses (re-arms the timeout), waiting for the slow reverse path to deliver
+    /// the leader's block instead of irreversibly gapping the chain.
+    #[tokio::test]
+    async fn crashed_leader_pauses_when_link_alive() {
+        let (other_a2a, tx, _) =
+            start_votor_with_liveness(Some(Arc::new(TestLiveness(true)))).await;
+
+        let slot = Slot::genesis().next().first_slot_in_window();
+        tx.send(VotorEvent::TimeoutCrashedLeader(slot)).await.unwrap();
+
+        // Must NOT see any skip vote promptly: the re-arm waits delta_timeout (long),
+        // so a short window proves it paused rather than skipped.
+        let got = tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await;
+        assert!(
+            got.is_err(),
+            "link alive: must pause, not skip — but saw a vote: {got:?}"
+        );
     }
 
     #[tokio::test]
