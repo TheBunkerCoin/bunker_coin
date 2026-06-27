@@ -229,4 +229,34 @@ mod tests {
         assert!(vote.is_final());
         assert!(vote.check_sig(&pk));
     }
+
+    /// A vote must survive a wire round-trip (serialize → deserialize → verify)
+    /// with the **compressed** 48-byte BLS signature, and the serialized form must
+    /// be small enough to confirm compression took effect (a notar vote with a
+    /// 96-byte sig would be ~48 bytes larger). This is what lets a vote fit in one
+    /// 300-byte MTU line on the slow reverse path instead of fragmenting.
+    #[test]
+    fn vote_wire_roundtrip_uses_compressed_sig() {
+        let sk = SecretKey::new(&mut rand::rng());
+        let pk = sk.to_pk();
+
+        // Notar carries a 32-byte block hash — the largest vote.
+        let vote = Vote::new_notar(Slot::new(7), GENESIS_BLOCK_HASH, &sk, 1);
+        let bytes = wincode::serialize(&vote).expect("serialize");
+        let back: Vote = wincode::deserialize(&bytes).expect("deserialize");
+
+        assert_eq!(back, vote, "vote must round-trip byte-identically");
+        assert!(back.check_sig(&pk), "signature must still verify after round-trip");
+
+        // With a compressed (48B) sig the largest vote (notar) is ~100 bytes; with
+        // the old uncompressed (96B) sig it would be ~148. Guard against a
+        // regression to uncompressed. Crucially, at ~100 bytes the vote fits in a
+        // single `#hex\r` line (~203 chars) under the 300-byte MTU, so it no longer
+        // fragments across two lines on the slow reverse path.
+        assert!(
+            bytes.len() <= 110,
+            "notar vote serialized to {} bytes; expected compressed sig (~100, was ~148)",
+            bytes.len()
+        );
+    }
 }
