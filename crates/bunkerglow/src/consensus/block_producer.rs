@@ -474,7 +474,19 @@ where
     let mut txs = Vec::new();
 
     let ret = loop {
-        let sleep_duration = duration_left.saturating_sub(start_time.elapsed());
+        // While the mempool is empty, wait only a short grace for the first tx;
+        // if none arrives, produce an EMPTY slice rather than sleeping the entire
+        // (delta-scaled) slice window. This keeps an idle, empty-block leader
+        // making progress promptly — otherwise at a high BUNKER_DELTA_MULT the
+        // leader can take minutes to emit slot 1, longer than a marginal HF band
+        // stays up, and never disseminates a block. Once we have packed at least
+        // one tx, fall back to the full window so a busy slice fills up normally.
+        let max_wait = if txs.is_empty() {
+            duration_left.min(super::delta_empty_slice())
+        } else {
+            duration_left
+        };
+        let sleep_duration = max_wait.saturating_sub(start_time.elapsed());
         let res = tokio::select! {
             () = tokio::time::sleep(sleep_duration) => {
                 break Duration::ZERO;

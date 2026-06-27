@@ -97,6 +97,20 @@ fn delta_standstill() -> Duration {
 pub(crate) fn delta_first_slice() -> Duration {
     scaled(30_000)
 }
+/// Max time the leader waits for the *first* transaction before producing an
+/// EMPTY slice anyway, so an idle mempool does not stall block production for the
+/// whole (delta-scaled) slice window.
+///
+/// Without this, the producer sleeps the entire `delta_first_slice` /
+/// `delta_block` waiting for txs that never arrive (empty-block consensus), so at
+/// a high `BUNKER_DELTA_MULT` the leader can take minutes to emit slot 1 — longer
+/// than a marginal HF band stays up, so no block is ever disseminated. This bound
+/// is deliberately small and *also* delta-scaled (so it still relaxes a little on
+/// slow links) but tiny in absolute terms, letting the leader make progress
+/// promptly when there is nothing to pack.
+pub(crate) fn delta_empty_slice() -> Duration {
+    scaled(2_000)
+}
 
 #[derive(Clone, Debug, SchemaRead, SchemaWrite)]
 pub enum ConsensusMessage {
