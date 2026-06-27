@@ -258,15 +258,17 @@ where
                 produce_slice_payload(slot, &self.txs_receiver, parent, time_for_slice, None);
 
             // If we have not yet received the ParentReady event, wait for it concurrently while producing the next slice.
-            let (mut payload, new_duration_left) = if parent_ready_receiver.is_terminated() {
+            let (mut payload, new_duration_left, terminal_empty) = if parent_ready_receiver
+                .is_terminated()
+            {
                 produce_slice_future.await
             } else {
                 pin!(produce_slice_future);
                 tokio::select! {
                     res = &mut produce_slice_future => {
-                        let (payload, _new_duration_left) = res;
+                        let (payload, _new_duration_left, terminal_empty) = res;
                         // ParentReady event still not seen, do not start DELTA_BLOCK timer yet
-                        (payload, Duration::MAX)
+                        (payload, Duration::MAX, terminal_empty)
                     }
                     res = &mut parent_ready_receiver => {
                         // Got ParentReady event while producing slice.
@@ -274,7 +276,7 @@ where
 
                         let start = Instant::now();
                         let (new_slot, new_hash) = res.unwrap();
-                        let (mut payload, _maybe_duration) = produce_slice_future.await;
+                        let (mut payload, _maybe_duration, terminal_empty) = produce_slice_future.await;
                         if new_hash == *parent_hash {
                             debug!("parent is ready, continuing with same parent");
                         } else {
@@ -292,12 +294,13 @@ where
                         // account for the time it took to finish producing the slice
                         debug!("starting blocktime timer");
                         let duration = self.delta_block.saturating_sub(start.elapsed());
-                        (payload, duration)
+                        (payload, duration, terminal_empty)
                   }
                 }
             };
 
-            let is_last = slice_index.is_max() || new_duration_left.is_zero();
+            // An empty block is a single slice (see `produce_slice_payload`).
+            let is_last = slice_index.is_max() || terminal_empty || new_duration_left.is_zero();
             if is_last && !parent_ready_receiver.is_terminated() {
                 let (new_slot, new_hash) = (&mut parent_ready_receiver).await.unwrap();
                 if new_hash != *parent_hash {
@@ -350,11 +353,11 @@ where
 
         let mut duration_left = self.delta_block;
         for slice_index in SliceIndex::all() {
-            let (payload, new_duration_left) = if slice_index.is_first() {
+            let (payload, new_duration_left, terminal_empty) = if slice_index.is_first() {
                 // make sure first slice is produced quickly enough so that other nodes do not generate the [`TimeoutCrashedLeader`] event
                 let time_for_slice = self.delta_first_slice;
                 let epoch_transition = self.epoch_transition_payload(slot).await;
-                let (payload, slice_duration_left) = produce_slice_payload(
+                let (payload, slice_duration_left, terminal_empty) = produce_slice_payload(
                     slot,
                     &self.txs_receiver,
                     Some(parent_block_id.clone()),
@@ -365,11 +368,14 @@ where
                 let elapsed = self.delta_first_slice - slice_duration_left;
                 let left = duration_left.saturating_sub(elapsed);
 
-                (payload, left)
+                (payload, left, terminal_empty)
             } else {
                 produce_slice_payload(slot, &self.txs_receiver, None, duration_left, None).await
             };
-            let is_last = slice_index.is_max() || new_duration_left.is_zero();
+            // An empty block is a SINGLE slice: if the slice was produced empty via
+            // the grace timeout, mark it last so we don't emit a phantom second
+            // empty slice (which would double the shreds on the wire).
+            let is_last = slice_index.is_max() || terminal_empty || new_duration_left.is_zero();
             let header = SliceHeader {
                 slot,
                 slice_index,
@@ -444,13 +450,21 @@ where
 
 // TODO: extend docstring
 /// Returns
+/// Produces one slice's payload, returning `(payload, duration_left, terminal)`.
+///
+/// `terminal` is `true` when the slice was produced EMPTY via the short
+/// empty-slice grace (idle mempool) — signalling the caller that there is nothing
+/// more to pack, so this slice should be the block's last (an empty block is a
+/// single slice). Without this, returning a zero `duration_left` from the first
+/// slice would (via the caller's elapsed math) spawn a phantom second empty
+/// slice, doubling the shreds on the wire.
 async fn produce_slice_payload<T>(
     slot: Slot,
     txs_receiver: &T,
     parent: Option<BlockId>,
     duration_left: Duration,
     epoch_transition: Option<Vec<u8>>,
-) -> (SlicePayload, Duration)
+) -> (SlicePayload, Duration, bool)
 where
     T: TransactionNetwork,
 {
@@ -473,7 +487,8 @@ where
         .unwrap();
     let mut txs = Vec::new();
 
-    let ret = loop {
+    // `(duration_left, terminal_empty)` — see the function docs for `terminal`.
+    let (ret, terminal_empty) = loop {
         // While the mempool is empty, wait only a short grace for the first tx;
         // if none arrives, produce an EMPTY slice rather than sleeping the entire
         // (delta-scaled) slice window. This keeps an idle, empty-block leader
@@ -481,7 +496,8 @@ where
         // leader can take minutes to emit slot 1, longer than a marginal HF band
         // stays up, and never disseminates a block. Once we have packed at least
         // one tx, fall back to the full window so a busy slice fills up normally.
-        let max_wait = if txs.is_empty() {
+        let empty_so_far = txs.is_empty();
+        let max_wait = if empty_so_far {
             duration_left.min(super::delta_empty_slice())
         } else {
             duration_left
@@ -489,7 +505,10 @@ where
         let sleep_duration = max_wait.saturating_sub(start_time.elapsed());
         let res = tokio::select! {
             () = tokio::time::sleep(sleep_duration) => {
-                break Duration::ZERO;
+                // Timed out. If still empty, this is a terminal empty slice (the
+                // whole, single-slice empty block). If we already have txs, it is
+                // a normal full-window flush (not terminal — the slot may continue).
+                break (Duration::ZERO, empty_so_far);
             }
             res = txs_receiver.receive() => {
                 res
@@ -505,7 +524,7 @@ where
         // if there is not enough space for another tx, break
         // this needs to account for the 8 bytes to encode the length of the tx payload
         if slice_capacity_left < MAX_TRANSACTION_SIZE + 8 {
-            break duration_left.saturating_sub(start_time.elapsed());
+            break (duration_left.saturating_sub(start_time.elapsed()), false);
         }
     };
 
@@ -516,7 +535,7 @@ where
     })
     .expect("serialization should not panic");
     let payload = SlicePayload::new(slot, parent, txs);
-    (payload, ret)
+    (payload, ret, terminal_empty)
 }
 
 /// Enum to capture the different scenarios that can be returned from [`wait_for_first_slot`].
@@ -617,20 +636,23 @@ mod tests {
         let duration_left = Duration::from_micros(0);
 
         let parent = None;
-        let (payload, maybe_duration) =
+        let (payload, maybe_duration, terminal_empty) =
             produce_slice_payload(Slot::new(1), &txs_receiver, parent.clone(), duration_left, None)
                 .await;
         assert_eq!(maybe_duration, Duration::ZERO);
+        // Empty slice produced via the grace timeout is terminal (single-slice block).
+        assert!(terminal_empty, "empty slice must be marked terminal");
         assert_eq!(payload.parent, parent);
         let block_payload: BlockPayload = wincode::deserialize(&payload.data).unwrap();
         assert!(block_payload.epoch_transition.is_none());
         assert!(block_payload.transactions.is_empty());
 
         let parent = Some((Slot::genesis(), GENESIS_BLOCK_HASH));
-        let (payload, maybe_duration) =
+        let (payload, maybe_duration, terminal_empty) =
             produce_slice_payload(Slot::new(1), &txs_receiver, parent.clone(), duration_left, None)
                 .await;
         assert_eq!(maybe_duration, Duration::ZERO);
+        assert!(terminal_empty, "empty slice must be marked terminal");
         assert_eq!(payload.parent, parent);
         let block_payload: BlockPayload = wincode::deserialize(&payload.data).unwrap();
         assert!(block_payload.epoch_transition.is_none());
@@ -654,10 +676,12 @@ mod tests {
         });
 
         let parent = None;
-        let (payload, maybe_duration) =
+        let (payload, maybe_duration, terminal_empty) =
             produce_slice_payload(Slot::new(1), &txs_receiver, parent.clone(), duration_left, None)
                 .await;
         assert!(maybe_duration > Duration::ZERO);
+        // A full slice (txs packed) is NOT terminal-empty.
+        assert!(!terminal_empty, "full slice must not be marked terminal-empty");
         assert_eq!(payload.parent, parent);
         assert!(payload.data.len() <= MAX_DATA_PER_SLICE);
         assert!(payload.data.len() > MAX_DATA_PER_SLICE - MAX_TRANSACTION_SIZE);
