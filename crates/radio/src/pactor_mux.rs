@@ -78,15 +78,29 @@ const TURN_DRAIN_GRACE: Duration = Duration::from_secs(3);
 /// How often the turn-holder sends a keepalive line while idle, to keep the
 /// PACTOR ARQ link from timing out to STBY during quiet periods. Must be
 /// comfortably shorter than the modem's inactivity timeout (~40s observed).
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+///
+/// Kept short and aggressive: the turn-holder is the ONLY side that can transmit
+/// under ARQ half-duplex (the IRS/non-holder cannot send without forcing a
+/// changeover), so on-air link liveness depends entirely on the holder feeding
+/// the link. On the slow reverse path a single keepalive can take 15-20s to
+/// clear, so a short nominal interval means the next keepalive is already queued
+/// the moment the previous one drains — keeping the ARQ link continuously busy.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7);
 
 /// How long a turn-holder keeps the turn while idle — sending keepalives every
 /// [`KEEPALIVE_INTERVAL`] throughout — before granting it to the peer so the peer
-/// can send anything queued. Must be long enough that the link stays busy with
-/// keepalives across quiet periods, but short enough that a peer with a vote to
-/// send does not wait too long for a turn. The turn still flips immediately when
-/// real data arrives, so voting stays responsive.
-const IDLE_TURN_GRANT: Duration = Duration::from_secs(20);
+/// can send anything queued.
+///
+/// Deliberately long. Each changeover opens a fragile quiet window (the new
+/// holder must receive the grant, then start keepaliving, all over a slow
+/// reverse path) — that handoff gap is exactly what dropped the link to STBY
+/// after a slot. Holding the turn longer means FEWER changeovers per quiet
+/// period and lets the holder push many keepalives through the slow path before
+/// handing over, so the link stays continuously fed by one side rather than
+/// repeatedly risking the handoff. The turn still flips IMMEDIATELY when real
+/// data arrives (votes are enqueued, not idle-waited), so voting stays
+/// responsive despite the long idle hold.
+const IDLE_TURN_GRANT: Duration = Duration::from_secs(60);
 
 /// Shared half-duplex turn state between the mux reader and writer.
 ///
@@ -367,7 +381,22 @@ impl PactorMux {
                     turn.granted.notified().await;
                 }
 
-                let turn_deadline = tokio::time::Instant::now() + MAX_TURN_HOLD;
+                // Send a keepalive the INSTANT we acquire the turn, before waiting.
+                // After a changeover the link has just gone quiet (the old holder
+                // stopped, the grant + this changeover took seconds over a slow
+                // path); feeding the link immediately — rather than idling up to
+                // KEEPALIVE_INTERVAL first — closes that post-changeover gap that
+                // otherwise lets the ARQ link time out to STBY. Skip it if data is
+                // already queued (the drain loop below will transmit right away).
+                if outbound_rx.is_empty() {
+                    if let Err(e) =
+                        write_message(&writer_transport, &counter, KEEPALIVE_TAG, &[]).await
+                    {
+                        warn!("[mux:writer] post-changeover keepalive failed: {e}");
+                        return;
+                    }
+                }
+
                 // Wait for the first item to send. While idle, send keepalives
                 // every KEEPALIVE_INTERVAL to keep the ARQ link alive, and KEEP
                 // HOLDING the turn for up to IDLE_TURN_GRANT before granting it to
@@ -419,7 +448,10 @@ impl PactorMux {
                 // later), so don't grant the instant the queue momentarily empties
                 // — wait a short grace period for follow-up messages so a whole
                 // slot goes out in ONE transmit turn instead of fragmenting across
-                // many expensive changeovers. Bounded by MAX_TURN_HOLD.
+                // many expensive changeovers. Bounded by MAX_TURN_HOLD, measured
+                // from when real data started (so a preceding long idle keepalive
+                // hold does not eat into the data-burst window).
+                let turn_deadline = tokio::time::Instant::now() + MAX_TURN_HOLD;
                 loop {
                     if tokio::time::Instant::now() >= turn_deadline {
                         break;
@@ -750,6 +782,37 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!probe.is_finished(), "idle receive returned early (queue closed?)");
         probe.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_turn_holder_keepalives_immediately_and_repeatedly() {
+        // The turn-holder must feed the ARQ link during a quiet period — both the
+        // instant it acquires the turn (closing the post-changeover gap) and then
+        // periodically — so the modem never sees the multi-minute inter-block
+        // silence that dropped the on-air link to STBY. RecordingTransport's
+        // read_data never returns a grant, so this side keeps the turn and idles.
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
+        let _chan: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
+        let _h = mux.spawn();
+
+        // Almost immediately (well under one KEEPALIVE_INTERVAL) there must be a
+        // keepalive line: the on-acquire keepalive fired without waiting.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let after_acquire = transport.written.lock().await.len();
+        assert!(
+            after_acquire >= 1,
+            "expected an immediate keepalive on acquiring the turn, got {after_acquire}"
+        );
+
+        // Over a long quiet stretch the holder must keep emitting keepalives every
+        // KEEPALIVE_INTERVAL (not fall silent after one), so the link stays busy.
+        tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
+        let later = transport.written.lock().await.len();
+        assert!(
+            later >= after_acquire + 4,
+            "expected repeated keepalives over the quiet period, got {later} (was {after_acquire})"
+        );
     }
 
     #[tokio::test]
