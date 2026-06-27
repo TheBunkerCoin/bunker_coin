@@ -170,7 +170,8 @@ mod tests {
         let mut shreds = Vec::new();
         let final_slice_index = SliceIndex::new_unchecked(1);
         for slice_index in final_slice_index.until() {
-            let payload = create_slice_payload_with_invalid_txs(None, MAX_DATA_PER_SLICE);
+            let payload =
+                create_slice_payload_with_invalid_txs(Slot::new(0), None, MAX_DATA_PER_SLICE);
             let header = SliceHeader {
                 slot: Slot::new(0),
                 slice_index,
@@ -228,7 +229,8 @@ mod tests {
         let mut shreds = Vec::new();
         let final_slice_index = SliceIndex::new_unchecked(1023);
         for slice_index in final_slice_index.until() {
-            let payload = create_slice_payload_with_invalid_txs(None, MAX_DATA_PER_SLICE);
+            let payload =
+                create_slice_payload_with_invalid_txs(Slot::new(0), None, MAX_DATA_PER_SLICE);
             let header = SliceHeader {
                 slot: Slot::new(0),
                 slice_index,
@@ -286,7 +288,8 @@ mod tests {
         let mut shreds = Vec::new();
         let final_slice_index = SliceIndex::new_unchecked(1023);
         for slice_index in final_slice_index.until() {
-            let payload = create_slice_payload_with_invalid_txs(None, MAX_DATA_PER_SLICE);
+            let payload =
+                create_slice_payload_with_invalid_txs(Slot::new(0), None, MAX_DATA_PER_SLICE);
             let header = SliceHeader {
                 slot: Slot::new(0),
                 slice_index,

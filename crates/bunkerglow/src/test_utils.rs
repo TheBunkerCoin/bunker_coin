@@ -123,7 +123,7 @@ pub fn create_random_block(slot: Slot, num_slices: usize) -> Vec<Slice> {
         } else {
             None
         };
-        let payload = create_random_slice_payload_valid_txs(parent);
+        let payload = create_random_slice_payload_valid_txs(slot, parent);
         let header = SliceHeader {
             slot,
             slice_index,
@@ -191,10 +191,11 @@ pub fn assert_votor_events_match(ev0: VotorEvent, ev1: VotorEvent) {
 }
 
 /// Creates a valid [`SlicePayload`] which contains valid transactions that can be decoded.
-fn create_random_slice_payload_valid_txs(parent: Option<BlockId>) -> SlicePayload {
+fn create_random_slice_payload_valid_txs(slot: Slot, parent: Option<BlockId>) -> SlicePayload {
     // HACK: manually picked number of maximally sized transactions that fit in the slice
-    // without going over the [`MAX_DATA_PER_SLICE`] limit.
-    const NUM_TXS_PER_SLICE: usize = 61;
+    // without going over the [`MAX_DATA_PER_SLICE`] limit (the slot now also occupies
+    // 8 bytes of the hashed payload, so this is one fewer than before).
+    const NUM_TXS_PER_SLICE: usize = 60;
 
     let mut data = vec![0; MAX_TRANSACTION_SIZE];
     rand::rng().fill_bytes(&mut data);
@@ -205,7 +206,7 @@ fn create_random_slice_payload_valid_txs(parent: Option<BlockId>) -> SlicePayloa
         transactions: txs,
     })
     .expect("serialization should not panic");
-    let payload = SlicePayload::new(parent, txs);
+    let payload = SlicePayload::new(slot, parent, txs);
     let payload: Vec<u8> = payload.into();
     assert!(payload.len() <= MAX_DATA_PER_SLICE);
     SlicePayload::from(payload.as_slice())

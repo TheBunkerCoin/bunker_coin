@@ -45,7 +45,16 @@ impl Slice {
             slice_index,
             is_last,
         } = header;
-        let SlicePayload { parent, data } = payload;
+        // The payload now also carries the slot (it is part of the hashed bytes).
+        // `from_parts` is only called with a header and payload from the same
+        // slice, so `payload.slot` matches `header.slot`; the authenticated check
+        // for *reconstructed* slices lives in the deshred path (see
+        // `Slice::from_shreds_checked`).
+        let SlicePayload {
+            slot: _,
+            parent,
+            data,
+        } = payload;
         Self {
             slot,
             slice_index,
@@ -56,12 +65,26 @@ impl Slice {
         }
     }
 
-    /// Creates a [`Slice`] from raw payload bytes and the metadata extracted from a shred.
-    #[must_use]
-    pub(crate) fn from_shreds(payload: SlicePayload, any_shred: &ValidatedShred) -> Self {
+    /// Creates a [`Slice`] from raw payload bytes and the metadata extracted from
+    /// a shred, **verifying the slot the (signed, Merkle-committed) payload claims
+    /// matches the slot in the shred's (unauthenticated) header**.
+    ///
+    /// The payload's slot is covered by the leader's signature over the Merkle
+    /// root, so it is the trustworthy one; the header's slot is plain metadata. A
+    /// mismatch means a tampered or corrupt header and the slice is rejected.
+    pub(crate) fn from_shreds_checked(
+        payload: SlicePayload,
+        any_shred: &ValidatedShred,
+    ) -> Result<Self, SliceSlotMismatch> {
         let header = any_shred.payload().header.clone();
+        if payload.slot != header.slot {
+            return Err(SliceSlotMismatch {
+                payload_slot: payload.slot,
+                header_slot: header.slot,
+            });
+        }
         let merkle_root = Some(any_shred.merkle_root.clone());
-        Self::from_parts(header, payload, merkle_root)
+        Ok(Self::from_parts(header, payload, merkle_root))
     }
 
     /// Deconstructs a [`Slice`] into its components: [`SliceHeader`] and [`SlicePayload`].
@@ -80,7 +103,9 @@ impl Slice {
                 slice_index,
                 is_last,
             },
-            SlicePayload { parent, data },
+            // Slot goes into the hashed payload as well as the header, so the
+            // Merkle root (and the leader's signature over it) commit to it.
+            SlicePayload { slot, parent, data },
         )
     }
 
@@ -92,6 +117,14 @@ impl Slice {
             is_last: self.is_last,
         }
     }
+}
+
+/// A reconstructed slice's signed payload slot did not match the slot in the
+/// shred header it was carried in (a tampered or corrupt header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SliceSlotMismatch {
+    pub(crate) payload_slot: Slot,
+    pub(crate) header_slot: Slot,
 }
 
 /// Struct to hold all the header payload of a [`Slice`].
@@ -112,6 +145,13 @@ pub(crate) struct SliceHeader {
 /// This is what actually gets "shredded" into different shreds.
 #[derive(Clone, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
 pub(crate) struct SlicePayload {
+    /// Slot this slice belongs to. Included in the *hashed* payload (not just the
+    /// unauthenticated [`SliceHeader`]) so that the slice Merkle root — and hence
+    /// the block hash and the leader's signature over the root — commit to the
+    /// block's position in the chain. Without this, two empty blocks built on the
+    /// same parent at different slots hash identically (the slot was carried only
+    /// in the header, which is neither Merkle-hashed nor signed).
+    pub(crate) slot: Slot,
     /// Same as [`Slice::parent`].
     pub(crate) parent: Option<(Slot, BlockHash)>,
     /// Same as [`Slice::data`].
@@ -120,8 +160,8 @@ pub(crate) struct SlicePayload {
 
 impl SlicePayload {
     /// Constructs a new [`SlicePayload`] from its component parts.
-    pub(crate) fn new(parent: Option<(Slot, BlockHash)>, data: Vec<u8>) -> Self {
-        Self { parent, data }
+    pub(crate) fn new(slot: Slot, parent: Option<(Slot, BlockHash)>, data: Vec<u8>) -> Self {
+        Self { slot, parent, data }
     }
 
     /// Serializes the payload into bytes.
@@ -155,21 +195,24 @@ impl From<&[u8]> for SlicePayload {
 // XXX: This is only used in test and benchmarking code.
 // Ensure it is only compiled when we are testing or benchmarking.
 pub(crate) fn create_slice_payload_with_invalid_txs(
+    slot: Slot,
     parent: Option<BlockId>,
     desired_size: usize,
 ) -> SlicePayload {
     let parent_bytes = <Option<BlockId> as wincode::SchemaWrite>::size_of(&parent).unwrap();
+    // 8 bytes for the slot (Slot is a u64, fixed-length in wincode).
+    let slot_bytes = <Slot as wincode::SchemaWrite>::size_of(&slot).unwrap();
     // 8 bytes for data length (usize), since wincode uses fixed-length integer encoding
     let data_len_bytes = 8;
 
     let size = desired_size
-        .checked_sub(parent_bytes + data_len_bytes)
+        .checked_sub(parent_bytes + slot_bytes + data_len_bytes)
         .unwrap();
     let mut data = vec![0; size];
     let mut rng = rng();
     rng.fill_bytes(&mut data);
 
-    SlicePayload { parent, data }
+    SlicePayload { slot, parent, data }
 }
 
 /// Creates a [`Slice`] with a random payload of desired size (in bytes).
@@ -179,9 +222,10 @@ pub(crate) fn create_slice_payload_with_invalid_txs(
 //
 // XXX: This is only used in test and benchmarking code.  Ensure it is only compiled when we are testing or benchmarking.
 pub fn create_slice_with_invalid_txs(desired_size: usize) -> Slice {
-    let payload = create_slice_payload_with_invalid_txs(None, desired_size);
+    let slot = Slot::new(0);
+    let payload = create_slice_payload_with_invalid_txs(slot, None, desired_size);
     let header = SliceHeader {
-        slot: Slot::new(0),
+        slot,
         slice_index: SliceIndex::first(),
         is_last: true,
     };

@@ -85,6 +85,14 @@ pub enum DeshredError {
     InvalidMerkleTree,
     #[error("shreds array contains invalid sequence")]
     InvalidLayout,
+    #[error("reconstructed slice slot does not match shred header slot")]
+    SlotMismatch,
+}
+
+impl From<crate::types::slice::SliceSlotMismatch> for DeshredError {
+    fn from(_: crate::types::slice::SliceSlotMismatch) -> Self {
+        Self::SlotMismatch
+    }
 }
 
 impl From<ReedSolomonDeshredError> for DeshredError {
@@ -296,7 +304,7 @@ impl Shredder for RegularShredder {
 
         // deshreding succeeded above, there should be at least one shred in the array so the unwrap() below should be safe
         let any_shred = shreds.to_shreds().iter().find_map(|s| s.as_ref()).unwrap();
-        let slice = Slice::from_shreds(payload, any_shred);
+        let slice = Slice::from_shreds_checked(payload, any_shred)?;
         let header = slice.to_header();
 
         // additional Merkle tree validity check
@@ -351,7 +359,7 @@ impl Shredder for CodingOnlyShredder {
 
         // deshreding succeeded above, there should be at least one shred in the array so the unwrap() below should be safe
         let any_shred = shreds.to_shreds().iter().find_map(|s| s.as_ref()).unwrap();
-        let slice = Slice::from_shreds(payload, any_shred);
+        let slice = Slice::from_shreds_checked(payload, any_shred)?;
 
         // additional Merkle tree validity check
         let merkle_root = any_shred.merkle_root.clone();
@@ -448,7 +456,7 @@ impl Shredder for PetsShredder {
         let mut cipher = Ctr64LE::<Aes128>::new(&key, &iv);
         cipher.apply_keystream(&mut buffer);
         let payload = SlicePayload::from(buffer.as_slice());
-        let slice = Slice::from_shreds(payload, any_shred);
+        let slice = Slice::from_shreds_checked(payload, any_shred)?;
 
         // turn reconstructed shreds into output shreds (with root, path, sig)
         let leader_sig = any_shred.merkle_root_sig;
@@ -540,7 +548,7 @@ impl Shredder for AontShredder {
         let mut cipher = Ctr64LE::<Aes128>::new(&key, &iv);
         cipher.apply_keystream(&mut buffer);
         let payload = SlicePayload::from(buffer.as_slice());
-        let slice = Slice::from_shreds(payload, any_shred);
+        let slice = Slice::from_shreds_checked(payload, any_shred)?;
 
         // turn reconstructed shreds into output shreds (with root, path, sig)
         let leader_sig = any_shred.merkle_root_sig;
@@ -682,7 +690,106 @@ mod tests {
     use color_eyre::Result;
 
     use super::*;
+    use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH};
     use crate::types::slice::create_slice_with_invalid_txs;
+    use crate::types::SliceIndex;
+    use crate::Slot;
+
+    /// Build a first slice (the one that carries the block's parent) at `slot`,
+    /// pointing at `parent`, with `data` as its payload. Mirrors how the leader
+    /// constructs a slot's first slice.
+    fn first_slice_at(slot: u64, parent: Option<(Slot, BlockHash)>, data: Vec<u8>) -> Slice {
+        let slot = Slot::new(slot);
+        Slice::from_parts(
+            SliceHeader {
+                slot,
+                slice_index: SliceIndex::first(),
+                is_last: true,
+            },
+            SlicePayload::new(slot, parent, data),
+            None,
+        )
+    }
+
+    /// REGRESSION: the block's slot is now part of the hashed slice payload, so
+    /// two EMPTY blocks built on the SAME parent at DIFFERENT slots hash
+    /// **differently**. Before the fix they hashed identically — the slot was
+    /// carried only in the (unhashed, unsigned) slice header — which produced the
+    /// on-air anomaly where finalized slots 4 and 8 (both empty, both
+    /// `parent_slot:3`) reported the same block hash. A block's identity must bind
+    /// its chain position, not just its parent.
+    #[test]
+    fn empty_blocks_same_parent_different_slot_hash_differently() {
+        let mut shredder = RegularShredder::default();
+        let sk = SecretKey::new(&mut rng());
+
+        let parent = Some((Slot::new(3), GENESIS_BLOCK_HASH));
+        // Two EMPTY (data = []) first slices on the same parent, different slots.
+        let slice_slot4 = first_slice_at(4, parent.clone(), vec![]);
+        let slice_slot8 = first_slice_at(8, parent, vec![]);
+
+        let root4 = shredder.shred(slice_slot4, &sk).unwrap()[0].merkle_root.clone();
+        let root8 = shredder.shred(slice_slot8, &sk).unwrap()[0].merkle_root.clone();
+
+        // The fix: distinct roots → distinct block hashes, despite identical
+        // parent and (empty) data, because the slot is now in the hashed payload.
+        assert_ne!(
+            root4, root8,
+            "slice Merkle root must bind the block's own slot (it is now in the \
+             hashed payload); same-parent empty blocks at different slots must differ"
+        );
+    }
+
+    /// Deshredding must REJECT shreds whose (unauthenticated) header slot has been
+    /// tampered to disagree with the (signed, Merkle-committed) payload slot. This
+    /// is the authentication the slot-in-payload change buys: the header can no
+    /// longer lie about a slice's slot without detection.
+    #[test]
+    fn deshred_rejects_tampered_header_slot() {
+        let mut shredder = RegularShredder::default();
+        let sk = SecretKey::new(&mut rng());
+
+        // A real slice at slot 5 (slot is in the hashed/signed payload).
+        let slice = first_slice_at(5, Some((Slot::new(4), GENESIS_BLOCK_HASH)), vec![]);
+        let shreds = shredder.shred(slice, &sk).unwrap();
+
+        // Tamper the header slot on every shred (the header is plain metadata,
+        // outside the Merkle tree, so the path still verifies) to a different slot.
+        let mut tampered = into_array(&shreds);
+        for s in tampered.iter_mut().flatten() {
+            s.payload_mut().header.slot = Slot::new(9);
+        }
+
+        let result = shredder.deshred(&tampered);
+        assert_eq!(
+            result.err(),
+            Some(DeshredError::SlotMismatch),
+            "deshred must reject a header slot that disagrees with the signed payload slot"
+        );
+    }
+
+    /// Counterpart to the probe above: the slice Merkle root DOES bind the
+    /// `parent`, so blocks on different parents hash differently (the chain is
+    /// linked by parent, just not by self-slot). Establishes that only the
+    /// self-slot is missing from the commitment, not the whole header.
+    #[test]
+    fn empty_blocks_different_parent_hash_differently() {
+        let mut shredder = RegularShredder::default();
+        let sk = SecretKey::new(&mut rng());
+
+        // Same slot, same (empty) data, but different parent slot → different
+        // `parent` tuple in the hashed payload → different Merkle root.
+        let on_parent3 = first_slice_at(4, Some((Slot::new(3), GENESIS_BLOCK_HASH)), vec![]);
+        let on_parent2 = first_slice_at(4, Some((Slot::new(2), GENESIS_BLOCK_HASH)), vec![]);
+
+        let root_a = shredder.shred(on_parent3, &sk).unwrap()[0].merkle_root.clone();
+        let root_b = shredder.shred(on_parent2, &sk).unwrap()[0].merkle_root.clone();
+
+        assert_ne!(
+            root_a, root_b,
+            "slice Merkle root must bind the parent (it is in the hashed payload)"
+        );
+    }
 
     /// Constructs a valid layout of `Shred`s from the input.
     fn into_array(shreds: &[ValidatedShred]) -> [Option<ValidatedShred>; TOTAL_SHREDS] {

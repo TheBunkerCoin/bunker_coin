@@ -255,7 +255,7 @@ where
                 duration_left.min(self.delta_block)
             };
             let produce_slice_future =
-                produce_slice_payload(&self.txs_receiver, parent, time_for_slice, None);
+                produce_slice_payload(slot, &self.txs_receiver, parent, time_for_slice, None);
 
             // If we have not yet received the ParentReady event, wait for it concurrently while producing the next slice.
             let (mut payload, new_duration_left) = if parent_ready_receiver.is_terminated() {
@@ -355,6 +355,7 @@ where
                 let time_for_slice = self.delta_first_slice;
                 let epoch_transition = self.epoch_transition_payload(slot).await;
                 let (payload, slice_duration_left) = produce_slice_payload(
+                    slot,
                     &self.txs_receiver,
                     Some(parent_block_id.clone()),
                     time_for_slice,
@@ -366,7 +367,7 @@ where
 
                 (payload, left)
             } else {
-                produce_slice_payload(&self.txs_receiver, None, duration_left, None).await
+                produce_slice_payload(slot, &self.txs_receiver, None, duration_left, None).await
             };
             let is_last = slice_index.is_max() || new_duration_left.is_zero();
             let header = SliceHeader {
@@ -444,6 +445,7 @@ where
 // TODO: extend docstring
 /// Returns
 async fn produce_slice_payload<T>(
+    slot: Slot,
     txs_receiver: &T,
     parent: Option<BlockId>,
     duration_left: Duration,
@@ -458,7 +460,8 @@ where
     // need 8 bytes to encode number of txs + 8 bytes to encode the length of the tx payload
     const_assert!(MAX_DATA_PER_SLICE >= MAX_TRANSACTION_SIZE + 8 + 8);
 
-    // reserve space for parent and block payload overhead
+    // reserve space for the slot, parent, and block payload overhead
+    let slot_encoded_len = <Slot as wincode::SchemaWrite>::size_of(&slot).unwrap();
     let parent_encoded_len = <Option<BlockId> as wincode::SchemaWrite>::size_of(&parent).unwrap();
     let fixed_payload_len = <BlockPayload as wincode::SchemaWrite>::size_of(&BlockPayload {
         epoch_transition: epoch_transition.clone(),
@@ -466,7 +469,7 @@ where
     })
     .unwrap_or(8);
     let mut slice_capacity_left = MAX_DATA_PER_SLICE
-        .checked_sub(parent_encoded_len + fixed_payload_len)
+        .checked_sub(slot_encoded_len + parent_encoded_len + fixed_payload_len)
         .unwrap();
     let mut txs = Vec::new();
 
@@ -500,7 +503,7 @@ where
         transactions: txs,
     })
     .expect("serialization should not panic");
-    let payload = SlicePayload::new(parent, txs);
+    let payload = SlicePayload::new(slot, parent, txs);
     (payload, ret)
 }
 
@@ -603,7 +606,8 @@ mod tests {
 
         let parent = None;
         let (payload, maybe_duration) =
-            produce_slice_payload(&txs_receiver, parent.clone(), duration_left, None).await;
+            produce_slice_payload(Slot::new(1), &txs_receiver, parent.clone(), duration_left, None)
+                .await;
         assert_eq!(maybe_duration, Duration::ZERO);
         assert_eq!(payload.parent, parent);
         let block_payload: BlockPayload = wincode::deserialize(&payload.data).unwrap();
@@ -612,7 +616,8 @@ mod tests {
 
         let parent = Some((Slot::genesis(), GENESIS_BLOCK_HASH));
         let (payload, maybe_duration) =
-            produce_slice_payload(&txs_receiver, parent.clone(), duration_left, None).await;
+            produce_slice_payload(Slot::new(1), &txs_receiver, parent.clone(), duration_left, None)
+                .await;
         assert_eq!(maybe_duration, Duration::ZERO);
         assert_eq!(payload.parent, parent);
         let block_payload: BlockPayload = wincode::deserialize(&payload.data).unwrap();
@@ -638,7 +643,8 @@ mod tests {
 
         let parent = None;
         let (payload, maybe_duration) =
-            produce_slice_payload(&txs_receiver, parent.clone(), duration_left, None).await;
+            produce_slice_payload(Slot::new(1), &txs_receiver, parent.clone(), duration_left, None)
+                .await;
         assert!(maybe_duration > Duration::ZERO);
         assert_eq!(payload.parent, parent);
         assert!(payload.data.len() <= MAX_DATA_PER_SLICE);

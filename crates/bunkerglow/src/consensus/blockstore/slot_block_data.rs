@@ -325,6 +325,18 @@ impl BlockData {
         let mut epoch_transition = None;
         let mut transactions = vec![];
         for (ind, slice) in &self.slices {
+            // Every slice must belong to the slot we are reconstructing. The slot
+            // is part of each slice's signed/Merkle-committed payload (and was
+            // cross-checked against the shred header at deshred), so a mismatch
+            // here means slices from different slots were combined — reject rather
+            // than silently produce a block whose hash/identity is ambiguous.
+            if slice.slot != self.slot {
+                warn!(
+                    "slice {ind} claims slot {} but reconstructing slot {}",
+                    slice.slot, self.slot
+                );
+                return ReconstructBlockResult::Error;
+            }
             // handle optimistic handover
             if !ind.is_first()
                 && let Some(new_parent) = slice.parent.clone()
