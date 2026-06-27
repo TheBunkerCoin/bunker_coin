@@ -372,6 +372,15 @@ where
         Arc::clone(&self.pool)
     }
 
+    /// Shared handle to this node's block store (cheap `Arc` clone).
+    ///
+    /// Lets an out-of-band reader (e.g. an RPC server) query finalized blocks
+    /// while the node runs — the same handle the consensus loop writes to, so
+    /// reads see blocks as soon as they are persisted.
+    pub fn get_blockstore(&self) -> Arc<RwLock<Box<dyn Blockstore + Send + Sync>>> {
+        Arc::clone(&self.blockstore)
+    }
+
     pub fn get_cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
     }

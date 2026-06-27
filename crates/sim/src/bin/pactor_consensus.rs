@@ -110,6 +110,55 @@ struct Args {
     /// How long to run before shutting down, in seconds.
     #[arg(long, default_value_t = 120)]
     duration: u64,
+
+    /// Serve the HTTP RPC API (same endpoints as the simulation) on
+    /// 127.0.0.1:3001, reading blocks from this node's live block store. Query
+    /// e.g. `curl localhost:3001/block/slot/4` or `curl localhost:3001/blocks`.
+    #[arg(long)]
+    rpc: bool,
+}
+
+/// Block-store handle type shared between a node and the RPC server.
+type SharedBlockstore =
+    Arc<tokio::sync::RwLock<Box<dyn bunkerglow::consensus::Blockstore + Send + Sync>>>;
+
+/// Build a minimal RPC [`SharedState`](rpc::SharedState) backed by `blockstore`.
+///
+/// Reuses `rpc::run_api` (the exact server the simulations expose) so the on-air
+/// chain is queryable through the same endpoints — `/block/slot/{n}`, `/blocks`,
+/// `/block/{hash}`, `/ws`, … — without a bespoke API. Only `blockstore` is wired
+/// (block queries); transaction/account/snapshot endpoints that need a populated
+/// execution state are present but empty (this binary produces empty blocks).
+fn rpc_state_for(blockstore: SharedBlockstore) -> rpc::SharedState {
+    let (updates_tx, _updates_rx) = tokio::sync::broadcast::channel(256);
+    rpc::SharedState {
+        blocks: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        nodes: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        radio_stats: Arc::new(tokio::sync::RwLock::new(rpc::RadioStats {
+            bandwidth_bps: 0,
+            packet_loss_percent: 0.0,
+            latency_ms: 0,
+            jitter_ms: 0,
+            packets_sent: 0,
+            packets_dropped: 0,
+            current_throughput_bps: 0.0,
+        })),
+        updates: updates_tx,
+        blockstore: Some(blockstore),
+        mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        tx_sender: None,
+        execution_state: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        tx_results: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        genesis_signing_key: None,
+        snapshot_store: None,
+    }
+}
+
+/// Spawn the RPC server over `blockstore` (used by the simulated, never-reconnect
+/// path; the hardware path spawns/aborts it per session inline).
+fn spawn_rpc(blockstore: SharedBlockstore) {
+    println!("RPC API serving on http://127.0.0.1:3001 (try /block/slot/1, /blocks)");
+    tokio::spawn(rpc::run_api(rpc_state_for(blockstore)));
 }
 
 /// Deterministically generated keys + public validator info for the 2-node set.
@@ -290,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
     let duration = Duration::from_secs(args.duration);
 
     if args.simulated {
-        run_simulated(cluster, duration, args.half_duplex).await
+        run_simulated(cluster, duration, args.half_duplex, args.rpc).await
     } else {
         run_hardware(&args, cluster, duration).await
     }
@@ -306,6 +355,7 @@ async fn run_simulated(
     cluster: Cluster,
     duration: Duration,
     half_duplex: bool,
+    rpc: bool,
 ) -> anyhow::Result<()> {
     println!(
         "=== simulated 2-node empty-block consensus over PACTOR mux ({}) ===",
@@ -347,6 +397,11 @@ async fn run_simulated(
     let turn_b = half_duplex.then_some(false);
     let (node_a, handle_a) = build_node(ta, 0, &cluster, turn_a);
     let (node_b, handle_b) = build_node(tb, 1, &cluster, turn_b);
+
+    // Optional RPC over node 0's block store (both nodes share the same chain).
+    if rpc {
+        spawn_rpc(node_a.get_blockstore());
+    }
 
     let until = tokio::time::Instant::now() + duration;
     // Simulated link never "drops" (full-duplex), so no link watch / reconnect.
@@ -498,9 +553,30 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
         let transport: Arc<dyn PactorTransport> = Arc::new(transport);
         // Half-duplex link: the caller (node 0) starts holding the transmit turn.
         let (node, handle) = build_node(transport.clone(), own_id, &cluster, Some(is_caller));
+
+        // Optional RPC over THIS session's block store. Spawned per session and
+        // aborted before teardown below, so each reconnect's fresh RocksDB handle
+        // is the one being served and the DB lock is released for the next
+        // session. Block queries still see all finalized slots — the chain
+        // persists on disk and a rebuilt node resumes from it.
+        let rpc_task = if args.rpc {
+            Some(tokio::spawn(rpc::run_api(rpc_state_for(node.get_blockstore()))))
+        } else {
+            None
+        };
+        if rpc_task.is_some() {
+            println!("[{label}] RPC API on http://127.0.0.1:3001 (try /block/slot/1, /blocks)");
+        }
+
         let (slot, stop) =
             run_node(&label, node, handle, overall_deadline, Some(transport.clone())).await;
         highest = highest.max(slot);
+
+        // Stop serving before tearing the session's block store down, so the next
+        // session can re-open the RocksDB without lock contention.
+        if let Some(t) = rpc_task {
+            t.abort();
+        }
 
         // Tell the modem to drop the link, then release the transport so its
         // serial port is freed before the next session re-opens it. Dropping the
