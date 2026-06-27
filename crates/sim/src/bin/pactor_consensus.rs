@@ -302,14 +302,19 @@ async fn run_node(
     // Stop consensus, then tear the mux down so the transport (and its serial
     // fd) can be released for a reconnect.
     //
-    // Order matters: cancel consensus and give it a moment to wind down BEFORE
-    // aborting the mux reader. Aborting the reader drops its inbound senders; a
-    // still-running repair task's `receive().unwrap()` would then see a closed
-    // queue and panic (isolated to that task, but noisy). After shutdown +
-    // dropping the handle, the mux reader/writer tasks release their transport
-    // clones, so the caller dropping the last transport Arc frees the modem port.
+    // Order matters: cancel consensus and let `run()` fully wind down BEFORE
+    // aborting the mux reader. `run()` aborts its internal loops and returns,
+    // dropping the `Arc<Alpenglow>` it owns — which is what releases the RocksDB
+    // blockstore/pool handles the NEXT session must re-open. We must therefore
+    // *await run() to completion*, not abandon it on a short timeout: a premature
+    // timeout leaves `run()`'s task (and its blockstore Arc) alive, so the next
+    // session's `DB::open` hits "lock held by current process" and panics.
+    // A generous cap still bounds a pathologically stuck teardown.
     cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(2), run_task).await;
+    match tokio::time::timeout(Duration::from_secs(15), run_task).await {
+        Ok(_) => {}
+        Err(_) => eprintln!("[{label}] consensus teardown did not finish within 15s"),
+    }
     handle.shutdown();
     drop(handle);
     (highest, stop)
@@ -585,10 +590,15 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
             run_node(&label, node, handle, overall_deadline, Some(transport.clone())).await;
         highest = highest.max(slot);
 
-        // Stop serving before tearing the session's block store down, so the next
-        // session can re-open the RocksDB without lock contention.
+        // Stop serving and WAIT for the server task to actually end before the
+        // next session re-opens the RocksDB. The RPC `SharedState` holds an `Arc`
+        // clone of this session's blockstore; that clone is only dropped once the
+        // axum server future is dropped, which happens when the aborted task is
+        // awaited. Skipping the await would leave the blockstore locked and the
+        // next session's `DB::open` would fail with "lock held by current process".
         if let Some(t) = rpc_task {
             t.abort();
+            let _ = t.await;
         }
 
         // Tell the modem to drop the link, then release the transport so its

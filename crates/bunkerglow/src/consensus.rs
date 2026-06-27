@@ -378,9 +378,31 @@ where
         epoch_loop.abort();
         finalized_checkpoint_loop.abort();
 
-        let (msg_res, prod_res) = tokio::join!(msg_loop, prod_loop);
-        msg_res??;
-        prod_res??;
+        // Await ALL spawned tasks (not just msg/prod) so every `Arc<Alpenglow>`
+        // clone they hold is dropped before `run()` returns. Those Arcs keep the
+        // RocksDB blockstore/pool handles alive; if any task is still unwinding
+        // when `run()` returns and the node is rebuilt (reconnect), the new
+        // `DB::open` hits "lock held by current process". Aborted tasks resolve to
+        // `JoinError::Cancelled`, which we ignore here — teardown, not failure.
+        let (msg_res, prod_res, _, _, _) = tokio::join!(
+            msg_loop,
+            prod_loop,
+            standstill_loop,
+            epoch_loop,
+            finalized_checkpoint_loop,
+        );
+        // Drop the local Arc; with all tasks finished this is the last reference,
+        // so the node (and its DB handles) is fully released here.
+        drop(node);
+
+        // Surface a genuine panic (not a cancellation) from the main loops; a
+        // cancelled join is expected teardown and ignored.
+        if let Ok(Err(e)) = msg_res {
+            return Err(e);
+        }
+        if let Ok(Err(e)) = prod_res {
+            return Err(e);
+        }
         Ok(())
     }
 
