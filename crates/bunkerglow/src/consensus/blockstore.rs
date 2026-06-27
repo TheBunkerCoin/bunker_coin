@@ -25,19 +25,38 @@ use crate::shredder::{RegularShredder, Shred, ShredIndex, ShredderPool, Validate
 use crate::types::SliceIndex;
 use crate::{Block, BlockId, Slot};
 
-/// Open a RocksDB database, retrying briefly if the lock is still held.
+/// Process-global cache of opened RocksDB handles, keyed by path.
 ///
-/// On a reconnect (e.g. consensus over a radio link that dropped) a fresh node
-/// re-opens the same DB paths while the previous node's detached tasks may not
-/// have released their handles yet. RocksDB allows only one handle per path, so
-/// the open can transiently fail with a LOCK error; retry with backoff so the
-/// prior handle has time to drop instead of panicking immediately.
-pub(crate) fn open_db_with_retry(opts: &Options, path: &str) -> Result<DB, rocksdb::Error> {
+/// RocksDB allows only one handle per path *per process*. On a reconnect (e.g.
+/// consensus over a radio link that dropped) a fresh node re-opens the same DB
+/// paths, but the previous node's detached tasks (repair handlers, etc.) may
+/// still hold the old handle — so a plain re-open fails with "lock held by
+/// current process", which no retry can clear (it is the *same* process). The
+/// durable fix is to open each path **once** and hand back the same shared
+/// handle on every subsequent open, so reconnects never re-acquire the lock.
+static DB_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Arc<DB>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Open a RocksDB database, reusing an already-open handle for the same path.
+///
+/// First open for a path actually opens the DB (retrying briefly in case an
+/// out-of-process holder is releasing it); subsequent opens return the cached
+/// [`Arc<DB>`]. The handle lives for the process lifetime, which is exactly what
+/// we want for a node that is torn down and rebuilt across link drops.
+pub(crate) fn open_db_with_retry(opts: &Options, path: &str) -> Result<Arc<DB>, rocksdb::Error> {
+    let mut cache = DB_CACHE.lock().unwrap();
+    if let Some(db) = cache.get(path) {
+        return Ok(db.clone());
+    }
     const ATTEMPTS: u32 = 30;
     let mut last_err = None;
     for attempt in 0..ATTEMPTS {
         match DB::open(opts, path) {
-            Ok(db) => return Ok(db),
+            Ok(db) => {
+                let db = Arc::new(db);
+                cache.insert(path.to_owned(), db.clone());
+                return Ok(db);
+            }
             Err(e) => {
                 if attempt + 1 < ATTEMPTS {
                     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -91,7 +110,10 @@ pub struct BlockstoreImpl {
     epoch_info: Arc<EpochInfo>,
 
     /// Persistent RocksDB handle for durable block storage.
-    db: DB,
+    ///
+    /// Shared (`Arc`) and cached process-wide by path, so a node rebuilt across a
+    /// reconnect reuses the same handle instead of re-acquiring the file lock.
+    db: Arc<DB>,
 }
 
 impl BlockstoreImpl {
@@ -518,6 +540,29 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    /// Re-opening the same DB path within one process must succeed (returning the
+    /// cached shared handle), not fail with a "lock held by current process"
+    /// error. This is the on-air reconnect scenario: a rebuilt node re-opens the
+    /// same blockstore/pool path while the old handle may still be alive.
+    #[test]
+    fn open_db_with_retry_reuses_handle_for_same_path() {
+        let dir = std::env::temp_dir().join(format!("bunker_db_cache_test_{}", std::process::id()));
+        let path = dir.to_str().unwrap();
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+
+        let a = open_db_with_retry(&opts, path).expect("first open");
+        // Second open of the SAME path while `a` is still held must not lock-fail.
+        let b = open_db_with_retry(&opts, path).expect("second open of same path");
+        // Same underlying handle (cache hit).
+        assert!(Arc::ptr_eq(&a, &b));
+
+        a.put(b"k", b"v").unwrap();
+        assert_eq!(b.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use crate::ValidatorInfo;
     use crate::crypto::merkle::DoubleMerkleTree;
     use crate::crypto::signature::SecretKey;

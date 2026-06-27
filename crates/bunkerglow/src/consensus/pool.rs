@@ -140,7 +140,10 @@ pub struct PoolImpl {
     repair_channel: Sender<BlockId>,
 
     /// RocksDB handle for persisting certificates & metadata.
-    db: DB,
+    ///
+    /// Shared (`Arc`) and cached process-wide by path, so a node rebuilt across a
+    /// reconnect reuses the same handle instead of re-acquiring the file lock.
+    db: Arc<DB>,
     /// Reference to blockstore for updating finalized timestamps.
     blockstore: Option<Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>>,
     /// Channel for signaling epoch boundary crossings.
