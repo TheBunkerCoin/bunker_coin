@@ -107,9 +107,10 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     seed: u64,
 
-    /// How long to run before shutting down, in seconds.
-    #[arg(long, default_value_t = 120)]
-    duration: u64,
+    /// How long to run before shutting down, in seconds. Omit to run
+    /// continuously until Ctrl-C (graceful shutdown on signal).
+    #[arg(long)]
+    duration: Option<u64>,
 
     /// Serve the HTTP RPC API (same endpoints as the simulation) on
     /// 127.0.0.1:3001, reading blocks from this node's live block store. Query
@@ -262,12 +263,35 @@ fn build_node(
     (node, handle)
 }
 
+/// Process-wide "stop now" flag, set by the Ctrl-C watcher (see
+/// [`spawn_shutdown_watcher`]). The hardware reconnect loop and `run_node`'s poll
+/// loop both honor it so a continuous (`--duration`-less) run ends promptly and
+/// cleanly on Ctrl-C — tearing down consensus and releasing the modem/DB.
+static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Spawn a task that flips [`SHUTDOWN`] on the first Ctrl-C. Idempotent enough for
+/// our use: started once per run function before the work begins.
+fn spawn_shutdown_watcher() {
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            println!("\n=== Ctrl-C received; shutting down gracefully ===");
+            SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
 /// Why [`run_node`] stopped.
 enum RunStop {
     /// The `until` deadline elapsed.
     Deadline,
     /// The PACTOR link dropped mid-session (caller may reconnect).
     LinkDown,
+    /// Ctrl-C requested a graceful shutdown.
+    Shutdown,
 }
 
 /// Drive a node until `until`, polling its finalized slot for progress and (if
@@ -293,6 +317,10 @@ async fn run_node(
         if finalized != last {
             println!("[{label}] finalized slot {finalized}");
             last = finalized;
+        }
+        if shutdown_requested() {
+            println!("[{label}] shutdown requested (finalized {finalized} so far)");
+            break (finalized, RunStop::Shutdown);
         }
         if tokio::time::Instant::now() >= until {
             break (finalized, RunStop::Deadline);
@@ -358,7 +386,8 @@ async fn main() -> anyhow::Result<()> {
     install_teardown_panic_filter();
     let args = Args::parse();
     let cluster = build_cluster(args.seed);
-    let duration = Duration::from_secs(args.duration);
+    // `None` => run continuously until Ctrl-C; `Some` => stop after that long.
+    let duration = args.duration.map(Duration::from_secs);
 
     if args.inspect {
         run_inspect(&args, cluster, duration).await
@@ -369,11 +398,41 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Resolves a run budget to an instant to stop at: the deadline if a finite
+/// `--duration` was given, or `Ctrl-C` if not. Returns a future that completes
+/// when the run should end, so callers can `select!` consensus work against it.
+async fn run_until(duration: Option<Duration>) {
+    match duration {
+        Some(d) => tokio::time::sleep(d).await,
+        None => {
+            let _ = tokio::signal::ctrl_c().await;
+            println!("\n=== Ctrl-C received; shutting down gracefully ===");
+        }
+    }
+}
+
+/// A far-future instant used as the per-session deadline when running
+/// continuously (no `--duration`). The run actually stops on Ctrl-C via
+/// [`run_until`]; this just keeps per-session timing math (which expects an
+/// `Instant` deadline) well-defined without special-casing every call site.
+fn deadline_for(duration: Option<Duration>) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    match duration {
+        Some(d) => now + d,
+        // ~10 years; the Ctrl-C path ends the run long before this.
+        None => now + Duration::from_secs(10 * 365 * 24 * 3600),
+    }
+}
+
 /// Serve the RPC API over a node's persisted on-disk block store, without any
 /// modem or consensus. Lets you inspect the finalized chain (`/blocks`, etc.)
 /// after a run has ended — the chain lives in RocksDB under the current dir's
 /// `data/`, so run this from the same dir the node ran in (e.g. `/tmp/bc-node0`).
-async fn run_inspect(args: &Args, cluster: Cluster, duration: Duration) -> anyhow::Result<()> {
+async fn run_inspect(
+    args: &Args,
+    cluster: Cluster,
+    duration: Option<Duration>,
+) -> anyhow::Result<()> {
     let own_id = args
         .node
         .ok_or_else(|| anyhow::anyhow!("--inspect requires --node <id> to pick the block store"))?;
@@ -392,8 +451,9 @@ async fn run_inspect(args: &Args, cluster: Cluster, duration: Duration) -> anyho
     );
     spawn_rpc(blockstore);
 
-    // Stay up so the endpoint is reachable; honor --duration as an auto-exit.
-    tokio::time::sleep(duration).await;
+    // Stay up so the endpoint is reachable; honor --duration as an auto-exit, or
+    // run until Ctrl-C when no duration was given.
+    run_until(duration).await;
     Ok(())
 }
 
@@ -405,10 +465,11 @@ async fn run_inspect(args: &Args, cluster: Cluster, duration: Duration) -> anyho
 /// integration bugs before going on-air.
 async fn run_simulated(
     cluster: Cluster,
-    duration: Duration,
+    duration: Option<Duration>,
     half_duplex: bool,
     rpc: bool,
 ) -> anyhow::Result<()> {
+    spawn_shutdown_watcher();
     println!(
         "=== simulated 2-node empty-block consensus over PACTOR mux ({}) ===",
         if half_duplex {
@@ -480,14 +541,16 @@ async fn run_simulated(
         spawn_rpc(node_a.get_blockstore());
     }
 
-    let until = tokio::time::Instant::now() + duration;
+    let until = deadline_for(duration);
     // Simulated link never "drops" (full-duplex), so no link watch / reconnect.
     let a = tokio::spawn(async move { run_node("node0", node_a, handle_a, until, None).await });
     let b = tokio::spawn(async move { run_node("node1", node_b, handle_b, until, None).await });
 
     let (slot_a, slot_b) = (a.await?.0, b.await?.0);
     println!("=== done: node0 finalized {slot_a}, node1 finalized {slot_b} ===");
-    if slot_a == 0 && slot_b == 0 {
+    // Only treat zero progress as an error for a bounded run; a continuous run
+    // stopped by Ctrl-C may legitimately be ended before the first finalization.
+    if slot_a == 0 && slot_b == 0 && duration.is_some() {
         anyhow::bail!("no slots finalized — consensus did not make progress");
     }
     Ok(())
@@ -560,7 +623,12 @@ const LINK_HEALTH_WINDOW: Duration = Duration::from_secs(10);
 /// Consensus state (finalized slot, blocks) persists in the on-disk RocksDB pool
 /// / blockstore, so a node rebuilt after a reconnect resumes from where it left
 /// off — a marginal-band drop becomes a recoverable pause, not a restart.
-async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyhow::Result<()> {
+async fn run_hardware(
+    args: &Args,
+    cluster: Cluster,
+    duration: Option<Duration>,
+) -> anyhow::Result<()> {
+    spawn_shutdown_watcher();
     let own_id = args
         .node
         .ok_or_else(|| anyhow::anyhow!("hardware mode requires --node 0|1"))?;
@@ -603,11 +671,11 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
     // The listener must enable LISTEN 1 to accept the incoming connect.
     init_cfg.listen = !is_caller;
 
-    let overall_deadline = tokio::time::Instant::now() + duration;
+    let overall_deadline = deadline_for(duration);
     let mut highest = 0u64;
     let mut session = 0u32;
 
-    while tokio::time::Instant::now() < overall_deadline {
+    while tokio::time::Instant::now() < overall_deadline && !shutdown_requested() {
         session += 1;
         if session > 1 {
             println!("[{label}] reconnecting (session {session}) ...");
@@ -630,6 +698,9 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
         {
             Ok(t) => t,
             Err(e) => {
+                if shutdown_requested() {
+                    break;
+                }
                 eprintln!("[{label}] link bring-up failed: {e}; retrying ...");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
@@ -679,13 +750,15 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         match stop {
-            RunStop::Deadline => break,
+            RunStop::Deadline | RunStop::Shutdown => break,
             RunStop::LinkDown => {}
         }
     }
 
     println!("=== done: node{own_id} finalized {highest} (after {session} session(s)) ===");
-    if highest == 0 {
+    // A bounded run that finalized nothing is a failure; a continuous run ended by
+    // Ctrl-C before the first finalization is not.
+    if highest == 0 && duration.is_some() && !shutdown_requested() {
         anyhow::bail!("no slots finalized — consensus did not make progress");
     }
     Ok(())
