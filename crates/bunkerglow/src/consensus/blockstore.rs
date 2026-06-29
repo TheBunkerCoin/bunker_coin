@@ -162,11 +162,54 @@ impl BlockstoreImpl {
                     &hex::encode(block_info.parent.1.as_hash())[..8],
                     block_info.parent.0,
                 );
+                // Persist the full block + base metadata to RocksDB so the chain is
+                // durable across restarts (resume, `--inspect`, RPC after a session
+                // ends). Without this only in-memory `block_data` had the block, so a
+                // rebuilt node could resume by finalized-slot but never serve the
+                // block bytes/hashes. Keyed exactly as `load_block_from_db` /
+                // `load_block_metadata` read them.
+                let hash = block_info.hash.as_hash().clone();
+                let block_id = (*slot, block_info.hash.clone());
+                if let Some(block) = self.get_block(&block_id) {
+                    self.persist_block(*slot, &hash, &block);
+                }
+
                 self.votor_channel.send(event).await.unwrap();
 
                 Some(block_info)
             }
             ev => panic!("unexpected event {ev:?}"),
+        }
+    }
+
+    /// Persists a completed block and its base metadata to RocksDB, keyed exactly
+    /// as `load_block_from_db` / `load_block_metadata` read them. Idempotent:
+    /// re-persisting the same (slot, hash) overwrites with identical bytes. The
+    /// `finalized_timestamp` is filled in later by `update_finalized_timestamp`
+    /// when the slot finalizes.
+    fn persist_block(&self, slot: Slot, hash: &Hash, block: &Block) {
+        let key = format!("{:016X}{}", slot, hex::encode(hash));
+        if let Ok(value) = bincode::serde::encode_to_vec(block, bincode::config::standard()) {
+            let _ = self.db.put(key.as_bytes(), value);
+        }
+        // Only write base metadata once, so we never clobber a finalized timestamp.
+        if self.load_block_metadata(slot, hash.clone()).is_none() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let metadata = BlockMetadata {
+                slot,
+                hash: hash.clone(),
+                producer: self.epoch_info.leader(slot).id,
+                proposed_timestamp: now,
+                finalized_timestamp: None,
+            };
+            let meta_key = format!("meta|{:016X}{}", slot, hex::encode(hash));
+            if let Ok(value) = bincode::serde::encode_to_vec(&metadata, bincode::config::standard())
+            {
+                let _ = self.db.put(meta_key.as_bytes(), value);
+            }
         }
     }
 
@@ -373,13 +416,16 @@ impl Blockstore for BlockstoreImpl {
     }
 
     fn get_block(&self, block_id: &BlockId) -> Option<Block> {
-        let block_data = self.get_block_data(block_id)?;
-        if let Some((hash, block)) = block_data.completed.as_ref() {
-            debug_assert_eq!(*hash, block_id.1);
-            Some(block.clone())
-        } else {
-            None
+        if let Some(block_data) = self.get_block_data(block_id) {
+            if let Some((hash, block)) = block_data.completed.as_ref() {
+                debug_assert_eq!(*hash, block_id.1);
+                return Some(block.clone());
+            }
         }
+        // Fall back to the persisted copy (in-memory `block_data` is empty after a
+        // restart or in `--inspect` mode, but the block is durable in RocksDB).
+        let (slot, hash) = block_id;
+        self.load_block_from_db(*slot, hash.as_hash().clone())
     }
 
     /// Gives the last slice index for the given `block_id`.
@@ -435,8 +481,27 @@ impl Blockstore for BlockstoreImpl {
     }
 
     fn canonical_block_hash(&self, slot: Slot) -> Option<Hash> {
-        self.disseminated_block_hash(slot)
-            .map(|bh| bh.as_hash().clone())
+        if let Some(bh) = self.disseminated_block_hash(slot) {
+            return Some(bh.as_hash().clone());
+        }
+        // Fall back to the persisted metadata (in-memory is empty after a restart
+        // or in `--inspect`): the `meta|{slot}{hash}` key encodes the slot's hash.
+        let prefix = format!("meta|{:016X}", slot);
+        let prefix_bytes = prefix.as_bytes();
+        for item in self.db.prefix_iterator(prefix_bytes).flatten() {
+            let (k, _) = item;
+            if !k.starts_with(prefix_bytes) {
+                break;
+            }
+            // key = meta|{16 hex slot}{64 hex hash}
+            let hex_hash = &k[prefix_bytes.len()..];
+            if let Ok(bytes) = hex::decode(hex_hash) {
+                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                    return Some(Hash::from(arr));
+                }
+            }
+        }
+        None
     }
 
     fn load_block_by_hash(&self, hash: Hash) -> Option<(Slot, Block)> {

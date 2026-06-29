@@ -116,6 +116,13 @@ struct Args {
     /// e.g. `curl localhost:3001/block/slot/4` or `curl localhost:3001/blocks`.
     #[arg(long)]
     rpc: bool,
+
+    /// Inspect the persisted chain WITHOUT touching the modem: open this node's
+    /// on-disk block store (under the current dir's `data/`) and serve the RPC API
+    /// so `/blocks` etc. are queryable offline. Needs `--node <id>` to pick which
+    /// node's store to read. Runs until Ctrl-C (or `--duration`).
+    #[arg(long)]
+    inspect: bool,
 }
 
 /// Block-store handle type shared between a node and the RPC server.
@@ -353,11 +360,41 @@ async fn main() -> anyhow::Result<()> {
     let cluster = build_cluster(args.seed);
     let duration = Duration::from_secs(args.duration);
 
-    if args.simulated {
+    if args.inspect {
+        run_inspect(&args, cluster, duration).await
+    } else if args.simulated {
         run_simulated(cluster, duration, args.half_duplex, args.rpc).await
     } else {
         run_hardware(&args, cluster, duration).await
     }
+}
+
+/// Serve the RPC API over a node's persisted on-disk block store, without any
+/// modem or consensus. Lets you inspect the finalized chain (`/blocks`, etc.)
+/// after a run has ended — the chain lives in RocksDB under the current dir's
+/// `data/`, so run this from the same dir the node ran in (e.g. `/tmp/bc-node0`).
+async fn run_inspect(args: &Args, cluster: Cluster, duration: Duration) -> anyhow::Result<()> {
+    let own_id = args
+        .node
+        .ok_or_else(|| anyhow::anyhow!("--inspect requires --node <id> to pick the block store"))?;
+
+    // A blockstore needs a votor channel, but in inspect mode nothing consumes it;
+    // a dropped receiver is fine (the store performs no sends during pure reads).
+    let (votor_tx, _votor_rx) = tokio::sync::mpsc::channel(1);
+    let epoch_info = Arc::new(EpochInfo::new(0, own_id, cluster.validators.clone()));
+    let blockstore: SharedBlockstore = Arc::new(tokio::sync::RwLock::new(Box::new(
+        bunkerglow::consensus::BlockstoreImpl::new(epoch_info, votor_tx),
+    )));
+
+    println!(
+        "=== inspect: serving node {own_id}'s on-disk chain (data/blockstore/{own_id}) ===\n\
+         RPC API on http://127.0.0.1:3001 — try /blocks or /block/slot/1"
+    );
+    spawn_rpc(blockstore);
+
+    // Stay up so the endpoint is reachable; honor --duration as an auto-exit.
+    tokio::time::sleep(duration).await;
+    Ok(())
 }
 
 /// Build both nodes over a simulated PACTOR pair and run them against each other.
