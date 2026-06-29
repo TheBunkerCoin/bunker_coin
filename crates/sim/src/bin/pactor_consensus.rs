@@ -380,6 +380,15 @@ async fn run_simulated(
             "full-duplex"
         }
     );
+    // The half-duplex sim faithfully models the slow reverse path, so exercise the
+    // same reverse-path optimization the hardware path uses: defer the slow-path
+    // finalization vote so a fast-finalized slot sends nothing extra back.
+    if half_duplex {
+        // SAFETY: set before any node / Votor is built below.
+        unsafe {
+            std::env::set_var("BUNKER_DEFER_FINAL_VOTE", "1");
+        }
+    }
     // Two link models:
     // - Full-duplex: a clean, symmetric, independent-direction link. Validates the
     //   consensus-over-mux wiring without HF physics (the original sim behavior).
@@ -537,6 +546,12 @@ async fn run_hardware(args: &Args, cluster: Cluster, duration: Duration) -> anyh
     // SAFETY: set at startup before any consensus task / timer reads it.
     unsafe {
         std::env::set_var("BUNKER_DELTA_MULT", delta_mult.to_string());
+        // Over the slow half-duplex link, defer the slow-path finalization vote so
+        // a slot that fast-finalizes (both notar votes meet the 80% strong quorum)
+        // never sends the final vote / notar cert / final cert back over the
+        // expensive reverse path. Falls back to slow-final if fast-final does not
+        // fire in time. See `Votor::defer_final_vote`.
+        std::env::set_var("BUNKER_DEFER_FINAL_VOTE", "1");
     }
     println!(
         "=== hardware node {own_id} ({}) over {port} | delta_mult={delta_mult} ===",

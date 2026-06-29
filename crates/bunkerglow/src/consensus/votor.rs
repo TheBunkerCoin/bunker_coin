@@ -21,7 +21,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use super::blockstore::BlockInfo;
 use super::link_liveness::{LinkLiveness, NoLiveness};
 use super::{Cert, Vote, delta_block, delta_timeout};
-use crate::consensus::delta_first_slice;
+use crate::consensus::{delta_final_vote_grace, delta_first_slice};
 use crate::crypto::aggsig::SecretKey;
 use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH, MerkleRoot};
 use crate::{All2All, Slot, ValidatorId};
@@ -62,6 +62,10 @@ pub enum VotorEvent {
     Timeout(Slot),
     /// Early timeout for a crashed leader (nothing was received) has fired.
     TimeoutCrashedLeader(Slot),
+    /// The grace period for deferring a finalization vote has elapsed (see
+    /// [`Votor::defer_final_vote`]). If the slot has not fast-finalized by now,
+    /// the (slow-path) finalization vote should be sent for the given block.
+    FinalVoteDeadline(Slot, BlockHash),
 }
 
 /// Votor implements the decision process of which votes to cast.
@@ -108,6 +112,19 @@ pub struct Votor<A: All2All> {
     /// merely-slow (but alive) link pauses instead of skipping. Defaults to
     /// [`NoLiveness`] (sim/UDP); the radio path injects a keepalive-driven impl.
     link_liveness: Arc<dyn LinkLiveness>,
+    /// When `true`, the (slow-path) finalization vote is **deferred** by a grace
+    /// period instead of being broadcast eagerly alongside the notar vote. If the
+    /// slot fast-finalizes within the grace window (the common case when all
+    /// validators are reachable — e.g. a 2-node link where both notar votes meet
+    /// the 80% strong quorum), the finalization vote, notar cert, and final cert
+    /// are never sent — saving three messages per slot over the expensive reverse
+    /// path. If fast-final does *not* happen in time, the vote is sent when the
+    /// grace elapses, falling back to slow-final exactly as before. Defaults to
+    /// `false` (eager, original behavior); the radio half-duplex path enables it.
+    defer_final_vote: bool,
+    /// Slots for which a fast-final cert has been observed (so a deferred
+    /// finalization vote can be suppressed — fast-final already finalized them).
+    fast_finalized: BTreeSet<Slot>,
 }
 
 impl<A: All2All> Votor<A> {
@@ -148,6 +165,15 @@ impl<A: All2All> Votor<A> {
             event_sender,
             all2all,
             link_liveness: Arc::new(NoLiveness),
+            // Off by default (eager finalization vote — original behavior for
+            // sim/UDP/full-duplex and all existing tests). The radio half-duplex
+            // path opts in via `BUNKER_DEFER_FINAL_VOTE=1` (set in `pactor_init`),
+            // matching the `BUNKER_DELTA_MULT` env-config pattern, so `Alpenglow::new`
+            // keeps a stable signature.
+            defer_final_vote: std::env::var("BUNKER_DEFER_FINAL_VOTE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            fast_finalized: BTreeSet::new(),
         };
         votor.set_timeouts(Slot::new(0));
         votor
@@ -159,6 +185,16 @@ impl<A: All2All> Votor<A> {
     /// on a slow-but-alive link pauses instead of skipping the window.
     pub fn set_link_liveness(&mut self, liveness: Arc<dyn LinkLiveness>) {
         self.link_liveness = liveness;
+    }
+
+    /// Enable deferring the slow-path finalization vote (see [`Self::defer_final_vote`]).
+    ///
+    /// Saves the finalization vote + notar cert + final cert per slot over the
+    /// reverse path whenever a slot fast-finalizes within the grace window. Safe:
+    /// it only ever delays (never fabricates) a finalization vote, and falls back
+    /// to slow-final if fast-final does not occur in time.
+    pub fn set_defer_final_vote(&mut self, defer: bool) {
+        self.defer_final_vote = defer;
     }
 
     /// Max times a window's crashed-leader timeout may be re-armed (paused) while
@@ -216,10 +252,22 @@ impl<A: All2All> Votor<A> {
                         Cert::Notar(_) => {
                             self.block_notarized
                                 .insert(cert.slot(), cert.block_hash().cloned().unwrap());
-                            self.try_final(cert.slot(), cert.block_hash().cloned().unwrap())
-                                .await;
+                            // When deferring, do NOT send the finalization vote on the
+                            // notar cert; the FinalVoteDeadline path sends it later only
+                            // if fast-final has not finalized the slot by then.
+                            if !self.defer_final_vote {
+                                self.try_final(cert.slot(), cert.block_hash().cloned().unwrap())
+                                    .await;
+                            }
                         }
-                        Cert::Final(_) | Cert::FastFinal(_) => {
+                        Cert::FastFinal(_) => {
+                            // Record so a deferred (or pending) finalization vote is
+                            // suppressed — fast-final already finalized this slot.
+                            self.fast_finalized.insert(cert.slot());
+                            let first_slot_in_window = cert.slot().first_slot_in_window();
+                            self.set_timeouts(first_slot_in_window);
+                        }
+                        Cert::Final(_) => {
                             let first_slot_in_window = cert.slot().first_slot_in_window();
                             self.set_timeouts(first_slot_in_window);
                         }
@@ -303,6 +351,13 @@ impl<A: All2All> Votor<A> {
                         }
                     }
                 }
+                VotorEvent::FinalVoteDeadline(slot, hash) => {
+                    // The deferral grace has elapsed. If fast-final already
+                    // finalized the slot, `try_final` is a no-op (the savings).
+                    // Otherwise, send the slow-path finalization vote now, exactly
+                    // as the eager path would have — preserving slow-final liveness.
+                    self.try_final(slot, hash).await;
+                }
             }
         }
 
@@ -365,12 +420,30 @@ impl<A: All2All> Votor<A> {
         self.voted.insert(slot);
         self.voted_notar.insert(slot, hash.clone());
         self.pending_blocks.remove(&slot);
-        self.try_final(slot, hash).await;
+        if self.defer_final_vote {
+            // Defer the slow-path finalization vote: give fast-final a chance to
+            // fire from the notar votes alone (saving the final vote + notar cert
+            // + final cert over the slow reverse path). If it has not fired by the
+            // deadline, `FinalVoteDeadline` triggers the vote as a fallback.
+            let sender = self.event_sender.clone();
+            let h = hash.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delta_final_vote_grace()).await;
+                let _ = sender.send(VotorEvent::FinalVoteDeadline(slot, h)).await;
+            });
+        } else {
+            self.try_final(slot, hash).await;
+        }
         true
     }
 
     /// Sends a finalization vote for the given block if the conditions are met.
     async fn try_final(&mut self, slot: Slot, hash: BlockHash) {
+        // If the slot already fast-finalized, the slow-path finalization vote is
+        // redundant — skip it (this is the whole point of deferring it).
+        if self.fast_finalized.contains(&slot) {
+            return;
+        }
         let notarized = self.block_notarized.get(&slot) == Some(&hash);
         let voted_notar = self.voted_notar.get(&slot) == Some(&hash);
         let not_bad = !self.bad_window.contains(&slot);
@@ -415,7 +488,8 @@ impl VotorEvent {
             | Self::FirstShred(slot)
             | Self::Block { slot, .. }
             | Self::Timeout(slot)
-            | Self::TimeoutCrashedLeader(slot) => *slot,
+            | Self::TimeoutCrashedLeader(slot)
+            | Self::FinalVoteDeadline(slot, _) => *slot,
             Self::CertCreated(cert) => cert.slot(),
         }
     }
@@ -429,7 +503,7 @@ mod tests {
 
     use super::*;
     use crate::all2all::TrivialAll2All;
-    use crate::consensus::cert::NotarCert;
+    use crate::consensus::cert::{FastFinalCert, NotarCert};
     use crate::consensus::{ConsensusMessage, EpochInfo};
     use crate::crypto::Hash;
     use crate::network::SimulatedNetwork;
@@ -453,6 +527,14 @@ mod tests {
     async fn start_votor_with_liveness(
         liveness: Option<Arc<dyn LinkLiveness>>,
     ) -> (A2A, mpsc::Sender<VotorEvent>, Arc<EpochInfo>) {
+        start_votor_full(liveness, false).await
+    }
+
+    /// Start a votor with explicit liveness and `defer_final_vote` settings.
+    async fn start_votor_full(
+        liveness: Option<Arc<dyn LinkLiveness>>,
+        defer_final_vote: bool,
+    ) -> (A2A, mpsc::Sender<VotorEvent>, Arc<EpochInfo>) {
         let (sks, epoch_info) = generate_validators(2);
         let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
         let (tx, rx) = mpsc::channel(100);
@@ -462,6 +544,7 @@ mod tests {
         if let Some(l) = liveness {
             votor.set_link_liveness(l);
         }
+        votor.set_defer_final_vote(defer_final_vote);
         tokio::spawn(async move {
             votor.voting_loop().await.unwrap();
         });
@@ -563,6 +646,126 @@ mod tests {
                 assert_eq!(v.slot(), slot);
             }
             m => panic!("other msg: {m:?}"),
+        }
+    }
+
+    /// With `defer_final_vote` enabled, after a node notar-votes it must NOT emit
+    /// a finalization vote on the notar cert. If a fast-final cert then arrives,
+    /// the finalization vote must be suppressed entirely (the reverse-path saving):
+    /// the only consensus messages over the link are the notar vote and the
+    /// re-broadcast certs — never a `Final` vote.
+    #[tokio::test]
+    async fn defer_final_vote_suppressed_on_fast_final() {
+        let (other_a2a, tx, epoch_info) = start_votor_full(None, true).await;
+
+        let slot = Slot::genesis().next();
+        tx.send(VotorEvent::FirstShred(slot)).await.unwrap();
+        let hash: BlockHash = Hash::random_for_test().into();
+        let block_info = BlockInfo {
+            hash: hash.clone(),
+            parent: (Slot::genesis(), GENESIS_BLOCK_HASH),
+        };
+        tx.send(VotorEvent::Block { slot, block_info })
+            .await
+            .unwrap();
+
+        // First message must be the notar vote.
+        let notar = match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Vote(v) => v,
+            m => panic!("expected notar vote, got {m:?}"),
+        };
+        assert!(notar.is_notar());
+
+        // Deliver a Notar cert: in deferred mode this must NOT trigger a final vote.
+        let notar_cert = Cert::Notar(NotarCert::new_unchecked(
+            std::slice::from_ref(&notar),
+            &epoch_info.validators,
+        ));
+        tx.send(VotorEvent::CertCreated(Box::new(notar_cert)))
+            .await
+            .unwrap();
+        // The notar cert is re-broadcast, but no final vote rides along.
+        match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::Notar(_))),
+            ConsensusMessage::Vote(v) => panic!("unexpected vote in deferred mode: {v:?}"),
+        }
+
+        // Now fast-final fires. After this, the deferred finalization-vote deadline
+        // must find the slot already fast-finalized and send nothing.
+        let ff = Cert::FastFinal(FastFinalCert::new_unchecked(
+            std::slice::from_ref(&notar),
+            &epoch_info.validators,
+        ));
+        tx.send(VotorEvent::CertCreated(Box::new(ff)))
+            .await
+            .unwrap();
+        // The fast-final cert is re-broadcast (a cert, not a vote)...
+        match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::FastFinal(_))),
+            ConsensusMessage::Vote(v) => panic!("unexpected vote: {v:?}"),
+        }
+
+        // Fire the deferral deadline explicitly (rather than waiting the full grace):
+        // because the slot already fast-finalized, it must emit NOTHING. This is the
+        // reverse-path saving — the final vote is suppressed.
+        tx.send(VotorEvent::FinalVoteDeadline(slot, hash))
+            .await
+            .unwrap();
+        let leftover = tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await;
+        assert!(
+            leftover.is_err(),
+            "fast-final must suppress the final vote, but saw: {leftover:?}"
+        );
+    }
+
+    /// With `defer_final_vote` enabled but fast-final NOT occurring, the deferral
+    /// deadline must still send the finalization vote (slow-final fallback) — so a
+    /// flaky peer that prevents the 80% strong quorum cannot stall finalization.
+    #[tokio::test]
+    async fn defer_final_vote_falls_back_to_slow_final() {
+        let (other_a2a, tx, epoch_info) = start_votor_full(None, true).await;
+
+        let slot = Slot::genesis().next();
+        tx.send(VotorEvent::FirstShred(slot)).await.unwrap();
+        let hash: BlockHash = Hash::random_for_test().into();
+        let block_info = BlockInfo {
+            hash: hash.clone(),
+            parent: (Slot::genesis(), GENESIS_BLOCK_HASH),
+        };
+        tx.send(VotorEvent::Block { slot, block_info })
+            .await
+            .unwrap();
+
+        let notar = match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Vote(v) => v,
+            m => panic!("expected notar vote, got {m:?}"),
+        };
+        assert!(notar.is_notar());
+
+        // A notar cert forms (60%) but never a fast-final (no 80% strong quorum).
+        let notar_cert = Cert::Notar(NotarCert::new_unchecked(
+            std::slice::from_ref(&notar),
+            &epoch_info.validators,
+        ));
+        tx.send(VotorEvent::CertCreated(Box::new(notar_cert)))
+            .await
+            .unwrap();
+        // Re-broadcast of the notar cert, no final vote yet (deferred).
+        match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::Notar(_))),
+            ConsensusMessage::Vote(v) => panic!("premature final vote: {v:?}"),
+        }
+
+        // Deadline fires without a fast-final: must now send the final vote.
+        tx.send(VotorEvent::FinalVoteDeadline(slot, hash))
+            .await
+            .unwrap();
+        match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Vote(v) => {
+                assert!(v.is_final(), "expected final vote fallback, got {v:?}");
+                assert_eq!(v.slot(), slot);
+            }
+            m => panic!("expected final vote, got {m:?}"),
         }
     }
 

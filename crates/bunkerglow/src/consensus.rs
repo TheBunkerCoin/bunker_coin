@@ -111,6 +111,15 @@ pub(crate) fn delta_first_slice() -> Duration {
 pub(crate) fn delta_empty_slice() -> Duration {
     scaled(2_000)
 }
+/// Grace period for which a node defers its slow-path finalization vote, giving
+/// fast-final a chance to finalize the slot from notar votes alone (see
+/// `Votor::defer_final_vote`). Sized to roughly one network round-trip (so both
+/// notar votes can meet the 80% strong quorum) and delta-scaled so it stretches
+/// with a slow link. If fast-final does not fire within this window the node
+/// falls back to sending the finalization vote, so slow-final liveness is kept.
+pub(crate) fn delta_final_vote_grace() -> Duration {
+    scaled(16_000)
+}
 
 #[derive(Clone, Debug, SchemaRead, SchemaWrite)]
 pub enum ConsensusMessage {
