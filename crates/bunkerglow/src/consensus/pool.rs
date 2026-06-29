@@ -332,9 +332,13 @@ impl PoolImpl {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64;
-                        if let Ok(bs) = blockstore.try_read() {
-                            bs.update_finalized_timestamp(slot, hash.as_hash().clone(), timestamp);
-                        }
+                        // Use a blocking read, not try_read: a momentarily-held lock
+                        // must not silently drop the finalized-status write (that left
+                        // finalized slots showing "proposed" on disk / via --inspect).
+                        blockstore
+                            .read()
+                            .await
+                            .update_finalized_timestamp(slot, hash.as_hash().clone(), timestamp);
                     }
                 }
 
@@ -357,13 +361,13 @@ impl PoolImpl {
                                     .unwrap()
                                     .as_millis()
                                     as u64;
-                                if let Ok(bs) = blockstore.try_read() {
-                                    bs.update_finalized_timestamp(
-                                        slot,
-                                        hash.as_hash().clone(),
-                                        timestamp,
-                                    );
-                                }
+                                // Blocking read, not try_read: do not silently drop
+                                // the finalized-status write under lock contention.
+                                blockstore.read().await.update_finalized_timestamp(
+                                    slot,
+                                    hash.as_hash().clone(),
+                                    timestamp,
+                                );
                             }
                         }
                     }
