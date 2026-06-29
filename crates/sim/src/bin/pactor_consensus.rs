@@ -380,19 +380,35 @@ async fn run_simulated(
             "full-duplex"
         }
     );
-    // Lossless link: the mux/consensus layer has no line-level retransmission of
-    // its own (real PACTOR does ARQ in hardware). This increment validates the
-    // consensus-over-mux wiring, not loss recovery, so model a clean link with
-    // no read timeout (a long-lived node parks on idle reads).
-    let config = SimulatedPactorConfig {
-        packet_loss: 0.0,
-        latency: Duration::from_millis(20),
-        latency_jitter: Duration::ZERO,
-        setup_delay: Duration::ZERO,
-        forced_initial_losses: 0,
-        fade_windows: Vec::new(),
-        read_timeout: None,
-        ..SimulatedPactorConfig::default()
+    // Two link models:
+    // - Full-duplex: a clean, symmetric, independent-direction link. Validates the
+    //   consensus-over-mux wiring without HF physics (the original sim behavior).
+    // - Half-duplex: ONE shared channel (only one side transmits at a time) with an
+    //   ARQ changeover cost and a ~10× slower reverse (slave→master) path — the
+    //   faithful model that reproduces the on-air "stall after a few slots".
+    // Both are lossless (real PACTOR does ARQ in hardware) with no read timeout (a
+    // long-lived node parks on idle reads).
+    let config = if half_duplex {
+        SimulatedPactorConfig {
+            packet_loss: 0.0,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            forced_initial_losses: 0,
+            fade_windows: Vec::new(),
+            read_timeout: None,
+            ..SimulatedPactorConfig::half_duplex_hf()
+        }
+    } else {
+        SimulatedPactorConfig {
+            packet_loss: 0.0,
+            latency: Duration::from_millis(20),
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            forced_initial_losses: 0,
+            fade_windows: Vec::new(),
+            read_timeout: None,
+            ..SimulatedPactorConfig::default()
+        }
     };
     let (ta, tb) = SimulatedPactorPair::new(config);
 

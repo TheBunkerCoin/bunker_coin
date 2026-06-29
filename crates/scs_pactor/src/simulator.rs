@@ -79,6 +79,21 @@ pub struct SimulatedPactorConfig {
     pub forced_initial_losses: u32,
     pub fade_windows: Vec<FadeWindow>,
     pub read_timeout: Option<Duration>,
+    /// When `true`, the two endpoints share ONE physical channel: only one side
+    /// may transmit at a time (a `write_data` blocks while the peer is mid-write)
+    /// and reversing the transmit direction costs `changeover_delay`. This is what
+    /// makes the simulator faithful to a real PACTOR ARQ link; with it `false`
+    /// (the default) both directions are independent and full-duplex, preserving
+    /// the original behavior for existing tests.
+    pub half_duplex: bool,
+    /// Cost of reversing the transmit direction on the shared half-duplex medium
+    /// (the ARQ changeover). Ignored unless `half_duplex` is `true`.
+    pub changeover_delay: Duration,
+    /// Throughput penalty applied to the *reverse* (slave→master) direction,
+    /// i.e. transmissions from the endpoint that did NOT initiate the connection.
+    /// On-air the reverse ARQ path is roughly 10× slower; `10.0` models that.
+    /// `1.0` means symmetric. Ignored unless `half_duplex` is `true`.
+    pub reverse_slowdown: f64,
 }
 
 impl Default for SimulatedPactorConfig {
@@ -94,6 +109,9 @@ impl Default for SimulatedPactorConfig {
             forced_initial_losses: 0,
             fade_windows: Vec::new(),
             read_timeout: Some(Duration::from_secs(10)),
+            half_duplex: false,
+            changeover_delay: Duration::from_secs(2),
+            reverse_slowdown: 10.0,
         }
     }
 }
@@ -111,6 +129,7 @@ impl SimulatedPactorConfig {
             forced_initial_losses: 0,
             fade_windows: Vec::new(),
             read_timeout: Some(Duration::from_secs(10)),
+            ..Self::default()
         }
     }
 
@@ -126,6 +145,7 @@ impl SimulatedPactorConfig {
             forced_initial_losses: 0,
             fade_windows: Vec::new(),
             read_timeout: Some(Duration::from_secs(20)),
+            ..Self::default()
         }
     }
 
@@ -133,6 +153,30 @@ impl SimulatedPactorConfig {
         Self {
             fade_windows,
             ..Self::marginal_link()
+        }
+    }
+
+    /// A faithful **half-duplex** HF link: one shared physical channel (only one
+    /// side transmits at a time), expensive ARQ changeover, and a ~10× slower
+    /// reverse (slave→master) path. This is the profile that reproduces the
+    /// on-air "stall after a few slots" — the reverse notar-vote round-trip
+    /// competes for the single channel and crawls back over the slow reverse leg.
+    pub fn half_duplex_hf() -> Self {
+        Self {
+            half_duplex: true,
+            changeover_delay: Duration::from_secs(2),
+            reverse_slowdown: 10.0,
+            // Forward path is the healthy master→slave direction.
+            speed: PactorSpeed::P4,
+            packet_loss: 0.05,
+            latency: Duration::from_millis(250),
+            latency_jitter: Duration::from_millis(50),
+            setup_delay: Duration::from_secs(2),
+            max_retries: 8,
+            downshift_after_retries: 2,
+            forced_initial_losses: 0,
+            fade_windows: Vec::new(),
+            read_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -201,6 +245,26 @@ impl SharedStats {
     }
 }
 
+/// The single shared physical channel for a half-duplex link.
+///
+/// Holding `lock` for a transmission serializes the two directions (only one
+/// side on the air at a time). `last_sender` records who transmitted last so a
+/// direction reversal can be charged the ARQ `changeover_delay`. The "master"
+/// (`true`) is endpoint A — the connection initiator — and the "slave" (`false`)
+/// is endpoint B; the reverse (B→master) path is the slow one.
+#[derive(Debug)]
+struct HalfDuplexMedium {
+    lock: Mutex<Option<bool>>,
+}
+
+impl HalfDuplexMedium {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lock: Mutex::new(None),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct SimulatedPactorTransport {
     local: Arc<Endpoint>,
@@ -208,6 +272,11 @@ pub struct SimulatedPactorTransport {
     config: SimulatedPactorConfig,
     stats: Arc<SharedStats>,
     started_at: tokio::time::Instant,
+    /// Shared single channel; only consulted when `config.half_duplex` is set.
+    medium: Arc<HalfDuplexMedium>,
+    /// `true` for the master (connection initiator, endpoint A), `false` for the
+    /// slave (endpoint B). The slave's transmit direction is the slow reverse path.
+    is_master: bool,
 }
 
 pub struct SimulatedPactorPair;
@@ -220,6 +289,7 @@ impl SimulatedPactorPair {
         let b = Endpoint::new();
         let stats = Arc::new(SharedStats::default());
         let started_at = tokio::time::Instant::now();
+        let medium = HalfDuplexMedium::new();
         (
             SimulatedPactorTransport {
                 local: a.clone(),
@@ -227,6 +297,8 @@ impl SimulatedPactorPair {
                 config: config.clone(),
                 stats: stats.clone(),
                 started_at,
+                medium: medium.clone(),
+                is_master: true,
             },
             SimulatedPactorTransport {
                 local: b,
@@ -234,6 +306,8 @@ impl SimulatedPactorPair {
                 config,
                 stats,
                 started_at,
+                medium,
+                is_master: false,
             },
         )
     }
@@ -388,12 +462,39 @@ impl PactorTransport for SimulatedPactorTransport {
             return Err(ScsPactorError::Disconnected);
         }
 
+        // On a half-duplex link there is ONE physical channel: hold it for the
+        // whole transmission so the peer cannot transmit concurrently, and charge
+        // the ARQ changeover whenever the transmit direction reverses. The guard
+        // is held across the retry loop below, so a retransmitting sender keeps
+        // the channel for the duration of its (possibly slow) burst.
+        let _medium_guard = if self.config.half_duplex {
+            let mut last_sender = self.medium.lock.lock().await;
+            if *last_sender != Some(self.is_master) {
+                // Direction reversal (or first transmit): pay the changeover.
+                if last_sender.is_some() {
+                    sleep(self.config.changeover_delay).await;
+                }
+                *last_sender = Some(self.is_master);
+            }
+            Some(last_sender)
+        } else {
+            None
+        };
+
+        // The reverse (slave→master) direction is the slow ARQ leg.
+        let direction_slowdown = if self.config.half_duplex && !self.is_master {
+            self.config.reverse_slowdown.max(1.0)
+        } else {
+            1.0
+        };
+
         let mut retries = 0;
         let mut speed = self.config.speed;
         loop {
             self.stats.frames_attempted.fetch_add(1, Ordering::Relaxed);
-            let transmit_time =
-                Duration::from_secs_f64((data.len() * 8) as f64 / speed.raw_bps() as f64);
+            let transmit_time = Duration::from_secs_f64(
+                (data.len() * 8) as f64 / speed.raw_bps() as f64 * direction_slowdown,
+            );
             let jitter = if self.config.latency_jitter.is_zero() {
                 Duration::ZERO
             } else {
@@ -692,6 +793,89 @@ mod tests {
         assert_eq!(stats.frames_lost, 0);
         assert_eq!(stats.retransmissions, 0);
         assert_eq!(stats.bytes_delivered, 128);
+    }
+
+    #[tokio::test]
+    async fn half_duplex_reverse_path_is_slower_than_forward() {
+        // Same payload, same link — but the slave→master (reverse) transmit must
+        // take `reverse_slowdown`× longer than the master→slave (forward) one.
+        let config = SimulatedPactorConfig {
+            half_duplex: true,
+            reverse_slowdown: 10.0,
+            changeover_delay: Duration::ZERO,
+            speed: PactorSpeed::P4,
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            ..Default::default()
+        };
+        let (master, slave) = SimulatedPactorPair::new(config);
+        master.set_mycall("MASTER").await.unwrap();
+        slave.set_mycall("SLAVE").await.unwrap();
+        master.connect_peer("SLAVE").await.unwrap();
+
+        let payload = [0xAB; 64];
+
+        let t0 = tokio::time::Instant::now();
+        master.write_data(&payload).await.unwrap();
+        let forward = t0.elapsed();
+        let _ = slave.read_data(1024).await.unwrap();
+
+        let t1 = tokio::time::Instant::now();
+        slave.write_data(&payload).await.unwrap();
+        let reverse = t1.elapsed();
+        let _ = master.read_data(1024).await.unwrap();
+
+        // Reverse should be ~10× forward (allow slack for the changeover-free path).
+        assert!(
+            reverse >= forward * 8,
+            "reverse {reverse:?} should be ~10x forward {forward:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn half_duplex_serializes_concurrent_transmissions() {
+        // Both sides try to transmit at once over ONE channel. They must not
+        // overlap: total wall time ≈ sum of both transmit times (+ a changeover),
+        // not the max (which is what a full-duplex link would give).
+        let config = SimulatedPactorConfig {
+            half_duplex: true,
+            reverse_slowdown: 1.0,
+            changeover_delay: Duration::from_secs(2),
+            speed: PactorSpeed::P4,
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            ..Default::default()
+        };
+        let (master, slave) = SimulatedPactorPair::new(config);
+        master.set_mycall("MASTER").await.unwrap();
+        slave.set_mycall("SLAVE").await.unwrap();
+        master.connect_peer("SLAVE").await.unwrap();
+
+        let payload = vec![0xCD; 130]; // ~0.2s each at P4 (5200 bps)
+        let one_tx =
+            Duration::from_secs_f64((payload.len() * 8) as f64 / PactorSpeed::P4.raw_bps() as f64);
+
+        let m = master.clone();
+        let s = slave.clone();
+        let p1 = payload.clone();
+        let p2 = payload.clone();
+        let t0 = tokio::time::Instant::now();
+        let wm = tokio::spawn(async move { m.write_data(&p1).await });
+        let ws = tokio::spawn(async move { s.write_data(&p2).await });
+        wm.await.unwrap().unwrap();
+        ws.await.unwrap().unwrap();
+        let total = t0.elapsed();
+
+        // Serialized: both transmits run back-to-back (≥ 2× one_tx). A full-duplex
+        // link would finish in ~one_tx.
+        assert!(
+            total >= one_tx * 2,
+            "half-duplex transmits must serialize: total {total:?} < 2x one_tx {one_tx:?}"
+        );
     }
 
     #[tokio::test]
