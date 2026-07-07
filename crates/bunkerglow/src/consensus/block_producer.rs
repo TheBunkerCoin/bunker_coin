@@ -500,7 +500,12 @@ where
         let max_wait = if empty_so_far {
             duration_left.min(super::delta_empty_slice())
         } else {
-            duration_left
+            // Already packed ≥1 tx: wait only a short grace for the NEXT tx
+            // (measured from the last one packed) rather than holding the slice
+            // open for the whole block window. A steady tx stream re-arms this
+            // each iteration and keeps filling the slice; a lull closes it
+            // promptly so the block disseminates and its slot can finalize.
+            duration_left.min(start_time.elapsed() + super::delta_pack_grace())
         };
         let sleep_duration = max_wait.saturating_sub(start_time.elapsed());
         let res = tokio::select! {

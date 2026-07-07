@@ -8,8 +8,11 @@ internet) or **in-process** with a simulated link.
 Binary: `crates/sim/src/bin/pactor_consensus.rs`
 (package `bunker_coin_sim`, bin `pactor_consensus`).
 
-Currently produces **empty blocks** (no transactions); execution/tx parity is a
-separate follow-up.
+Full **transaction parity**: a genesis account is funded at startup, the RPC
+`/transactions` endpoint injects client transactions into consensus, the leader
+packs them into blocks, and each finalized block is executed into a shared
+execution state — so `/accounts/{pk}`, `/transactions/{hash}`, and balances all
+reflect real transaction processing. See [§9](#9-submitting-transactions).
 
 ---
 
@@ -169,6 +172,70 @@ and a real `finalized_timestamp`.
 ssh -L 3001:localhost:3001 user@node       # on the laptop
 # then start the run on the node; browse http://localhost:3001/blocks locally
 ```
+
+---
+
+## 9. Submitting transactions
+
+At startup a **genesis account** is created and funded (`1_000_000_000_000`
+µBUNKER). Its keypair is derived from `--seed`, so **both nodes fund and sign
+the identical account** and — applying the same finalized blocks — stay in
+lockstep without exchanging state. Watch for this line on startup:
+
+```
+genesis account (funded 1000000000000): 3f3c247ae6a099e87547278e83d2b51ad6b8fb85ff1d7265e849cf782a871d70
+```
+
+Submit a transfer to the node running `--rpc` (POST `/transactions`). Leave the
+`signature` all-zero and set `sender` to the genesis pubkey — the RPC
+**server-signs** it and auto-fills the nonce:
+
+```bash
+GEN=<genesis pubkey from the startup line>
+ZERO=$(python3 -c "print('00'*64)")
+curl -s -X POST localhost:3001/transactions -H 'content-type: application/json' -d "{
+  \"sender\":\"$GEN\", \"nonce\":0, \"fee\":100, \"signature\":\"$ZERO\",
+  \"body\":{\"Transfer\":{\"to\":\"00000000000000000000000000000000000000000000000000000000000000aa\",\"amount\":5000}}
+}"
+# → {"hash":"a7507d…"}
+```
+
+The transaction flows: RPC → tx-bridge → Txs mux channel → the leader packs it
+into a block → dissemination / voting / **finalization** → the finalized block is
+executed into the shared state. Once its slot finalizes you'll see:
+
+```
+[node0] executed slot 16: 1 ok, 0 failed (1 txs)
+```
+
+Then query the outcome and balances (the `body` enum is externally tagged, e.g.
+`{"Transfer":{…}}`):
+
+```bash
+curl -s localhost:3001/transactions/<hash>        # status → finalized/failed
+curl -s localhost:3001/accounts/$GEN              # genesis: 1e12 - amount - fee
+curl -s localhost:3001/accounts/000…0aa           # recipient: amount
+```
+
+### Per-node mempool
+
+Each node runs its own mempool (`bunkerglow::mempool::Mempool`): it admits a
+submitted transaction, **gossips** it to the peer over the Txs channel (so both
+nodes' mempools converge), orders pending txs by per-sender nonce then fee for
+the leader to pack, and **evicts** a tx once its block finalizes. So whichever
+node leads a slot packs from its own converged mempool — a tx submitted at one
+node can be included by the other. Deduplication means a tx appears **once** in a
+block, not as repeated stale copies.
+
+Notes:
+- **Submit to the `--rpc` node.** The mempool gossips the tx to the peer, so you
+  don't need to submit to both. (You *can* run `--rpc` on each node — each keeps
+  its own mempool view.)
+- **Latency is the band, not the code.** A tx finalizes as fast as its slot does
+  (tens of seconds to minutes on HF). A tx packed into a slot that never
+  finalizes is returned to the pending set after ~120 s and re-packed.
+- **Non-genesis senders** must submit a real ed25519 signature over
+  `Transaction::signing_hash()` (the server only auto-signs the genesis account).
 
 ---
 

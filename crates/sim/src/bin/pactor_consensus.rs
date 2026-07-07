@@ -22,6 +22,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bunker_coin_core::execution::State as ExecutionState;
+use bunker_coin_core::transaction::Transaction as CoreTransaction;
 use bunker_coin_radio::{Channel, MuxChannel, PactorMux, PactorMuxHandle};
 use bunker_coin_sim::pactor_init::{
     connect_with_retries, init_modem, light_init_modem, PactorInitConfig,
@@ -29,16 +31,21 @@ use bunker_coin_sim::pactor_init::{
 use bunkerglow::all2all::TrivialAll2All;
 use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
 use bunkerglow::crypto::aggsig;
+use bunkerglow::crypto::merkle::DoubleMerkleRoot;
 use bunkerglow::crypto::signature::SecretKey;
+use bunkerglow::Slot;
+use ed25519_dalek::SigningKey;
+use std::collections::HashMap;
 use bunkerglow::disseminator::rotor::StakeWeightedSampler;
 use bunkerglow::disseminator::Rotor;
+use bunkerglow::mempool::Mempool;
 use bunkerglow::network::dontcare_sockaddr;
 use bunkerglow::repair::{RepairRequest, RepairResponse};
 use bunkerglow::shredder::Shred;
 use bunkerglow::{Transaction, ValidatorInfo};
 use clap::Parser;
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{RngCore, SeedableRng};
 use scs_pactor::{
     PactorTransport, SimulatedPactorConfig, SimulatedPactorPair, UsbPactorTransport,
 };
@@ -50,8 +57,15 @@ type MuxRepair = MuxChannel<RepairRequest, RepairResponse>;
 type MuxRepairReq = MuxChannel<RepairResponse, RepairRequest>;
 type MuxTxs = MuxChannel<Transaction, Transaction>;
 
-/// A full Alpenglow node whose networks are all multiplexed over PACTOR.
-type Node = Alpenglow<TrivialAll2All<MuxAll2All>, Rotor<MuxShred, StakeWeightedSampler>, MuxTxs>;
+/// Per-node mempool over the Txs mux channel. Shared (`Arc`) between the node
+/// (as the producer's `txs_receiver`) and this binary (for `submit`/`evict`).
+type NodeMempool = Arc<Mempool<MuxTxs>>;
+
+/// A full Alpenglow node whose networks are all multiplexed over PACTOR. The
+/// transactions network is the per-node [`Mempool`], not the raw Txs channel, so
+/// the block producer packs from mempool-ordered pending txs.
+type Node =
+    Alpenglow<TrivialAll2All<MuxAll2All>, Rotor<MuxShred, StakeWeightedSampler>, NodeMempool>;
 
 #[derive(Parser)]
 #[command(version, about = "Empty-block Alpenglow consensus over PACTOR", long_about = None)]
@@ -130,14 +144,73 @@ struct Args {
 type SharedBlockstore =
     Arc<tokio::sync::RwLock<Box<dyn bunkerglow::consensus::Blockstore + Send + Sync>>>;
 
-/// Build a minimal RPC [`SharedState`](rpc::SharedState) backed by `blockstore`.
+/// The shared RPC surfaces threaded through the node: transaction submission,
+/// mempool, execution state, and per-tx results. Constructed once per node and
+/// handed to both the RPC server and the finalized-block executor so the API
+/// reflects real transaction processing.
+#[derive(Clone)]
+struct TxContext {
+    /// Sender the RPC `/submit` handler pushes client transactions onto; drained
+    /// by the tx-bridge task, which injects them into consensus.
+    tx_sender: tokio::sync::mpsc::UnboundedSender<CoreTransaction>,
+    /// Genesis-funded execution state, updated as finalized blocks are executed.
+    execution_state: Arc<tokio::sync::RwLock<ExecutionState>>,
+    /// Pending client transactions awaiting inclusion (for the RPC mempool view).
+    mempool: Arc<tokio::sync::RwLock<Vec<rpc::MempoolEntry>>>,
+    /// Finalized/failed outcome per tx hash, populated by the executor.
+    tx_results: Arc<tokio::sync::RwLock<HashMap<String, rpc::TxResult>>>,
+    /// Genesis ed25519 key, so the RPC can server-side-sign transactions whose
+    /// sender is the genesis account (submit with an all-zero signature).
+    genesis_signing_key: Arc<SigningKey>,
+}
+
+impl TxContext {
+    /// Build a fresh context around this node's genesis-funded execution state.
+    /// The returned `UnboundedReceiver` is consumed by the tx-bridge task.
+    fn new(
+        cluster: &Cluster,
+        execution_state: Arc<tokio::sync::RwLock<ExecutionState>>,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<CoreTransaction>) {
+        let (tx_sender, tx_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = TxContext {
+            tx_sender,
+            execution_state,
+            mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            tx_results: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            genesis_signing_key: Arc::new(cluster.genesis_key.clone()),
+        };
+        (ctx, tx_rx)
+    }
+
+    /// Rebind this context to a new session's execution state, keeping the same
+    /// `tx_sender`, mempool, tx_results, and genesis key. Used on the hardware
+    /// path, where each reconnect builds a fresh (genesis) execution state that
+    /// the block executor rebuilds by replaying the persisted finalized chain,
+    /// while the client-facing mempool/results persist across the drop.
+    fn with_execution_state(
+        &self,
+        execution_state: Arc<tokio::sync::RwLock<ExecutionState>>,
+    ) -> Self {
+        TxContext {
+            tx_sender: self.tx_sender.clone(),
+            execution_state,
+            mempool: self.mempool.clone(),
+            tx_results: self.tx_results.clone(),
+            genesis_signing_key: self.genesis_signing_key.clone(),
+        }
+    }
+}
+
+/// Build an RPC [`SharedState`](rpc::SharedState) backed by `blockstore` and the
+/// node's live transaction context.
 ///
-/// Reuses `rpc::run_api` (the exact server the simulations expose) so the on-air
-/// chain is queryable through the same endpoints — `/block/slot/{n}`, `/blocks`,
-/// `/block/{hash}`, `/ws`, … — without a bespoke API. Only `blockstore` is wired
-/// (block queries); transaction/account/snapshot endpoints that need a populated
-/// execution state are present but empty (this binary produces empty blocks).
-fn rpc_state_for(blockstore: SharedBlockstore) -> rpc::SharedState {
+/// Reuses `rpc::run_api` (the exact server the simulations expose) so the chain
+/// AND its transaction state are queryable through the same endpoints —
+/// `/blocks`, `/block/slot/{n}`, `/transactions` (submit), `/account/{pk}`,
+/// `/tx/{hash}`, `/ws`, … Transactions submitted here are injected into
+/// consensus, packed into blocks, and executed on finalization (see
+/// [`spawn_tx_bridge`] and [`spawn_block_executor`]).
+fn rpc_state_for(blockstore: SharedBlockstore, tx: &TxContext) -> rpc::SharedState {
     let (updates_tx, _updates_rx) = tokio::sync::broadcast::channel(256);
     rpc::SharedState {
         blocks: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -153,27 +226,253 @@ fn rpc_state_for(blockstore: SharedBlockstore) -> rpc::SharedState {
         })),
         updates: updates_tx,
         blockstore: Some(blockstore),
-        mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-        tx_sender: None,
-        execution_state: Arc::new(tokio::sync::RwLock::new(Default::default())),
-        tx_results: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        genesis_signing_key: None,
+        mempool: tx.mempool.clone(),
+        tx_sender: Some(tx.tx_sender.clone()),
+        execution_state: tx.execution_state.clone(),
+        tx_results: tx.tx_results.clone(),
+        genesis_signing_key: Some(tx.genesis_signing_key.clone()),
         snapshot_store: None,
     }
 }
 
-/// Spawn the RPC server over `blockstore` (used by the simulated, never-reconnect
-/// path; the hardware path spawns/aborts it per session inline).
-fn spawn_rpc(blockstore: SharedBlockstore) {
-    println!("RPC API serving on http://127.0.0.1:3001 (try /block/slot/1, /blocks)");
-    tokio::spawn(rpc::run_api(rpc_state_for(blockstore)));
+/// Spawn the RPC server over `blockstore` + `tx` context (used by the simulated,
+/// never-reconnect path; the hardware path spawns/aborts it per session inline).
+fn spawn_rpc(blockstore: SharedBlockstore, tx: &TxContext) {
+    println!("RPC API serving on http://127.0.0.1:3001 (try /blocks, POST /transactions)");
+    tokio::spawn(rpc::run_api(rpc_state_for(blockstore, tx)));
 }
+
+/// A slot holding the *current* per-node mempool. On the hardware path the
+/// mempool is rebuilt every reconnect (each session has a fresh mux underneath),
+/// so the long-lived bridge task submits into the live mempool read from here.
+/// `None` while the link is down between sessions — submissions are dropped from
+/// the bridge, but a tx already admitted to a prior session's mempool that has
+/// not yet finalized will not survive the reconnect; the client can resubmit.
+type MempoolSlot = Arc<tokio::sync::RwLock<Option<NodeMempool>>>;
+
+/// Drain client transactions from the RPC (`tx_rx`) and submit them into this
+/// node's mempool. The mempool owns dedup, per-sender nonce/fee ordering,
+/// gossip to the peer, and eviction on finalization — so the bridge only has to
+/// encode each `CoreTransaction` to its `bunkerglow::Transaction` wire form and
+/// hand it over.
+fn spawn_tx_bridge(
+    mut tx_rx: tokio::sync::mpsc::UnboundedReceiver<CoreTransaction>,
+    mempool: MempoolSlot,
+) {
+    tokio::spawn(async move {
+        while let Some(core_tx) = tx_rx.recv().await {
+            match bincode::serde::encode_to_vec(&core_tx, bincode::config::standard()) {
+                Ok(bytes) => {
+                    let wire = Transaction(bytes);
+                    if let Some(mp) = mempool.read().await.as_ref() {
+                        let admitted = mp.submit(wire).await;
+                        trace_submit(&core_tx, admitted);
+                    } else {
+                        log::warn!("tx dropped: no live mempool (link down)");
+                    }
+                }
+                Err(e) => log::warn!("tx encode failed: {e}"),
+            }
+        }
+        log::info!("tx bridge shutting down");
+    });
+}
+
+/// Log the outcome of a mempool submission at debug level.
+fn trace_submit(core_tx: &CoreTransaction, admitted: bool) {
+    if admitted {
+        log::debug!("mempool admitted tx {}", hex::encode(core_tx.hash()));
+    } else {
+        log::debug!(
+            "mempool rejected tx {} (duplicate/undecodable)",
+            hex::encode(core_tx.hash())
+        );
+    }
+}
+
+/// Spawn a task that periodically returns long-in-flight mempool transactions to
+/// the pending set, so a tx packed into a slot that never finalized (e.g. a lost
+/// shred or a band drop) is re-packed rather than stuck. Runs until `cancel`.
+fn spawn_mempool_maintenance(mempool: NodeMempool, cancel: tokio_util::sync::CancellationToken) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {
+                    let n = mempool.requeue_stale_inflight().await;
+                    if n > 0 {
+                        log::info!("requeued {n} stale in-flight mempool tx(s)");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Spawn a task that executes the transactions of newly finalized blocks into
+/// the shared execution state, recording per-tx results and pruning the mempool.
+///
+/// Polls the node's finalized frontier; for each newly finalized slot it reads
+/// the canonical block from `blockstore`, decodes its transactions (with the
+/// same raw / 8-byte-length-prefix fallback the UDP sim uses), applies them via
+/// `State::execute_block`, and records a [`rpc::TxResult`] per tx so `/tx/{hash}`
+/// and `/account/{pk}` reflect the outcome. Both nodes run this over identical
+/// genesis + identical finalized blocks, so their state stays in agreement.
+///
+/// Returns immediately; the task runs until `cancel` is cancelled.
+fn spawn_block_executor(
+    label: String,
+    blockstore: SharedBlockstore,
+    pool: Arc<tokio::sync::RwLock<Box<dyn bunkerglow::consensus::Pool + Send + Sync>>>,
+    tx: TxContext,
+    mempool: NodeMempool,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut last_executed: u64 = 0;
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let finalized = pool.read().await.finalized_slot().inner();
+            if finalized <= last_executed {
+                continue;
+            }
+
+            let bs = blockstore.read().await;
+            for slot in (last_executed + 1)..=finalized {
+                let slot_id = Slot::new(slot);
+                let Some(hash) = bs.canonical_block_hash(slot_id) else {
+                    continue; // skip-certified slot: no block to execute
+                };
+                let block_hash_hex = hex::encode(&hash);
+                let block_hash: DoubleMerkleRoot = hash.into();
+                let Some(block) = bs.get_block(&(slot_id, block_hash)) else {
+                    continue;
+                };
+                let raw_txs = block.transactions();
+                // Evict this block's txs from the mempool now that they are
+                // finalized (whether they execute ok or fail — they will never be
+                // valid to re-pack). Uses the raw wire txs so the hashes match
+                // what the mempool admitted.
+                let evicted = mempool.evict_finalized(raw_txs).await;
+                if evicted > 0 {
+                    log::debug!("[{label}] evicted {evicted} finalized tx(s) from mempool");
+                }
+
+                let core_txs = decode_block_txs(raw_txs);
+                if core_txs.is_empty() {
+                    continue;
+                }
+
+                let results = tx.execution_state.write().await.execute_block(&core_txs);
+                let ok = results.iter().filter(|r| r.is_ok()).count();
+                println!(
+                    "[{label}] executed slot {slot}: {ok} ok, {} failed ({} txs)",
+                    results.len() - ok,
+                    core_txs.len()
+                );
+
+                record_tx_results(&tx, slot, &block_hash_hex, &core_txs, &results).await;
+            }
+            drop(bs);
+            last_executed = finalized;
+        }
+    });
+}
+
+/// Decode a finalized block's raw transactions into `CoreTransaction`s. A block
+/// transaction is the bincode encoding of a `CoreTransaction`, possibly wrapped
+/// with a wincode 8-byte length prefix; try the raw bytes first, then skip the
+/// prefix. Undecodable entries are dropped (they were never valid client txs).
+fn decode_block_txs(raw: &[Transaction]) -> Vec<CoreTransaction> {
+    raw.iter()
+        .filter_map(|t| {
+            let data = &t.0;
+            bincode::serde::decode_from_slice(data, bincode::config::standard())
+                .or_else(|_| {
+                    if data.len() > 8 {
+                        bincode::serde::decode_from_slice(&data[8..], bincode::config::standard())
+                    } else {
+                        Err(bincode::error::DecodeError::Other("too short"))
+                    }
+                })
+                .ok()
+                .map(|(tx, _)| tx)
+        })
+        .collect()
+}
+
+/// Record execution results for one finalized slot: insert a [`rpc::TxResult`]
+/// per tx (so `/tx/{hash}` resolves) and prune those txs from the RPC mempool.
+async fn record_tx_results(
+    tx: &TxContext,
+    slot: u64,
+    block_hash_hex: &str,
+    core_txs: &[CoreTransaction],
+    results: &[Result<(), bunker_coin_core::execution::ExecutionError>],
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut mempool = tx.mempool.write().await;
+    let mut results_map = tx.tx_results.write().await;
+    for (core_tx, exec_result) in core_txs.iter().zip(results.iter()) {
+        let hash = hex::encode(core_tx.hash());
+        let (status, error) = match exec_result {
+            Ok(()) => (rpc::TxFinalStatus::Finalized, None),
+            Err(e) => (rpc::TxFinalStatus::Failed, Some(e.to_string())),
+        };
+        results_map.insert(
+            hash.clone(),
+            rpc::TxResult {
+                hash: hash.clone(),
+                slot,
+                block_hash: block_hash_hex.to_string(),
+                status,
+                error,
+                executed_at: now,
+            },
+        );
+        mempool.retain(|e| e.hash != hash);
+    }
+}
+
+/// Native balance credited to the genesis account at startup, so
+/// client-submitted transfers have funds to move. Large enough for many
+/// transfers-plus-fees over a long run.
+const GENESIS_BALANCE: u64 = 1_000_000_000_000;
 
 /// Deterministically generated keys + public validator info for the 2-node set.
 struct Cluster {
     secret_keys: Vec<SecretKey>,
     voting_keys: Vec<aggsig::SecretKey>,
     validators: Vec<ValidatorInfo>,
+    /// Genesis ed25519 key that funds and signs client transactions. Derived
+    /// from the same `--seed` on both nodes, so both fund the identical account
+    /// and execute the same transactions to the same state.
+    genesis_key: SigningKey,
+}
+
+impl Cluster {
+    /// Public key of the genesis (funded) account.
+    fn genesis_pubkey(&self) -> [u8; 32] {
+        self.genesis_key.verifying_key().to_bytes()
+    }
+
+    /// Fresh execution state with the genesis account funded. Both nodes build
+    /// an identical genesis, then apply the same finalized transactions, so
+    /// their execution state stays in agreement without gossiping state.
+    fn genesis_state(&self) -> ExecutionState {
+        let mut state = ExecutionState::new();
+        state.get_or_create_account(&self.genesis_pubkey()).native_balance = GENESIS_BALANCE;
+        state
+    }
 }
 
 /// Build the fixed 2-validator set from `seed`. Both machines call this with the
@@ -202,10 +501,17 @@ fn build_cluster(seed: u64) -> Cluster {
         secret_keys.push(sk);
         voting_keys.push(vk);
     }
+    // Genesis key derived from the same RNG stream (after the validator keys),
+    // so a given --seed always yields the same funded/ signing account on both
+    // nodes. Build from 32 raw bytes to avoid a rand_core version dependency.
+    let mut genesis_seed = [0u8; 32];
+    rng.fill_bytes(&mut genesis_seed);
+    let genesis_key = SigningKey::from_bytes(&genesis_seed);
     Cluster {
         secret_keys,
         voting_keys,
         validators,
+        genesis_key,
     }
 }
 
@@ -221,7 +527,12 @@ fn build_node(
     own_id: u64,
     cluster: &Cluster,
     turn: Option<bool>,
-) -> (Node, PactorMuxHandle) {
+) -> (
+    Node,
+    PactorMuxHandle,
+    NodeMempool,
+    Arc<tokio::sync::RwLock<ExecutionState>>,
+) {
     let mut mux = match turn {
         None => PactorMux::new(transport),
         Some(starts_with_turn) => PactorMux::new_half_duplex(transport, starts_with_turn),
@@ -233,14 +544,26 @@ fn build_node(
     let shred_net: MuxShred = mux.channel(Channel::Disseminator);
     let repair_net: MuxRepair = mux.channel(Channel::Repair);
     let repair_req_net: MuxRepairReq = mux.channel(Channel::RepairRequest);
+    // Txs channel: NOT self-delivering. The per-node mempool provides the local
+    // path — a locally-submitted tx is admitted straight into this node's pool
+    // (and the producer packs from the pool), so it never needs to loop back
+    // through the channel. The channel carries only peer gossip, which the
+    // mempool's admit loop reads.
     let txs_net: MuxTxs = mux.channel(Channel::Txs);
     let handle = mux.spawn();
+
+    // Per-node mempool wrapping the Txs channel. Over a single mux link there is
+    // one peer, addressed by a placeholder (the mux ignores the address); the
+    // mempool gossips each newly-admitted tx to it and its admit loop admits +
+    // re-gossips inbound peer txs, so both nodes' mempools converge.
+    let mempool: NodeMempool = Mempool::new(txs_net, vec![dontcare_sockaddr()]);
+    mempool.spawn_admit_loop();
 
     let epoch_info = Arc::new(EpochInfo::new(0, own_id, cluster.validators.clone()));
     let all2all = TrivialAll2All::new(cluster.validators.clone(), all2all_net);
     let disseminator = Rotor::new(shred_net, epoch_info.clone());
 
-    let node = Alpenglow::new(
+    let mut node = Alpenglow::new(
         cluster.secret_keys[own_id as usize].clone(),
         cluster.voting_keys[own_id as usize].clone(),
         all2all,
@@ -248,8 +571,15 @@ fn build_node(
         repair_net,
         repair_req_net,
         epoch_info,
-        txs_net,
+        mempool.clone(),
     );
+
+    // Genesis-funded execution state, shared with the RPC server (balances,
+    // accounts) and the finalized-block executor below. Both nodes start from an
+    // identical genesis and apply the same finalized transactions, so their
+    // execution state stays in lockstep without exchanging state.
+    let execution_state = Arc::new(tokio::sync::RwLock::new(cluster.genesis_state()));
+    node.set_execution_state(execution_state.clone());
 
     // On a real half-duplex link, feed Votor the mux's keepalive-driven liveness
     // so its crashed-leader timeout PAUSES (re-arms) while the link is up but the
@@ -260,7 +590,7 @@ fn build_node(
         node.set_link_liveness(handle.liveness());
     }
 
-    (node, handle)
+    (node, handle, mempool, execution_state)
 }
 
 /// Process-wide "stop now" flag, set by the Ctrl-C watcher (see
@@ -449,7 +779,12 @@ async fn run_inspect(
         "=== inspect: serving node {own_id}'s on-disk chain (data/blockstore/{own_id}) ===\n\
          RPC API on http://127.0.0.1:3001 — try /blocks or /block/slot/1"
     );
-    spawn_rpc(blockstore);
+    // Inspect is offline: no consensus, so no injection or live execution. Build
+    // a context around a genesis-funded state (so `/account` shows the genesis
+    // balance) with the tx-bridge receiver dropped — `/submit` is a no-op here.
+    let exec = Arc::new(tokio::sync::RwLock::new(cluster.genesis_state()));
+    let (tx_ctx, _tx_rx) = TxContext::new(&cluster, exec);
+    spawn_rpc(blockstore, &tx_ctx);
 
     // Stay up so the endpoint is reachable; honor --duration as an auto-exit, or
     // run until Ctrl-C when no duration was given.
@@ -533,12 +868,46 @@ async fn run_simulated(
     // the turn, node 1 without.
     let turn_a = half_duplex.then_some(true);
     let turn_b = half_duplex.then_some(false);
-    let (node_a, handle_a) = build_node(ta, 0, &cluster, turn_a);
-    let (node_b, handle_b) = build_node(tb, 1, &cluster, turn_b);
+    let (node_a, handle_a, mempool_a, exec_a) = build_node(ta, 0, &cluster, turn_a);
+    let (node_b, handle_b, mempool_b, exec_b) = build_node(tb, 1, &cluster, turn_b);
 
-    // Optional RPC over node 0's block store (both nodes share the same chain).
+    // Per-node transaction contexts (each over its own genesis-funded state).
+    let (tx_a, tx_rx_a) = TxContext::new(&cluster, exec_a);
+    let (tx_b, _tx_rx_b) = TxContext::new(&cluster, exec_b);
+    println!(
+        "genesis account (funded {GENESIS_BALANCE}): {}",
+        hex::encode(cluster.genesis_pubkey())
+    );
+
+    // Node 0's RPC feeds its mempool; the mempool gossips each tx to node 1, so
+    // both nodes' mempools converge and whichever leads a slot packs from its own
+    // pool. Both nodes execute finalized blocks into their own state (identical
+    // genesis + blocks ⇒ identical state) and evict the finalized txs. The
+    // simulated link never drops, so node 0's mempool stays live for the run.
+    let mempool_slot: MempoolSlot = Arc::new(tokio::sync::RwLock::new(Some(mempool_a.clone())));
+    spawn_tx_bridge(tx_rx_a, mempool_slot);
+    spawn_mempool_maintenance(mempool_a.clone(), node_a.get_cancel_token());
+    spawn_mempool_maintenance(mempool_b.clone(), node_b.get_cancel_token());
+    spawn_block_executor(
+        "node0".into(),
+        node_a.get_blockstore(),
+        node_a.get_pool(),
+        tx_a.clone(),
+        mempool_a,
+        node_a.get_cancel_token(),
+    );
+    spawn_block_executor(
+        "node1".into(),
+        node_b.get_blockstore(),
+        node_b.get_pool(),
+        tx_b,
+        mempool_b,
+        node_b.get_cancel_token(),
+    );
+
+    // Optional RPC over node 0's block store + transaction context.
     if rpc {
-        spawn_rpc(node_a.get_blockstore());
+        spawn_rpc(node_a.get_blockstore(), &tx_a);
     }
 
     let until = deadline_for(duration);
@@ -671,6 +1040,24 @@ async fn run_hardware(
     // The listener must enable LISTEN 1 to accept the incoming connect.
     init_cfg.listen = !is_caller;
 
+    // Persistent transaction plumbing, created once and shared across reconnects:
+    // per-tx results, genesis key, and the long-lived tx-bridge. The mempool
+    // itself is per-session (each reconnect builds a fresh mux underneath), so the
+    // bridge submits into the live mempool read from `mempool_slot`, which each
+    // session repopulates. A dummy execution state seeds the context; it is
+    // replaced per session with the node's real (genesis) state via
+    // `with_execution_state`.
+    let (base_tx, tx_rx) = TxContext::new(
+        &cluster,
+        Arc::new(tokio::sync::RwLock::new(cluster.genesis_state())),
+    );
+    println!(
+        "genesis account (funded {GENESIS_BALANCE}): {}",
+        hex::encode(cluster.genesis_pubkey())
+    );
+    let mempool_slot: MempoolSlot = Arc::new(tokio::sync::RwLock::new(None));
+    spawn_tx_bridge(tx_rx, mempool_slot.clone());
+
     let overall_deadline = deadline_for(duration);
     let mut highest = 0u64;
     let mut session = 0u32;
@@ -709,25 +1096,54 @@ async fn run_hardware(
 
         let transport: Arc<dyn PactorTransport> = Arc::new(transport);
         // Half-duplex link: the caller (node 0) starts holding the transmit turn.
-        let (node, handle) = build_node(transport.clone(), own_id, &cluster, Some(is_caller));
+        let (node, handle, mempool, exec) =
+            build_node(transport.clone(), own_id, &cluster, Some(is_caller));
 
-        // Optional RPC over THIS session's block store. Spawned per session and
-        // aborted before teardown below, so each reconnect's fresh RocksDB handle
-        // is the one being served and the DB lock is released for the next
-        // session. Block queries still see all finalized slots — the chain
-        // persists on disk and a rebuilt node resumes from it.
+        // Publish this session's mempool so the bridge submits over the new mux.
+        *mempool_slot.write().await = Some(mempool.clone());
+
+        // This session's transaction context: same client-facing mempool/results
+        // as prior sessions, but this session's fresh (genesis) execution state.
+        // The executor rebuilds that state by replaying the persisted finalized
+        // chain from slot 1 (deterministic, so a reconnect resumes seamlessly).
+        let session_tx = base_tx.with_execution_state(exec);
+        spawn_mempool_maintenance(mempool.clone(), node.get_cancel_token());
+        spawn_block_executor(
+            label.clone(),
+            node.get_blockstore(),
+            node.get_pool(),
+            session_tx.clone(),
+            mempool,
+            node.get_cancel_token(),
+        );
+
+        // Optional RPC over THIS session's block store + transaction context.
+        // Spawned per session and aborted before teardown below, so each
+        // reconnect's fresh RocksDB handle is the one being served and the DB
+        // lock is released for the next session. Block queries still see all
+        // finalized slots — the chain persists on disk and a rebuilt node resumes
+        // from it.
         let rpc_task = if args.rpc {
-            Some(tokio::spawn(rpc::run_api(rpc_state_for(node.get_blockstore()))))
+            Some(tokio::spawn(rpc::run_api(rpc_state_for(
+                node.get_blockstore(),
+                &session_tx,
+            ))))
         } else {
             None
         };
         if rpc_task.is_some() {
-            println!("[{label}] RPC API on http://127.0.0.1:3001 (try /block/slot/1, /blocks)");
+            println!(
+                "[{label}] RPC API on http://127.0.0.1:3001 (try /blocks, POST /transactions)"
+            );
         }
 
         let (slot, stop) =
             run_node(&label, node, handle, overall_deadline, Some(transport.clone())).await;
         highest = highest.max(slot);
+
+        // Link is down for teardown: clear the mempool so the bridge drops
+        // submissions until the next session repopulates it.
+        *mempool_slot.write().await = None;
 
         // Stop serving and WAIT for the server task to actually end before the
         // next session re-opens the RocksDB. The RPC `SharedState` holds an `Arc`

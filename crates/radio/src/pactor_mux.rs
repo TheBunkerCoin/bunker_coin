@@ -135,7 +135,9 @@ pub enum Channel {
     Repair = 2,
     /// Repair-request handler: outgoing `RepairResponse`, incoming `RepairRequest`.
     RepairRequest = 3,
-    /// Transactions (`Transaction`) — unused for empty-block consensus.
+    /// Transactions (`Transaction`) — client-submitted txs the leader packs
+    /// into blocks. Fed by a [`MuxInjector`] (from the RPC / gateway) and
+    /// consumed by the block producer's `txs_receiver`.
     Txs = 4,
 }
 
@@ -254,6 +256,27 @@ impl PactorMux {
     /// quorum. Self-delivery replicates the loopback the network layer assumes.
     pub fn channel_self_delivering<S, R>(&mut self, channel: Channel) -> MuxChannel<S, R> {
         self.channel_inner(channel, true)
+    }
+
+    /// Take a **send-only** injector for one channel: a lightweight handle that
+    /// can push messages onto the channel without owning its inbound queue.
+    ///
+    /// The channel's own [`MuxChannel`] (owned by, e.g., the block producer)
+    /// consumes the inbound queue via `receive`; an injector cannot be a second
+    /// `MuxChannel` because there is exactly one inbound receiver. This handle
+    /// clones only the *sending* halves — the shared outbound queue (→ over-air
+    /// to the peer) and the channel's inbound sender (→ self-delivery to the
+    /// local consumer) — so a message injected on the leader reaches both its own
+    /// block producer and the peer's. Used to feed client transactions from the
+    /// RPC server (or LoRa gateway) into [`Channel::Txs`].
+    ///
+    /// Call before [`spawn`](Self::spawn); cheap to clone the returned handle.
+    pub fn injector(&self, channel: Channel) -> MuxInjector {
+        MuxInjector {
+            channel,
+            outbound_tx: self.outbound_tx.clone(),
+            self_delivery: self.inbound_tx[channel as usize].clone(),
+        }
     }
 
     fn channel_inner<S, R>(&mut self, channel: Channel, self_deliver: bool) -> MuxChannel<S, R> {
@@ -607,6 +630,47 @@ pub struct MuxChannel<S, R> {
     /// inbound queue (see [`PactorMux::channel_self_delivering`]).
     self_delivery: Option<mpsc::Sender<Vec<u8>>>,
     _msg_types: PhantomData<(S, R)>,
+}
+
+/// A send-only handle onto one mux channel, obtained from
+/// [`PactorMux::injector`]. Serializes and enqueues a message just like
+/// [`MuxChannel::enqueue`] — onto the shared outbound queue (over-air to the
+/// peer) and, if the channel self-delivers, onto its own inbound queue (to the
+/// local consumer) — but owns no inbound receiver, so it can coexist with the
+/// channel's [`MuxChannel`] and be cloned freely across injector tasks.
+#[derive(Clone)]
+pub struct MuxInjector {
+    channel: Channel,
+    outbound_tx: mpsc::Sender<Outbound>,
+    /// Sender onto the channel's inbound queue, so an injected message is also
+    /// delivered to this node's own consumer (the local block producer packs
+    /// transactions the RPC injects here). `None` only if the channel was never
+    /// set up (should not happen for a live channel).
+    self_delivery: Option<mpsc::Sender<Vec<u8>>>,
+}
+
+impl MuxInjector {
+    /// Serialize and inject `message` onto this channel. Delivers to the local
+    /// consumer (self-delivery) and enqueues for over-air transmission to the
+    /// peer. Best-effort on self-delivery (a full inbound queue does not block
+    /// the over-air send); errors only if the mux outbound queue is closed.
+    pub async fn send<S>(&self, message: &S) -> std::io::Result<()>
+    where
+        S: SchemaWrite<Src = S> + Send + Sync,
+    {
+        let payload = wincode::serialize(message)
+            .map_err(|e| std::io::Error::other(format!("serialize failed: {e:?}")))?;
+        if let Some(self_tx) = &self.self_delivery {
+            let _ = self_tx.try_send(payload.clone());
+        }
+        self.outbound_tx
+            .send(Outbound {
+                channel: self.channel,
+                payload,
+            })
+            .await
+            .map_err(|_| std::io::Error::other("mux outbound queue closed"))
+    }
 }
 
 impl<S, R> MuxChannel<S, R>

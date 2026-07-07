@@ -20,6 +20,7 @@ bunkerglow = { workspace = true }
 scs_pactor = { path = "../scs_pactor" }
 
 tokio = { workspace = true }
+tokio-util = "0.7"
 serde = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }

@@ -640,6 +640,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-serial",
+ "tokio-util",
  "wincode",
 ]
 

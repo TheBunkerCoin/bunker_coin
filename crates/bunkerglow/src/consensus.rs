@@ -111,6 +111,20 @@ pub(crate) fn delta_first_slice() -> Duration {
 pub(crate) fn delta_empty_slice() -> Duration {
     scaled(2_000)
 }
+/// Max time the leader waits for the *next* transaction after already packing at
+/// least one into the current slice, before closing the slice and disseminating.
+///
+/// Without this bound the producer holds a partially-full slice open for the
+/// whole (delta-scaled) `delta_block` window waiting to fill it — minutes on a
+/// slow link — so a single-transaction block takes a full block window to even
+/// begin dissemination, and finalization of that slot stalls far behind the
+/// empty-block frontier. Bounding the inter-tx wait lets a lightly-loaded leader
+/// close a slice promptly after the last tx, while a steady tx stream still
+/// fills slices (each packed tx re-arms this grace). Delta-scaled so it relaxes a
+/// little on slow links, but small in absolute terms.
+pub(crate) fn delta_pack_grace() -> Duration {
+    scaled(2_000)
+}
 /// Grace period for which a node defers its slow-path finalization vote, giving
 /// fast-final a chance to finalize the slot from notar votes alone (see
 /// `Votor::defer_final_vote`). Sized to roughly one network round-trip (so both
