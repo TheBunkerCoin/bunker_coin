@@ -23,7 +23,28 @@ use crate::crypto::signature;
 use crate::network::{Network, TransactionNetwork};
 use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder};
 use crate::types::{Slice, SliceHeader, SliceIndex, SlicePayload, Slot};
-use crate::{BlockId, BlockPayload, Disseminator, MAX_TRANSACTION_SIZE};
+use crate::{BlockId, BlockPayload, Disseminator, MAX_TRANSACTION_SIZE, Transaction};
+
+/// Target number of "bloat" payload bytes to pad each produced slice up to,
+/// read from `BUNKER_BLOAT_BYTES` (default `0` = disabled).
+///
+/// When set, after packing real transactions the leader tops the slice up with
+/// dummy [`Transaction`]s of random bytes until the slice holds at least this
+/// many payload bytes (capped at the slice capacity). This makes every block —
+/// including otherwise-empty ones — occupy the HF link longer, so there is a
+/// steady stream of data to disseminate and consume. Each bloat tx is a normal
+/// `Transaction(Vec<u8>)` on the wire, so this is not a wire-format change; both
+/// nodes still parse blocks identically whether or not bloat is enabled.
+///
+/// Values above [`MAX_DATA_PER_SLICE`] just fill a single slice; multi-slice
+/// bloat blocks are not produced (one padded slice is a simpler, band-friendlier
+/// increase than several).
+fn bloat_target_bytes() -> usize {
+    std::env::var("BUNKER_BLOAT_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
 
 /// Produces blocks from transactions and dissminates them.
 ///
@@ -485,6 +506,7 @@ where
     let mut slice_capacity_left = MAX_DATA_PER_SLICE
         .checked_sub(slot_encoded_len + parent_encoded_len + fixed_payload_len)
         .unwrap();
+    let initial_capacity = slice_capacity_left;
     let mut txs = Vec::new();
 
     // `(duration_left, terminal_empty)` — see the function docs for `terminal`.
@@ -532,6 +554,36 @@ where
             break (duration_left.saturating_sub(start_time.elapsed()), false);
         }
     };
+
+    // Top the slice up with dummy bloat transactions when configured
+    // (`BUNKER_BLOAT_BYTES`), so the block occupies the radio link longer even
+    // with an idle mempool. Random bytes, so modem-level compression (PACTOR
+    // PMC) cannot shrink the padding back down. The padded slice keeps its
+    // `terminal_empty` flag: an idle-mempool block stays a single (now padded)
+    // slice rather than growing into a multi-slice block.
+    let bloat_target = bloat_target_bytes().min(initial_capacity);
+    let mut packed_bytes = initial_capacity - slice_capacity_left;
+    if bloat_target > packed_bytes {
+        use rand::RngCore;
+        let mut rng = rand::rng();
+        while packed_bytes < bloat_target && slice_capacity_left > 8 {
+            let chunk = (bloat_target - packed_bytes)
+                .min(MAX_TRANSACTION_SIZE)
+                .min(slice_capacity_left - 8);
+            let mut bytes = vec![0u8; chunk];
+            rng.fill_bytes(&mut bytes);
+            let tx = Transaction(bytes);
+            let tx_len = wincode::serialize(&tx)
+                .expect("serialization should not panic")
+                .len();
+            if tx_len > slice_capacity_left {
+                break;
+            }
+            slice_capacity_left -= tx_len;
+            packed_bytes += tx_len;
+            txs.push(tx);
+        }
+    }
 
     // TODO: not accounting for this potentially expensive operation in duration_left calculation above.
     let txs = wincode::serialize(&BlockPayload {

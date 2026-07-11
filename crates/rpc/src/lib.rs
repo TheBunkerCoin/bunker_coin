@@ -2270,10 +2270,16 @@ pub async fn run_api(state: SharedState) {
         .route("/ws", get(websocket_handler))
         .layer(cors)
         .with_state(state);
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:3001").await {
+    // Bind address is overridable via BUNKER_RPC_ADDR (default loopback-only).
+    // Set it to e.g. `0.0.0.0:3001` (or `<tailnet-ip>:3001`) when the API must
+    // be reachable from another machine, such as the bastion proxying the
+    // explorer's chain queries over Tailscale.
+    let bind_addr =
+        std::env::var("BUNKER_RPC_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".to_owned());
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("failed to bind API server on 127.0.0.1:3001: {err}");
+            eprintln!("failed to bind API server on {bind_addr}: {err}");
             return;
         }
     };

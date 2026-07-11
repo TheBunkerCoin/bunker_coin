@@ -162,6 +162,10 @@ struct TxContext {
     /// Genesis ed25519 key, so the RPC can server-side-sign transactions whose
     /// sender is the genesis account (submit with an all-zero signature).
     genesis_signing_key: Arc<SigningKey>,
+    /// Validator statuses served by `/nodes`, updated by the block executor.
+    /// In this two-node setup finalization requires both validators' votes, so
+    /// the local finalized frontier is (modulo reverse-path lag) the network's.
+    nodes: Arc<tokio::sync::RwLock<Vec<rpc::NodeStatus>>>,
 }
 
 impl TxContext {
@@ -178,6 +182,18 @@ impl TxContext {
             mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             tx_results: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             genesis_signing_key: Arc::new(cluster.genesis_key.clone()),
+            // Both validators of the two-node cluster, so `/nodes` is populated
+            // from startup (finalized_slot advances via the block executor).
+            nodes: Arc::new(tokio::sync::RwLock::new(vec![
+                rpc::NodeStatus {
+                    node_id: 0,
+                    finalized_slot: 0,
+                },
+                rpc::NodeStatus {
+                    node_id: 1,
+                    finalized_slot: 0,
+                },
+            ])),
         };
         (ctx, tx_rx)
     }
@@ -197,6 +213,7 @@ impl TxContext {
             mempool: self.mempool.clone(),
             tx_results: self.tx_results.clone(),
             genesis_signing_key: self.genesis_signing_key.clone(),
+            nodes: self.nodes.clone(),
         }
     }
 }
@@ -214,7 +231,7 @@ fn rpc_state_for(blockstore: SharedBlockstore, tx: &TxContext) -> rpc::SharedSta
     let (updates_tx, _updates_rx) = tokio::sync::broadcast::channel(256);
     rpc::SharedState {
         blocks: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-        nodes: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        nodes: tx.nodes.clone(),
         radio_stats: Arc::new(tokio::sync::RwLock::new(rpc::RadioStats {
             bandwidth_bps: 0,
             packet_loss_percent: 0.0,
@@ -341,6 +358,13 @@ fn spawn_block_executor(
             let finalized = pool.read().await.finalized_slot().inner();
             if finalized <= last_executed {
                 continue;
+            }
+
+            // Advance `/nodes` to the new finalized frontier. Finalizing a slot
+            // in this two-node cluster requires both validators' votes, so both
+            // entries track the locally observed frontier.
+            for node in tx.nodes.write().await.iter_mut() {
+                node.finalized_slot = finalized;
             }
 
             let bs = blockstore.read().await;
