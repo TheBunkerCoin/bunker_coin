@@ -414,13 +414,17 @@ fn spawn_block_executor(
 /// with a wincode 8-byte length prefix; try the raw bytes first, then skip the
 /// prefix. Undecodable entries are dropped (they were never valid client txs).
 fn decode_block_txs(raw: &[Transaction]) -> Vec<CoreTransaction> {
+    // Limit-guarded decode: without a limit bincode skips its container-length
+    // check, and these bytes include BUNKER_BLOAT_BYTES random padding — a
+    // random u64 read as a Vec length would abort the process on allocation.
+    let config = bincode::config::standard().with_limit::<4096>();
     raw.iter()
         .filter_map(|t| {
             let data = &t.0;
-            bincode::serde::decode_from_slice(data, bincode::config::standard())
+            bincode::serde::decode_from_slice(data, config)
                 .or_else(|_| {
                     if data.len() > 8 {
-                        bincode::serde::decode_from_slice(&data[8..], bincode::config::standard())
+                        bincode::serde::decode_from_slice(&data[8..], config)
                     } else {
                         Err(bincode::error::DecodeError::Other("too short"))
                     }
