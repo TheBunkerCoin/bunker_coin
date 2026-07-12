@@ -623,6 +623,7 @@ name = "bunker_coin_sim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bincode",
  "bunker_coin_core",
  "bunker_coin_radio",

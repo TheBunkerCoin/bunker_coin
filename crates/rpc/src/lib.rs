@@ -485,11 +485,15 @@ fn body_type_name(body: &TransactionBody) -> &'static str {
 fn decode_raw_transaction(raw: &bunkerglow::Transaction) -> Option<CoreTransaction> {
     // Transaction.0 may have a wincode Vec<u8> length prefix (8-byte LE u64)
     // wrapping the bincode payload. Try raw first, then skip the prefix.
+    // Limit-guarded: block payloads include BUNKER_BLOAT_BYTES random padding,
+    // and without a limit bincode skips its length check — a random u64 read as
+    // a Vec length would abort the process on allocation. Real txs are < 4 KiB.
+    let config = bincode::config::standard().with_limit::<4096>();
     let data = &raw.0;
-    bincode::serde::decode_from_slice(data, bincode::config::standard())
+    bincode::serde::decode_from_slice(data, config)
         .or_else(|_| {
             if data.len() > 8 {
-                bincode::serde::decode_from_slice(&data[8..], bincode::config::standard())
+                bincode::serde::decode_from_slice(&data[8..], config)
             } else {
                 Err(bincode::error::DecodeError::Other("too short"))
             }
@@ -800,8 +804,17 @@ async fn blocks(
         let bs = bs_arc.read().await;
 
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
+        // The in-memory list stays empty on the persistent-node path (e.g.
+        // pactor_consensus), which used to freeze this scan at slot 200 while
+        // the chain kept climbing. The validators' finalized frontier (kept
+        // current in `state.nodes` by the block executor) tracks the real
+        // chain height; +200 headroom covers produced-but-unfinalized slots.
+        let highest_finalized_slot = {
+            let nodes = state.nodes.read().await;
+            nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
+        };
 
-        for slot_u64 in 0..=highest_mem_slot + 200 {
+        for slot_u64 in 0..=highest_mem_slot.max(highest_finalized_slot) + 200 {
             if all_blocks.iter().any(|b| b.slot() == slot_u64) {
                 continue;
             }
@@ -1009,6 +1022,85 @@ async fn get_transaction(
     axum::http::StatusCode::NOT_FOUND.into_response()
 }
 
+/// `GET /transactions` — list transactions across the finalized chain,
+/// newest-first, paginated. Mirrors `/blocks`. Walks the blockstore up to the
+/// finalized frontier (`state.nodes`), decodes each block's real transactions
+/// (bloat padding is undecodable and skipped), and annotates finalized ones
+/// with their execution outcome from `tx_results`.
+async fn list_transactions(
+    Query(p): Query<Pagination>,
+    state: axum::extract::State<SharedState>,
+) -> Json<serde_json::Value> {
+    let limit = p.limit.unwrap_or(50).min(200);
+    let offset = p.offset.unwrap_or(0);
+
+    let mut txs: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(bs_arc) = &state.blockstore {
+        let bs = bs_arc.read().await;
+        let results = state.tx_results.read().await;
+
+        let highest_finalized_slot = {
+            let nodes = state.nodes.read().await;
+            nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
+        };
+
+        // Newest-first: scan slots high→low.
+        for slot_u64 in (0..=highest_finalized_slot).rev() {
+            let slot = Slot::new(slot_u64);
+            let Some(hash) = bs.canonical_block_hash(slot) else {
+                continue;
+            };
+            let block_hash: DoubleMerkleRoot = hash.clone().into();
+            let Some(blk) = bs.get_block(&(slot, block_hash)) else {
+                continue;
+            };
+            let blk_hash_hex = hex::encode(&hash);
+            for raw_tx in blk.transactions() {
+                let Some(core_tx) = decode_raw_transaction(raw_tx) else {
+                    continue; // bloat padding / undecodable — not a real tx
+                };
+                let tx_hash = hex::encode(core_tx.hash());
+                let status = match results.get(&tx_hash) {
+                    Some(r) => serde_json::json!({
+                        "location": "finalized",
+                        "slot": r.slot,
+                        "block_hash": r.block_hash,
+                        "success": matches!(r.status, TxFinalStatus::Finalized),
+                        "error": r.error,
+                    }),
+                    None => serde_json::json!({
+                        "location": "confirmed",
+                        "slot": slot_u64,
+                        "block_hash": blk_hash_hex,
+                    }),
+                };
+                txs.push(serde_json::json!({
+                    "hash": tx_hash,
+                    "sender": hex::encode(core_tx.sender),
+                    "nonce": core_tx.nonce,
+                    "fee": core_tx.fee,
+                    "slot": slot_u64,
+                    "block_hash": blk_hash_hex,
+                    "body": core_tx_to_body_response(&core_tx.body),
+                    "status": status,
+                }));
+            }
+        }
+    }
+
+    let total = txs.len();
+    let page: Vec<serde_json::Value> =
+        txs.into_iter().skip(offset).take(limit).collect();
+
+    Json(serde_json::json!({
+        "transactions": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }))
+}
+
 async fn find_tx_details_in_blockstore(
     state: &SharedState,
     hash: &str,
@@ -1034,8 +1126,15 @@ async fn find_tx_in_blockstore(
     let blocks = state.blocks.read().await;
     let highest_mem_slot = blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
     drop(blocks);
+    // Same frontier-aware bound as `blocks()`: the in-memory list is empty on
+    // the persistent-node path, so without the finalized frontier this scan
+    // would stop finding transactions past slot 200.
+    let highest_finalized_slot = {
+        let nodes = state.nodes.read().await;
+        nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
+    };
 
-    for slot_u64 in 0..=highest_mem_slot + 200 {
+    for slot_u64 in 0..=highest_mem_slot.max(highest_finalized_slot) + 200 {
         let slot = Slot::new(slot_u64);
         if let Some(blk_hash) = bs.canonical_block_hash(slot) {
             let block_hash: DoubleMerkleRoot = blk_hash.clone().into();
@@ -2254,7 +2353,7 @@ pub async fn run_api(state: SharedState) {
         .route("/block/{hash}", get(block))
         .route("/block/slot/{slot_num}", get(block_by_slot))
         .route("/transactions/{hash}", get(get_transaction))
-        .route("/transactions", post(submit_transaction))
+        .route("/transactions", get(list_transactions).post(submit_transaction))
         .route("/mempool", get(mempool))
         .route("/mempool/{hash}", get(mempool_transaction))
         .route("/accounts/{pubkey}", get(get_account))

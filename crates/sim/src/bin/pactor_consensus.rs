@@ -19,6 +19,7 @@
 //! Both nodes derive the same 2-validator set from a fixed `--seed` so keys and
 //! stake match; they differ only in which `own_id` they run.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -166,6 +167,11 @@ struct TxContext {
     /// In this two-node setup finalization requires both validators' votes, so
     /// the local finalized frontier is (modulo reverse-path lag) the network's.
     nodes: Arc<tokio::sync::RwLock<Vec<rpc::NodeStatus>>>,
+    /// WebSocket update channel shared with the RPC server, so long-lived tasks
+    /// (e.g. the radio-stats sampler) can push updates to connected clients.
+    updates: tokio::sync::broadcast::Sender<rpc::WebSocketUpdate>,
+    /// Radio link stats served by `/radio`, updated by the radio-stats sampler.
+    radio_stats: Arc<tokio::sync::RwLock<rpc::RadioStats>>,
 }
 
 impl TxContext {
@@ -194,6 +200,16 @@ impl TxContext {
                     finalized_slot: 0,
                 },
             ])),
+            updates: tokio::sync::broadcast::channel(256).0,
+            radio_stats: Arc::new(tokio::sync::RwLock::new(rpc::RadioStats {
+                bandwidth_bps: 0,
+                packet_loss_percent: 0.0,
+                latency_ms: 0,
+                jitter_ms: 0,
+                packets_sent: 0,
+                packets_dropped: 0,
+                current_throughput_bps: 0.0,
+            })),
         };
         (ctx, tx_rx)
     }
@@ -214,8 +230,138 @@ impl TxContext {
             tx_results: self.tx_results.clone(),
             genesis_signing_key: self.genesis_signing_key.clone(),
             nodes: self.nodes.clone(),
+            updates: self.updates.clone(),
+            radio_stats: self.radio_stats.clone(),
         }
     }
+}
+
+/// Cumulative I/O counters observed at the PACTOR transport boundary. Created
+/// once per process and shared across reconnect sessions, so the radio-stats
+/// sampler sees one continuous byte stream regardless of link drops.
+#[derive(Default)]
+struct LinkCounters {
+    frames_sent: AtomicU64,
+    bytes_sent: AtomicU64,
+    frames_received: AtomicU64,
+    bytes_received: AtomicU64,
+}
+
+/// Transparent [`PactorTransport`] wrapper that counts frames and bytes going
+/// over the modem, so the RPC can serve real link throughput (`/radio` and the
+/// `radio_stats` WebSocket update the explorer's live stats panel waits for).
+struct CountingTransport {
+    inner: Arc<dyn PactorTransport>,
+    counters: Arc<LinkCounters>,
+}
+
+#[async_trait::async_trait]
+impl PactorTransport for CountingTransport {
+    async fn set_mycall(&self, callsign: &str) -> Result<(), scs_pactor::ScsPactorError> {
+        self.inner.set_mycall(callsign).await
+    }
+
+    async fn connect_peer(&self, remote_call: &str) -> Result<(), scs_pactor::ScsPactorError> {
+        self.inner.connect_peer(remote_call).await
+    }
+
+    async fn accept_incoming(
+        &self,
+        timeout_after: Option<Duration>,
+    ) -> Result<String, scs_pactor::ScsPactorError> {
+        self.inner.accept_incoming(timeout_after).await
+    }
+
+    async fn write_data(&self, data: &[u8]) -> Result<(), scs_pactor::ScsPactorError> {
+        self.inner.write_data(data).await?;
+        self.counters.frames_sent.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .bytes_sent
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, scs_pactor::ScsPactorError> {
+        let payload = self.inner.read_data(max_len).await?;
+        self.counters.frames_received.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .bytes_received
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        Ok(payload)
+    }
+
+    async fn changeover(&self) -> Result<(), scs_pactor::ScsPactorError> {
+        self.inner.changeover().await
+    }
+
+    async fn disconnect(&self) -> Result<(), scs_pactor::ScsPactorError> {
+        self.inner.disconnect().await
+    }
+
+    fn is_link_up(&self) -> bool {
+        self.inner.is_link_up()
+    }
+
+    async fn next_event(
+        &self,
+        timeout_after: Option<Duration>,
+    ) -> Result<scs_pactor::PactorLinkEvent, scs_pactor::ScsPactorError> {
+        self.inner.next_event(timeout_after).await
+    }
+
+    async fn broadcast_fec(&self, data: &[u8]) -> Result<(), scs_pactor::ScsPactorError> {
+        self.inner.broadcast_fec(data).await
+    }
+}
+
+/// Every 2s, turn the transport counters into the `radio_stats` WebSocket
+/// update (which the explorer's "Live Radio Network Stats" panel renders) and
+/// the `/radio` REST stats. Only counters we actually observe are reported:
+/// PACTOR ARQ retransmits below this layer, so per-frame loss is not visible —
+/// dropped/loss stay 0 rather than being fabricated.
+fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
+    let updates = tx.updates.clone();
+    let radio_stats = tx.radio_stats.clone();
+    tokio::spawn(async move {
+        let mut last_sent_frames = 0u64;
+        let mut last_sent_bytes = 0u64;
+        let mut last_recv_bytes = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let sent_frames = counters.frames_sent.load(Ordering::Relaxed);
+            let sent_bytes = counters.bytes_sent.load(Ordering::Relaxed);
+            let recv_bytes = counters.bytes_received.load(Ordering::Relaxed);
+
+            let d_frames = sent_frames - last_sent_frames;
+            let d_sent = sent_bytes - last_sent_bytes;
+            let d_recv = recv_bytes - last_recv_bytes;
+            last_sent_frames = sent_frames;
+            last_sent_bytes = sent_bytes;
+            last_recv_bytes = recv_bytes;
+
+            // Throughput counts both directions: this node's transmissions and
+            // what it hears from the peer — i.e. traffic on the shared channel.
+            let throughput_bps = ((d_sent + d_recv) * 8) as f64 / 2.0;
+
+            {
+                let mut stats = radio_stats.write().await;
+                stats.packets_sent = sent_frames;
+                stats.current_throughput_bps = throughput_bps;
+            }
+
+            // No WS client connected is fine; send() just returns Err.
+            let _ = updates.send(rpc::WebSocketUpdate::RadioStats {
+                packets_sent_2s: d_frames,
+                packets_dropped_2s: 0,
+                packets_transmitted_2s: d_frames,
+                bytes_transmitted_2s: d_sent,
+                effective_throughput_bps_2s: throughput_bps,
+                packet_loss_rate_2s: 0.0,
+                packets_queued: 0,
+            });
+        }
+    });
 }
 
 /// Build an RPC [`SharedState`](rpc::SharedState) backed by `blockstore` and the
@@ -228,20 +374,11 @@ impl TxContext {
 /// consensus, packed into blocks, and executed on finalization (see
 /// [`spawn_tx_bridge`] and [`spawn_block_executor`]).
 fn rpc_state_for(blockstore: SharedBlockstore, tx: &TxContext) -> rpc::SharedState {
-    let (updates_tx, _updates_rx) = tokio::sync::broadcast::channel(256);
     rpc::SharedState {
         blocks: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         nodes: tx.nodes.clone(),
-        radio_stats: Arc::new(tokio::sync::RwLock::new(rpc::RadioStats {
-            bandwidth_bps: 0,
-            packet_loss_percent: 0.0,
-            latency_ms: 0,
-            jitter_ms: 0,
-            packets_sent: 0,
-            packets_dropped: 0,
-            current_throughput_bps: 0.0,
-        })),
-        updates: updates_tx,
+        radio_stats: tx.radio_stats.clone(),
+        updates: tx.updates.clone(),
         blockstore: Some(blockstore),
         mempool: tx.mempool.clone(),
         tx_sender: Some(tx.tx_sender.clone()),
@@ -889,7 +1026,13 @@ async fn run_simulated(
     tb.accept_incoming(None).await.ok();
     ta.connect_peer("NODE1").await?;
 
-    let ta: Arc<dyn PactorTransport> = Arc::new(ta);
+    // Count node 0's radio I/O (node 0 serves the RPC, so its stats feed the
+    // explorer's live radio panel).
+    let link_counters = Arc::new(LinkCounters::default());
+    let ta: Arc<dyn PactorTransport> = Arc::new(CountingTransport {
+        inner: Arc::new(ta),
+        counters: link_counters.clone(),
+    });
     let tb: Arc<dyn PactorTransport> = Arc::new(tb);
 
     // Full-duplex: no turn discipline (None). Half-duplex: node 0 starts with
@@ -902,6 +1045,7 @@ async fn run_simulated(
     // Per-node transaction contexts (each over its own genesis-funded state).
     let (tx_a, tx_rx_a) = TxContext::new(&cluster, exec_a);
     let (tx_b, _tx_rx_b) = TxContext::new(&cluster, exec_b);
+    spawn_radio_stats_sampler(link_counters, &tx_a);
     println!(
         "genesis account (funded {GENESIS_BALANCE}): {}",
         hex::encode(cluster.genesis_pubkey())
@@ -1086,6 +1230,11 @@ async fn run_hardware(
     let mempool_slot: MempoolSlot = Arc::new(tokio::sync::RwLock::new(None));
     spawn_tx_bridge(tx_rx, mempool_slot.clone());
 
+    // Radio I/O counters, shared across reconnect sessions; the sampler feeds
+    // the explorer's live stats panel (WS `radio_stats`) and `/radio`.
+    let link_counters = Arc::new(LinkCounters::default());
+    spawn_radio_stats_sampler(link_counters.clone(), &base_tx);
+
     let overall_deadline = deadline_for(duration);
     let mut highest = 0u64;
     let mut session = 0u32;
@@ -1122,7 +1271,11 @@ async fn run_hardware(
             }
         };
 
-        let transport: Arc<dyn PactorTransport> = Arc::new(transport);
+        // Count frames/bytes over the modem for the live radio-stats panel.
+        let transport: Arc<dyn PactorTransport> = Arc::new(CountingTransport {
+            inner: Arc::new(transport),
+            counters: link_counters.clone(),
+        });
         // Half-duplex link: the caller (node 0) starts holding the transmit turn.
         let (node, handle, mempool, exec) =
             build_node(transport.clone(), own_id, &cluster, Some(is_caller));
