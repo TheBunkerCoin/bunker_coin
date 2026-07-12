@@ -1045,7 +1045,12 @@ async fn list_transactions(
             nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
         };
 
-        // Newest-first: scan slots high→low.
+        // Newest-first: scan slots high→low. The same tx can land in two
+        // blocks (each node's mempool packs it before finalization evicts
+        // it) with the duplicate failing on nonce mismatch; list each tx
+        // once, at its canonical inclusion — the one that actually executed
+        // (per tx_results).
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for slot_u64 in (0..=highest_finalized_slot).rev() {
             let slot = Slot::new(slot_u64);
             let Some(hash) = bs.canonical_block_hash(slot) else {
@@ -1061,6 +1066,15 @@ async fn list_transactions(
                     continue; // bloat padding / undecodable — not a real tx
                 };
                 let tx_hash = hex::encode(core_tx.hash());
+                if let Some(r) = results.get(&tx_hash) {
+                    // Skip duplicate inclusions: emit only where it executed.
+                    if r.slot != slot_u64 {
+                        continue;
+                    }
+                }
+                if !seen.insert(tx_hash.clone()) {
+                    continue;
+                }
                 let status = match results.get(&tx_hash) {
                     Some(r) => serde_json::json!({
                         "location": "finalized",

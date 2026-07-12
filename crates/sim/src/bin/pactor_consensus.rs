@@ -593,17 +593,19 @@ async fn record_tx_results(
             Ok(()) => (rpc::TxFinalStatus::Finalized, None),
             Err(e) => (rpc::TxFinalStatus::Failed, Some(e.to_string())),
         };
-        results_map.insert(
-            hash.clone(),
-            rpc::TxResult {
-                hash: hash.clone(),
-                slot,
-                block_hash: block_hash_hex.to_string(),
-                status,
-                error,
-                executed_at: now,
-            },
-        );
+        // First execution wins: the same tx can land in two blocks (each
+        // node's mempool packs it before finalization evicts it), and the
+        // duplicate then fails on nonce mismatch. Overwriting here made a
+        // SUCCESSFUL transfer report "failed" (observed on-air: nonce-0 tx
+        // succeeded in slot 23, its slot-24 duplicate's failure clobbered it).
+        results_map.entry(hash.clone()).or_insert(rpc::TxResult {
+            hash: hash.clone(),
+            slot,
+            block_hash: block_hash_hex.to_string(),
+            status,
+            error,
+            executed_at: now,
+        });
         mempool.retain(|e| e.hash != hash);
     }
 }
