@@ -237,6 +237,22 @@ Notes:
 - **Non-genesis senders** must submit a real ed25519 signature over
   `Transaction::signing_hash()` (the server only auto-signs the genesis account).
 
+### A series of transactions
+
+The server-signer fills the **current finalized** nonce, so each genesis tx must
+finalize before the next is sent (otherwise they reuse the same nonce).
+`scripts/send_txs.sh` submits a series that way — submit, wait for finalization,
+repeat:
+
+```bash
+GEN=<genesis pubkey>   scripts/send_txs.sh 5          # 5 transfers (defaults)
+GEN=<...>              scripts/send_txs.sh 10 500 50  # 10 of 500, fee 50
+```
+
+Args: `COUNT AMOUNT FEE TO URL`. After it finishes, genesis balance has dropped
+by `COUNT × (AMOUNT + FEE)` (nonce = `COUNT`) and the recipient holds
+`COUNT × AMOUNT`.
+
 ---
 
 ## 5. Inspecting the chain offline (`--inspect`)
@@ -302,6 +318,20 @@ experiments):
 - `BUNKER_DELTA_MULT` — same as `--delta-mult`.
 - `BUNKER_DEFER_FINAL_VOTE=1` — defer the slow-path finalization vote so a
   fast-finalized slot sends nothing extra over the reverse path.
+- `BUNKER_RPC_ADDR=<ip:port>` — bind address for the `--rpc` API (default
+  `127.0.0.1:3001`, loopback-only). Set `0.0.0.0:3001` (or the machine's
+  tailnet IP, e.g. `100.75.135.127:3001`) when the explorer chain (bastion →
+  explorer-api → browser) must reach this node's RPC from another machine.
+- `BUNKER_BLOAT_BYTES=<n>` — pad every produced slice with dummy random-byte
+  transactions up to ~n bytes (capped at one slice, ~`MAX_DATA_PER_SLICE`), so
+  each block occupies the link longer even with an idle mempool. Set it on the
+  **leader** side (both nodes, since leadership alternates). Random bytes defeat
+  the modem's PMC compression. Bloat txs are ordinary `Transaction(Vec<u8>)`
+  entries on the wire — **not** a wire-format change, and the executor drops
+  them as undecodable — but a padded block takes proportionally longer to
+  disseminate, so raise `--delta-mult` if slots stop finalizing. Start around
+  `BUNKER_BLOAT_BYTES=2000` on a healthy band and dial up/down from there.
+  Unset / `0` = disabled (default).
 
 ---
 

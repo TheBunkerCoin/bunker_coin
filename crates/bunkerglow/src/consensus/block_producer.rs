@@ -564,8 +564,14 @@ where
     let bloat_target = bloat_target_bytes().min(initial_capacity);
     let mut packed_bytes = initial_capacity - slice_capacity_left;
     if bloat_target > packed_bytes {
-        use rand::RngCore;
-        let mut rng = rand::rng();
+        use rand::{RngCore, SeedableRng};
+        // DETERMINISTIC padding, seeded by the slot: a leader that crashes and
+        // re-produces the same slot must emit byte-identical padding. With
+        // fresh random bytes each production, a crash-restart re-production
+        // hashed differently and FORKED the slot (observed on-air: two slot-3
+        // blocks, consensus deadlocked). Slot-seeded pseudo-random bytes are
+        // reproducible while still incompressible to the modem's PMC.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(slot.inner());
         while packed_bytes < bloat_target && slice_capacity_left > 8 {
             let chunk = (bloat_target - packed_bytes)
                 .min(MAX_TRANSACTION_SIZE)
@@ -897,6 +903,10 @@ mod tests {
 
     #[tokio::test]
     async fn verify_produce_block_parent_not_ready() {
+        // With an idle mempool the first slice is produced empty and terminal
+        // (an empty block is a SINGLE slice), so the producer awaits the
+        // ParentReady event before disseminating that one slice. The block must
+        // adopt the parent delivered by ParentReady.
         let slot = Slot::windows().nth(10).unwrap();
         let slot_hash: BlockHash = Hash::random_for_test().into();
         let old_parent = (slot.prev(), Hash::random_for_test().into());
@@ -910,32 +920,8 @@ mod tests {
             parent: new_parent.clone(),
         };
 
-        let (first_slice_finished_tx, first_slice_finished_rx) = oneshot::channel();
-        let (start_second_slice_tx, start_second_slice_rx) = oneshot::channel();
-
         let mut seq = Sequence::new();
         let mut blockstore = MockBlockstore::new();
-
-        // handle first slice
-        blockstore
-            .expect_add_shred_from_disseminator()
-            .times(TOTAL_SHREDS - 1)
-            .in_sequence(&mut seq)
-            .returning(move |_| Box::pin(async move { Ok(None) }));
-        blockstore
-            .expect_add_shred_from_disseminator()
-            .times(1)
-            .in_sequence(&mut seq)
-            .return_once(move |_| {
-                Box::pin(async move {
-                    // last shred; wait for the parent ready event to be sent before continuing
-                    first_slice_finished_tx.send(()).unwrap();
-                    let () = start_second_slice_rx.await.unwrap();
-                    Ok(None)
-                })
-            });
-
-        // handle second slice
         blockstore
             .expect_add_shred_from_disseminator()
             .times(TOTAL_SHREDS - 1)
@@ -949,8 +935,7 @@ mod tests {
             .returning(move |_| {
                 let nbi = nbi.clone();
                 Box::pin(async {
-                    // final shred of second slice
-                    // block is constructed with the new parent
+                    // final shred: block is constructed with the new parent
                     Ok(Some(nbi))
                 })
             });
@@ -977,13 +962,7 @@ mod tests {
         );
 
         let (parent_ready_tx, parent_ready_rx) = oneshot::channel();
-
-        let np = new_parent.clone();
-        tokio::spawn(async move {
-            let () = first_slice_finished_rx.await.unwrap();
-            parent_ready_tx.send(np).unwrap();
-            start_second_slice_tx.send(()).unwrap();
-        });
+        parent_ready_tx.send(new_parent.clone()).unwrap();
 
         let ret = block_producer
             .produce_block_parent_not_ready(slot, old_block_info.parent, parent_ready_rx)
