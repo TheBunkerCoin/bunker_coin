@@ -704,8 +704,18 @@ impl Pool for PoolImpl {
     }
 
     /// Gives the currently highest finalized (fast or slow) slot.
+    ///
+    /// Includes the persisted frontier restored by `load_from_db`: the
+    /// finality tracker only advances on live finalization events, so after a
+    /// restart it reports genesis even though the reload restored e.g. slot
+    /// 288 — which made `Alpenglow::run()`'s `clean_beyond_finalized(0)` WIPE
+    /// the whole persisted chain, the producer re-produce from slot 1, and the
+    /// executor/RPC report a zero frontier (observed on-air). Both sources are
+    /// monotonic, so taking the max is safe.
     fn finalized_slot(&self) -> Slot {
-        self.finality_tracker.highest_finalized_slot()
+        self.finality_tracker
+            .highest_finalized_slot()
+            .max(self.highest_finalized_slot)
     }
 
     fn has_notar_or_fallback_cert(&self, slot: Slot) -> bool {
