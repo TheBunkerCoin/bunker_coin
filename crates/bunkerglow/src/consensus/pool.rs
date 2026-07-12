@@ -821,7 +821,14 @@ impl PoolImpl {
             self.slot_state(slot).add_cert(cert.clone());
 
             match &cert {
-                Cert::Notar(_) | Cert::NotarFallback(_) => {
+                // A fast-final cert is ≥80% notar votes — strictly stronger
+                // than a notar cert — but was not marked in the parent-ready
+                // tracker on reload. A slot whose only stored cert is FastFinal
+                // then vanished from the parent-ready chain after a restart,
+                // and the next window re-anchored on its parent — orphaning a
+                // FINALIZED block (observed on-air: slot 8 produced with
+                // parent 3, skipping finalized slot 4).
+                Cert::Notar(_) | Cert::NotarFallback(_) | Cert::FastFinal(_) => {
                     if let Some(hash) = cert.block_hash() {
                         let block_id = (slot, hash.clone());
                         let newly = self.parent_ready_tracker.mark_notar_fallback(&block_id);
