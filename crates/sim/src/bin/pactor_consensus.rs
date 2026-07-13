@@ -251,12 +251,25 @@ struct LinkCounters {
     speed_level: AtomicU64,
 }
 
+/// Consecutive `write_data` failures after which the link is declared dead.
+/// A wedged modem (hostmode transactions timing out) never sends an explicit
+/// disconnect event, so `is_link_up` stayed true and the session stalled
+/// FOREVER (observed on-air: 40+ minutes at a frozen frontier while every
+/// transaction timed out). Three consecutive failed writes ≈ several minutes
+/// of a dead exchange — tear the session down and let the reconnect + --reset
+/// machinery recover it.
+const WRITE_FAILURES_LINK_DOWN: u64 = 3;
+
 /// Transparent [`PactorTransport`] wrapper that counts frames and bytes going
 /// over the modem, so the RPC can serve real link throughput (`/radio` and the
 /// `radio_stats` WebSocket update the explorer's live stats panel waits for).
+/// Also watchdogs the link: consecutive write failures flip `is_link_up`.
 struct CountingTransport {
     inner: Arc<dyn PactorTransport>,
     counters: Arc<LinkCounters>,
+    /// Per-session (this wrapper wraps one session's transport), so a fresh
+    /// reconnect never inherits a stale failure count.
+    consecutive_write_failures: AtomicU64,
 }
 
 #[async_trait::async_trait]
@@ -277,12 +290,24 @@ impl PactorTransport for CountingTransport {
     }
 
     async fn write_data(&self, data: &[u8]) -> Result<(), scs_pactor::ScsPactorError> {
-        self.inner.write_data(data).await?;
-        self.counters.frames_sent.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .bytes_sent
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-        Ok(())
+        match self.inner.write_data(data).await {
+            Ok(()) => {
+                self.consecutive_write_failures.store(0, Ordering::Relaxed);
+                self.counters.frames_sent.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .bytes_sent
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                let failures = self
+                    .consecutive_write_failures
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                log::warn!("[link-watchdog] write failure {failures}/{WRITE_FAILURES_LINK_DOWN}: {e}");
+                Err(e)
+            }
+        }
     }
 
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, scs_pactor::ScsPactorError> {
@@ -303,6 +328,12 @@ impl PactorTransport for CountingTransport {
     }
 
     fn is_link_up(&self) -> bool {
+        if self.consecutive_write_failures.load(Ordering::Relaxed) >= WRITE_FAILURES_LINK_DOWN {
+            // Wedged modem: transactions time out but no disconnect event ever
+            // arrives. Declare the link down so the session watch tears it
+            // down and the reconnect path (--reset) recovers.
+            return false;
+        }
         self.inner.is_link_up()
     }
 
@@ -344,45 +375,6 @@ fn spawn_link_quality_poller(
                     if ev.is_err() {
                         // Timeout (no event) or torn-down transport: don't spin.
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// Actively poll the modem's hostmode STATUS channel every 10s (hardware
-/// only). Hostmode is host-driven: the modem reports link status — including
-/// the negotiated speed level — only when polled, and nothing polls channel
-/// 254 during a session, so the panel's speed level stayed empty on air.
-/// This is serial-line traffic between host and modem only (nothing is
-/// transmitted over the radio), and `hostmode_transaction` serializes it
-/// against concurrent data I/O. The response frame also flows through the
-/// reader's LinkQuality routing; recording here is the direct path.
-fn spawn_status_poller(
-    transport: Arc<UsbPactorTransport>,
-    counters: Arc<LinkCounters>,
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(Duration::from_secs(10)) => {
-                    match transport.poll_status().await {
-                        Ok(payload) => {
-                            // Log the raw payload: the DR-7400's status block
-                            // layout is firmware-defined, and this is how we
-                            // verify which byte carries the speed level.
-                            log::info!("[status-poll] payload={payload:02x?}");
-                            // Same layout route_frame parses: speed level at [2].
-                            if payload.len() >= 3 {
-                                counters
-                                    .speed_level
-                                    .store(u64::from(payload[2]), Ordering::Relaxed);
-                            }
-                        }
-                        Err(e) => log::info!("[status-poll] failed: {e}"),
                     }
                 }
             }
@@ -1138,6 +1130,7 @@ async fn run_simulated(
     let ta: Arc<dyn PactorTransport> = Arc::new(CountingTransport {
         inner: Arc::new(ta),
         counters: link_counters.clone(),
+        consecutive_write_failures: AtomicU64::new(0),
     });
     let tb: Arc<dyn PactorTransport> = Arc::new(tb);
 
@@ -1378,20 +1371,24 @@ async fn run_hardware(
             }
         };
 
-        // Keep a concrete handle for hostmode status polling (the trait
-        // doesn't expose poll_status), then wrap for frame/byte counting.
-        let concrete = Arc::new(transport);
+        // Count frames/bytes over the modem for the live radio-stats panel.
+        // NOTE: no active hostmode status polling here — a 10s status poll was
+        // tried and it destabilized the link: its transactions interleaved
+        // with the mux writer's data transactions on a busy (receive-heavy)
+        // link and desynced the hostmode exchange, wedging the modem twice
+        // within minutes on-air. The counters also gate is_link_up (see
+        // CountingTransport) so a wedged link tears the session down instead
+        // of stalling forever.
         let transport: Arc<dyn PactorTransport> = Arc::new(CountingTransport {
-            inner: concrete.clone(),
+            inner: Arc::new(transport),
             counters: link_counters.clone(),
+            consecutive_write_failures: AtomicU64::new(0),
         });
         // Half-duplex link: the caller (node 0) starts holding the transmit turn.
         let (node, handle, mempool, exec) =
             build_node(transport.clone(), own_id, &cluster, Some(is_caller));
-        // Drive the modem's passive status events, and actively poll the
-        // STATUS channel so the negotiated speed level reaches the panel.
+        // Drive the modem's passive status events (LinkQuality etc.).
         spawn_link_quality_poller(transport.clone(), node.get_cancel_token());
-        spawn_status_poller(concrete, link_counters.clone(), node.get_cancel_token());
 
         // Publish this session's mempool so the bridge submits over the new mux.
         *mempool_slot.write().await = Some(mempool.clone());
