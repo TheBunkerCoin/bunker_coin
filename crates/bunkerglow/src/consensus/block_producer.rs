@@ -154,6 +154,23 @@ where
 
             let last_slot_in_window = first_slot_in_window.last_slot_in_window();
 
+            // Skip windows already behind the finalized frontier. After a
+            // restart the pool restores the frontier (e.g. slot 619), but this
+            // loop starts at genesis — and `wait_for_first_slot` reports old
+            // windows Ready (their parents are in the blockstore), so the
+            // leader RE-produced and re-disseminated every historical window
+            // at full block cadence (hours of radio time at frontier 619)
+            // before producing anything new. Deterministic re-production made
+            // this harmless to state, but it stalled fresh blocks entirely.
+            let finalized = self.pool.read().await.finalized_slot();
+            if last_slot_in_window <= finalized {
+                debug!(
+                    "[val {}] not producing in window {first_slot_in_window}..{last_slot_in_window}, already finalized up to {finalized}",
+                    self.epoch_info.own_id
+                );
+                continue;
+            }
+
             // don't do anything if we are not the leader
             let leader = self.epoch_info.leader(first_slot_in_window);
             if leader.id != self.epoch_info.own_id {
