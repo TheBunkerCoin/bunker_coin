@@ -823,6 +823,7 @@ pub async fn multi_node_consensus_simulation_with_api(
                     packet_loss_rate_2s: 0.0,
                     packets_queued: 0,
                     link_speed_level: 0,
+                    bytes_received_2s: 0,
                 });
 
                 let blocks_result = blocks.try_write();

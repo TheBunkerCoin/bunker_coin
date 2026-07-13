@@ -351,6 +351,38 @@ fn spawn_link_quality_poller(
     });
 }
 
+/// Actively poll the modem's hostmode STATUS channel every 10s (hardware
+/// only). Hostmode is host-driven: the modem reports link status — including
+/// the negotiated speed level — only when polled, and nothing polls channel
+/// 254 during a session, so the panel's speed level stayed empty on air.
+/// This is serial-line traffic between host and modem only (nothing is
+/// transmitted over the radio), and `hostmode_transaction` serializes it
+/// against concurrent data I/O. The response frame also flows through the
+/// reader's LinkQuality routing; recording here is the direct path.
+fn spawn_status_poller(
+    transport: Arc<UsbPactorTransport>,
+    counters: Arc<LinkCounters>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(Duration::from_secs(10)) => {
+                    if let Ok(payload) = transport.poll_status().await {
+                        // Same layout route_frame parses: speed level at [2].
+                        if payload.len() >= 3 {
+                            counters
+                                .speed_level
+                                .store(u64::from(payload[2]), Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Number of 2s samples in the radio-stats rolling window (15 × 2s = 30s).
 const RADIO_STATS_WINDOW_SAMPLES: usize = 15;
 
@@ -423,6 +455,7 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
                 packet_loss_rate_2s: 0.0,
                 packets_queued: 0,
                 link_speed_level: speed_level,
+                bytes_received_2s: w_recv,
             });
         }
     });
@@ -1338,17 +1371,20 @@ async fn run_hardware(
             }
         };
 
-        // Count frames/bytes over the modem for the live radio-stats panel.
+        // Keep a concrete handle for hostmode status polling (the trait
+        // doesn't expose poll_status), then wrap for frame/byte counting.
+        let concrete = Arc::new(transport);
         let transport: Arc<dyn PactorTransport> = Arc::new(CountingTransport {
-            inner: Arc::new(transport),
+            inner: concrete.clone(),
             counters: link_counters.clone(),
         });
         // Half-duplex link: the caller (node 0) starts holding the transmit turn.
         let (node, handle, mempool, exec) =
             build_node(transport.clone(), own_id, &cluster, Some(is_caller));
-        // Drive the modem's passive status events so the speed level reaches
-        // the radio-stats panel.
+        // Drive the modem's passive status events, and actively poll the
+        // STATUS channel so the negotiated speed level reaches the panel.
         spawn_link_quality_poller(transport.clone(), node.get_cancel_token());
+        spawn_status_poller(concrete, link_counters.clone(), node.get_cancel_token());
 
         // Publish this session's mempool so the bridge submits over the new mux.
         *mempool_slot.write().await = Some(mempool.clone());

@@ -163,10 +163,14 @@ pub enum WebSocketUpdate {
         effective_throughput_bps_2s: f64,
         packet_loss_rate_2s: f64,
         packets_queued: u64,
-        /// Modem-reported PACTOR speed level (from passive LinkQuality status
-        /// events); 0 = not yet reported. The live band-health signal: drops
-        /// when the band degrades, climbs as it clears.
+        /// Modem-reported PACTOR speed level (from LinkQuality status events);
+        /// 0 = not yet reported. The live band-health signal: drops when the
+        /// band degrades, climbs as it clears.
         link_speed_level: u64,
+        /// Bytes heard from the peer over the window. On a half-duplex link a
+        /// node spends whole windows only receiving; without this the panel
+        /// showed 0 transmitted alongside nonzero (two-way) throughput.
+        bytes_received_2s: u64,
     },
     #[serde(rename = "transaction_received")]
     TransactionReceived {
