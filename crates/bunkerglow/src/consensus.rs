@@ -90,8 +90,21 @@ fn delta_timeout() -> Duration {
     scaled(240_000)
 }
 /// Timeout for standstill detection mechanism.
+///
+/// Deliberately NOT scaled by `BUNKER_DELTA_MULT`: standstill recovery is a
+/// small cert+vote rebroadcast that only fires when finalization has made no
+/// progress at all, so a short period is safe even on a slow link. Scaled,
+/// this was 30 minutes on the hardware profile — and a link outage that
+/// loses in-flight votes (both nodes voted, votes were lost, the
+/// double-vote guard stops re-voting) deadlocks the chain until standstill
+/// recovery rebroadcasts them (observed on-air at slot 760). Override with
+/// `BUNKER_STANDSTILL_SECS`.
 fn delta_standstill() -> Duration {
-    scaled(300_000)
+    std::env::var("BUNKER_STANDSTILL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(300))
 }
 /// Max time to produce and send the first slice of a block.
 pub(crate) fn delta_first_slice() -> Duration {
@@ -497,7 +510,10 @@ where
                 self.pool.read().await.recover_from_standstill().await;
                 last_progress = Instant::now();
             }
-            tokio::time::sleep(delta_block()).await;
+            // Check at a fixed cadence: sleeping delta_block() (12 minutes at
+            // the hardware delta_mult) added up to a full block window of
+            // detection latency on top of the standstill period itself.
+            tokio::time::sleep(delta_block().min(Duration::from_secs(60))).await;
         }
     }
 
