@@ -369,13 +369,20 @@ fn spawn_status_poller(
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(Duration::from_secs(10)) => {
-                    if let Ok(payload) = transport.poll_status().await {
-                        // Same layout route_frame parses: speed level at [2].
-                        if payload.len() >= 3 {
-                            counters
-                                .speed_level
-                                .store(u64::from(payload[2]), Ordering::Relaxed);
+                    match transport.poll_status().await {
+                        Ok(payload) => {
+                            // Log the raw payload: the DR-7400's status block
+                            // layout is firmware-defined, and this is how we
+                            // verify which byte carries the speed level.
+                            log::info!("[status-poll] payload={payload:02x?}");
+                            // Same layout route_frame parses: speed level at [2].
+                            if payload.len() >= 3 {
+                                counters
+                                    .speed_level
+                                    .store(u64::from(payload[2]), Ordering::Relaxed);
+                            }
                         }
+                        Err(e) => log::info!("[status-poll] failed: {e}"),
                     }
                 }
             }
