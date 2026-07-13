@@ -843,6 +843,58 @@ async fn blocks(
         }
     }
 
+    // A finalized block finalizes all its ancestors, but only the slot with
+    // the explicit certificate gets a finalized timestamp written — adopted
+    // ancestors otherwise display as eternal "proposed" HOLES inside the
+    // finalized chain (observed on-air: 752-755 shown proposed while
+    // finalized 756 chained through them). Walk parent links down from the
+    // highest finalized block and mark every visited block finalized. (A
+    // naive "below the frontier" rule would wrongly bless skip-certified
+    // slots whose produced-but-dead blocks are still stored.)
+    {
+        let mut index_by_hash: HashMap<String, usize> = HashMap::new();
+        for (i, b) in all_blocks.iter().enumerate() {
+            if let Block::Block { hash, .. } = b {
+                index_by_hash.insert(hash.clone(), i);
+            }
+        }
+        let mut cursor = all_blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b,
+                    Block::Block {
+                        status: SlotStatus::Finalized,
+                        ..
+                    }
+                )
+            })
+            .max_by_key(|b| b.slot())
+            .and_then(|b| match b {
+                Block::Block { hash, .. } => Some(hash.clone()),
+                _ => None,
+            });
+        while let Some(h) = cursor {
+            let Some(&i) = index_by_hash.get(&h) else {
+                break;
+            };
+            // Guard against parent-hash cycles (corrupt data): each hop is
+            // removed from the map, so the walk visits each block once.
+            index_by_hash.remove(&h);
+            cursor = match &mut all_blocks[i] {
+                Block::Block {
+                    status,
+                    parent_hash,
+                    ..
+                } => {
+                    *status = SlotStatus::Finalized;
+                    Some(parent_hash.clone())
+                }
+                _ => None,
+            };
+        }
+    }
+
     all_blocks.sort_by(|a, b| b.slot().cmp(&a.slot()));
 
     let total = all_blocks.len();
