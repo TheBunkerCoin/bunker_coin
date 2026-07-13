@@ -314,11 +314,18 @@ impl PactorTransport for CountingTransport {
     }
 }
 
+/// Number of 2s samples in the radio-stats rolling window (15 × 2s = 30s).
+const RADIO_STATS_WINDOW_SAMPLES: usize = 15;
+
 /// Every 2s, turn the transport counters into the `radio_stats` WebSocket
-/// update (which the explorer's "Live Radio Network Stats" panel renders) and
-/// the `/radio` REST stats. Only counters we actually observe are reported:
-/// PACTOR ARQ retransmits below this layer, so per-frame loss is not visible —
-/// dropped/loss stay 0 rather than being fabricated.
+/// update (which the explorer's live stats panel renders) and the `/radio`
+/// REST stats. Reports a ROLLING 30s WINDOW rather than raw 2s deltas: on a
+/// half-duplex HF link traffic comes in bursts with long quiet gaps, so most
+/// 2s snapshots are genuinely zero and the panel strobed 0 between bursts.
+/// The windowed figures show the link's recent activity at any moment.
+/// Only counters we actually observe are reported: PACTOR ARQ retransmits
+/// below this layer, so per-frame loss is not visible — dropped/loss stay 0
+/// rather than being fabricated.
 fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
     let updates = tx.updates.clone();
     let radio_stats = tx.radio_stats.clone();
@@ -326,6 +333,9 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
         let mut last_sent_frames = 0u64;
         let mut last_sent_bytes = 0u64;
         let mut last_recv_bytes = 0u64;
+        // Ring of (frames_sent, bytes_sent, bytes_received) per 2s tick.
+        let mut window: std::collections::VecDeque<(u64, u64, u64)> =
+            std::collections::VecDeque::with_capacity(RADIO_STATS_WINDOW_SAMPLES);
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -340,9 +350,20 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
             last_sent_bytes = sent_bytes;
             last_recv_bytes = recv_bytes;
 
+            if window.len() == RADIO_STATS_WINDOW_SAMPLES {
+                window.pop_front();
+            }
+            window.push_back((d_frames, d_sent, d_recv));
+
+            let w_frames: u64 = window.iter().map(|s| s.0).sum();
+            let w_sent: u64 = window.iter().map(|s| s.1).sum();
+            let w_recv: u64 = window.iter().map(|s| s.2).sum();
+            let window_secs = (window.len() * 2) as f64;
+
             // Throughput counts both directions: this node's transmissions and
-            // what it hears from the peer — i.e. traffic on the shared channel.
-            let throughput_bps = ((d_sent + d_recv) * 8) as f64 / 2.0;
+            // what it hears from the peer — i.e. traffic on the shared channel,
+            // averaged over the window.
+            let throughput_bps = ((w_sent + w_recv) * 8) as f64 / window_secs;
 
             {
                 let mut stats = radio_stats.write().await;
@@ -350,12 +371,14 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
                 stats.current_throughput_bps = throughput_bps;
             }
 
+            // Windowed totals in the *_2s fields (the wire names are historic;
+            // the explorer labels the panel with the actual window length).
             // No WS client connected is fine; send() just returns Err.
             let _ = updates.send(rpc::WebSocketUpdate::RadioStats {
-                packets_sent_2s: d_frames,
+                packets_sent_2s: w_frames,
                 packets_dropped_2s: 0,
-                packets_transmitted_2s: d_frames,
-                bytes_transmitted_2s: d_sent,
+                packets_transmitted_2s: w_frames,
+                bytes_transmitted_2s: w_sent,
                 effective_throughput_bps_2s: throughput_bps,
                 packet_loss_rate_2s: 0.0,
                 packets_queued: 0,
