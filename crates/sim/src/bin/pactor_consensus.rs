@@ -209,6 +209,7 @@ impl TxContext {
                 packets_sent: 0,
                 packets_dropped: 0,
                 current_throughput_bps: 0.0,
+                link_speed_level: 0,
             })),
         };
         (ctx, tx_rx)
@@ -245,6 +246,9 @@ struct LinkCounters {
     bytes_sent: AtomicU64,
     frames_received: AtomicU64,
     bytes_received: AtomicU64,
+    /// Last modem-reported PACTOR speed level (passive LinkQuality status
+    /// events, recorded as they pass through `next_event`). 0 = none yet.
+    speed_level: AtomicU64,
 }
 
 /// Transparent [`PactorTransport`] wrapper that counts frames and bytes going
@@ -306,12 +310,45 @@ impl PactorTransport for CountingTransport {
         &self,
         timeout_after: Option<Duration>,
     ) -> Result<scs_pactor::PactorLinkEvent, scs_pactor::ScsPactorError> {
-        self.inner.next_event(timeout_after).await
+        let event = self.inner.next_event(timeout_after).await;
+        // Record the modem's negotiated speed level as events pass through —
+        // the honest live band-health signal for the radio-stats panel.
+        if let Ok(scs_pactor::PactorLinkEvent::LinkQuality { speed_level, .. }) = &event {
+            self.counters
+                .speed_level
+                .store(u64::from(*speed_level), Ordering::Relaxed);
+        }
+        event
     }
 
     async fn broadcast_fec(&self, data: &[u8]) -> Result<(), scs_pactor::ScsPactorError> {
         self.inner.broadcast_fec(data).await
     }
+}
+
+/// Drive the transport's passive event stream so LinkQuality status events
+/// (modem speed level) are observed. Nothing else on this path consumes
+/// `next_event`, so without a driver the events would sit unread; the
+/// recording itself happens inside [`CountingTransport::next_event`]. Ends
+/// when the session's cancel token fires (each session wraps a fresh
+/// transport).
+fn spawn_link_quality_poller(
+    transport: Arc<dyn PactorTransport>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                ev = transport.next_event(Some(Duration::from_secs(5))) => {
+                    if ev.is_err() {
+                        // Timeout (no event) or torn-down transport: don't spin.
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Number of 2s samples in the radio-stats rolling window (15 × 2s = 30s).
@@ -365,10 +402,13 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
             // averaged over the window.
             let throughput_bps = ((w_sent + w_recv) * 8) as f64 / window_secs;
 
+            let speed_level = counters.speed_level.load(Ordering::Relaxed);
+
             {
                 let mut stats = radio_stats.write().await;
                 stats.packets_sent = sent_frames;
                 stats.current_throughput_bps = throughput_bps;
+                stats.link_speed_level = speed_level;
             }
 
             // Windowed totals in the *_2s fields (the wire names are historic;
@@ -382,6 +422,7 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
                 effective_throughput_bps_2s: throughput_bps,
                 packet_loss_rate_2s: 0.0,
                 packets_queued: 0,
+                link_speed_level: speed_level,
             });
         }
     });
@@ -1064,8 +1105,9 @@ async fn run_simulated(
     // the turn, node 1 without.
     let turn_a = half_duplex.then_some(true);
     let turn_b = half_duplex.then_some(false);
-    let (node_a, handle_a, mempool_a, exec_a) = build_node(ta, 0, &cluster, turn_a);
+    let (node_a, handle_a, mempool_a, exec_a) = build_node(ta.clone(), 0, &cluster, turn_a);
     let (node_b, handle_b, mempool_b, exec_b) = build_node(tb, 1, &cluster, turn_b);
+    spawn_link_quality_poller(ta, node_a.get_cancel_token());
 
     // Per-node transaction contexts (each over its own genesis-funded state).
     let (tx_a, tx_rx_a) = TxContext::new(&cluster, exec_a);
@@ -1304,6 +1346,9 @@ async fn run_hardware(
         // Half-duplex link: the caller (node 0) starts holding the transmit turn.
         let (node, handle, mempool, exec) =
             build_node(transport.clone(), own_id, &cluster, Some(is_caller));
+        // Drive the modem's passive status events so the speed level reaches
+        // the radio-stats panel.
+        spawn_link_quality_poller(transport.clone(), node.get_cancel_token());
 
         // Publish this session's mempool so the bridge submits over the new mux.
         *mempool_slot.write().await = Some(mempool.clone());

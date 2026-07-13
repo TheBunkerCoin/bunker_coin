@@ -163,6 +163,10 @@ pub enum WebSocketUpdate {
         effective_throughput_bps_2s: f64,
         packet_loss_rate_2s: f64,
         packets_queued: u64,
+        /// Modem-reported PACTOR speed level (from passive LinkQuality status
+        /// events); 0 = not yet reported. The live band-health signal: drops
+        /// when the band degrades, climbs as it clears.
+        link_speed_level: u64,
     },
     #[serde(rename = "transaction_received")]
     TransactionReceived {
@@ -198,6 +202,9 @@ pub struct RadioStats {
     pub packets_sent: u64,
     pub packets_dropped: u64,
     pub current_throughput_bps: f64,
+    /// Modem-reported PACTOR speed level (0 = not yet reported).
+    #[serde(default)]
+    pub link_speed_level: u64,
 }
 
 // -- transaction / mempool types --

@@ -41,6 +41,7 @@ async fn main() {
         packets_sent: 0,
         packets_dropped: 0,
         current_throughput_bps: 0.0,
+        link_speed_level: 0,
     }));
     let (updates_tx, _) = broadcast::channel(1000);
 
