@@ -2412,6 +2412,224 @@ mod tests {
     }
 }
 
+
+// -- Solana-style JSON-RPC 2.0 (wallet interface) --
+//
+// Wallets POST envelopes to "/" — {"jsonrpc":"2.0","id":1,"method":"getBalance",
+// "params":["<pubkey>"]} — single or batch. Method names follow Solana's
+// conventions, mapped onto this node's native REST surface by dispatching
+// internally through the same Router (no re-implementation of handlers).
+
+#[derive(serde::Deserialize)]
+struct JsonRpcRequest {
+    jsonrpc: Option<String>,
+    id: Option<serde_json::Value>,
+    method: Option<String>,
+    #[serde(default)]
+    params: Vec<serde_json::Value>,
+}
+
+fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+fn rpc_ok(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+fn param_str(params: &[serde_json::Value], i: usize) -> Result<&str, ()> {
+    params.get(i).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or(())
+}
+
+fn param_u64(params: &[serde_json::Value], i: usize, fallback: u64) -> Result<u64, ()> {
+    match params.get(i) {
+        None => Ok(fallback),
+        Some(v) => v.as_u64().ok_or(()),
+    }
+}
+
+/// Dispatch an internal request through the REST router and parse the JSON body.
+async fn rest_dispatch(
+    rest: &Router,
+    method: axum::http::Method,
+    path_and_query: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, (i64, String)> {
+    use tower::util::ServiceExt;
+
+    let builder = axum::http::Request::builder().method(method).uri(path_and_query);
+    let request = match body {
+        Some(b) => builder
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(b).unwrap_or_default())),
+        None => builder.body(axum::body::Body::empty()),
+    }
+    .map_err(|e| (-32603i64, format!("internal request build failed: {e}")))?;
+
+    let response = rest
+        .clone()
+        .oneshot(request)
+        .await
+        .map_err(|_| (-32603i64, "internal dispatch failed".to_owned()))?;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .map_err(|e| (-32603i64, format!("body read failed: {e}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+
+    if status.is_success() {
+        Ok(value)
+    } else {
+        let message = value
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("upstream status {status}"));
+        Err((-32000, message))
+    }
+}
+
+async fn handle_rpc_call(rest: &Router, call: JsonRpcRequest) -> serde_json::Value {
+    let id = call.id.unwrap_or(serde_json::Value::Null);
+    if call.jsonrpc.as_deref() != Some("2.0") || call.method.is_none() {
+        return rpc_error(id, -32600, "Invalid request");
+    }
+    let method = call.method.unwrap();
+    let p = &call.params;
+    use axum::http::Method as M;
+
+    // Map the Solana-style method onto a REST dispatch (or answer locally).
+    let dispatched: Result<Result<serde_json::Value, (i64, String)>, ()> = match method.as_str() {
+        "getHealth" => Ok(Ok(serde_json::json!("ok"))),
+        "getSlot" => Ok(match rest_dispatch(rest, M::GET, "/nodes", None).await {
+            Ok(nodes) => Ok(serde_json::json!(nodes
+                .as_array()
+                .map(|ns| ns
+                    .iter()
+                    .filter_map(|n| n.get("finalized_slot").and_then(|s| s.as_u64()))
+                    .max()
+                    .unwrap_or(0))
+                .unwrap_or(0))),
+            Err(e) => Err(e),
+        }),
+        "getNodes" => Ok(rest_dispatch(rest, M::GET, "/nodes", None).await),
+        "getGenesis" => Ok(rest_dispatch(rest, M::GET, "/genesis", None).await),
+        "getStaking" => Ok(rest_dispatch(rest, M::GET, "/staking", None).await),
+        "getTokens" => Ok(rest_dispatch(rest, M::GET, "/tokens", None).await),
+        "getBlock" => match param_u64(p, 0, u64::MAX) {
+            Ok(slot) if slot != u64::MAX => {
+                Ok(rest_dispatch(rest, M::GET, &format!("/block/slot/{slot}"), None).await)
+            }
+            _ => Err(()),
+        },
+        "getBlocks" => match (param_u64(p, 0, 20), param_u64(p, 1, 0)) {
+            (Ok(limit), Ok(offset)) => Ok(rest_dispatch(
+                rest,
+                M::GET,
+                &format!("/blocks?limit={limit}&offset={offset}"),
+                None,
+            )
+            .await),
+            _ => Err(()),
+        },
+        "getBalance" => match param_str(p, 0) {
+            Ok(pk) => Ok(
+                match rest_dispatch(rest, M::GET, &format!("/accounts/{pk}"), None).await {
+                    Ok(acct) => Ok(acct.get("native_balance").cloned().unwrap_or(serde_json::json!(0))),
+                    Err(e) => Err(e),
+                },
+            ),
+            Err(()) => Err(()),
+        },
+        "getAccountInfo" => match param_str(p, 0) {
+            Ok(pk) => Ok(rest_dispatch(rest, M::GET, &format!("/accounts/{pk}"), None).await),
+            Err(()) => Err(()),
+        },
+        "getTokenAccountsByOwner" => match param_str(p, 0) {
+            Ok(pk) => Ok(rest_dispatch(rest, M::GET, &format!("/accounts/{pk}/tokens"), None).await),
+            Err(()) => Err(()),
+        },
+        "getToken" => match param_str(p, 0) {
+            Ok(tid) => Ok(rest_dispatch(rest, M::GET, &format!("/tokens/{tid}"), None).await),
+            Err(()) => Err(()),
+        },
+        "getTokenHolders" => match param_str(p, 0) {
+            Ok(tid) => Ok(rest_dispatch(rest, M::GET, &format!("/tokens/{tid}/holders"), None).await),
+            Err(()) => Err(()),
+        },
+        "sendTransaction" => match p.first() {
+            Some(tx) if tx.is_object() => {
+                Ok(rest_dispatch(rest, M::POST, "/transactions", Some(tx)).await)
+            }
+            _ => Err(()),
+        },
+        "getTransaction" => match param_str(p, 0) {
+            Ok(hash) => Ok(rest_dispatch(rest, M::GET, &format!("/transactions/{hash}"), None).await),
+            Err(()) => Err(()),
+        },
+        "getTransactions" => match (param_u64(p, 0, 50), param_u64(p, 1, 0)) {
+            (Ok(limit), Ok(offset)) => Ok(rest_dispatch(
+                rest,
+                M::GET,
+                &format!("/transactions?limit={limit}&offset={offset}"),
+                None,
+            )
+            .await),
+            _ => Err(()),
+        },
+        "getMempool" => match (param_u64(p, 0, 100), param_u64(p, 1, 0)) {
+            (Ok(limit), Ok(offset)) => Ok(rest_dispatch(
+                rest,
+                M::GET,
+                &format!("/mempool?limit={limit}&offset={offset}"),
+                None,
+            )
+            .await),
+            _ => Err(()),
+        },
+        _ => return rpc_error(id, -32601, "Method not found"),
+    };
+
+    match dispatched {
+        Err(()) => rpc_error(id, -32602, "Invalid params"),
+        Ok(Ok(result)) => rpc_ok(id, result),
+        Ok(Err((code, message))) => rpc_error(id, code, &message),
+    }
+}
+
+async fn jsonrpc_handler(
+    axum::extract::Extension(rest): axum::extract::Extension<Router>,
+    body: String,
+) -> Json<serde_json::Value> {
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(rpc_error(serde_json::Value::Null, -32700, "Parse error")),
+    };
+
+    if let serde_json::Value::Array(calls) = payload {
+        if calls.is_empty() {
+            return Json(rpc_error(serde_json::Value::Null, -32600, "Invalid request"));
+        }
+        let mut out = Vec::with_capacity(calls.len());
+        for call in calls {
+            let parsed: JsonRpcRequest = serde_json::from_value(call).unwrap_or(JsonRpcRequest {
+                jsonrpc: None,
+                id: None,
+                method: None,
+                params: Vec::new(),
+            });
+            out.push(handle_rpc_call(&rest, parsed).await);
+        }
+        return Json(serde_json::Value::Array(out));
+    }
+
+    let parsed: JsonRpcRequest = match serde_json::from_value(payload) {
+        Ok(r) => r,
+        Err(_) => return Json(rpc_error(serde_json::Value::Null, -32600, "Invalid request")),
+    };
+    Json(handle_rpc_call(&rest, parsed).await)
+}
+
 pub async fn run_api(state: SharedState) {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
@@ -2444,8 +2662,15 @@ pub async fn run_api(state: SharedState) {
         .route("/snapshots/{epoch}/chunks/{index}", get(get_snapshot_chunk))
         .route("/genesis", get(get_genesis))
         .route("/ws", get(websocket_handler))
-        .layer(cors)
+        .layer(cors.clone())
         .with_state(state);
+    // Solana-style JSON-RPC 2.0 at POST / — dispatches into the REST router
+    // internally, so every method reuses the exact same handlers.
+    let app = Router::new()
+        .route("/", axum::routing::post(jsonrpc_handler))
+        .layer(axum::extract::Extension(app.clone()))
+        .layer(cors)
+        .merge(app);
     // Bind address is overridable via BUNKER_RPC_ADDR (default loopback-only).
     // Set it to e.g. `0.0.0.0:3001` (or `<tailnet-ip>:3001`) when the API must
     // be reachable from another machine, such as the bastion proxying the

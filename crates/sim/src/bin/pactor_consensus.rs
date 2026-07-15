@@ -21,7 +21,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::Transaction as CoreTransaction;
@@ -260,6 +260,21 @@ struct LinkCounters {
 /// machinery recover it.
 const WRITE_FAILURES_LINK_DOWN: u64 = 3;
 
+/// Seconds without a single received byte after which the link is declared
+/// dead (override with BUNKER_RX_STALL_SECS). Catches the BLACK-HOLED link the
+/// write watchdog cannot see: a modem stuck in a stale "connected" state
+/// accepts writes into its buffer while nothing crosses the air — and also
+/// refuses the peer's reconnect calls (observed on-air: node0 failed 35
+/// connect sessions while node1 sat "connected" for hours at a frozen
+/// frontier). On this network there is no legitimate 10-minute radio silence:
+/// blocks, votes, or standstill rebroadcasts cross every couple of minutes.
+fn rx_stall_link_down_secs() -> u64 {
+    std::env::var("BUNKER_RX_STALL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(600)
+}
+
 /// Transparent [`PactorTransport`] wrapper that counts frames and bytes going
 /// over the modem, so the RPC can serve real link throughput (`/radio` and the
 /// `radio_stats` WebSocket update the explorer's live stats panel waits for).
@@ -270,6 +285,9 @@ struct CountingTransport {
     /// Per-session (this wrapper wraps one session's transport), so a fresh
     /// reconnect never inherits a stale failure count.
     consecutive_write_failures: AtomicU64,
+    /// When we last received bytes (session start seeds it, so bring-up gets
+    /// the full grace period). Drives the rx-stall link watchdog.
+    last_rx: std::sync::Mutex<Instant>,
 }
 
 #[async_trait::async_trait]
@@ -312,6 +330,7 @@ impl PactorTransport for CountingTransport {
 
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, scs_pactor::ScsPactorError> {
         let payload = self.inner.read_data(max_len).await?;
+        *self.last_rx.lock().unwrap() = Instant::now();
         self.counters.frames_received.fetch_add(1, Ordering::Relaxed);
         self.counters
             .bytes_received
@@ -328,6 +347,13 @@ impl PactorTransport for CountingTransport {
     }
 
     fn is_link_up(&self) -> bool {
+        let rx_stalled = self.last_rx.lock().unwrap().elapsed().as_secs();
+        if rx_stalled > rx_stall_link_down_secs() {
+            log::warn!(
+                "[link-watchdog] no bytes received for {rx_stalled}s; declaring link down"
+            );
+            return false;
+        }
         if self.consecutive_write_failures.load(Ordering::Relaxed) >= WRITE_FAILURES_LINK_DOWN {
             // Wedged modem: transactions time out but no disconnect event ever
             // arrives. Declare the link down so the session watch tears it
@@ -1131,6 +1157,7 @@ async fn run_simulated(
         inner: Arc::new(ta),
         counters: link_counters.clone(),
         consecutive_write_failures: AtomicU64::new(0),
+        last_rx: std::sync::Mutex::new(Instant::now()),
     });
     let tb: Arc<dyn PactorTransport> = Arc::new(tb);
 
@@ -1383,6 +1410,7 @@ async fn run_hardware(
             inner: Arc::new(transport),
             counters: link_counters.clone(),
             consecutive_write_failures: AtomicU64::new(0),
+            last_rx: std::sync::Mutex::new(Instant::now()),
         });
         // Half-duplex link: the caller (node 0) starts holding the transmit turn.
         let (node, handle, mempool, exec) =
