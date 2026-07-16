@@ -824,8 +824,18 @@ async fn blocks(
             let nodes = state.nodes.read().await;
             nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
         };
+        let top = highest_mem_slot.max(highest_finalized_slot) + 200;
 
-        for slot_u64 in 0..=highest_mem_slot.max(highest_finalized_slot) + 200 {
+        // Only scan the window this page needs, newest-first — NOT from slot 0.
+        // Blocks sort descending and we return [offset, offset+limit); scanning
+        // the whole chain from genesis on every request was O(chain length)
+        // RocksDB lookups (seconds-to-minutes per call on a month-long chain).
+        // Extra headroom absorbs skip-certified slots that yield no block.
+        let want = offset + limit;
+        let window = (want * 3).max(400) as u64;
+        let low = top.saturating_sub(window);
+
+        for slot_u64 in low..=top {
             if all_blocks.iter().any(|b| b.slot() == slot_u64) {
                 continue;
             }
@@ -1113,8 +1123,19 @@ async fn list_transactions(
         // it) with the duplicate failing on nonce mismatch; list each tx
         // once, at its canonical inclusion — the one that actually executed
         // (per tx_results).
+        // Bounded newest-first scan: collect enough for this page, then stop —
+        // and never scan more than `max_scan` slots back, so a month-long chain
+        // (hundreds of thousands of slots) can't turn one request into a
+        // full-chain sweep. `total` is therefore "known so far", not the whole
+        // chain's tx count.
+        let need = offset + limit;
+        let max_scan: u64 = 20_000;
+        let scan_floor = highest_finalized_slot.saturating_sub(max_scan);
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for slot_u64 in (0..=highest_finalized_slot).rev() {
+        for slot_u64 in (scan_floor..=highest_finalized_slot).rev() {
+            if txs.len() >= need {
+                break;
+            }
             let slot = Slot::new(slot_u64);
             let Some(hash) = bs.canonical_block_hash(slot) else {
                 continue;
@@ -1211,7 +1232,14 @@ async fn find_tx_in_blockstore(
         nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
     };
 
-    for slot_u64 in 0..=highest_mem_slot.max(highest_finalized_slot) + 200 {
+    // Newest-first, bounded: a hash lookup backs "did my tx land" for a wallet,
+    // so the tx is recent — scan from the tip down, and no further than
+    // `max_scan` slots, so this stays O(1)-ish on a month-long chain instead of
+    // sweeping from genesis.
+    let top = highest_mem_slot.max(highest_finalized_slot) + 200;
+    let max_scan: u64 = 20_000;
+    let floor = top.saturating_sub(max_scan);
+    for slot_u64 in (floor..=top).rev() {
         let slot = Slot::new(slot_u64);
         if let Some(blk_hash) = bs.canonical_block_hash(slot) {
             let block_hash: DoubleMerkleRoot = blk_hash.clone().into();

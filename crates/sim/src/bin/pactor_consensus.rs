@@ -615,19 +615,27 @@ fn spawn_block_executor(
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             let finalized = pool.read().await.finalized_slot().inner();
-            if finalized <= last_executed {
-                continue;
-            }
 
-            // Advance `/nodes` to the new finalized frontier. Finalizing a slot
-            // in this two-node cluster requires both validators' votes, so both
-            // entries track the locally observed frontier.
+            // Advance `/nodes` to the finalized frontier EVERY tick, before and
+            // independent of execution. Previously this ran only when there was
+            // new work AND sat before a loop that could panic and kill this
+            // task — which froze /nodes forever (observed on-air: a bloat-tx
+            // decode panic at slot 3899 killed the executor; /nodes stuck,
+            // /blocks capped at frontier+200). Now the frontier tracks
+            // consensus even if execution stalls.
             for node in tx.nodes.write().await.iter_mut() {
                 node.finalized_slot = finalized;
             }
 
+            if finalized <= last_executed {
+                continue;
+            }
+
             let bs = blockstore.read().await;
-            for slot in (last_executed + 1)..=finalized {
+            // Bound per-tick work so catch-up after a restart stays responsive
+            // (a long-running chain can be hundreds of thousands of slots behind).
+            let batch_end = finalized.min(last_executed + 500);
+            for slot in (last_executed + 1)..=batch_end {
                 let slot_id = Slot::new(slot);
                 let Some(hash) = bs.canonical_block_hash(slot_id) else {
                     continue; // skip-certified slot: no block to execute
@@ -663,7 +671,7 @@ fn spawn_block_executor(
                 record_tx_results(&tx, slot, &block_hash_hex, &core_txs, &results).await;
             }
             drop(bs);
-            last_executed = finalized;
+            last_executed = batch_end;
         }
     });
 }

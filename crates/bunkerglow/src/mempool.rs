@@ -85,11 +85,18 @@ struct Entry {
 /// prefix-stripped bytes. Returns `None` for anything that is not a decodable
 /// transaction (it was never a valid client tx and must not be admitted).
 fn decode_core(wire: &Transaction) -> Option<CoreTransaction> {
+    // Limit-guarded: block payloads include BUNKER_BLOAT_BYTES random padding,
+    // and without a limit bincode skips its length check — a random u64 read as
+    // a String/Vec length triggers a `capacity overflow` PANIC. That panic in
+    // the block-executor task killed it permanently (chain kept finalizing but
+    // /nodes froze and /blocks capped at frontier+200; observed on-air at slot
+    // 3899). Real client txs are well under 4 KiB.
+    let config = bincode::config::standard().with_limit::<4096>();
     let data = &wire.0;
-    bincode::serde::decode_from_slice(data, bincode::config::standard())
+    bincode::serde::decode_from_slice(data, config)
         .or_else(|_| {
             if data.len() > 8 {
-                bincode::serde::decode_from_slice(&data[8..], bincode::config::standard())
+                bincode::serde::decode_from_slice(&data[8..], config)
             } else {
                 Err(bincode::error::DecodeError::Other("too short"))
             }
