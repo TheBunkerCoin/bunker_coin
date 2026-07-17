@@ -112,6 +112,41 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7);
 /// responsive despite the long idle hold.
 const IDLE_TURN_GRANT: Duration = Duration::from_secs(60);
 
+/// How long a non-holder waits with the link gone silent before it *reclaims*
+/// the transmit turn (self-grants). This is the recovery path for a lost
+/// turn-grant frame: without it, if the grant line is lost on-air (or dropped
+/// as an unparseable fragment), the granting side has already set
+/// `holds_turn=false` while the intended new holder never set it `true`, so
+/// **both** sides block forever waiting for the turn and the link deadlocks
+/// until the node-level rx-stall watchdog tears down the whole session.
+///
+/// The holder keeps the link busy with keepalives every [`KEEPALIVE_INTERVAL`]
+/// (~7s), so genuine peer activity refreshes `last_activity_ms` far inside this
+/// window; only a truly silent link (grant lost, or peer gone) lets it elapse.
+/// Sized well above the keepalive interval and one changeover so a merely-slow
+/// reverse path does not trigger a spurious reclaim. Overridable for tests via
+/// `BUNKER_TURN_RECLAIM_MS`.
+fn turn_reclaim_silence() -> Duration {
+    std::env::var("BUNKER_TURN_RECLAIM_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(45))
+}
+
+/// Extra reclaim delay applied to the side that did NOT start with the turn.
+/// Both sides reclaiming at the same instant could have them grab the turn
+/// together; staggering by role makes the original turn-holder reclaim first,
+/// so in the common case only one side ever reclaims. Overridable for tests via
+/// `BUNKER_RECLAIM_STAGGER_MS`.
+fn reclaim_role_stagger() -> Duration {
+    std::env::var("BUNKER_RECLAIM_STAGGER_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(15))
+}
+
 /// Shared half-duplex turn state between the mux reader and writer.
 ///
 /// `holds_turn` is `true` while this side may transmit. The writer waits on
@@ -120,6 +155,9 @@ const IDLE_TURN_GRANT: Duration = Duration::from_secs(60);
 struct TurnState {
     holds_turn: AtomicBool,
     granted: Notify,
+    /// Whether this side started with the turn (the caller). Used only to
+    /// stagger turn *reclaim* so both sides do not reclaim simultaneously.
+    starts_with_turn: bool,
 }
 
 /// Logical channel a multiplexed message belongs to. The discriminant is the
@@ -210,6 +248,7 @@ impl PactorMux {
         let turn = Arc::new(TurnState {
             holds_turn: AtomicBool::new(starts_with_turn),
             granted: Notify::new(),
+            starts_with_turn,
         });
         Self::build(transport, Some(turn))
     }
@@ -379,6 +418,7 @@ impl PactorMux {
         // the expensive changeover is used sparingly and the ARQ link does not
         // time out to STBY.
         let writer_transport = transport.clone();
+        let writer_activity = last_activity_ms.clone();
         let writer = tokio::spawn(async move {
             let mut outbound_rx = outbound_rx;
             let counter = message_counter;
@@ -404,9 +444,13 @@ impl PactorMux {
             // data. (Simulator / TCP — both sides write freely.)
             let Some(turn) = turn else {
                 while let Some(item) = outbound_rx.recv().await {
-                    if let Err(e) =
-                        write_message(&writer_transport, &counter, item.channel as u8, &item.payload)
-                            .await
+                    if let Err(e) = write_message(
+                        &writer_transport,
+                        &counter,
+                        item.channel as u8,
+                        &item.payload,
+                    )
+                    .await
                     {
                         warn!("[mux:writer] write_data failed: {e}");
                         return;
@@ -420,10 +464,42 @@ impl PactorMux {
             // queued, then grant to the peer so voting stays responsive. Before
             // an idle grant, send a keepalive so the silent changeover window does
             // not let the ARQ link time out to STBY.
+            // Reclaim delay for this side: the original turn-holder (caller)
+            // reclaims first, the listener waits an extra stagger, so a lost
+            // grant in either direction is recovered without both sides grabbing
+            // the turn at once.
+            let reclaim_after = if turn.starts_with_turn {
+                turn_reclaim_silence()
+            } else {
+                turn_reclaim_silence() + reclaim_role_stagger()
+            };
             loop {
-                // Wait until we hold the turn.
+                // Wait until we hold the turn. A turn-grant frame lost on-air
+                // would otherwise block here forever (the peer already dropped
+                // its own turn), deadlocking the link. So instead of waiting
+                // unboundedly, poll: if the link has been SILENT (no inbound
+                // activity — a live turn-holder keepalives every ~7s) for longer
+                // than `reclaim_after`, reclaim the turn by self-granting. Safe
+                // either way: if the peer is gone we hold the turn harmlessly; if
+                // its grant was lost we correctly take the turn it meant to hand us.
                 while !turn.holds_turn.load(Ordering::SeqCst) {
-                    turn.granted.notified().await;
+                    let silence = now_ms().saturating_sub(writer_activity.load(Ordering::Relaxed));
+                    if silence >= reclaim_after.as_millis() as u64 {
+                        warn!(
+                            "[mux:writer] link silent {silence}ms with no turn — reclaiming \
+                             (lost turn-grant or peer gone)"
+                        );
+                        turn.holds_turn.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    // Wake periodically to re-check silence even if no grant
+                    // notification arrives. Bounded by KEEPALIVE_INTERVAL, but
+                    // also by a fraction of the reclaim window so a short
+                    // (test-configured) window is still polled promptly.
+                    let poll = KEEPALIVE_INTERVAL
+                        .min(reclaim_after / 4)
+                        .max(Duration::from_millis(10));
+                    let _ = tokio::time::timeout(poll, turn.granted.notified()).await;
                 }
 
                 // Send a keepalive the INSTANT we acquire the turn, before waiting.
@@ -523,7 +599,8 @@ impl PactorMux {
                 }
 
                 // Hand the turn to the peer.
-                if let Err(e) = write_message(&writer_transport, &counter, TURN_GRANT_TAG, &[]).await
+                if let Err(e) =
+                    write_message(&writer_transport, &counter, TURN_GRANT_TAG, &[]).await
                 {
                     warn!("[mux:writer] turn-grant write failed: {e}");
                     return;
@@ -901,7 +978,10 @@ mod tests {
 
         let probe = tokio::spawn(async move { repair.receive().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!probe.is_finished(), "idle receive returned early (queue closed?)");
+        assert!(
+            !probe.is_finished(),
+            "idle receive returned early (queue closed?)"
+        );
         probe.abort();
     }
 
@@ -987,8 +1067,14 @@ mod tests {
         let addr = "127.0.0.1:1".parse().unwrap();
         // A sends a shred and an all2all message; B must receive each on the
         // matching channel, never crossed.
-        a_shred.send(&b"shred-payload".to_vec(), addr).await.unwrap();
-        a_all2all.send(&b"vote-payload".to_vec(), addr).await.unwrap();
+        a_shred
+            .send(&b"shred-payload".to_vec(), addr)
+            .await
+            .unwrap();
+        a_all2all
+            .send(&b"vote-payload".to_vec(), addr)
+            .await
+            .unwrap();
 
         let got_all2all = b_all2all.receive().await.unwrap();
         let got_shred = b_shred.receive().await.unwrap();
@@ -1041,5 +1127,97 @@ mod tests {
         let mut mux = PactorMux::new(transport);
         let _first: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
         let _second: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
+    }
+
+    /// A loopback transport that silently drops the first `drop_grants`
+    /// turn-grant frames it is asked to write, simulating grant loss on-air.
+    /// All other lines pass through to the peer.
+    struct GrantDroppingTransport {
+        inner: Arc<LoopbackTransport>,
+        grants_to_drop: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl PactorTransport for GrantDroppingTransport {
+        async fn set_mycall(&self, c: &str) -> Result<(), ScsPactorError> {
+            self.inner.set_mycall(c).await
+        }
+        async fn connect_peer(&self, c: &str) -> Result<(), ScsPactorError> {
+            self.inner.connect_peer(c).await
+        }
+        async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
+            // A turn-grant is a single fragment whose chunk is [TURN_GRANT_TAG].
+            if let Some((_hdr, chunk)) = crate::pactor_framing::parse_fragment(data) {
+                if chunk.first().copied() == Some(TURN_GRANT_TAG)
+                    && self
+                        .grants_to_drop
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        > 0
+                {
+                    self.grants_to_drop
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    // Pretend the write succeeded, but never deliver it — exactly
+                    // what a lost grant frame looks like to the sender.
+                    return Ok(());
+                }
+            }
+            self.inner.write_data(data).await
+        }
+        async fn read_data(&self, n: usize) -> Result<Vec<u8>, ScsPactorError> {
+            self.inner.read_data(n).await
+        }
+        async fn disconnect(&self) -> Result<(), ScsPactorError> {
+            self.inner.disconnect().await
+        }
+        async fn next_event(&self, t: Option<Duration>) -> Result<PactorLinkEvent, ScsPactorError> {
+            self.inner.next_event(t).await
+        }
+    }
+
+    /// A lost turn-grant frame must NOT deadlock the half-duplex link forever.
+    /// The caller (A) grants the turn to the listener (B), but A's grant frame
+    /// is dropped on-air — so B never learns it holds the turn. Before the
+    /// reclaim fix both sides then block forever. With it, B reclaims the turn
+    /// after the (test-shortened) silence window and its queued message still
+    /// reaches A.
+    #[tokio::test]
+    async fn lost_turn_grant_recovers_via_reclaim() {
+        // SAFETY: single-threaded test; env vars shorten the reclaim timers so we
+        // do not wait the 45s production window.
+        unsafe {
+            std::env::set_var("BUNKER_TURN_RECLAIM_MS", "300");
+            std::env::set_var("BUNKER_RECLAIM_STAGGER_MS", "150");
+        }
+
+        let (a_raw, b) = LoopbackTransport::pair();
+        // Wrap A so it drops the FIRST turn-grant it sends to B.
+        let a = Arc::new(GrantDroppingTransport {
+            inner: a_raw,
+            grants_to_drop: std::sync::atomic::AtomicU32::new(1),
+        });
+
+        let mut mux_a = PactorMux::new_half_duplex(a, true);
+        let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
+        let _ha = mux_a.spawn();
+
+        let mut mux_b = PactorMux::new_half_duplex(b, false);
+        let b_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_b.channel(Channel::All2All);
+        let _hb = mux_b.spawn();
+
+        let addr = "127.0.0.1:1".parse().unwrap();
+        // B queues a message but does not hold the turn; A's grant to B is lost,
+        // so only the reclaim path can get B's message out.
+        b_chan.send(&b"from-b".to_vec(), addr).await.unwrap();
+
+        let got_at_a = tokio::time::timeout(Duration::from_secs(10), a_chan.receive())
+            .await
+            .expect("B must reclaim the turn after the lost grant and deliver its message")
+            .unwrap();
+        assert_eq!(got_at_a, b"from-b");
+
+        unsafe {
+            std::env::remove_var("BUNKER_TURN_RECLAIM_MS");
+            std::env::remove_var("BUNKER_RECLAIM_STAGGER_MS");
+        }
     }
 }
