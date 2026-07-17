@@ -635,7 +635,17 @@ impl Pool for PoolImpl {
     /// This should be called once for every valid block (e.g. directly by blockstore).
     /// Ensures that the parent information is available for safe-to-notar checks.
     async fn add_block(&mut self, block_id: BlockId, parent_id: BlockId) {
-        assert!(block_id.0 > parent_id.0);
+        // A block's parent must be a strictly earlier slot. Callers
+        // (blockstore reconstruction, repair) already reject malformed blocks
+        // before this point; this is defense-in-depth so a bad (block, parent)
+        // pair can never panic the consensus task — it is dropped instead.
+        if block_id.0 <= parent_id.0 {
+            warn!(
+                "add_block: block slot {} not greater than parent slot {} — dropping",
+                block_id.0, parent_id.0
+            );
+            return;
+        }
         let (slot, block_hash) = &block_id;
         let (parent_slot, parent_hash) = &parent_id;
 
@@ -1671,6 +1681,41 @@ mod tests {
                 unreachable!("unexpected vote {vote:?}");
             }
         }
+    }
+
+    /// A block whose parent slot is not strictly earlier than its own slot
+    /// (equal, or in the future) must be dropped by `add_block`, not panic the
+    /// consensus task. Previously this was `assert!(block_id.0 > parent_id.0)`,
+    /// so a single malformed/hostile block from a peer crashed the node.
+    #[tokio::test]
+    async fn add_block_rejects_non_earlier_parent_without_panic() {
+        let (_sks, epoch_info) = generate_validators(11);
+        let (votor_tx, mut votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
+
+        let slot = Slot::new(5);
+        let (hash, parent_hash): (BlockHash, BlockHash) = (
+            Hash::random_for_test().into(),
+            Hash::random_for_test().into(),
+        );
+
+        // parent == self: must be dropped (no panic, no events emitted).
+        pool.add_block((slot, hash.clone()), (slot, parent_hash.clone()))
+            .await;
+        // parent in the future: likewise dropped.
+        pool.add_block((slot, hash), (slot.next(), parent_hash))
+            .await;
+
+        // No consensus event may be emitted for a dropped malformed block, and
+        // crucially the two calls above must not have panicked.
+        assert!(
+            matches!(
+                votor_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "a malformed block must not drive any consensus events"
+        );
     }
 
     #[tokio::test]

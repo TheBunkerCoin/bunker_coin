@@ -382,6 +382,20 @@ impl BlockData {
             transactions.extend(payload.transactions);
         }
 
+        // The parent slot comes from the (leader-controlled) block payload. A
+        // valid block's parent must be a strictly earlier slot; anything else
+        // (parent == self, parent in the future) is a malformed/hostile block.
+        // Reject it here rather than let it reach `Pool::add_block`, whose
+        // `assert!(block_id.0 > parent_id.0)` would otherwise panic the whole
+        // consensus task on a single bad block from a peer.
+        if parent.0 >= self.slot {
+            warn!(
+                "block in slot {} claims parent in slot {} (not strictly earlier) — rejecting",
+                self.slot, parent.0
+            );
+            return ReconstructBlockResult::Error;
+        }
+
         let block = Block {
             slot: self.slot,
             hash: block_hash.clone(),
@@ -500,6 +514,56 @@ mod tests {
         assert_eq!(events.len(), 1);
         let first_shred_event = VotorEvent::FirstShred(slot);
         assert_votor_events_match(events[0].clone(), first_shred_event);
+    }
+
+    /// A block whose parent slot is not strictly earlier than its own slot is
+    /// malformed (a hostile/buggy leader) and must be rejected at
+    /// reconstruction — returning `InvalidShred` — rather than producing a
+    /// `Block` event that would later panic `Pool::add_block`.
+    ///
+    /// Builds the (single, empty-tx) slice directly rather than via
+    /// `create_random_block`, so it does not depend on that helper's payload
+    /// sizing.
+    #[test]
+    fn reconstruct_block_rejects_non_earlier_parent() {
+        use crate::BlockPayload;
+        use crate::types::{Slice, SliceHeader, SlicePayload};
+
+        fn malformed_single_slice(slot: Slot, parent_slot: Slot) -> Slice {
+            let parent_hash: BlockHash = crate::crypto::Hash::random_for_test().into();
+            let data = wincode::serialize(&BlockPayload {
+                epoch_transition: None,
+                transactions: vec![],
+            })
+            .unwrap();
+            let payload = SlicePayload::new(slot, Some((parent_slot, parent_hash)), data);
+            let header = SliceHeader {
+                slot,
+                slice_index: SliceIndex::first(),
+                is_last: true,
+            };
+            Slice::from_parts(header, payload, None)
+        }
+
+        let sk = SecretKey::new(&mut rand::rng());
+        let slot = Slot::new(123);
+
+        for parent_slot in [slot, slot.next()] {
+            let slice = malformed_single_slice(slot, parent_slot);
+            let (events, res) = handle_slice(&mut BlockData::new(slot), slice, &sk);
+            assert_eq!(
+                res.unwrap_err(),
+                AddShredError::InvalidShred,
+                "parent slot {parent_slot} (>= own slot {slot}) must be rejected"
+            );
+            // The FirstShred event may fire, but never a Block event.
+            assert!(
+                events
+                    .iter()
+                    .all(|e| !matches!(e, VotorEvent::Block { .. })),
+                "malformed block must not emit a Block event"
+            );
+        }
     }
 
     // If a subsequent slice switches parent to the original, the block is not reconstructed.
