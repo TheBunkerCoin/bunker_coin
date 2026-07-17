@@ -24,6 +24,7 @@ mod epoch_info;
 mod link_liveness;
 mod pool;
 mod vote;
+mod vote_history;
 pub(crate) mod votor;
 
 use std::marker::{Send, Sync};
@@ -45,6 +46,7 @@ pub use pool::{
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 pub use vote::Vote;
+use vote_history::VoteHistory;
 use votor::Votor;
 use wincode::{SchemaRead, SchemaWrite};
 
@@ -255,6 +257,9 @@ where
         pool.set_epoch_boundary_channel(epoch_boundary_tx);
         pool.set_finalized_slot_channel(finalized_slot_tx);
         pool.set_slashing_channel(slashing_tx);
+        // Frontier restored from the persisted certs by `PoolImpl::load_from_db`;
+        // Votor prunes/replays its own-vote log relative to this below.
+        let restored_finalized_slot = Pool::finalized_slot(&pool);
         let pool: Box<dyn Pool + Send + Sync> = Box::new(pool);
         let pool = Arc::new(RwLock::new(pool));
 
@@ -291,6 +296,10 @@ where
         // so a crashed-leader timeout on a slow-but-alive link pauses, not skips.
         let link_liveness = Arc::new(SwappableLiveness::new());
         votor.set_link_liveness(link_liveness.clone());
+        // Durable own-vote log ("tower storage"): votes are persisted before
+        // broadcast and replayed here, so a crash-restart cannot cast a vote
+        // conflicting with one already sent (a slashable offence otherwise).
+        votor.set_vote_history(VoteHistory::open(epoch_info.own_id), restored_finalized_slot);
         let votor_handle = tokio::spawn(
             async move { votor.voting_loop().await.unwrap() }
                 .in_span(Span::enter_with_local_parent("voting loop")),

@@ -20,6 +20,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::blockstore::BlockInfo;
 use super::link_liveness::{LinkLiveness, NoLiveness};
+use super::vote_history::VoteHistory;
 use super::{Cert, Vote, delta_block, delta_timeout};
 use crate::consensus::{delta_final_vote_grace, delta_first_slice};
 use crate::crypto::aggsig::SecretKey;
@@ -125,6 +126,16 @@ pub struct Votor<A: All2All> {
     /// Slots for which a fast-final cert has been observed (so a deferred
     /// finalization vote can be suppressed — fast-final already finalized them).
     fast_finalized: BTreeSet<Slot>,
+    /// Durable log of own votes, written before each broadcast so a restarted
+    /// node can never cast a vote conflicting with one sent before the crash.
+    /// Disabled by default; wired up with [`Self::set_vote_history`].
+    vote_history: VoteHistory,
+    /// Votes restored from [`Self::vote_history`], rebroadcast once when the
+    /// voting loop starts: if the pre-crash vote was lost in flight (a link
+    /// drop and a crash often coincide), the double-vote guard would otherwise
+    /// leave the peer waiting for a vote that never comes again until
+    /// standstill recovery. Identical votes are deduplicated by peers.
+    restored_votes: Vec<Vote>,
 }
 
 impl<A: All2All> Votor<A> {
@@ -174,6 +185,8 @@ impl<A: All2All> Votor<A> {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             fast_finalized: BTreeSet::new(),
+            vote_history: VoteHistory::disabled(),
+            restored_votes: Vec::new(),
         };
         votor.set_timeouts(Slot::new(0));
         votor
@@ -185,6 +198,37 @@ impl<A: All2All> Votor<A> {
     /// on a slow-but-alive link pauses instead of skipping the window.
     pub fn set_link_liveness(&mut self, liveness: Arc<dyn LinkLiveness>) {
         self.link_liveness = liveness;
+    }
+
+    /// Inject the durable own-vote log and rebuild voting state from it.
+    ///
+    /// Replays every persisted vote for slots at or after `finalized_slot`
+    /// into `voted` / `voted_notar` / `bad_window` / `retired_slots`, so the
+    /// voting rules hold across a crash-restart exactly as they would have in
+    /// a single uninterrupted run: a slot notar-voted before the crash cannot
+    /// be skip-voted after it (and vice versa), and a slot with a fallback
+    /// vote cannot receive a finalization vote. Records below the finalized
+    /// frontier are pruned — peers reject votes for finalized slots, so no
+    /// conflict is possible there.
+    pub fn set_vote_history(&mut self, history: VoteHistory, finalized_slot: Slot) {
+        self.vote_history = history;
+        for vote in self.vote_history.load_and_prune(finalized_slot) {
+            let slot = vote.slot();
+            if vote.is_notar() {
+                self.voted.insert(slot);
+                if let Some(hash) = vote.block_hash() {
+                    self.voted_notar.insert(slot, hash.clone());
+                }
+            } else if vote.is_skip() {
+                self.voted.insert(slot);
+                self.bad_window.insert(slot);
+            } else if vote.is_notar_fallback() || vote.is_skip_fallback() {
+                self.bad_window.insert(slot);
+            } else if vote.is_final() {
+                self.retired_slots.insert(slot);
+            }
+            self.restored_votes.push(vote);
+        }
     }
 
     /// Enable deferring the slow-path finalization vote (see [`Self::defer_final_vote`]).
@@ -209,6 +253,11 @@ impl<A: All2All> Votor<A> {
     /// Checks consensus conditions and broadcasts new votes.
     #[fastrace::trace]
     pub async fn voting_loop(&mut self) -> Result<()> {
+        // Rebroadcast votes restored after a crash-restart (see `restored_votes`).
+        for vote in std::mem::take(&mut self.restored_votes) {
+            debug!("rebroadcasting restored vote for slot {}", vote.slot());
+            self.all2all.broadcast(&vote.into()).await.unwrap();
+        }
         while let Some(event) = self.event_receiver.recv().await {
             //println!("[Votor {}] event: {:?}", self.validator_id, event);
             if self.retired_slots.contains(&event.slot()) {
@@ -234,6 +283,7 @@ impl<A: All2All> Votor<A> {
                     debug!("voted notar-fallback in slot {slot}");
                     let vote =
                         Vote::new_notar_fallback(slot, hash, &self.voting_key, self.validator_id);
+                    self.vote_history.record(&vote);
                     self.all2all.broadcast(&vote.into()).await.unwrap();
                     self.try_skip_window(slot).await;
                     self.bad_window.insert(slot);
@@ -242,6 +292,7 @@ impl<A: All2All> Votor<A> {
                     //println!("[Votor {}] SAFE_TO_SKIP slot {}", self.validator_id, slot);
                     debug!("voted skip-fallback in slot {slot}");
                     let vote = Vote::new_skip_fallback(slot, &self.voting_key, self.validator_id);
+                    self.vote_history.record(&vote);
                     self.all2all.broadcast(&vote.into()).await.unwrap();
                     self.try_skip_window(slot).await;
                     self.bad_window.insert(slot);
@@ -265,10 +316,12 @@ impl<A: All2All> Votor<A> {
                             // suppressed — fast-final already finalized this slot.
                             self.fast_finalized.insert(cert.slot());
                             let first_slot_in_window = cert.slot().first_slot_in_window();
+                            self.vote_history.prune(first_slot_in_window);
                             self.set_timeouts(first_slot_in_window);
                         }
                         Cert::Final(_) => {
                             let first_slot_in_window = cert.slot().first_slot_in_window();
+                            self.vote_history.prune(first_slot_in_window);
                             self.set_timeouts(first_slot_in_window);
                         }
                         _ => {}
@@ -416,6 +469,7 @@ impl<A: All2All> Votor<A> {
             return false;
         }
         let vote = Vote::new_notar(slot, hash.clone(), &self.voting_key, self.validator_id);
+        self.vote_history.record(&vote);
         self.all2all.broadcast(&vote.into()).await.unwrap();
         self.voted.insert(slot);
         self.voted_notar.insert(slot, hash.clone());
@@ -449,6 +503,7 @@ impl<A: All2All> Votor<A> {
         let not_bad = !self.bad_window.contains(&slot);
         if notarized && voted_notar && not_bad {
             let vote = Vote::new_final(slot, &self.voting_key, self.validator_id);
+            self.vote_history.record(&vote);
             self.all2all.broadcast(&vote.into()).await.unwrap();
             self.retired_slots.insert(slot);
         }
@@ -460,6 +515,7 @@ impl<A: All2All> Votor<A> {
         for s in slot.slots_in_window() {
             if self.voted.insert(s) {
                 let vote = Vote::new_skip(s, &self.voting_key, self.validator_id);
+                self.vote_history.record(&vote);
                 self.all2all.broadcast(&vote.into()).await.unwrap();
                 self.bad_window.insert(s);
                 debug!("voted skip for slot {s}");
@@ -767,6 +823,83 @@ mod tests {
             }
             m => panic!("expected final vote, got {m:?}"),
         }
+    }
+
+    /// Crash-restart voting safety: a Votor that notar-voted a slot, then
+    /// "crashed" (state dropped) and was rebuilt with the same [`VoteHistory`],
+    /// must NOT cast a skip vote for that slot when the restart path fires its
+    /// timeout — that would be a slashable conflicting vote. Without the
+    /// restored history the same timeout provably produces skip votes (see the
+    /// `timeouts` test).
+    #[tokio::test]
+    async fn vote_history_prevents_conflicting_skip_after_restart() {
+        let db_path = format!(
+            "{}/bunkerglow-votor-restart-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+
+        let (sks, _epoch_info) = generate_validators(2);
+        let slot = Slot::genesis().next();
+        let hash: BlockHash = Hash::random_for_test().into();
+
+        // --- First life: notar-vote `slot`, recording into the history.
+        {
+            let mut a2a = generate_all2all_instances(_epoch_info.validators.clone()).await;
+            let (tx, rx) = mpsc::channel(100);
+            let other_a2a = a2a.pop().unwrap();
+            let votor_a2a = a2a.pop().unwrap();
+            let mut votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+            votor.set_vote_history(VoteHistory::open_at(&db_path), Slot::genesis());
+            tokio::spawn(async move {
+                votor.voting_loop().await.unwrap();
+            });
+
+            tx.send(VotorEvent::FirstShred(slot)).await.unwrap();
+            let block_info = BlockInfo {
+                hash: hash.clone(),
+                parent: (Slot::genesis(), GENESIS_BLOCK_HASH),
+            };
+            tx.send(VotorEvent::Block { slot, block_info }).await.unwrap();
+            let vote = match other_a2a.receive().await.unwrap() {
+                ConsensusMessage::Vote(v) => v,
+                m => panic!("expected notar vote, got {m:?}"),
+            };
+            assert!(vote.is_notar());
+            assert_eq!(vote.slot(), slot);
+        } // votor task's channel sender drops → first life ends ("crash")
+
+        // --- Second life: fresh Votor, same history, empty in-memory state.
+        let mut a2a = generate_all2all_instances(_epoch_info.validators.clone()).await;
+        let (tx, rx) = mpsc::channel(100);
+        let other_a2a = a2a.pop().unwrap();
+        let votor_a2a = a2a.pop().unwrap();
+        let mut votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+        votor.set_vote_history(VoteHistory::open_at(&db_path), Slot::genesis());
+        tokio::spawn(async move {
+            votor.voting_loop().await.unwrap();
+        });
+
+        // Liveness: the restored notar vote is rebroadcast on startup (byte-
+        // identical to the pre-crash vote, in case it was lost in flight).
+        match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Vote(v) => {
+                assert!(v.is_notar(), "expected rebroadcast notar vote, got {v:?}");
+                assert_eq!(v.slot(), slot);
+                assert_eq!(v.block_hash(), Some(&hash));
+            }
+            m => panic!("expected rebroadcast notar vote, got {m:?}"),
+        }
+
+        // Safety: the restart path fires a timeout for the unfinished slot.
+        // With the restored history the slot counts as voted → no skip vote.
+        tx.send(VotorEvent::Timeout(slot)).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await;
+        assert!(
+            got.is_err(),
+            "restored votor must not skip a slot it already notar-voted, but sent: {got:?}"
+        );
     }
 
     #[tokio::test]
