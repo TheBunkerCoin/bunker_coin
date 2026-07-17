@@ -192,10 +192,13 @@ pub fn assert_votor_events_match(ev0: VotorEvent, ev1: VotorEvent) {
 
 /// Creates a valid [`SlicePayload`] which contains valid transactions that can be decoded.
 fn create_random_slice_payload_valid_txs(slot: Slot, parent: Option<BlockId>) -> SlicePayload {
-    // HACK: manually picked number of maximally sized transactions that fit in the slice
-    // without going over the [`MAX_DATA_PER_SLICE`] limit (the slot now also occupies
-    // 8 bytes of the hashed payload, so this is one fewer than before).
-    const NUM_TXS_PER_SLICE: usize = 60;
+    // Max number of maximally sized transactions that fit in one slice without
+    // exceeding [`MAX_DATA_PER_SLICE`] (4095). Budget = 4095 minus the outer
+    // SlicePayload framing — 8 (slot) + up to 41 (Some(parent)) + 8 (data-len
+    // prefix) + 1 (BlockPayload epoch_transition None) + 8 (txs vec len) — leaves
+    // ~4029 bytes; each MAX_TRANSACTION_SIZE (512) tx serializes to 8 + 512 = 520
+    // bytes, so 4029 / 520 = 7 fit (8 would overrun at 4160).
+    const NUM_TXS_PER_SLICE: usize = 7;
 
     let mut data = vec![0; MAX_TRANSACTION_SIZE];
     rand::rng().fill_bytes(&mut data);

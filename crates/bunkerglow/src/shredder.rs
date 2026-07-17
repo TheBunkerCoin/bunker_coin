@@ -690,10 +690,10 @@ mod tests {
     use color_eyre::Result;
 
     use super::*;
-    use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH};
-    use crate::types::slice::create_slice_with_invalid_txs;
-    use crate::types::SliceIndex;
     use crate::Slot;
+    use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH};
+    use crate::types::SliceIndex;
+    use crate::types::slice::create_slice_with_invalid_txs;
 
     /// Build a first slice (the one that carries the block's parent) at `slot`,
     /// pointing at `parent`, with `data` as its payload. Mirrors how the leader
@@ -728,8 +728,12 @@ mod tests {
         let slice_slot4 = first_slice_at(4, parent.clone(), vec![]);
         let slice_slot8 = first_slice_at(8, parent, vec![]);
 
-        let root4 = shredder.shred(slice_slot4, &sk).unwrap()[0].merkle_root.clone();
-        let root8 = shredder.shred(slice_slot8, &sk).unwrap()[0].merkle_root.clone();
+        let root4 = shredder.shred(slice_slot4, &sk).unwrap()[0]
+            .merkle_root
+            .clone();
+        let root8 = shredder.shred(slice_slot8, &sk).unwrap()[0]
+            .merkle_root
+            .clone();
 
         // The fix: distinct roots → distinct block hashes, despite identical
         // parent and (empty) data, because the slot is now in the hashed payload.
@@ -782,8 +786,12 @@ mod tests {
         let on_parent3 = first_slice_at(4, Some((Slot::new(3), GENESIS_BLOCK_HASH)), vec![]);
         let on_parent2 = first_slice_at(4, Some((Slot::new(2), GENESIS_BLOCK_HASH)), vec![]);
 
-        let root_a = shredder.shred(on_parent3, &sk).unwrap()[0].merkle_root.clone();
-        let root_b = shredder.shred(on_parent2, &sk).unwrap()[0].merkle_root.clone();
+        let root_a = shredder.shred(on_parent3, &sk).unwrap()[0]
+            .merkle_root
+            .clone();
+        let root_b = shredder.shred(on_parent2, &sk).unwrap()[0]
+            .merkle_root
+            .clone();
 
         assert_ne!(
             root_a, root_b,
@@ -826,7 +834,11 @@ mod tests {
         assert_eq!(slice_restored, slice);
 
         // restore from non-consecutive shreds
-        let nc_shreds = [&shreds[..1], &shreds[DATA_SHREDS + 1..]].concat();
+        // Non-consecutive selection that still has >= DATA_SHREDS shreds: keep
+        // shred 0, drop shred 1, keep the rest (TOTAL_SHREDS - 1 shreds total).
+        // (The old `[..1] + [DATA_SHREDS+1..]` left only 2 shreds under the 4/6
+        // config — fewer than DATA_SHREDS — so reconstruction failed.)
+        let nc_shreds = [&shreds[..1], &shreds[2..]].concat();
         let nc_shreds = into_array(&nc_shreds);
         let (slice_restored, _) = shredder.deshred(&nc_shreds)?;
         assert_eq!(slice_restored, slice);
@@ -876,7 +888,11 @@ mod tests {
         assert_eq!(slice_restored, slice);
 
         // restore from non-consecutive shreds
-        let nc_shreds = [&shreds[..1], &shreds[DATA_SHREDS + 1..]].concat();
+        // Non-consecutive selection that still has >= DATA_SHREDS shreds: keep
+        // shred 0, drop shred 1, keep the rest (TOTAL_SHREDS - 1 shreds total).
+        // (The old `[..1] + [DATA_SHREDS+1..]` left only 2 shreds under the 4/6
+        // config — fewer than DATA_SHREDS — so reconstruction failed.)
+        let nc_shreds = [&shreds[..1], &shreds[2..]].concat();
         let input = into_array(&nc_shreds);
         let (slice_restored, _) = shredder.deshred(&input)?;
         assert_eq!(slice_restored, slice);
@@ -919,7 +935,11 @@ mod tests {
         assert_eq!(slice_restored, slice);
 
         // restore from non-consecutive shreds
-        let nc_shreds = [&shreds[..1], &shreds[DATA_SHREDS + 1..]].concat();
+        // Non-consecutive selection that still has >= DATA_SHREDS shreds: keep
+        // shred 0, drop shred 1, keep the rest (TOTAL_SHREDS - 1 shreds total).
+        // (The old `[..1] + [DATA_SHREDS+1..]` left only 2 shreds under the 4/6
+        // config — fewer than DATA_SHREDS — so reconstruction failed.)
+        let nc_shreds = [&shreds[..1], &shreds[2..]].concat();
         let input = into_array(&nc_shreds);
         let (slice_restored, _) = shredder.deshred(&input)?;
         assert_eq!(slice_restored, slice);
@@ -969,7 +989,11 @@ mod tests {
         assert_eq!(slice_restored, slice);
 
         // restore from non-consecutive shreds
-        let nc_shreds = [&shreds[..1], &shreds[DATA_SHREDS + 1..]].concat();
+        // Non-consecutive selection that still has >= DATA_SHREDS shreds: keep
+        // shred 0, drop shred 1, keep the rest (TOTAL_SHREDS - 1 shreds total).
+        // (The old `[..1] + [DATA_SHREDS+1..]` left only 2 shreds under the 4/6
+        // config — fewer than DATA_SHREDS — so reconstruction failed.)
+        let nc_shreds = [&shreds[..1], &shreds[2..]].concat();
         let input = into_array(&nc_shreds);
         let (slice_restored, _) = shredder.deshred(&input)?;
         assert_eq!(slice_restored, slice);

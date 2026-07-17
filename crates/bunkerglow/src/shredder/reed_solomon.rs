@@ -306,7 +306,11 @@ mod tests {
     ) -> [Option<ValidatedShred>; TOTAL_SHREDS] {
         let sk = SecretKey::new(&mut rand::rng());
         let mut shreds = data_and_coding_to_output_shreds(header, shreds, &sk).map(Some);
-        for shred in shreds.iter_mut().skip(TOTAL_SHREDS - DATA_SHREDS) {
+        // Keep exactly DATA_SHREDS shreds (the minimum reconstruction needs) and
+        // drop the rest. Previously this skipped `TOTAL_SHREDS - DATA_SHREDS`,
+        // which kept only 2 shreds under the current 4/6 config — fewer than
+        // DATA_SHREDS, so deshred failed with NotEnoughShreds.
+        for shred in shreds.iter_mut().skip(DATA_SHREDS) {
             *shred = None;
         }
         shreds

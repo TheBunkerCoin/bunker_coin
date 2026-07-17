@@ -136,6 +136,10 @@ pub struct Votor<A: All2All> {
     /// leave the peer waiting for a vote that never comes again until
     /// standstill recovery. Identical votes are deduplicated by peers.
     restored_votes: Vec<Vote>,
+    /// Deferred-final intents restored from [`Self::vote_history`] after a crash
+    /// during the grace window. Re-armed as `FinalVoteDeadline` timers when the
+    /// voting loop starts, so slow-final liveness survives the crash.
+    restored_final_deadlines: Vec<(Slot, BlockHash)>,
 }
 
 impl<A: All2All> Votor<A> {
@@ -187,6 +191,7 @@ impl<A: All2All> Votor<A> {
             fast_finalized: BTreeSet::new(),
             vote_history: VoteHistory::disabled(),
             restored_votes: Vec::new(),
+            restored_final_deadlines: Vec::new(),
         };
         votor.set_timeouts(Slot::new(0));
         votor
@@ -229,6 +234,22 @@ impl<A: All2All> Votor<A> {
             }
             self.restored_votes.push(vote);
         }
+
+        // Restore deferred-final intents (see `defer_final_vote`). A crash during
+        // the grace window leaves a `pendfinal|` marker with no live timer to
+        // drive it; re-arm the deadline here so slow-final liveness survives the
+        // crash. Skip any slot already retired (its final vote was sent before
+        // the crash and replayed above) — that marker is stale.
+        for (slot, hash) in self
+            .vote_history
+            .load_and_prune_pending_finals(finalized_slot)
+        {
+            if !self.retired_slots.contains(&slot) {
+                self.restored_final_deadlines.push((slot, hash));
+            } else {
+                self.vote_history.clear_pending_final(slot, &hash);
+            }
+        }
     }
 
     /// Enable deferring the slow-path finalization vote (see [`Self::defer_final_vote`]).
@@ -257,6 +278,21 @@ impl<A: All2All> Votor<A> {
         for vote in std::mem::take(&mut self.restored_votes) {
             debug!("rebroadcasting restored vote for slot {}", vote.slot());
             self.all2all.broadcast(&vote.into()).await.unwrap();
+        }
+        // Re-arm deferred-final deadlines restored after a crash during the grace
+        // window (see `restored_final_deadlines`). Spawn the same grace-delayed
+        // timer as the original notar path rather than firing immediately: the
+        // block-notarized cert that makes `try_final` actionable may not have
+        // arrived yet on restart, so the deadline must give it time (exactly as
+        // in the uninterrupted run). If the slot fast-finalizes first, the
+        // deadline is a no-op.
+        for (slot, hash) in std::mem::take(&mut self.restored_final_deadlines) {
+            debug!("re-arming deferred-final deadline for slot {slot} after restart");
+            let sender = self.event_sender.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delta_final_vote_grace()).await;
+                let _ = sender.send(VotorEvent::FinalVoteDeadline(slot, hash)).await;
+            });
         }
         while let Some(event) = self.event_receiver.recv().await {
             //println!("[Votor {}] event: {:?}", self.validator_id, event);
@@ -315,6 +351,12 @@ impl<A: All2All> Votor<A> {
                             // Record so a deferred (or pending) finalization vote is
                             // suppressed — fast-final already finalized this slot.
                             self.fast_finalized.insert(cert.slot());
+                            // The deferred-final intent for this slot is now moot
+                            // (fast-final finalized it); drop its marker so a
+                            // restart doesn't re-arm a redundant deadline.
+                            if let Some(hash) = cert.block_hash() {
+                                self.vote_history.clear_pending_final(cert.slot(), hash);
+                            }
                             let first_slot_in_window = cert.slot().first_slot_in_window();
                             self.vote_history.prune(first_slot_in_window);
                             self.set_timeouts(first_slot_in_window);
@@ -386,7 +428,10 @@ impl<A: All2All> Votor<A> {
                             *rearms += 1;
                             println!(
                                 "[Votor {}] EARLY_TIMEOUT slot {} — link alive, pausing (re-arm {}/{})",
-                                self.validator_id, slot, *rearms, Self::MAX_CRASHED_LEADER_REARMS
+                                self.validator_id,
+                                slot,
+                                *rearms,
+                                Self::MAX_CRASHED_LEADER_REARMS
                             );
                             let sender = self.event_sender.clone();
                             tokio::spawn(async move {
@@ -479,6 +524,13 @@ impl<A: All2All> Votor<A> {
             // fire from the notar votes alone (saving the final vote + notar cert
             // + final cert over the slow reverse path). If it has not fired by the
             // deadline, `FinalVoteDeadline` triggers the vote as a fallback.
+            //
+            // Persist the *intent* before spawning the in-memory timer: a crash
+            // during the grace window would otherwise lose the deadline entirely
+            // (the timer is memory-only), and slow-final for this slot would
+            // never be driven again. The marker is cleared when the final vote is
+            // sent (`try_final`) or the slot fast-finalizes.
+            self.vote_history.record_pending_final(slot, &hash);
             let sender = self.event_sender.clone();
             let h = hash.clone();
             tokio::spawn(async move {
@@ -494,8 +546,11 @@ impl<A: All2All> Votor<A> {
     /// Sends a finalization vote for the given block if the conditions are met.
     async fn try_final(&mut self, slot: Slot, hash: BlockHash) {
         // If the slot already fast-finalized, the slow-path finalization vote is
-        // redundant — skip it (this is the whole point of deferring it).
+        // redundant — skip it (this is the whole point of deferring it). The
+        // pending marker is cleared by the fast-final handler; clear here too in
+        // case this path is reached first.
         if self.fast_finalized.contains(&slot) {
+            self.vote_history.clear_pending_final(slot, &hash);
             return;
         }
         let notarized = self.block_notarized.get(&slot) == Some(&hash);
@@ -506,6 +561,9 @@ impl<A: All2All> Votor<A> {
             self.vote_history.record(&vote);
             self.all2all.broadcast(&vote.into()).await.unwrap();
             self.retired_slots.insert(slot);
+            // The deferred-final intent has now been fulfilled — drop its marker
+            // so a later restart does not re-arm a redundant deadline.
+            self.vote_history.clear_pending_final(slot, &hash);
         }
     }
 
@@ -618,7 +676,9 @@ mod tests {
         // voted on / seen a shred for; the genesis window is pre-seeded as voted.
         let slot = Slot::new(4);
         assert!(slot.is_start_of_window());
-        tx.send(VotorEvent::TimeoutCrashedLeader(slot)).await.unwrap();
+        tx.send(VotorEvent::TimeoutCrashedLeader(slot))
+            .await
+            .unwrap();
 
         // Should skip the whole window.
         match tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await {
@@ -638,7 +698,9 @@ mod tests {
             start_votor_with_liveness(Some(Arc::new(TestLiveness(true)))).await;
 
         let slot = Slot::genesis().next().first_slot_in_window();
-        tx.send(VotorEvent::TimeoutCrashedLeader(slot)).await.unwrap();
+        tx.send(VotorEvent::TimeoutCrashedLeader(slot))
+            .await
+            .unwrap();
 
         // Must NOT see any skip vote promptly: the re-arm waits delta_timeout (long),
         // so a short window proves it paused rather than skipped.
@@ -861,7 +923,9 @@ mod tests {
                 hash: hash.clone(),
                 parent: (Slot::genesis(), GENESIS_BLOCK_HASH),
             };
-            tx.send(VotorEvent::Block { slot, block_info }).await.unwrap();
+            tx.send(VotorEvent::Block { slot, block_info })
+                .await
+                .unwrap();
             let vote = match other_a2a.receive().await.unwrap() {
                 ConsensusMessage::Vote(v) => v,
                 m => panic!("expected notar vote, got {m:?}"),
@@ -900,6 +964,109 @@ mod tests {
             got.is_err(),
             "restored votor must not skip a slot it already notar-voted, but sent: {got:?}"
         );
+    }
+
+    /// Crash-during-grace liveness: with `defer_final_vote` on, a node
+    /// notar-votes and defers its finalization vote behind a grace timer. If it
+    /// crashes during the grace window, the in-memory timer is lost — but the
+    /// persisted pending-final marker lets the restarted node re-arm the
+    /// deadline, so the slow-path finalization vote is still eventually sent.
+    /// Without the marker (pre-fix) the slot would never get a final vote and
+    /// finalization would stall whenever fast-final could not complete.
+    #[tokio::test]
+    async fn deferred_final_vote_rearmed_after_crash() {
+        let db_path = format!(
+            "{}/bunkerglow-votor-deferfinal-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+
+        let (sks, epoch_info) = generate_validators(2);
+        let slot = Slot::genesis().next();
+        let hash: BlockHash = Hash::random_for_test().into();
+
+        // --- First life: notar-vote with deferral on, then "crash" mid-grace.
+        {
+            let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
+            let (tx, rx) = mpsc::channel(100);
+            let other_a2a = a2a.pop().unwrap();
+            let votor_a2a = a2a.pop().unwrap();
+            let mut votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+            votor.set_defer_final_vote(true);
+            votor.set_vote_history(VoteHistory::open_at(&db_path), Slot::genesis());
+            tokio::spawn(async move {
+                votor.voting_loop().await.unwrap();
+            });
+
+            tx.send(VotorEvent::FirstShred(slot)).await.unwrap();
+            let block_info = BlockInfo {
+                hash: hash.clone(),
+                parent: (Slot::genesis(), GENESIS_BLOCK_HASH),
+            };
+            tx.send(VotorEvent::Block { slot, block_info })
+                .await
+                .unwrap();
+            // Only the notar vote is emitted (final vote is deferred). The
+            // pending-final marker is now persisted.
+            let vote = match other_a2a.receive().await.unwrap() {
+                ConsensusMessage::Vote(v) => v,
+                m => panic!("expected notar vote, got {m:?}"),
+            };
+            assert!(vote.is_notar());
+            // Crash before the grace deadline fires (we never wait it out).
+        }
+
+        // --- Second life: fresh Votor, same DB, deferral still on.
+        let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
+        let (tx, rx) = mpsc::channel(100);
+        let other_a2a = a2a.pop().unwrap();
+        let votor_a2a = a2a.pop().unwrap();
+        let mut votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+        votor.set_defer_final_vote(true);
+        votor.set_vote_history(VoteHistory::open_at(&db_path), Slot::genesis());
+        tokio::spawn(async move {
+            votor.voting_loop().await.unwrap();
+        });
+
+        // Startup rebroadcasts the restored notar vote.
+        let rebroadcast = match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Vote(v) => v,
+            m => panic!("expected rebroadcast notar vote, got {m:?}"),
+        };
+        assert!(rebroadcast.is_notar());
+
+        // Deliver a notar cert so `try_final`'s condition (block_notarized) holds.
+        let notar_cert = Cert::Notar(NotarCert::new_unchecked(
+            std::slice::from_ref(&rebroadcast),
+            &epoch_info.validators,
+        ));
+        tx.send(VotorEvent::CertCreated(Box::new(notar_cert)))
+            .await
+            .unwrap();
+        // The notar cert is re-broadcast (deferred mode → no final vote on it).
+        match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::Notar(_))),
+            ConsensusMessage::Vote(v) => panic!("unexpected vote before deadline: {v:?}"),
+        }
+
+        // The re-armed deadline (fired on startup) must now drive the final vote,
+        // even though the original in-memory timer was lost in the crash. The
+        // re-armed timer waits `delta_final_vote_grace()` (~16s unscaled), so
+        // allow generously beyond that.
+        let final_vote = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match other_a2a.receive().await.unwrap() {
+                    ConsensusMessage::Vote(v) if v.is_final() => break v,
+                    ConsensusMessage::Vote(v) => panic!("unexpected non-final vote: {v:?}"),
+                    ConsensusMessage::Cert(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("re-armed deferred-final deadline must send the finalization vote");
+        assert!(final_vote.is_final());
+        assert_eq!(final_vote.slot(), slot);
     }
 
     #[tokio::test]

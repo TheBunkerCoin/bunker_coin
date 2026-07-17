@@ -205,9 +205,11 @@ pub(crate) fn create_slice_payload_with_invalid_txs(
     // 8 bytes for data length (usize), since wincode uses fixed-length integer encoding
     let data_len_bytes = 8;
 
-    let size = desired_size
-        .checked_sub(parent_bytes + slot_bytes + data_len_bytes)
-        .unwrap();
+    // `desired_size` is the total serialized payload budget; subtract the framing
+    // overhead to get the raw data length. A `desired_size` smaller than the
+    // overhead (e.g. the `restore_tiny` case) saturates to an empty data vec
+    // rather than underflow-panicking.
+    let size = desired_size.saturating_sub(parent_bytes + slot_bytes + data_len_bytes);
     let mut data = vec![0; size];
     let mut rng = rng();
     rng.fill_bytes(&mut data);

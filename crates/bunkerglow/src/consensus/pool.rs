@@ -167,11 +167,26 @@ impl PoolImpl {
     ) -> Self {
         std::fs::create_dir_all("data").ok();
         let db_path = format!("data/pool/{}", epoch_info.own_id);
-        std::fs::create_dir_all(&db_path).ok();
+        Self::new_at(epoch_info, votor_event_channel, repair_channel, &db_path)
+    }
+
+    /// Creates a new pool backed by RocksDB at an explicit path.
+    ///
+    /// Same handle-cache semantics as [`Self::new`]. Lets tests that persist
+    /// state at unusual slots (e.g. epoch boundaries) use an isolated DB
+    /// instead of contaminating the shared `data/pool/{id}` path that every
+    /// other pool test reloads via `load_from_db`.
+    pub fn new_at(
+        epoch_info: Arc<EpochInfo>,
+        votor_event_channel: Sender<VotorEvent>,
+        repair_channel: Sender<BlockId>,
+        db_path: &str,
+    ) -> Self {
+        std::fs::create_dir_all(db_path).ok();
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = super::blockstore::open_db_with_retry(&opts, &db_path)
-            .expect("open RocksDB pool db");
+        let db =
+            super::blockstore::open_db_with_retry(&opts, db_path).expect("open RocksDB pool db");
 
         let mut s = Self {
             slot_states: BTreeMap::new(),
@@ -230,11 +245,19 @@ impl PoolImpl {
     }
 
     async fn notify_finalization_event(&self, event: &FinalizationEvent) {
+        // Check every finalized slot for an epoch boundary — the directly
+        // finalized slot AND every implicitly finalized ancestor. The last slot
+        // of an epoch is also the last slot of a window, so it can be finalized
+        // only *implicitly* (a later slot fast-finalizes and finalizes it by
+        // descent). Checking only the direct cert slot then silently skipped the
+        // epoch transition (validator-set update / rewards) for that epoch.
         if let Some((slot, _)) = &event.finalized {
             self.notify_finalized_slot(*slot).await;
+            self.check_epoch_boundary(*slot).await;
         }
         for (slot, _) in &event.implicitly_finalized {
             self.notify_finalized_slot(*slot).await;
+            self.check_epoch_boundary(*slot).await;
         }
     }
 
@@ -335,14 +358,17 @@ impl PoolImpl {
                         // Use a blocking read, not try_read: a momentarily-held lock
                         // must not silently drop the finalized-status write (that left
                         // finalized slots showing "proposed" on disk / via --inspect).
-                        blockstore
-                            .read()
-                            .await
-                            .update_finalized_timestamp(slot, hash.as_hash().clone(), timestamp);
+                        blockstore.read().await.update_finalized_timestamp(
+                            slot,
+                            hash.as_hash().clone(),
+                            timestamp,
+                        );
                     }
                 }
 
-                self.check_epoch_boundary(slot).await;
+                // Epoch-boundary check now happens in `notify_finalization_event`
+                // (line above), covering both this slot and any implicitly
+                // finalized ancestors.
                 self.prune();
             }
             Cert::Final(_) => {
@@ -373,7 +399,8 @@ impl PoolImpl {
                     }
                 }
 
-                self.check_epoch_boundary(slot).await;
+                // Epoch-boundary check happens in `notify_finalization_event`
+                // above (covers this slot + implicitly finalized ancestors).
                 self.prune();
             }
         }
@@ -692,7 +719,9 @@ impl Pool for PoolImpl {
         // slow/marginal link where consensus can stall at slot 0 before the first
         // finalization; treat it as a no-op recovery rather than asserting.
         if certs.is_empty() {
-            warn!("standstill recovery at slot {slot} with no final cert yet; nothing to re-broadcast");
+            warn!(
+                "standstill recovery at slot {slot} with no final cert yet; nothing to re-broadcast"
+            );
             return;
         }
         certs.extend(self.get_certs(slot.next()..));
@@ -1710,11 +1739,78 @@ mod tests {
         // No consensus event may be emitted for a dropped malformed block, and
         // crucially the two calls above must not have panicked.
         assert!(
-            matches!(
-                votor_rx.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
-            ),
+            matches!(votor_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
             "a malformed block must not drive any consensus events"
+        );
+    }
+
+    /// The last slot of an epoch is also the last slot of a window, so it can be
+    /// finalized only *implicitly* (a later slot fast-finalizes and finalizes it
+    /// by descent). The epoch-boundary event must still fire in that case — it
+    /// used to be checked only for the directly finalized cert slot, silently
+    /// skipping the epoch transition. Here slot 17999 (last in epoch 0) is
+    /// implicitly finalized by fast-finalizing slot 18000, and we assert an
+    /// `EpochBoundaryEvent` for epoch 0 is emitted.
+    #[tokio::test]
+    async fn epoch_boundary_fires_on_implicit_finalization() {
+        let (sks, epoch_info) = generate_validators(11);
+        let (votor_tx, _votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let (epoch_tx, mut epoch_rx) = mpsc::channel(16);
+        // Isolated DB: this test persists certs at slots 17999/18000, which
+        // would otherwise poison every later pool test that reloads the shared
+        // `data/pool/{id}` DB (their slot-0..2 votes get rejected as below the
+        // restored frontier).
+        let db_path = format!(
+            "{}/bunkerglow-pool-epoch-boundary-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let mut pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
+        pool.set_epoch_boundary_channel(epoch_tx);
+
+        // Last slot of epoch 0 (== last slot of its window) and first slot of
+        // epoch 1.
+        let boundary = Slot::new(SLOTS_PER_EPOCH - 1);
+        assert!(boundary.is_last_in_epoch());
+        let next = boundary.next();
+        assert_eq!(next.epoch(), 1);
+        let (bhash, nhash): (BlockHash, BlockHash) = (
+            Hash::random_for_test().into(),
+            Hash::random_for_test().into(),
+        );
+
+        // Notarize the boundary slot (so the tracker holds a Notarized status it
+        // can later upgrade to ImplicitlyFinalized), but do NOT finalize it.
+        for v in 0..7 {
+            let vote = Vote::new_notar(boundary, bhash.clone(), &sks[v as usize], v);
+            assert_eq!(pool.add_vote(vote).await, Ok(()));
+        }
+        assert!(pool.has_notar_cert(boundary));
+
+        // Register the parent link next -> boundary, then fast-finalize `next`.
+        // Fast-finalizing `next` finalizes `boundary` implicitly by descent.
+        pool.add_block((next, nhash.clone()), (boundary, bhash.clone()))
+            .await;
+        for v in 0..9 {
+            let vote = Vote::new_notar(next, nhash.clone(), &sks[v as usize], v);
+            assert_eq!(pool.add_vote(vote).await, Ok(()));
+        }
+        assert!(pool.has_final_cert(next));
+
+        // Drain the epoch-boundary channel: an event for epoch 0 must be present.
+        let mut saw_epoch_0 = false;
+        while let Ok(ev) = epoch_rx.try_recv() {
+            if ev.epoch == 0 {
+                assert_eq!(ev.finalized_slot, boundary);
+                saw_epoch_0 = true;
+            }
+        }
+        assert!(
+            saw_epoch_0,
+            "epoch-boundary event for epoch 0 must fire when slot {boundary} is \
+             finalized only implicitly"
         );
     }
 
