@@ -36,9 +36,9 @@ pub use blockstore::{BlockInfo, BlockMetadata, Blockstore, BlockstoreImpl};
 pub use cert::Cert;
 use color_eyre::Result;
 pub use epoch_info::EpochInfo;
-pub use link_liveness::{LinkLiveness, NoLiveness, SwappableLiveness};
 use fastrace::Span;
 use fastrace::future::FutureExt;
+pub use link_liveness::{LinkLiveness, NoLiveness, SwappableLiveness};
 use log::{info, trace, warn};
 pub use pool::{
     AddVoteError, EpochBoundaryEvent, FinalizedSlotEvent, Pool, PoolError, PoolImpl, SlashingReport,
@@ -299,7 +299,10 @@ where
         // Durable own-vote log ("tower storage"): votes are persisted before
         // broadcast and replayed here, so a crash-restart cannot cast a vote
         // conflicting with one already sent (a slashable offence otherwise).
-        votor.set_vote_history(VoteHistory::open(epoch_info.own_id), restored_finalized_slot);
+        votor.set_vote_history(
+            VoteHistory::open(epoch_info.own_id),
+            restored_finalized_slot,
+        );
         let votor_handle = tokio::spawn(
             async move { votor.voting_loop().await.unwrap() }
                 .in_span(Span::enter_with_local_parent("voting loop")),

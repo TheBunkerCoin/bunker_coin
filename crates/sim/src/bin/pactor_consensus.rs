@@ -34,22 +34,20 @@ use bunkerglow::consensus::{Alpenglow, ConsensusMessage, EpochInfo};
 use bunkerglow::crypto::aggsig;
 use bunkerglow::crypto::merkle::DoubleMerkleRoot;
 use bunkerglow::crypto::signature::SecretKey;
-use bunkerglow::Slot;
-use ed25519_dalek::SigningKey;
-use std::collections::HashMap;
 use bunkerglow::disseminator::rotor::StakeWeightedSampler;
 use bunkerglow::disseminator::Rotor;
 use bunkerglow::mempool::Mempool;
 use bunkerglow::network::dontcare_sockaddr;
 use bunkerglow::repair::{RepairRequest, RepairResponse};
 use bunkerglow::shredder::Shred;
+use bunkerglow::Slot;
 use bunkerglow::{Transaction, ValidatorInfo};
 use clap::Parser;
+use ed25519_dalek::SigningKey;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
-use scs_pactor::{
-    PactorTransport, SimulatedPactorConfig, SimulatedPactorPair, UsbPactorTransport,
-};
+use scs_pactor::{PactorTransport, SimulatedPactorConfig, SimulatedPactorPair, UsbPactorTransport};
+use std::collections::HashMap;
 
 /// The five logical networks, each a [`MuxChannel`] sharing one PACTOR link.
 type MuxAll2All = MuxChannel<ConsensusMessage, ConsensusMessage>;
@@ -322,7 +320,9 @@ impl PactorTransport for CountingTransport {
                     .consecutive_write_failures
                     .fetch_add(1, Ordering::Relaxed)
                     + 1;
-                log::warn!("[link-watchdog] write failure {failures}/{WRITE_FAILURES_LINK_DOWN}: {e}");
+                log::warn!(
+                    "[link-watchdog] write failure {failures}/{WRITE_FAILURES_LINK_DOWN}: {e}"
+                );
                 Err(e)
             }
         }
@@ -331,7 +331,9 @@ impl PactorTransport for CountingTransport {
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, scs_pactor::ScsPactorError> {
         let payload = self.inner.read_data(max_len).await?;
         *self.last_rx.lock().unwrap() = Instant::now();
-        self.counters.frames_received.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .frames_received
+            .fetch_add(1, Ordering::Relaxed);
         self.counters
             .bytes_received
             .fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -349,9 +351,7 @@ impl PactorTransport for CountingTransport {
     fn is_link_up(&self) -> bool {
         let rx_stalled = self.last_rx.lock().unwrap().elapsed().as_secs();
         if rx_stalled > rx_stall_link_down_secs() {
-            log::warn!(
-                "[link-watchdog] no bytes received for {rx_stalled}s; declaring link down"
-            );
+            log::warn!("[link-watchdog] no bytes received for {rx_stalled}s; declaring link down");
             return false;
         }
         if self.consecutive_write_failures.load(Ordering::Relaxed) >= WRITE_FAILURES_LINK_DOWN {
@@ -767,7 +767,9 @@ impl Cluster {
     /// their execution state stays in agreement without gossiping state.
     fn genesis_state(&self) -> ExecutionState {
         let mut state = ExecutionState::new();
-        state.get_or_create_account(&self.genesis_pubkey()).native_balance = GENESIS_BALANCE;
+        state
+            .get_or_create_account(&self.genesis_pubkey())
+            .native_balance = GENESIS_BALANCE;
         state
     }
 }
@@ -1464,8 +1466,14 @@ async fn run_hardware(
             );
         }
 
-        let (slot, stop) =
-            run_node(&label, node, handle, overall_deadline, Some(transport.clone())).await;
+        let (slot, stop) = run_node(
+            &label,
+            node,
+            handle,
+            overall_deadline,
+            Some(transport.clone()),
+        )
+        .await;
         highest = highest.max(slot);
 
         // Link is down for teardown: clear the mempool so the bridge drops

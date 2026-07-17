@@ -45,7 +45,9 @@ pub(crate) fn fragment_header_len() -> usize {
 /// the header and accounting for hex doubling within the MTU. At least 1.
 pub(crate) fn effective_chunk_len() -> usize {
     let line_byte_budget = (RADIO_MTU - 2) / 2;
-    line_byte_budget.saturating_sub(fragment_header_len()).max(1)
+    line_byte_budget
+        .saturating_sub(fragment_header_len())
+        .max(1)
 }
 
 /// Build one fragment line: bincode header followed by the raw chunk bytes.

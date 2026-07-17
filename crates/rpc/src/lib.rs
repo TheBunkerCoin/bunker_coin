@@ -1188,8 +1188,7 @@ async fn list_transactions(
     }
 
     let total = txs.len();
-    let page: Vec<serde_json::Value> =
-        txs.into_iter().skip(offset).take(limit).collect();
+    let page: Vec<serde_json::Value> = txs.into_iter().skip(offset).take(limit).collect();
 
     Json(serde_json::json!({
         "transactions": page,
@@ -2440,7 +2439,6 @@ mod tests {
     }
 }
 
-
 // -- Solana-style JSON-RPC 2.0 (wallet interface) --
 //
 // Wallets POST envelopes to "/" — {"jsonrpc":"2.0","id":1,"method":"getBalance",
@@ -2466,7 +2464,11 @@ fn rpc_ok(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value
 }
 
 fn param_str(params: &[serde_json::Value], i: usize) -> Result<&str, ()> {
-    params.get(i).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or(())
+    params
+        .get(i)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or(())
 }
 
 fn param_u64(params: &[serde_json::Value], i: usize, fallback: u64) -> Result<u64, ()> {
@@ -2485,11 +2487,15 @@ async fn rest_dispatch(
 ) -> Result<serde_json::Value, (i64, String)> {
     use tower::util::ServiceExt;
 
-    let builder = axum::http::Request::builder().method(method).uri(path_and_query);
+    let builder = axum::http::Request::builder()
+        .method(method)
+        .uri(path_and_query);
     let request = match body {
         Some(b) => builder
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(serde_json::to_vec(b).unwrap_or_default())),
+            .body(axum::body::Body::from(
+                serde_json::to_vec(b).unwrap_or_default(),
+            )),
         None => builder.body(axum::body::Body::empty()),
     }
     .map_err(|e| (-32603i64, format!("internal request build failed: {e}")))?;
@@ -2503,7 +2509,8 @@ async fn rest_dispatch(
     let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
         .await
         .map_err(|e| (-32603i64, format!("body read failed: {e}")))?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
 
     if status.is_success() {
         Ok(value)
@@ -2563,7 +2570,10 @@ async fn handle_rpc_call(rest: &Router, call: JsonRpcRequest) -> serde_json::Val
         "getBalance" => match param_str(p, 0) {
             Ok(pk) => Ok(
                 match rest_dispatch(rest, M::GET, &format!("/accounts/{pk}"), None).await {
-                    Ok(acct) => Ok(acct.get("native_balance").cloned().unwrap_or(serde_json::json!(0))),
+                    Ok(acct) => Ok(acct
+                        .get("native_balance")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(0))),
                     Err(e) => Err(e),
                 },
             ),
@@ -2574,7 +2584,9 @@ async fn handle_rpc_call(rest: &Router, call: JsonRpcRequest) -> serde_json::Val
             Err(()) => Err(()),
         },
         "getTokenAccountsByOwner" => match param_str(p, 0) {
-            Ok(pk) => Ok(rest_dispatch(rest, M::GET, &format!("/accounts/{pk}/tokens"), None).await),
+            Ok(pk) => {
+                Ok(rest_dispatch(rest, M::GET, &format!("/accounts/{pk}/tokens"), None).await)
+            }
             Err(()) => Err(()),
         },
         "getToken" => match param_str(p, 0) {
@@ -2582,7 +2594,9 @@ async fn handle_rpc_call(rest: &Router, call: JsonRpcRequest) -> serde_json::Val
             Err(()) => Err(()),
         },
         "getTokenHolders" => match param_str(p, 0) {
-            Ok(tid) => Ok(rest_dispatch(rest, M::GET, &format!("/tokens/{tid}/holders"), None).await),
+            Ok(tid) => {
+                Ok(rest_dispatch(rest, M::GET, &format!("/tokens/{tid}/holders"), None).await)
+            }
             Err(()) => Err(()),
         },
         "sendTransaction" => match p.first() {
@@ -2592,7 +2606,9 @@ async fn handle_rpc_call(rest: &Router, call: JsonRpcRequest) -> serde_json::Val
             _ => Err(()),
         },
         "getTransaction" => match param_str(p, 0) {
-            Ok(hash) => Ok(rest_dispatch(rest, M::GET, &format!("/transactions/{hash}"), None).await),
+            Ok(hash) => {
+                Ok(rest_dispatch(rest, M::GET, &format!("/transactions/{hash}"), None).await)
+            }
             Err(()) => Err(()),
         },
         "getTransactions" => match (param_u64(p, 0, 50), param_u64(p, 1, 0)) {
@@ -2636,7 +2652,11 @@ async fn jsonrpc_handler(
 
     if let serde_json::Value::Array(calls) = payload {
         if calls.is_empty() {
-            return Json(rpc_error(serde_json::Value::Null, -32600, "Invalid request"));
+            return Json(rpc_error(
+                serde_json::Value::Null,
+                -32600,
+                "Invalid request",
+            ));
         }
         let mut out = Vec::with_capacity(calls.len());
         for call in calls {
@@ -2653,7 +2673,13 @@ async fn jsonrpc_handler(
 
     let parsed: JsonRpcRequest = match serde_json::from_value(payload) {
         Ok(r) => r,
-        Err(_) => return Json(rpc_error(serde_json::Value::Null, -32600, "Invalid request")),
+        Err(_) => {
+            return Json(rpc_error(
+                serde_json::Value::Null,
+                -32600,
+                "Invalid request",
+            ))
+        }
     };
     Json(handle_rpc_call(&rest, parsed).await)
 }
@@ -2676,7 +2702,10 @@ pub async fn run_api(state: SharedState) {
         .route("/block/{hash}", get(block))
         .route("/block/slot/{slot_num}", get(block_by_slot))
         .route("/transactions/{hash}", get(get_transaction))
-        .route("/transactions", get(list_transactions).post(submit_transaction))
+        .route(
+            "/transactions",
+            get(list_transactions).post(submit_transaction),
+        )
         .route("/mempool", get(mempool))
         .route("/mempool/{hash}", get(mempool_transaction))
         .route("/accounts/{pubkey}", get(get_account))

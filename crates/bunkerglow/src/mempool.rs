@@ -48,8 +48,8 @@ use bunker_coin_core::transaction::Transaction as CoreTransaction;
 use log::{debug, trace};
 use tokio::sync::Mutex;
 
-use crate::network::Network;
 use crate::Transaction;
+use crate::network::Network;
 
 /// Maximum number of pending transactions held per node before new admissions
 /// are rejected. Bounds memory and, on a slow link, the gossip fan-out.

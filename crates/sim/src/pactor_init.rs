@@ -123,7 +123,11 @@ fn try_decode_hostmode(bytes: &[u8]) -> Vec<HostmodePacket> {
 async fn verify_hostmode(transport: &UsbPactorTransport) -> bool {
     let status = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
     matches!(
-        tokio::time::timeout(Duration::from_secs(3), transport.hostmode_transaction(status)).await,
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            transport.hostmode_transaction(status)
+        )
+        .await,
         Ok(Ok(_))
     )
 }

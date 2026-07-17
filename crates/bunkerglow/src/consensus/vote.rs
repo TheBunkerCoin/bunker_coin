@@ -246,7 +246,10 @@ mod tests {
         let back: Vote = wincode::deserialize(&bytes).expect("deserialize");
 
         assert_eq!(back, vote, "vote must round-trip byte-identically");
-        assert!(back.check_sig(&pk), "signature must still verify after round-trip");
+        assert!(
+            back.check_sig(&pk),
+            "signature must still verify after round-trip"
+        );
 
         // With a compressed (48B) sig the largest vote (notar) is ~100 bytes; with
         // the old uncompressed (96B) sig it would be ~148. Guard against a

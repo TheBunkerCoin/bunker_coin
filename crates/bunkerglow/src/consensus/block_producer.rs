@@ -716,9 +716,14 @@ mod tests {
         let duration_left = Duration::from_micros(0);
 
         let parent = None;
-        let (payload, maybe_duration, terminal_empty) =
-            produce_slice_payload(Slot::new(1), &txs_receiver, parent.clone(), duration_left, None)
-                .await;
+        let (payload, maybe_duration, terminal_empty) = produce_slice_payload(
+            Slot::new(1),
+            &txs_receiver,
+            parent.clone(),
+            duration_left,
+            None,
+        )
+        .await;
         assert_eq!(maybe_duration, Duration::ZERO);
         // Empty slice produced via the grace timeout is terminal (single-slice block).
         assert!(terminal_empty, "empty slice must be marked terminal");
@@ -728,9 +733,14 @@ mod tests {
         assert!(block_payload.transactions.is_empty());
 
         let parent = Some((Slot::genesis(), GENESIS_BLOCK_HASH));
-        let (payload, maybe_duration, terminal_empty) =
-            produce_slice_payload(Slot::new(1), &txs_receiver, parent.clone(), duration_left, None)
-                .await;
+        let (payload, maybe_duration, terminal_empty) = produce_slice_payload(
+            Slot::new(1),
+            &txs_receiver,
+            parent.clone(),
+            duration_left,
+            None,
+        )
+        .await;
         assert_eq!(maybe_duration, Duration::ZERO);
         assert!(terminal_empty, "empty slice must be marked terminal");
         assert_eq!(payload.parent, parent);
@@ -756,12 +766,20 @@ mod tests {
         });
 
         let parent = None;
-        let (payload, maybe_duration, terminal_empty) =
-            produce_slice_payload(Slot::new(1), &txs_receiver, parent.clone(), duration_left, None)
-                .await;
+        let (payload, maybe_duration, terminal_empty) = produce_slice_payload(
+            Slot::new(1),
+            &txs_receiver,
+            parent.clone(),
+            duration_left,
+            None,
+        )
+        .await;
         assert!(maybe_duration > Duration::ZERO);
         // A full slice (txs packed) is NOT terminal-empty.
-        assert!(!terminal_empty, "full slice must not be marked terminal-empty");
+        assert!(
+            !terminal_empty,
+            "full slice must not be marked terminal-empty"
+        );
         assert_eq!(payload.parent, parent);
         assert!(payload.data.len() <= MAX_DATA_PER_SLICE);
         assert!(payload.data.len() > MAX_DATA_PER_SLICE - MAX_TRANSACTION_SIZE);

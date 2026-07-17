@@ -712,10 +712,7 @@ async fn consensus_smoke_test(
     println!("Messages OK:      {messages_ok}");
     println!("Total time:       {elapsed:.1?}");
     if messages_ok > 0 {
-        println!(
-            "Avg per message:  {:.1?}",
-            elapsed / messages_ok
-        );
+        println!("Avg per message:  {:.1?}", elapsed / messages_ok);
     }
     println!("Consensus exchange succeeded over PACTOR!");
 
