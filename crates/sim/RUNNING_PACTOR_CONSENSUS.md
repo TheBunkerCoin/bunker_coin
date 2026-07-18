@@ -63,6 +63,12 @@ cargo run -p bunker_coin_sim --bin pactor_consensus -- --simulated --half-duplex
 
 # Clean full-duplex link (symmetric) — fastest; validates wiring only:
 cargo run -p bunker_coin_sim --bin pactor_consensus -- --simulated
+
+# Demo with live radio stats: add per-frame packet loss (percent). Lost frames
+# are retransmitted by the simulated link (as real PACTOR ARQ would), so
+# consensus still converges — but the /radio panel shows REAL, changing
+# dropped/loss/queued figures instead of a lossless link's zeros:
+cargo run -p bunker_coin_sim --bin pactor_consensus -- --simulated --half-duplex --packet-loss 10 --rpc
 ```
 
 Add `--rpc` to serve the API on `127.0.0.1:3001`, `--duration N` to auto-stop

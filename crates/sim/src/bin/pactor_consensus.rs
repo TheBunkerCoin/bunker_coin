@@ -78,6 +78,13 @@ struct Args {
     #[arg(long)]
     half_duplex: bool,
 
+    /// With --simulated, per-frame packet loss percentage (0-90). Lost frames
+    /// are retransmitted by the simulated link (as real PACTOR ARQ would), so
+    /// consensus still converges — but the radio-stats panel shows real,
+    /// changing dropped/loss/queued figures instead of a lossless link's zeros.
+    #[arg(long, default_value_t = 0.0)]
+    packet_loss: f32,
+
     /// Serial device for the modem (hardware mode).
     #[arg(long)]
     port: Option<String>,
@@ -212,6 +219,7 @@ impl TxContext {
                 jitter_ms: 0,
                 packets_sent: 0,
                 packets_dropped: 0,
+                packets_queued: 0,
                 current_throughput_bps: 0.0,
                 link_speed_level: 0,
             })),
@@ -254,6 +262,15 @@ struct LinkCounters {
     /// Last modem-reported PACTOR speed level (passive LinkQuality status
     /// events, recorded as they pass through `next_event`). 0 = none yet.
     speed_level: AtomicU64,
+    /// Cumulative frame retransmissions reported by the link (LinkQuality
+    /// events carry the retry count a frame needed before delivery). Each
+    /// retry is a frame the channel lost and had to resend — the honest
+    /// "dropped"/loss signal where the transport reports it (the simulator
+    /// does; PACTOR hardware ARQ retransmits below the observable layer).
+    frames_retried: AtomicU64,
+    /// Live outbound-queue depth (messages enqueued in the mux but not yet
+    /// transmitted), published by the mux's gauge sampler.
+    outbound_queued: Arc<AtomicU64>,
 }
 
 /// Consecutive `write_data` failures after which the link is declared dead.
@@ -375,12 +392,22 @@ impl PactorTransport for CountingTransport {
         timeout_after: Option<Duration>,
     ) -> Result<scs_pactor::PactorLinkEvent, scs_pactor::ScsPactorError> {
         let event = self.inner.next_event(timeout_after).await;
-        // Record the modem's negotiated speed level as events pass through —
-        // the honest live band-health signal for the radio-stats panel.
-        if let Ok(scs_pactor::PactorLinkEvent::LinkQuality { speed_level, .. }) = &event {
+        // Record the modem's negotiated speed level and any frame retries as
+        // events pass through — the honest live band-health signals for the
+        // radio-stats panel.
+        if let Ok(scs_pactor::PactorLinkEvent::LinkQuality {
+            speed_level,
+            retries,
+        }) = &event
+        {
             self.counters
                 .speed_level
                 .store(u64::from(*speed_level), Ordering::Relaxed);
+            if *retries > 0 {
+                self.counters
+                    .frames_retried
+                    .fetch_add(u64::from(*retries), Ordering::Relaxed);
+            }
         }
         event
     }
@@ -424,9 +451,11 @@ const RADIO_STATS_WINDOW_SAMPLES: usize = 15;
 /// half-duplex HF link traffic comes in bursts with long quiet gaps, so most
 /// 2s snapshots are genuinely zero and the panel strobed 0 between bursts.
 /// The windowed figures show the link's recent activity at any moment.
-/// Only counters we actually observe are reported: PACTOR ARQ retransmits
-/// below this layer, so per-frame loss is not visible — dropped/loss stay 0
-/// rather than being fabricated.
+/// Only counters we actually observe are reported: dropped/loss come from the
+/// transport's LinkQuality retry reports (real on the simulated link; PACTOR
+/// hardware ARQ retransmits below the observable layer, so on-air they stay 0
+/// rather than being fabricated), and queued is the live mux outbound-queue
+/// depth.
 fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
     let updates = tx.updates.clone();
     let radio_stats = tx.radio_stats.clone();
@@ -434,8 +463,10 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
         let mut last_sent_frames = 0u64;
         let mut last_sent_bytes = 0u64;
         let mut last_recv_bytes = 0u64;
-        // Ring of (frames_sent, bytes_sent, bytes_received) per 2s tick.
-        let mut window: std::collections::VecDeque<(u64, u64, u64)> =
+        let mut last_retried = 0u64;
+        // Ring of (frames_sent, bytes_sent, bytes_received, frames_retried)
+        // per 2s tick.
+        let mut window: std::collections::VecDeque<(u64, u64, u64, u64)> =
             std::collections::VecDeque::with_capacity(RADIO_STATS_WINDOW_SAMPLES);
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -443,23 +474,36 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
             let sent_frames = counters.frames_sent.load(Ordering::Relaxed);
             let sent_bytes = counters.bytes_sent.load(Ordering::Relaxed);
             let recv_bytes = counters.bytes_received.load(Ordering::Relaxed);
+            let retried = counters.frames_retried.load(Ordering::Relaxed);
 
             let d_frames = sent_frames - last_sent_frames;
             let d_sent = sent_bytes - last_sent_bytes;
             let d_recv = recv_bytes - last_recv_bytes;
+            let d_retried = retried - last_retried;
             last_sent_frames = sent_frames;
             last_sent_bytes = sent_bytes;
             last_recv_bytes = recv_bytes;
+            last_retried = retried;
 
             if window.len() == RADIO_STATS_WINDOW_SAMPLES {
                 window.pop_front();
             }
-            window.push_back((d_frames, d_sent, d_recv));
+            window.push_back((d_frames, d_sent, d_recv, d_retried));
 
             let w_frames: u64 = window.iter().map(|s| s.0).sum();
             let w_sent: u64 = window.iter().map(|s| s.1).sum();
             let w_recv: u64 = window.iter().map(|s| s.2).sum();
+            let w_retried: u64 = window.iter().map(|s| s.3).sum();
             let window_secs = (window.len() * 2) as f64;
+
+            // Loss rate over the window: retransmitted frames as a fraction of
+            // all frame transmissions (delivered + retried attempts).
+            let loss_rate = if w_frames + w_retried > 0 {
+                w_retried as f64 / (w_frames + w_retried) as f64
+            } else {
+                0.0
+            };
+            let queued = counters.outbound_queued.load(Ordering::Relaxed);
 
             // Throughput counts both directions: this node's transmissions and
             // what it hears from the peer — i.e. traffic on the shared channel,
@@ -471,21 +515,29 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
             {
                 let mut stats = radio_stats.write().await;
                 stats.packets_sent = sent_frames;
+                stats.packets_dropped = retried;
+                stats.packets_queued = queued;
+                stats.packet_loss_percent = (loss_rate * 100.0) as f32;
                 stats.current_throughput_bps = throughput_bps;
                 stats.link_speed_level = speed_level;
             }
 
             // Windowed totals in the *_2s fields (the wire names are historic;
             // the explorer labels the panel with the actual window length).
-            // No WS client connected is fine; send() just returns Err.
+            // Dropped/loss come from LinkQuality retry reports (each retry is a
+            // frame the channel lost and had to resend) — real where the
+            // transport reports them (the simulator does; PACTOR hardware ARQ
+            // retransmits below the observable layer, so on-air they stay 0
+            // rather than being fabricated). Queued is the mux outbound-queue
+            // depth. No WS client connected is fine; send() just returns Err.
             let _ = updates.send(rpc::WebSocketUpdate::RadioStats {
                 packets_sent_2s: w_frames,
-                packets_dropped_2s: 0,
-                packets_transmitted_2s: w_frames,
+                packets_dropped_2s: w_retried,
+                packets_transmitted_2s: w_frames + w_retried,
                 bytes_transmitted_2s: w_sent,
                 effective_throughput_bps_2s: throughput_bps,
-                packet_loss_rate_2s: 0.0,
-                packets_queued: 0,
+                packet_loss_rate_2s: loss_rate,
+                packets_queued: queued,
                 link_speed_level: speed_level,
                 bytes_received_2s: w_recv,
             });
@@ -850,6 +902,7 @@ fn build_node(
     own_id: u64,
     cluster: &Cluster,
     turn: Option<bool>,
+    queued_gauge: Arc<AtomicU64>,
 ) -> (
     Node,
     PactorMuxHandle,
@@ -860,6 +913,8 @@ fn build_node(
         None => PactorMux::new(transport),
         Some(starts_with_turn) => PactorMux::new_half_duplex(transport, starts_with_turn),
     };
+    // Publish the mux's outbound-queue depth for the radio-stats panel.
+    mux.set_queued_gauge(queued_gauge);
     // All2All votes/certs are broadcast to all validators including self; over a
     // single link there is no socket loopback, so self-deliver them or a node
     // never counts its own vote toward the finalization quorum.
@@ -1045,7 +1100,14 @@ async fn main() -> anyhow::Result<()> {
     if args.inspect {
         run_inspect(&args, cluster, duration).await
     } else if args.simulated {
-        run_simulated(cluster, duration, args.half_duplex, args.rpc).await
+        run_simulated(
+            cluster,
+            duration,
+            args.half_duplex,
+            args.rpc,
+            args.packet_loss,
+        )
+        .await
     } else {
         run_hardware(&args, cluster, duration).await
     }
@@ -1126,7 +1188,12 @@ async fn run_simulated(
     duration: Option<Duration>,
     half_duplex: bool,
     rpc: bool,
+    packet_loss_percent: f32,
 ) -> anyhow::Result<()> {
+    // The simulated link retries lost frames (its ARQ model), so loss slows the
+    // link but never breaks delivery. Clamp away configs that would make
+    // retry-exhaustion likely.
+    let packet_loss = (packet_loss_percent / 100.0).clamp(0.0, 0.9);
     spawn_shutdown_watcher();
     println!(
         "=== simulated 2-node empty-block consensus over PACTOR mux ({}) ===",
@@ -1155,7 +1222,7 @@ async fn run_simulated(
     // long-lived node parks on idle reads).
     let config = if half_duplex {
         SimulatedPactorConfig {
-            packet_loss: 0.0,
+            packet_loss,
             latency_jitter: Duration::ZERO,
             setup_delay: Duration::ZERO,
             forced_initial_losses: 0,
@@ -1165,7 +1232,7 @@ async fn run_simulated(
         }
     } else {
         SimulatedPactorConfig {
-            packet_loss: 0.0,
+            packet_loss,
             latency: Duration::from_millis(20),
             latency_jitter: Duration::ZERO,
             setup_delay: Duration::ZERO,
@@ -1199,8 +1266,17 @@ async fn run_simulated(
     // the turn, node 1 without.
     let turn_a = half_duplex.then_some(true);
     let turn_b = half_duplex.then_some(false);
-    let (node_a, handle_a, mempool_a, exec_a) = build_node(ta.clone(), 0, &cluster, turn_a);
-    let (node_b, handle_b, mempool_b, exec_b) = build_node(tb, 1, &cluster, turn_b);
+    // Node A's queue depth feeds the RPC radio stats (the demo panel serves
+    // node A); node B gets a throwaway gauge.
+    let (node_a, handle_a, mempool_a, exec_a) = build_node(
+        ta.clone(),
+        0,
+        &cluster,
+        turn_a,
+        link_counters.outbound_queued.clone(),
+    );
+    let (node_b, handle_b, mempool_b, exec_b) =
+        build_node(tb, 1, &cluster, turn_b, Arc::default());
     spawn_link_quality_poller(ta, node_a.get_cancel_token());
 
     // Per-node transaction contexts (each over its own genesis-funded state).
@@ -1447,8 +1523,13 @@ async fn run_hardware(
             last_rx: std::sync::Mutex::new(Instant::now()),
         });
         // Half-duplex link: the caller (node 0) starts holding the transmit turn.
-        let (node, handle, mempool, exec) =
-            build_node(transport.clone(), own_id, &cluster, Some(is_caller));
+        let (node, handle, mempool, exec) = build_node(
+            transport.clone(),
+            own_id,
+            &cluster,
+            Some(is_caller),
+            link_counters.outbound_queued.clone(),
+        );
         // Drive the modem's passive status events (LinkQuality etc.).
         spawn_link_quality_poller(transport.clone(), node.get_cancel_token());
 

@@ -205,6 +205,9 @@ pub struct RadioStats {
     pub jitter_ms: u32,
     pub packets_sent: u64,
     pub packets_dropped: u64,
+    /// Messages currently enqueued in the mux awaiting transmission.
+    #[serde(default)]
+    pub packets_queued: u64,
     pub current_throughput_bps: f64,
     /// Modem-reported PACTOR speed level (0 = not yet reported).
     #[serde(default)]

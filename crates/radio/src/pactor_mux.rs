@@ -225,6 +225,9 @@ pub struct PactorMux {
     /// simulator / full-duplex transports). `Some` = enforce one transmit turn at
     /// a time with explicit changeover (for real PACTOR).
     turn: Option<Arc<TurnState>>,
+    /// Optional gauge updated with the current outbound-queue depth (messages
+    /// enqueued but not yet transmitted), for live radio-stats telemetry.
+    queued_gauge: Option<Arc<AtomicU64>>,
 }
 
 impl PactorMux {
@@ -272,7 +275,15 @@ impl PactorMux {
             message_counter: Arc::new(AtomicU64::new(0)),
             last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
             turn,
+            queued_gauge: None,
         }
+    }
+
+    /// Configure a gauge that is periodically updated with the outbound-queue
+    /// depth (messages enqueued but not yet transmitted). Call before
+    /// [`spawn`](Self::spawn). Drives the live "queued" radio-stats figure.
+    pub fn set_queued_gauge(&mut self, gauge: Arc<AtomicU64>) {
+        self.queued_gauge = Some(gauge);
     }
 
     /// Take the [`MuxChannel`] for one logical channel.
@@ -613,12 +624,28 @@ impl PactorMux {
             }
         });
 
+        // Periodically publish the outbound-queue depth to the configured
+        // gauge. A separate task (rather than writer-loop hooks) so the gauge
+        // stays live precisely when it matters most: while the writer is
+        // parked waiting for the transmit turn and the queue is building up.
+        let gauge_task = self.queued_gauge.take().map(|gauge| {
+            let tx = self.outbound_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    let queued = (tx.max_capacity() - tx.capacity()) as u64;
+                    gauge.store(queued, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            })
+        });
+
         PactorMuxHandle {
             transport,
             reader,
             writer,
             inbound_tx: self.inbound_tx.clone(),
             last_activity_ms,
+            gauge_task,
         }
     }
 }
@@ -656,6 +683,9 @@ pub struct PactorMuxHandle {
     inbound_tx: [Option<mpsc::Sender<Vec<u8>>>; Channel::COUNT],
     /// Shared inbound-activity clock, surfaced via [`liveness`](Self::liveness).
     last_activity_ms: Arc<AtomicU64>,
+    /// Outbound-queue gauge sampler (present when configured via
+    /// [`PactorMux::set_queued_gauge`]); aborted on [`shutdown`](Self::shutdown).
+    gauge_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl PactorMuxHandle {
@@ -689,6 +719,9 @@ impl PactorMuxHandle {
     pub fn shutdown(&mut self) {
         self.reader.abort();
         self.writer.abort();
+        if let Some(t) = &self.gauge_task {
+            t.abort();
+        }
         // Drop the retained inbound senders so the channels close and orphaned
         // receivers terminate (freeing the RocksDB handles for the next session).
         for slot in &mut self.inbound_tx {
