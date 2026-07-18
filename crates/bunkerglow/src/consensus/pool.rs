@@ -835,18 +835,44 @@ impl PoolImpl {
     }
 
     fn load_from_db(&mut self) {
+        // Restore the persisted floor, but treat it as a CLAIM to be verified
+        // against the valid certs below — it was written by the same run that
+        // may have persisted an invalid cert, so on its own it can pin the
+        // floor to finality that never really happened.
+        let mut meta_final_slot = None;
         if let Ok(Some(val)) = self.db.get(b"meta|final_slot") {
             if val.len() == 8 {
                 let arr: [u8; 8] = val[..8].try_into().unwrap();
-                self.highest_finalized_slot = Slot::new(u64::from_be_bytes(arr));
+                meta_final_slot = Some(Slot::new(u64::from_be_bytes(arr)));
             }
         }
         let mut raw_certs: Vec<Cert> = Vec::new();
         let mut highest_nf_slot = Slot::genesis();
+        let mut invalid_keys: Vec<Box<[u8]>> = Vec::new();
         for item in self.db.iterator(IteratorMode::Start) {
             if let Ok((k, v)) = item {
                 if k.starts_with(b"cert|") {
                     if let Ok(cert) = wincode::deserialize::<Cert>(&v) {
+                        // Certs received over the network are threshold-checked
+                        // before entering the pool, but locally-created certs
+                        // were persisted unvalidated — an invalid cert written
+                        // here once is restored as truth on every restart.
+                        // Observed on-air: a sub-80% FastFinal "finalized" a
+                        // slot locally, pinned this node's floor there forever,
+                        // and every standstill rebroadcast of it was correctly
+                        // rejected by the peer — permanently diverged floors.
+                        // Drop (and delete) anything that fails validation so
+                        // the floor re-derives from certs the peer will accept.
+                        if !cert.check_threshold(&self.epoch_info) {
+                            warn!(
+                                "dropping persisted {} cert for slot {} failing stake \
+                                 threshold — was never valid finality",
+                                cert.kind_str(),
+                                cert.slot()
+                            );
+                            invalid_keys.push(k);
+                            continue;
+                        }
                         match cert {
                             Cert::FastFinal(_) | Cert::Final(_) => {
                                 self.highest_finalized_slot =
@@ -861,6 +887,21 @@ impl PoolImpl {
                     }
                 }
             }
+        }
+        for k in invalid_keys {
+            let _ = self.db.delete(k);
+        }
+
+        // Keep honoring the persisted floor even where the invalid-cert purge
+        // above removed the cert that once "finalized" it. Rolling the floor
+        // back would make `clean_beyond_finalized` DELETE real chain history
+        // above the rolled-back floor. Instead the floor divergence heals by
+        // leapfrog: with cert creation fixed (votes stored before counting,
+        // see SlotState::add_vote), the next NEW finalization produces a cert
+        // the peer accepts, and finalizing that slot implicitly finalizes the
+        // whole ancestry on both nodes.
+        if let Some(meta_slot) = meta_final_slot {
+            self.highest_finalized_slot = self.highest_finalized_slot.max(meta_slot);
         }
 
         let retain_up_to = highest_nf_slot.max(self.highest_finalized_slot);

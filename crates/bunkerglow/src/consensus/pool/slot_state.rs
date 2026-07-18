@@ -132,6 +132,30 @@ impl SlotState {
         }
     }
 
+    /// Emit a locally-aggregated cert only if its own signer set actually
+    /// meets its stake threshold.
+    ///
+    /// The creation gates in the `count_*_stake` methods use the running
+    /// stake TALLY, but the cert embeds the actual collected votes. If those
+    /// ever disagree (tally double-count, vote-list gap), emitting the cert
+    /// poisons this node's pool and DB with unprovable finality that every
+    /// peer will reject — observed on-air as a sub-80% FastFinal that pinned
+    /// the node's finalized floor to a slot the peer could never accept,
+    /// permanently diverging the two nodes. Suppress it and log loudly
+    /// instead: the divergence itself is a bug this tripwire makes visible.
+    fn push_cert_checked(&self, new_certs: &mut SmallVec<[Cert; 2]>, cert: Cert) {
+        if cert.check_threshold(&self.epoch_info) {
+            new_certs.push(cert);
+        } else {
+            log::error!(
+                "BUG: locally-created {} cert for slot {} fails its stake threshold — \
+                 stake tally and collected votes diverged; cert suppressed",
+                cert.kind_str(),
+                cert.slot()
+            );
+        }
+    }
+
     /// Adds a certificate to this slot.
     pub fn add_cert(&mut self, cert: Cert) {
         match cert {
@@ -159,16 +183,27 @@ impl SlotState {
         let v = voter as usize;
 
         let (certs_created, mut votor_events, mut blocks_to_repair) = match vote.kind() {
+            // Store the vote BEFORE counting its stake. The count_* methods
+            // build certificates from the STORED votes the moment the running
+            // tally reaches quorum — counting first minted every cert WITHOUT
+            // the vote that tipped it over the threshold. In a 2-validator
+            // set that made every locally-created notar/fast-final cert
+            // permanently sub-threshold (1 of 2 votes = 50%): trusted locally
+            // (finalizing slots on unprovable certs), correctly rejected by
+            // the peer on every rebroadcast — the on-air poison certs that
+            // pinned the two nodes' finalized floors apart. The skip and
+            // final arms below always stored first, which is why skip/final
+            // certs were valid on the wire all along.
             VoteKind::Notar(_, block_hash) => {
-                let outputs = self.count_notar_stake(slot, block_hash, voter_stake);
+                let block_hash = block_hash.clone();
                 self.votes.notar[v] = Some(vote);
-                outputs
+                self.count_notar_stake(slot, &block_hash, voter_stake)
             }
             VoteKind::NotarFallback(_, block_hash) => {
-                let outputs = self.count_notar_fallback_stake(block_hash, voter_stake);
+                let block_hash = block_hash.clone();
                 let res = self.votes.notar_fallback[v].insert(block_hash.clone(), vote);
                 assert!(res.is_none());
-                outputs
+                self.count_notar_fallback_stake(&block_hash, voter_stake)
             }
             VoteKind::Skip(_) => {
                 self.votes.skip[v] = Some(vote);
@@ -305,17 +340,17 @@ impl SlotState {
             let mut votes = self.votes.notar_votes(block_hash);
             votes.extend(self.votes.notar_fallback_votes(block_hash));
             let cert = NotarFallbackCert::new_unchecked(&votes, &self.epoch_info.validators);
-            new_certs.push(Cert::NotarFallback(cert));
+            self.push_cert_checked(&mut new_certs, Cert::NotarFallback(cert));
         }
         if self.is_quorum(notar_stake) && self.certificates.notar.is_none() {
             let votes = self.votes.notar_votes(block_hash);
             let cert = NotarCert::new_unchecked(&votes, &self.epoch_info.validators);
-            new_certs.push(Cert::Notar(cert));
+            self.push_cert_checked(&mut new_certs, Cert::Notar(cert));
         }
         if self.is_strong_quorum(notar_stake) && self.certificates.fast_finalize.is_none() {
             let votes = self.votes.notar_votes(block_hash);
             let cert = FastFinalCert::new_unchecked(&votes, &self.epoch_info.validators);
-            new_certs.push(Cert::FastFinal(cert));
+            self.push_cert_checked(&mut new_certs, Cert::FastFinal(cert));
         }
 
         (new_certs, votor_events, blocks_to_repair)
@@ -340,7 +375,7 @@ impl SlotState {
             let mut votes = self.votes.notar_votes(block_hash);
             votes.extend(self.votes.notar_fallback_votes(block_hash));
             let cert = NotarFallbackCert::new_unchecked(&votes, &self.epoch_info.validators);
-            new_certs.push(Cert::NotarFallback(cert));
+            self.push_cert_checked(&mut new_certs, Cert::NotarFallback(cert));
         }
         (new_certs, SmallVec::new(), SmallVec::new())
     }
@@ -376,7 +411,7 @@ impl SlotState {
             let mut votes = self.votes.skip_votes();
             votes.extend(self.votes.skip_fallback_votes());
             let cert = SkipCert::new_unchecked(&votes, &self.epoch_info.validators);
-            new_certs.push(Cert::Skip(cert));
+            self.push_cert_checked(&mut new_certs, Cert::Skip(cert));
         }
         if !self.sent_safe_to_skip
             && self.is_weak_quorum(self.voted_stakes.notar_or_skip - self.voted_stakes.top_notar)
@@ -398,7 +433,7 @@ impl SlotState {
         if self.is_quorum(self.voted_stakes.finalize) && self.certificates.finalize.is_none() {
             let votes: Vec<_> = self.votes.final_votes();
             let cert = FinalCert::new_unchecked(&votes, &self.epoch_info.validators);
-            new_certs.push(Cert::Final(cert));
+            self.push_cert_checked(&mut new_certs, Cert::Final(cert));
         }
         (new_certs, SmallVec::new(), SmallVec::new())
     }
@@ -640,6 +675,52 @@ mod tests {
                 Some(&((i + 1) as Stake))
             );
             assert_eq!(slot_state.voted_stakes.notar_or_skip, (i + 1) as Stake);
+        }
+    }
+
+    /// Locally-created certs must contain the vote that tipped their quorum
+    /// and pass their own stake-threshold validation.
+    ///
+    /// Regression test for the on-air poison certs: `add_vote` used to count
+    /// stake BEFORE storing the vote, so certs were built from the stored
+    /// votes MINUS the tipping vote. In this minimal 2-validator set every
+    /// notar/fast-final cert then carried 1-of-2 signatures (50%) — trusted
+    /// locally, permanently rejected by the peer ("stake threshold not met"),
+    /// pinning the two nodes' finalized floors apart. Fails if the
+    /// store-before-count order in `add_vote` regresses.
+    #[test]
+    fn locally_created_certs_meet_their_threshold() {
+        let (sks, epoch_info) = generate_validators(2);
+        let (slot, hash): BlockId = (Slot::new(1), Hash::random_for_test().into());
+        let mut slot_state = SlotState::new(slot, epoch_info.clone());
+
+        let mut all_certs = Vec::new();
+        for (i, sk) in sks.iter().enumerate() {
+            let vote = Vote::new_notar(slot, hash.clone(), sk, i as ValidatorId);
+            let voter_stake = epoch_info.validator(i as ValidatorId).stake;
+            let (certs, _, _) = slot_state.add_vote(vote, voter_stake);
+            all_certs.extend(certs);
+        }
+
+        // Both votes are in: notar (60%) and fast-final (80%) quorums are met,
+        // so both certs must have been created — not suppressed as invalid.
+        assert!(
+            all_certs.iter().any(|c| matches!(c, Cert::Notar(_))),
+            "notar cert must be created once both votes are counted"
+        );
+        assert!(
+            all_certs.iter().any(|c| matches!(c, Cert::FastFinal(_))),
+            "fast-final cert must be created once both votes are counted"
+        );
+        // And every emitted cert must validate exactly as a peer would
+        // validate it on receive.
+        for cert in &all_certs {
+            assert!(
+                cert.check_threshold(&epoch_info),
+                "locally-created {} cert fails its own stake threshold — \
+                 it was built missing the tipping vote",
+                cert.kind_str()
+            );
         }
     }
 
