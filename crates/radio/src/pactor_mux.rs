@@ -193,6 +193,23 @@ impl Channel {
             _ => None,
         }
     }
+
+    /// The channel a message sent on `self` must be TAGGED with, i.e. the
+    /// channel the PEER should route it to. The repair pair is asymmetric —
+    /// `Repair` sends `RepairRequest`s that must arrive at the peer's
+    /// `RepairRequest` handler, and vice versa — so those two cross over.
+    /// (Previously every channel tagged with itself, which delivered repair
+    /// requests to the peer's response queue and responses to its request
+    /// queue: mutual deserialize failures, and repair NEVER worked over the
+    /// mux — first observed on-air once real block loss finally exercised it.)
+    /// All other channels are symmetric.
+    fn outbound_tag(self) -> Channel {
+        match self {
+            Channel::Repair => Channel::RepairRequest,
+            Channel::RepairRequest => Channel::Repair,
+            other => other,
+        }
+    }
 }
 
 /// An outbound message handed from a [`MuxChannel`] to the mux writer: the
@@ -492,6 +509,13 @@ impl PactorMux {
             } else {
                 turn_reclaim_silence() + reclaim_role_stagger()
             };
+            // Millis-since-start of the last reclaim, so a reclaim fires at most
+            // once per reclaim window: during a sustained outage the silence
+            // clock never resets (no inbound), and without this floor the writer
+            // re-reclaimed within seconds of granting — each cycle burning an
+            // extra changeover + grant on a link that is already struggling
+            // (observed on-air: reclaims 3s apart with silence climbing 66s→271s).
+            let mut last_reclaim_ms = 0u64;
             loop {
                 // Wait until we hold the turn. A turn-grant frame lost on-air
                 // would otherwise block here forever (the peer already dropped
@@ -502,8 +526,13 @@ impl PactorMux {
                 // either way: if the peer is gone we hold the turn harmlessly; if
                 // its grant was lost we correctly take the turn it meant to hand us.
                 while !turn.holds_turn.load(Ordering::SeqCst) {
-                    let silence = now_ms().saturating_sub(writer_activity.load(Ordering::Relaxed));
-                    if silence >= reclaim_after.as_millis() as u64 {
+                    let now = now_ms();
+                    let silence = now.saturating_sub(writer_activity.load(Ordering::Relaxed));
+                    let since_last_reclaim = now.saturating_sub(last_reclaim_ms);
+                    if silence >= reclaim_after.as_millis() as u64
+                        && since_last_reclaim >= reclaim_after.as_millis() as u64
+                    {
+                        last_reclaim_ms = now;
                         warn!(
                             "[mux:writer] link silent {silence}ms with no turn — reclaiming \
                              (lost turn-grant or peer gone)"
@@ -783,7 +812,9 @@ impl MuxInjector {
         }
         self.outbound_tx
             .send(Outbound {
-                channel: self.channel,
+                // Tag with the channel the PEER must route this to — the
+                // repair pair crosses over (see Channel::outbound_tag).
+                channel: self.channel.outbound_tag(),
                 payload,
             })
             .await
@@ -807,7 +838,9 @@ where
         }
         self.outbound_tx
             .send(Outbound {
-                channel: self.channel,
+                // Tag with the channel the PEER must route this to — the
+                // repair pair crosses over (see Channel::outbound_tag).
+                channel: self.channel.outbound_tag(),
                 payload,
             })
             .await
@@ -1098,6 +1131,45 @@ mod tests {
             .unwrap();
         assert_eq!(got_at_b, b"from-a");
         assert_eq!(got_at_a, b"from-b");
+    }
+
+    /// The repair channel pair must CROSS over the link: a message sent on A's
+    /// `Repair` channel (a RepairRequest) must arrive on B's `RepairRequest`
+    /// channel (the request handler), and a message sent on B's
+    /// `RepairRequest` channel (a RepairResponse) must arrive on A's `Repair`
+    /// channel (the requester). Previously both tagged with their own channel,
+    /// so requests landed in the peer's response queue and vice versa —
+    /// mutual deserialize failures; repair NEVER worked over the mux
+    /// (observed on-air as endless ReadSizeLimit warnings on both nodes).
+    #[tokio::test]
+    async fn repair_channels_cross_over_the_link() {
+        let (a, b) = LoopbackTransport::pair();
+
+        let mut mux_a = PactorMux::new(a);
+        let a_repair: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::Repair);
+        let _ha = mux_a.spawn();
+
+        let mut mux_b = PactorMux::new(b);
+        let b_repair_req: MuxChannel<Vec<u8>, Vec<u8>> = mux_b.channel(Channel::RepairRequest);
+        let _hb = mux_b.spawn();
+
+        let addr = "127.0.0.1:1".parse().unwrap();
+
+        // A's request must reach B's request handler...
+        a_repair.send(&b"request".to_vec(), addr).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), b_repair_req.receive())
+            .await
+            .expect("request must arrive on the peer's RepairRequest channel")
+            .unwrap();
+        assert_eq!(got, b"request");
+
+        // ...and B's response must come back to A's requester channel.
+        b_repair_req.send(&b"response".to_vec(), addr).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), a_repair.receive())
+            .await
+            .expect("response must arrive on the requester's Repair channel")
+            .unwrap();
+        assert_eq!(got, b"response");
     }
 
     #[tokio::test]
