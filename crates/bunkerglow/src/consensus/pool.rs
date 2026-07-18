@@ -765,8 +765,18 @@ impl Pool for PoolImpl {
                  re-broadcasting higher certs and votes only"
             );
         }
-        certs.extend(self.get_certs(slot.next()..));
-        let votes = self.get_own_votes(slot.next()..);
+        // Rebroadcast from the floor slot itself, NOT floor+1. The floor's own
+        // certs/votes are exactly what a lagging peer needs to notarize the
+        // floor slot and parent-ready the window above it — and after the
+        // invalid-cert purge the floor's finality may only be provable by
+        // re-aggregating votes. With `slot.next()..` the floor-slot votes were
+        // sent once (startup restored-vote burst) and never again: observed
+        // on-air as 9 hours of standstill cycles where node1 re-sent votes
+        // 8811..8815 every 5 minutes while node0 waited forever for the one
+        // notar(8810) vote that would unlock parent-ready(8812). Duplicates
+        // are cheap (peer dedups); a missing vote is a permanent wedge.
+        certs.extend(self.get_certs(slot..));
+        let votes = self.get_own_votes(slot..);
         if certs.is_empty() && votes.is_empty() {
             warn!("standstill recovery at slot {slot}: nothing at all to re-broadcast");
             return;

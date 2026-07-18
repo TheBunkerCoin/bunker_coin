@@ -195,7 +195,11 @@ pub struct Repair<N: Network> {
     pool: Arc<RwLock<Box<dyn Pool + Send + Sync>>>,
     slice_roots: BTreeMap<(BlockId, SliceIndex), SliceRoot>,
     outstanding_requests: BTreeMap<Hash, RepairRequestType>,
-    request_timeouts: BinaryHeap<(Instant, Hash)>,
+    /// Retry deadlines, soonest first. `Reverse` turns the max-heap into a
+    /// min-heap: without it, peek/pop returned the FARTHEST deadline, so the
+    /// earliest-due retries starved behind every newer request and a timed-out
+    /// repair could wait unboundedly to be re-sent.
+    request_timeouts: BinaryHeap<std::cmp::Reverse<(Instant, Hash)>>,
     network: N,
     sampler: StakeWeightedSampler,
     epoch_info: Arc<EpochInfo>,
@@ -235,10 +239,13 @@ where
     /// Inititates the corresponding repair process and handles ongoing repairs.
     pub async fn repair_loop(&mut self, mut repair_receiver: tokio::sync::mpsc::Receiver<BlockId>) {
         loop {
-            let next_timeout = self.request_timeouts.peek().map(|(t, _)| t);
+            let next_timeout = self
+                .request_timeouts
+                .peek()
+                .map(|std::cmp::Reverse((t, _))| t);
             let sleep_duration = match next_timeout {
                 None => std::time::Duration::MAX,
-                Some(t) => t.duration_since(Instant::now()),
+                Some(t) => t.saturating_duration_since(Instant::now()),
             };
             tokio::select! {
                 // handle repair response from network
@@ -249,7 +256,7 @@ where
                 }
                 // handle next request timeout
                 () = tokio::time::sleep(sleep_duration) => {
-                    let Some((_, hash)) = self.request_timeouts.pop() else {
+                    let Some(std::cmp::Reverse((_, hash))) = self.request_timeouts.pop() else {
                         continue;
                     };
                     if let Some(request) = self.outstanding_requests.remove(&hash) {
@@ -285,106 +292,135 @@ where
         let request_hash = response.request_type().hash();
 
         // check whether we are (still) waiting on response to this request
-        let Some(_) = self.outstanding_requests.remove(&request_hash) else {
-            warn!("received repair response for unknown request {response:?}");
+        let Some(pending) = self.outstanding_requests.remove(&request_hash) else {
+            // Late duplicates are routine on a half-duplex radio link (ARQ
+            // retries + our own timeout re-requests cross in flight), so this
+            // is debug, not warn — it flooded on-air logs for hours.
+            debug!("received repair response for already-settled request");
             return;
         };
+        // The request was removed above; if the response below turns out to be
+        // malformed (mismatched type, bad proof, wrong shred), RE-ARM it so
+        // the timeout machinery re-sends it. Removing before validating used
+        // to permanently kill a repair on the first bad response — the
+        // timeout retry found nothing to re-send, and the block was never
+        // repaired. On a 2-node radio link a node that cannot repair a branch
+        // can never vote it, stalling finalization forever.
+        let handled: bool = 'validate: {
+            match response {
+                RepairResponse::LastSliceRoot(req_type, last_slice, root, proof) => {
+                    // check validity of response
+                    let RepairRequestType::LastSliceRoot(block_id) = &req_type else {
+                        warn!(
+                            "repair response (LastSliceRoot) to mismatching request {req_type:?}"
+                        );
+                        break 'validate false;
+                    };
+                    let (_, block_hash) = block_id;
+                    if !DoubleMerkleTree::check_proof_last(
+                        &root,
+                        last_slice.inner(),
+                        block_hash,
+                        &proof,
+                    ) {
+                        warn!("repair response (LastSliceRoot) with invalid proof");
+                        break 'validate false;
+                    }
 
-        match response {
-            RepairResponse::LastSliceRoot(req_type, last_slice, root, proof) => {
-                // check validity of response
-                let RepairRequestType::LastSliceRoot(block_id) = &req_type else {
-                    warn!("repair response (LastSliceRoot) to mismatching request {req_type:?}");
-                    return;
-                };
-                let (_, block_hash) = block_id;
-                if !DoubleMerkleTree::check_proof_last(
-                    &root,
-                    last_slice.inner(),
-                    block_hash,
-                    &proof,
-                ) {
-                    warn!("repair response (LastSliceRoot) with invalid proof");
-                    return;
-                }
+                    // store slice Merkle root
+                    self.slice_roots
+                        .insert((block_id.clone(), last_slice), root);
 
-                // store slice Merkle root
-                self.slice_roots
-                    .insert((block_id.clone(), last_slice), root);
+                    // issue next requests
+                    // TODO: do not request last slice root again
+                    // TODO: already requests shreds for last slice here
+                    for slice in last_slice.until() {
+                        let req_type = RepairRequestType::SliceRoot(block_id.clone(), slice);
+                        self.send_request(req_type).await.unwrap();
+                    }
+                }
+                RepairResponse::SliceRoot(req_type, root, proof) => {
+                    // check validity of response
+                    let RepairRequestType::SliceRoot(ref block_id, slice) = req_type else {
+                        warn!("repair response (SliceRoot) to mismatching request {req_type:?}");
+                        break 'validate false;
+                    };
+                    let (_, block_hash) = block_id;
+                    if !DoubleMerkleTree::check_proof(&root, slice.inner(), block_hash, &proof) {
+                        warn!("repair response (SliceRoot) with invalid proof");
+                        break 'validate false;
+                    }
 
-                // issue next requests
-                // TODO: do not request last slice root again
-                // TODO: already requests shreds for last slice here
-                for slice in last_slice.until() {
-                    let req_type = RepairRequestType::SliceRoot(block_id.clone(), slice);
-                    self.send_request(req_type).await.unwrap();
-                }
-            }
-            RepairResponse::SliceRoot(req_type, root, proof) => {
-                // check validity of response
-                let RepairRequestType::SliceRoot(ref block_id, slice) = req_type else {
-                    warn!("repair response (SliceRoot) to mismatching request {req_type:?}");
-                    return;
-                };
-                let (_, block_hash) = block_id;
-                if !DoubleMerkleTree::check_proof(&root, slice.inner(), block_hash, &proof) {
-                    warn!("repair response (SliceRoot) with invalid proof");
-                    return;
-                }
+                    // store slice Merkle root
+                    self.slice_roots.insert((block_id.clone(), slice), root);
 
-                // store slice Merkle root
-                self.slice_roots.insert((block_id.clone(), slice), root);
+                    // issue next requests
+                    // HACK: workaround for when other nodes don't have the first `DATA_SHREDS` shreds
+                    for shred_index in ShredIndex::all() {
+                        let req = RepairRequestType::Shred(block_id.clone(), slice, shred_index);
+                        self.send_request(req).await.unwrap();
+                    }
+                }
+                RepairResponse::Shred(req_type, shred) => {
+                    // check validity of response
+                    let RepairRequestType::Shred(ref block_id, slice, index) = req_type else {
+                        warn!("repair response (Shred) to mismatching request {req_type:?}");
+                        break 'validate false;
+                    };
+                    let (slot, block_hash) = block_id;
+                    if shred.payload().header.slot != *slot
+                        || shred.payload().header.slice_index != slice
+                        || shred.payload().shred_index != index
+                    {
+                        warn!("repair response (Shred) for mismatching shred index");
+                        break 'validate false;
+                    }
+                    let Some(root) = self.slice_roots.get(&(block_id.clone(), slice)) else {
+                        // Was unreachable!() — but a panic here kills the
+                        // repair task for the rest of the session, silently
+                        // ending all block repair. Reachable in principle via
+                        // response/retry races on a half-duplex link; treat as
+                        // a malformed response and re-arm instead.
+                        warn!("repair response (Shred) before knowing slice root — re-requesting");
+                        break 'validate false;
+                    };
+                    if !shred.verify_path_only(root) {
+                        warn!("repair response (Shred) with invalid Merkle proof");
+                        break 'validate false;
+                    }
 
-                // issue next requests
-                // HACK: workaround for when other nodes don't have the first `DATA_SHREDS` shreds
-                for shred_index in ShredIndex::all() {
-                    let req = RepairRequestType::Shred(block_id.clone(), slice, shred_index);
-                    self.send_request(req).await.unwrap();
-                }
-            }
-            RepairResponse::Shred(req_type, shred) => {
-                // check validity of response
-                let RepairRequestType::Shred(ref block_id, slice, index) = req_type else {
-                    warn!("repair response (Shred) to mismatching request {req_type:?}");
-                    return;
-                };
-                let (slot, block_hash) = block_id;
-                if shred.payload().header.slot != *slot
-                    || shred.payload().header.slice_index != slice
-                    || shred.payload().shred_index != index
-                {
-                    warn!("repair response (Shred) for mismatching shred index");
-                    return;
-                }
-                let Some(root) = self.slice_roots.get(&(block_id.clone(), slice)) else {
-                    unreachable!("issued repair request (Shred) before knowing slice root");
-                };
-                if !shred.verify_path_only(root) {
-                    warn!("repair response (Shred) with invalid Merkle proof");
-                    return;
-                }
-
-                // store shred
-                let res = self
-                    .blockstore
-                    .write()
-                    .await
-                    .add_shred_from_repair(block_hash.clone(), shred)
-                    .await;
-                if let Ok(Some(block_info)) = res {
-                    assert_eq!(block_info.hash, *block_hash);
-                    self.pool
+                    // store shred
+                    let res = self
+                        .blockstore
                         .write()
                         .await
-                        .add_block((*slot, block_info.hash), block_info.parent)
+                        .add_shred_from_repair(block_hash.clone(), shred)
                         .await;
-                    debug!(
-                        "successfully repaired block {} in slot {}",
-                        &hex::encode(block_hash.as_hash())[..8],
-                        slot
-                    );
+                    if let Ok(Some(block_info)) = res {
+                        assert_eq!(block_info.hash, *block_hash);
+                        self.pool
+                            .write()
+                            .await
+                            .add_block((*slot, block_info.hash), block_info.parent)
+                            .await;
+                        debug!(
+                            "successfully repaired block {} in slot {}",
+                            &hex::encode(block_hash.as_hash())[..8],
+                            slot
+                        );
+                    }
                 }
             }
+            true
+        };
+
+        if !handled {
+            let expiry = Instant::now() + repair_timeout();
+            self.request_timeouts
+                .retain(|std::cmp::Reverse((_, h))| h != &request_hash);
+            self.request_timeouts
+                .push(std::cmp::Reverse((expiry, request_hash.clone())));
+            self.outstanding_requests.insert(request_hash, pending);
         }
     }
 
@@ -394,8 +430,10 @@ where
         let expiry = Instant::now() + repair_timeout();
         self.outstanding_requests
             .insert(hash.clone(), req_type.clone());
-        self.request_timeouts.retain(|(_, h)| h != &hash);
-        self.request_timeouts.push((expiry, hash));
+        self.request_timeouts
+            .retain(|std::cmp::Reverse((_, h))| h != &hash);
+        self.request_timeouts
+            .push(std::cmp::Reverse((expiry, hash)));
 
         let request = RepairRequest {
             sender: self.epoch_info.own_id,
