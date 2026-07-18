@@ -708,7 +708,7 @@ async fn route_terminal_line(
         // must NOT inject status polls (typed text transmits over the air) —
         // so quality telemetry is parse-only: whatever the firmware volunteers.
         let _ = event_tx.send(event).await;
-    } else {
+    } else if !is_prompt_echo(body) {
         // Unrecognized status banner: log it distinctively so on-air runs
         // collect the firmware's actual status vocabulary — exact parsers
         // (e.g. for retry/quality reports) get added from this evidence
@@ -719,6 +719,15 @@ async fn route_terminal_line(
     // Always forward the raw line so callers polling read_status_line() see it.
     let _ = command_tx.send(body.to_owned()).await;
     link_down
+}
+
+/// The modem's terminal command prompt (and prompt-suffixed lines). Emitted in
+/// response to every CR nudge during connect-wait (one per 2s), so it floods
+/// the vocabulary log with zero information — filter it out. Observed on-air:
+/// a bare `cmd:` every nudge interval while awaiting a link.
+fn is_prompt_echo(body: &str) -> bool {
+    let b = body.trim();
+    b.is_empty() || b == "cmd:" || b.ends_with("cmd:")
 }
 
 /// Parse a spontaneous link-quality banner into a [`PactorLinkEvent`], if the
