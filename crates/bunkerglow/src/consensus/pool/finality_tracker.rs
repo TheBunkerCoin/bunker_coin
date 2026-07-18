@@ -143,11 +143,22 @@ impl FinalityTracker {
             return FinalizationEvent::default();
         };
 
-        match status {
-            FinalizationStatus::Notarized(hash)
-            | FinalizationStatus::Finalized(hash)
-            | FinalizationStatus::ImplicitlyFinalized(hash) => {
-                assert_eq!(hash, block_hash, "consensus safety violation");
+        match &status {
+            FinalizationStatus::Notarized(hash) => {
+                assert_eq!(*hash, block_hash, "consensus safety violation");
+                FinalizationEvent::default()
+            }
+            FinalizationStatus::Finalized(hash) | FinalizationStatus::ImplicitlyFinalized(hash) => {
+                assert_eq!(*hash, block_hash, "consensus safety violation");
+                // RESTORE the finalized status: the insert above downgraded it
+                // to Notarized. Leaving the downgrade in place (the old
+                // behavior) let a later descendant's finalization walk descend
+                // through this supposedly-final slot and re-report already
+                // finalized ancestors — harmless before state pruning existed,
+                // but a re-report of a pruned ancestor now duplicates
+                // parent-ready bookkeeping. A notar cert arriving after
+                // finalization is routine (cert ordering races).
+                self.status.insert(slot, status);
                 FinalizationEvent::default()
             }
             FinalizationStatus::ImplicitlySkipped => FinalizationEvent::default(),
@@ -176,9 +187,15 @@ impl FinalityTracker {
         };
 
         match status {
-            FinalizationStatus::FinalPendingNotar
-            | FinalizationStatus::Finalized(_)
-            | FinalizationStatus::ImplicitlyFinalized(_) => FinalizationEvent::default(),
+            FinalizationStatus::FinalPendingNotar => FinalizationEvent::default(),
+            status @ (FinalizationStatus::Finalized(_)
+            | FinalizationStatus::ImplicitlyFinalized(_)) => {
+                // RESTORE: the insert above downgraded a finalized slot to
+                // FinalPendingNotar (same downgrade bug as in
+                // `mark_notarized` — see the comment there).
+                self.status.insert(slot, status);
+                FinalizationEvent::default()
+            }
             FinalizationStatus::Notarized(block_hash) => {
                 let mut event = FinalizationEvent::default();
                 self.status
@@ -196,6 +213,35 @@ impl FinalityTracker {
     /// Also, all prior slots are finalized (directly or implicitly) OR implicitly skipped.
     pub fn highest_finalized_slot(&self) -> Slot {
         self.highest_finalized_slot
+    }
+
+    /// Drops per-slot state for slots strictly below `below`.
+    ///
+    /// Called as finalization advances (with `below` = the first slot of the
+    /// finalized slot's window), since without pruning `status` grows by one
+    /// entry per slot and `parents` by one entry per block, forever.
+    ///
+    /// Safe because nothing consults entries that far back: certs/votes below
+    /// the finalized frontier are rejected by the pool before reaching the
+    /// tracker, and the implicit-finalization recursion stops at the first
+    /// already-finalized ancestor — the frontier slot's own entry, which is at
+    /// or above `below` and therefore kept. `highest_finalized_slot` is a
+    /// stored field, unaffected.
+    pub fn prune(&mut self, below: Slot) {
+        self.status = self.status.split_off(&below);
+        self.parents.retain(|(child_slot, _), _| *child_slot >= below);
+    }
+
+    /// Number of tracked per-slot status entries (test-only, for prune assertions).
+    #[cfg(test)]
+    pub fn status_len(&self) -> usize {
+        self.status.len()
+    }
+
+    /// Number of tracked parent links (test-only, for prune assertions).
+    #[cfg(test)]
+    pub fn parents_len(&self) -> usize {
+        self.parents.len()
     }
 
     /// Handles the direct finalization of the given block.
@@ -230,6 +276,13 @@ impl FinalityTracker {
         event: &mut FinalizationEvent,
     ) {
         assert!(source_slot > implicitly_finalized.0);
+        // NOTE on pruning: this walk may cross the prune floor when parent
+        // links arrive out of order (a block learned only after finalization).
+        // That is a genuine FIRST report and must proceed — downstream
+        // parent-ready derivation depends on it. Re-reports of already-
+        // finalized ancestors cannot get here: the walk stops at the first
+        // kept Finalized/ImplicitlyFinalized status, and `mark_notarized`/
+        // `mark_finalized` restore (never downgrade) those statuses.
 
         // implicitly skip slots in between
         for slot in implicitly_finalized.0.future_slots() {
@@ -308,6 +361,84 @@ impl Default for FinalityTracker {
 mod tests {
     use super::*;
     use crate::crypto::Hash;
+
+    /// A notar (or final) cert arriving AFTER a slot finalized must not
+    /// downgrade its status: `mark_notarized`/`mark_finalized` insert first and
+    /// previously returned without restoring `Finalized`. Combined with state
+    /// pruning, the downgraded slot let a descendant's finalization walk
+    /// re-descend through it and re-report pruned, already-finalized ancestors
+    /// (observed live: duplicate parent-ready add → consensus task panic).
+    #[test]
+    fn late_certs_do_not_downgrade_finalized_status() {
+        let mut tracker = FinalityTracker::default();
+        let (h3, h4, h5): (BlockHash, BlockHash, BlockHash) = (
+            Hash::random_for_test().into(),
+            Hash::random_for_test().into(),
+            Hash::random_for_test().into(),
+        );
+        let (s3, s4, s5) = (Slot::new(3), Slot::new(4), Slot::new(5));
+
+        // Chain 3 <- 4 <- 5; slot 3 finalized; slot 4 fast-finalized.
+        tracker.mark_notarized(s3, h3.clone());
+        tracker.mark_finalized(s3);
+        tracker.add_parent((s4, h4.clone()), (s3, h3.clone()));
+        tracker.add_parent((s5, h5.clone()), (s4, h4.clone()));
+        let ev = tracker.mark_fast_finalized(s4, h4.clone());
+        assert_eq!(ev.finalized, Some((s4, h4.clone())));
+
+        // Prune below the finalized window start (as the pool does).
+        tracker.prune(s4);
+
+        // LATE certs for slot 4 (routine cert-ordering races) must not
+        // downgrade its Finalized status...
+        assert_eq!(
+            tracker.mark_notarized(s4, h4.clone()),
+            FinalizationEvent::default()
+        );
+        assert_eq!(tracker.mark_finalized(s4), FinalizationEvent::default());
+
+        // ...so finalizing slot 5 must NOT re-report already-finalized
+        // ancestors (pre-fix: the walk descended through the downgraded slot 4
+        // into the pruned region and re-reported slot 3).
+        let ev = tracker.mark_fast_finalized(s5, h5.clone());
+        assert_eq!(ev.finalized, Some((s5, h5)));
+        assert_eq!(
+            ev.implicitly_finalized,
+            vec![],
+            "already-finalized ancestors must not be re-reported"
+        );
+    }
+
+    /// Out-of-order parent links learned AFTER pruning must still produce a
+    /// FIRST report of implicitly finalized ancestors below the prune floor —
+    /// the downstream parent-ready derivation for the current window depends
+    /// on it (this is the `parent_ready_upon_finalization` pool scenario).
+    #[test]
+    fn out_of_order_parents_below_prune_floor_still_first_reported() {
+        let mut tracker = FinalityTracker::default();
+        let (h3, h4, h5): (BlockHash, BlockHash, BlockHash) = (
+            Hash::random_for_test().into(),
+            Hash::random_for_test().into(),
+            Hash::random_for_test().into(),
+        );
+        let (s3, s4, s5) = (Slot::new(3), Slot::new(4), Slot::new(5));
+
+        // Slot 5 fast-finalizes with NO parent links known yet, then prune.
+        tracker.mark_notarized(s5, h5.clone());
+        let ev = tracker.mark_fast_finalized(s5, h5.clone());
+        assert_eq!(ev.finalized, Some((s5, h5.clone())));
+        tracker.prune(s4);
+
+        // Parent links arrive late (block bodies learned after finalization).
+        let ev = tracker.add_parent((s5, h5), (s4, h4.clone()));
+        assert_eq!(ev.implicitly_finalized, vec![(s4, h4.clone())]);
+        let ev = tracker.add_parent((s4, h4), (s3, h3.clone()));
+        assert_eq!(
+            ev.implicitly_finalized,
+            vec![(s3, h3)],
+            "first report of a below-floor ancestor must still fire"
+        );
+    }
 
     #[test]
     fn basic() {

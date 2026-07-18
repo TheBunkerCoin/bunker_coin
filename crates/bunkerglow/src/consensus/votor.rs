@@ -140,6 +140,14 @@ pub struct Votor<A: All2All> {
     /// during the grace window. Re-armed as `FinalVoteDeadline` timers when the
     /// voting loop starts, so slow-final liveness survives the crash.
     restored_final_deadlines: Vec<(Slot, BlockHash)>,
+    /// First slot of the window containing the highest finalized slot. All
+    /// per-slot state below this floor has been pruned (see
+    /// [`Self::prune_below_floor`]); events for slots below it are dropped at
+    /// the top of the voting loop. The drop is what makes the pruning safe: a
+    /// stale timer firing for a pruned slot must never reach `try_skip_window`
+    /// (the pruned `voted` set would no longer prevent a conflicting skip vote
+    /// for a slot we already notar-voted — a slashable offence).
+    finalized_floor: Slot,
 }
 
 impl<A: All2All> Votor<A> {
@@ -192,6 +200,7 @@ impl<A: All2All> Votor<A> {
             vote_history: VoteHistory::disabled(),
             restored_votes: Vec::new(),
             restored_final_deadlines: Vec::new(),
+            finalized_floor: Slot::genesis(),
         };
         votor.set_timeouts(Slot::new(0));
         votor
@@ -217,6 +226,10 @@ impl<A: All2All> Votor<A> {
     /// conflict is possible there.
     pub fn set_vote_history(&mut self, history: VoteHistory, finalized_slot: Slot) {
         self.vote_history = history;
+        // Everything below the restored frontier is settled; the vote history
+        // for those slots is pruned on load, so the floor guard must drop any
+        // stale event for them (the restored `voted` set no longer covers them).
+        self.finalized_floor = finalized_slot;
         for vote in self.vote_history.load_and_prune(finalized_slot) {
             let slot = vote.slot();
             if vote.is_notar() {
@@ -262,6 +275,32 @@ impl<A: All2All> Votor<A> {
         self.defer_final_vote = defer;
     }
 
+    /// Drops all per-slot voting state for slots strictly below `floor` and
+    /// raises [`Self::finalized_floor`].
+    ///
+    /// Called as finalization advances (with `floor` = the finalized slot's
+    /// window start). Without this sweep, Votor's ten per-slot collections grow
+    /// one entry per slot for the life of the process. Safe ONLY together with
+    /// the floor guard at the top of [`Self::voting_loop`]: pruning `voted`
+    /// removes the double-vote protection for those slots, so events for slots
+    /// below the floor must never reach a voting path again.
+    fn prune_below_floor(&mut self, floor: Slot) {
+        if floor <= self.finalized_floor {
+            return;
+        }
+        self.finalized_floor = floor;
+        self.voted = self.voted.split_off(&floor);
+        self.voted_notar = self.voted_notar.split_off(&floor);
+        self.bad_window = self.bad_window.split_off(&floor);
+        self.crashed_leader_rearms = self.crashed_leader_rearms.split_off(&floor);
+        self.block_notarized = self.block_notarized.split_off(&floor);
+        self.received_shred = self.received_shred.split_off(&floor);
+        self.pending_blocks = self.pending_blocks.split_off(&floor);
+        self.retired_slots = self.retired_slots.split_off(&floor);
+        self.fast_finalized = self.fast_finalized.split_off(&floor);
+        self.parents_ready.retain(|(slot, _, _)| *slot >= floor);
+    }
+
     /// Max times a window's crashed-leader timeout may be re-armed (paused) while
     /// the link is alive before we skip anyway. Bounds the pause so a genuinely
     /// gone peer (whose transport still reports "up") is eventually skipped,
@@ -296,6 +335,25 @@ impl<A: All2All> Votor<A> {
         }
         while let Some(event) = self.event_receiver.recv().await {
             //println!("[Votor {}] event: {:?}", self.validator_id, event);
+            // Drop events for slots below the finalized floor. Per-slot state
+            // below the floor has been pruned (see `prune_below_floor`), so a
+            // stale timer or late blockstore event for such a slot must never
+            // reach a voting path — with the `voted` guard pruned it could cast
+            // a conflicting (slashable) vote. Cert re-broadcasts and standstill
+            // recovery are exempt: they carry no voting decision and dropping
+            // them could starve a lagging peer of a cert it still needs.
+            if event.slot() < self.finalized_floor
+                && !matches!(
+                    event,
+                    VotorEvent::CertCreated(_) | VotorEvent::Standstill(..)
+                )
+            {
+                trace!(
+                    "ignoring event below finalized floor {}: {event:?}",
+                    self.finalized_floor
+                );
+                continue;
+            }
             if self.retired_slots.contains(&event.slot()) {
                 trace!("ignoring event for retired slot {}", event.slot());
                 continue;
@@ -359,11 +417,13 @@ impl<A: All2All> Votor<A> {
                             }
                             let first_slot_in_window = cert.slot().first_slot_in_window();
                             self.vote_history.prune(first_slot_in_window);
+                            self.prune_below_floor(first_slot_in_window);
                             self.set_timeouts(first_slot_in_window);
                         }
                         Cert::Final(_) => {
                             let first_slot_in_window = cert.slot().first_slot_in_window();
                             self.vote_history.prune(first_slot_in_window);
+                            self.prune_below_floor(first_slot_in_window);
                             self.set_timeouts(first_slot_in_window);
                         }
                         _ => {}
@@ -1067,6 +1127,111 @@ mod tests {
         .expect("re-armed deferred-final deadline must send the finalization vote");
         assert!(final_vote.is_final());
         assert_eq!(final_vote.slot(), slot);
+    }
+
+    /// `prune_below_floor` must drop all per-slot state below the floor and
+    /// never lower an already-raised floor.
+    #[tokio::test]
+    async fn prune_below_floor_sweeps_per_slot_state() {
+        let (sks, epoch_info) = generate_validators(2);
+        let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
+        let (tx, rx) = mpsc::channel(16);
+        let mut votor = Votor::new(0, sks[0].clone(), tx, rx, Arc::new(a2a.pop().unwrap()));
+
+        // Populate per-slot state across two windows (0..4 and 4..8).
+        for s in 1..=6u64 {
+            let slot = Slot::new(s);
+            let hash: BlockHash = Hash::random_for_test().into();
+            votor.voted.insert(slot);
+            votor.voted_notar.insert(slot, hash.clone());
+            votor.bad_window.insert(slot);
+            votor.block_notarized.insert(slot, hash.clone());
+            votor.received_shred.insert(slot);
+            votor.retired_slots.insert(slot);
+            votor.fast_finalized.insert(slot);
+            votor.parents_ready.insert((slot, slot.prev(), hash));
+        }
+
+        votor.prune_below_floor(Slot::new(4));
+        assert_eq!(votor.finalized_floor, Slot::new(4));
+        for set_len in [
+            votor.voted.len(),
+            votor.bad_window.len(),
+            votor.received_shred.len(),
+            votor.retired_slots.len(),
+            votor.fast_finalized.len(),
+        ] {
+            assert_eq!(set_len, 3, "slots 4,5,6 survive; 1,2,3 pruned");
+        }
+        assert_eq!(votor.voted_notar.len(), 3);
+        assert_eq!(votor.block_notarized.len(), 3);
+        assert!(votor.parents_ready.iter().all(|(s, _, _)| *s >= Slot::new(4)));
+
+        // A lower floor must be a no-op (floor is monotone).
+        votor.prune_below_floor(Slot::new(0));
+        assert_eq!(votor.finalized_floor, Slot::new(4));
+    }
+
+    /// The floor guard invariant: after finalization prunes a window, a stale
+    /// timer firing for a pruned slot that we notar-voted must produce NO vote.
+    /// Without the guard, the pruned `voted` set would no longer block
+    /// `try_skip_window`, and the skip vote would conflict with the earlier
+    /// notar vote — a slashable offence.
+    #[tokio::test]
+    async fn stale_timeout_below_floor_casts_no_vote() {
+        let (sks, epoch_info) = generate_validators(2);
+        let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
+        let (tx, rx) = mpsc::channel(100);
+        let other_a2a = a2a.pop().unwrap();
+        let votor_a2a = a2a.pop().unwrap();
+        let votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+        tokio::spawn(async move {
+            let mut votor = votor;
+            votor.voting_loop().await.unwrap();
+        });
+
+        // Notar-vote slot 1.
+        let slot = Slot::genesis().next();
+        tx.send(VotorEvent::FirstShred(slot)).await.unwrap();
+        let hash: BlockHash = Hash::random_for_test().into();
+        let block_info = BlockInfo {
+            hash: hash.clone(),
+            parent: (Slot::genesis(), GENESIS_BLOCK_HASH),
+        };
+        tx.send(VotorEvent::Block { slot, block_info }).await.unwrap();
+        let notar = match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Vote(v) => v,
+            m => panic!("expected notar vote, got {m:?}"),
+        };
+        assert!(notar.is_notar());
+
+        // Fast-final slot 5 (next window, 4..8): raises the floor to 4 and
+        // prunes slot 1's voting state (including its `voted` entry).
+        let slot5_vote = Vote::new_notar(
+            Slot::new(5),
+            Hash::random_for_test().into(),
+            &sks[0],
+            0,
+        );
+        let ff = Cert::FastFinal(FastFinalCert::new_unchecked(
+            std::slice::from_ref(&slot5_vote),
+            &epoch_info.validators,
+        ));
+        tx.send(VotorEvent::CertCreated(Box::new(ff))).await.unwrap();
+        // The fast-final cert is re-broadcast; consume it.
+        match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::FastFinal(_))),
+            ConsensusMessage::Vote(v) => panic!("unexpected vote: {v:?}"),
+        }
+
+        // A stale timer fires for the pruned slot 1. The floor guard must drop
+        // it — any emitted vote here would be a conflicting skip.
+        tx.send(VotorEvent::Timeout(slot)).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await;
+        assert!(
+            got.is_err(),
+            "stale timeout below the floor must not cast a vote, but sent: {got:?}"
+        );
     }
 
     #[tokio::test]

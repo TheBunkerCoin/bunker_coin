@@ -157,6 +157,27 @@ impl ParentReadyTracker {
     fn slot_state(&mut self, slot: Slot) -> &mut ParentReadyState {
         self.0.entry(slot).or_default()
     }
+
+    /// Drops per-slot state for slots strictly below `below`.
+    ///
+    /// Called as finalization advances (with `below` = the first slot of the
+    /// finalized slot's window) — without pruning this map grows by at least
+    /// one entry per slot, forever.
+    ///
+    /// Safe at that boundary: certs below the finalized frontier are rejected
+    /// before reaching the tracker, `mark_skipped`'s backward walk stays
+    /// within the marked slot's own window (kept in full), the forward walks
+    /// only touch future slots, and parent-ready waiters are registered for
+    /// upcoming window starts above the frontier.
+    pub fn prune(&mut self, below: Slot) {
+        self.0.retain(|slot, _| *slot >= below);
+    }
+
+    /// Number of tracked per-slot entries (test-only, for prune assertions).
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 impl Default for ParentReadyTracker {

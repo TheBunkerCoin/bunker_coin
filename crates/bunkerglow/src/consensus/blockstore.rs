@@ -94,8 +94,11 @@ impl From<&Block> for BlockInfo {
     }
 }
 
-/// blocks kept in memory at start-up
-const HOT_BLOCK_LIMIT: usize = 200;
+/// Number of recent slots kept "hot" in memory as finalization advances (see
+/// [`Blockstore::prune_finalized`]) — enough to serve repair requests for the
+/// active frontier. Older blocks are already durable in RocksDB and reads fall
+/// back there ([`Blockstore::get_block`]).
+const HOT_BLOCK_LIMIT: u64 = 200;
 
 /// Blockstore is the fundamental data structure holding block data per slot.
 pub struct BlockstoreImpl {
@@ -142,7 +145,9 @@ impl BlockstoreImpl {
         }
     }
 
-    /// Deletes everything before the given `slot` from the blockstore.
+    /// Deletes everything before the given `slot` from the in-memory blockstore.
+    /// (RocksDB data is unaffected; see [`Blockstore::prune_finalized`] for the
+    /// finalization-driven policy.)
     pub fn prune(&mut self, slot: Slot) {
         self.block_data = self.block_data.split_off(&slot);
     }
@@ -331,6 +336,16 @@ pub trait Blockstore {
     fn update_finalized_timestamp(&self, slot: Slot, hash: Hash, timestamp: u64);
 
     fn clean_beyond_finalized(&mut self, highest_finalized_slot: Slot);
+
+    /// Drops in-memory block data for slots far enough below the finalized
+    /// frontier, keeping the most recent `HOT_BLOCK_LIMIT` slots hot for
+    /// repair serving. Called by the pool as finalization advances.
+    ///
+    /// Without this, the in-memory store retains every block AND all of its
+    /// reconstructed shreds forever — the dominant per-slot memory cost of a
+    /// long-running node. Old blocks stay durable in RocksDB; reads fall back
+    /// there ([`Self::get_block`], [`Self::canonical_block_hash`]).
+    fn prune_finalized(&mut self, finalized_slot: Slot);
 }
 
 #[async_trait]
@@ -548,6 +563,11 @@ impl Blockstore for BlockstoreImpl {
                 let _ = self.db.put(key.as_bytes(), value);
             }
         }
+    }
+
+    fn prune_finalized(&mut self, finalized_slot: Slot) {
+        let cutoff = Slot::new(finalized_slot.inner().saturating_sub(HOT_BLOCK_LIMIT));
+        self.prune(cutoff);
     }
 
     fn clean_beyond_finalized(&mut self, highest_finalized_slot: Slot) {
@@ -914,6 +934,47 @@ mod tests {
             assert_eq!(res.err(), Some(AddShredError::InvalidSignature));
         }
 
+        Ok(())
+    }
+
+    /// `prune_finalized` must drop in-memory block data older than
+    /// `HOT_BLOCK_LIMIT` slots below the finalized frontier — while the pruned
+    /// blocks stay readable through the RocksDB fallback. Without this hook the
+    /// in-memory store retained every block + shreds forever.
+    #[tokio::test]
+    async fn prune_finalized_keeps_hot_window_and_db_fallback() -> Result<()> {
+        // Two blocks far enough apart that the second's hot window excludes the
+        // first: cutoff = 451 - HOT_BLOCK_LIMIT(200) = 251 > 250.
+        let old_slot = Slot::new(250);
+        let new_slot = Slot::new(451);
+        let (tx, _rx) = mpsc::channel(1000);
+        let (sk, mut blockstore) = test_setup(tx);
+        let old_block = create_random_shredded_block(old_slot, 1, &sk);
+        let new_block = create_random_shredded_block(new_slot, 1, &sk);
+        let mut shreds = vec![];
+        shreds.extend(old_block.2.into_iter().flatten());
+        shreds.extend(new_block.2.into_iter().flatten());
+        for shred in shreds {
+            add_shred_ignore_duplicate(&mut blockstore, shred.into_shred()).await?;
+        }
+        let old_hash = blockstore.disseminated_block_hash(old_slot).unwrap();
+        assert!(blockstore.stored_shreds_for_slot(old_slot) > 0);
+        assert!(blockstore.stored_shreds_for_slot(new_slot) > 0);
+
+        blockstore.prune_finalized(new_slot);
+
+        // Old slot's in-memory data is gone; the hot slot survives.
+        assert_eq!(blockstore.stored_shreds_for_slot(old_slot), 0);
+        assert!(blockstore.stored_shreds_for_slot(new_slot) > 0);
+        // The pruned block is still served from RocksDB.
+        assert!(
+            blockstore.get_block(&(old_slot, old_hash)).is_some(),
+            "pruned block must remain readable via the DB fallback"
+        );
+
+        // A frontier within HOT_BLOCK_LIMIT of genesis prunes nothing.
+        blockstore.prune_finalized(Slot::new(100));
+        assert!(blockstore.stored_shreds_for_slot(new_slot) > 0);
         Ok(())
     }
 

@@ -685,10 +685,15 @@ async fn epoch_transition_loop(
                             bincode::config::standard(),
                         ) {
                             Ok(encoded) => {
-                                pending_epoch_transitions
-                                    .write()
-                                    .await
-                                    .insert(new_epoch, encoded);
+                                let mut pending = pending_epoch_transitions.write().await;
+                                // A transition payload is consumed only when THIS
+                                // node produces the first block of its epoch; on
+                                // every epoch another validator leads, the entry
+                                // would sit here forever. Any epoch older than the
+                                // one starting now can no longer be embedded —
+                                // drop it.
+                                *pending = pending.split_off(&new_epoch);
+                                pending.insert(new_epoch, encoded);
                             }
                             Err(e) => warn!(
                                 "failed to encode epoch transition block for epoch {}: {}",
@@ -734,11 +739,18 @@ async fn finalized_checkpoint_loop(
     blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
     snapshot_store: Option<Arc<SnapshotStore>>,
 ) {
-    let Some(snapshot_store) = snapshot_store else {
-        return;
-    };
-
     while let Some(event) = finalized_slot_rx.recv().await {
+        // Drop in-memory blocks/shreds far below the new finalized frontier
+        // (they stay durable in RocksDB; reads fall back there). Done HERE —
+        // outside any pool lock — because taking `blockstore.write()` from
+        // inside the pool's cert handling adds a pool→blockstore lock edge
+        // that deadlocked against the shred-ingest path (which holds the
+        // blockstore write lock across an await on the bounded votor channel).
+        blockstore.write().await.prune_finalized(event.slot);
+
+        let Some(ref snapshot_store) = snapshot_store else {
+            continue;
+        };
         let block_hash = event
             .finalization_certs
             .iter()

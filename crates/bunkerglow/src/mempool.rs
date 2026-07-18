@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bunker_coin_core::transaction::Transaction as CoreTransaction;
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use tokio::sync::Mutex;
 
 use crate::Transaction;
@@ -195,6 +195,15 @@ impl Inner {
     fn evict(&mut self, hashes: &HashSet<String>) -> usize {
         let before = self.entries.len();
         self.entries.retain(|h, _| !hashes.contains(h));
+        // Compact the admission-order deque once stale hashes dominate it.
+        // Finalization eviction removes from `entries` but not from the deque;
+        // below the capacity bound the deque was otherwise never popped, so it
+        // grew by one hash per transaction ever admitted, forever. Amortized
+        // O(1): compaction runs only when >= half the deque is stale.
+        if self.admission_order.len() > 2 * self.entries.len() {
+            self.admission_order
+                .retain(|h| self.entries.contains_key(h));
+        }
         before - self.entries.len()
     }
 
@@ -249,25 +258,46 @@ where
     /// Spawn the background admit loop: drain the inner network, admit inbound
     /// gossiped transactions, and re-gossip newly-admitted ones so the flood
     /// converges every node's mempool. Call once after construction.
-    pub fn spawn_admit_loop(self: &Arc<Self>) {
+    ///
+    /// Returns the task handle (callers may ignore it; tests await it).
+    pub fn spawn_admit_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        /// Consecutive receive errors after which the network is considered
+        /// permanently closed and the loop exits. A torn-down mux returns
+        /// "inbound queue closed" on every poll, so this trips within ~2s;
+        /// a transient error resets the counter on the next success.
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+
         let this = self.clone();
         tokio::spawn(async move {
+            let mut consecutive_errors = 0u32;
             loop {
                 match this.net.receive().await {
                     Ok(wire) => {
+                        consecutive_errors = 0;
                         if this.admit_and_gossip(wire).await {
                             this.notify.notify_one();
                         }
                     }
                     Err(e) => {
-                        // A closed inner network ends the loop; a transient error
-                        // backs off. Mirrors other consensus receive loops.
+                        // A permanently closed inner network must END the loop:
+                        // previously this arm looped forever, leaking a
+                        // 200ms-spinning task plus the full mempool it holds on
+                        // EVERY radio reconnect (the old comment claimed the
+                        // loop ends; the code never did).
+                        consecutive_errors += 1;
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            warn!(
+                                "[mempool] admit loop exiting after {consecutive_errors} \
+                                 consecutive receive errors (network closed?): {e}"
+                            );
+                            return;
+                        }
                         debug!("[mempool] admit loop receive error: {e}");
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
             }
-        });
+        })
     }
 
     /// Submit a locally-originated transaction (from RPC / gateway): admit it and
@@ -417,6 +447,45 @@ where
 mod tests {
     use super::*;
     use bunker_coin_core::transaction::TransactionBody;
+
+    /// A network that is permanently closed: every receive errors immediately.
+    struct ClosedNet;
+
+    #[async_trait]
+    impl Network for ClosedNet {
+        type Send = Transaction;
+        type Recv = Transaction;
+
+        async fn send_to_many(
+            &self,
+            _message: &Self::Send,
+            _addrs: impl Iterator<Item = SocketAddr> + Send,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, _message: &Self::Send, _addr: SocketAddr) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn receive(&self) -> std::io::Result<Self::Recv> {
+            Err(std::io::Error::other("mux inbound queue closed"))
+        }
+    }
+
+    /// The admit loop must EXIT once its network is permanently closed —
+    /// previously the error arm looped forever, leaking a spinning task plus
+    /// the entire mempool it holds on every radio reconnect.
+    #[tokio::test]
+    async fn admit_loop_exits_when_network_closed() {
+        let mempool = Mempool::new(ClosedNet, vec![]);
+        let handle = mempool.spawn_admit_loop();
+        // 10 consecutive errors at ~200ms backoff each → exits well within 10s.
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("admit loop must exit on a closed network")
+            .expect("admit loop task must not panic");
+    }
 
     /// Build a wire `Transaction` from sender/nonce/fee (signature is not checked
     /// by the mempool; ordering/dedup are what matter here).

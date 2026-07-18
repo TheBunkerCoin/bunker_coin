@@ -154,6 +154,9 @@ pub struct PoolImpl {
 
     highest_finalized_slot: Slot,
     highest_notarized_fallback_slot: Slot,
+    /// Epoch for which an [`EpochBoundaryEvent`] has already been emitted, so
+    /// the boundary fires at most once per epoch (see `check_epoch_boundary`).
+    last_epoch_boundary_fired: Option<u64>,
 }
 
 impl PoolImpl {
@@ -203,6 +206,7 @@ impl PoolImpl {
             slashing_channel: None,
             highest_finalized_slot: Slot::genesis(),
             highest_notarized_fallback_slot: Slot::genesis(),
+            last_epoch_boundary_fired: None,
         };
 
         s.load_from_db();
@@ -221,15 +225,24 @@ impl PoolImpl {
         self.slashing_channel = Some(tx);
     }
 
-    async fn check_epoch_boundary(&self, slot: Slot) {
+    async fn check_epoch_boundary(&mut self, slot: Slot) {
         if slot.is_last_in_epoch() {
+            // Fire at most once per epoch: finalization events can re-report a
+            // slot in rare out-of-order/re-derivation corners, and a duplicate
+            // boundary event would re-run the epoch transition (double reward
+            // distribution).
+            let epoch = slot.epoch();
+            if self.last_epoch_boundary_fired == Some(epoch) {
+                return;
+            }
             if let Some(ref tx) = self.epoch_boundary_channel {
                 let event = EpochBoundaryEvent {
-                    epoch: slot.epoch(),
+                    epoch,
                     finalized_slot: slot,
                     finalization_certs: self.get_final_certs(slot),
                 };
                 let _ = tx.send(event).await;
+                self.last_epoch_boundary_fired = Some(epoch);
             }
         }
     }
@@ -244,7 +257,7 @@ impl PoolImpl {
         }
     }
 
-    async fn notify_finalization_event(&self, event: &FinalizationEvent) {
+    async fn notify_finalization_event(&mut self, event: &FinalizationEvent) {
         // Check every finalized slot for an epoch boundary — the directly
         // finalized slot AND every implicitly finalized ancestor. The last slot
         // of an epoch is also the last slot of a window, so it can be finalized
@@ -364,6 +377,12 @@ impl PoolImpl {
                             timestamp,
                         );
                     }
+                    // NOTE: do NOT take `blockstore.write()` here — the pool
+                    // lock is held by our caller, and the shred-ingest path
+                    // holds the blockstore write lock across an await on the
+                    // bounded votor channel; the combination deadlocks. The
+                    // in-memory blockstore prune runs in
+                    // `finalized_checkpoint_loop` instead (no locks held).
                 }
 
                 // Epoch-boundary check now happens in `notify_finalization_event`
@@ -492,10 +511,29 @@ impl PoolImpl {
     /// Cleans up old finalized slots from the pool.
     ///
     /// After this, [`Self::slot_states`] will only contain entries for slots
-    /// >= [`Self::finalized_slot`].
+    /// >= [`Self::finalized_slot`], and the side trackers only entries for
+    /// slots >= the finalized slot's window start. Without the side-tracker
+    /// pruning, [`FinalityTracker`], [`ParentReadyTracker`], and
+    /// [`Self::s2n_waiting_parent_cert`] each grow forever (one entry per
+    /// slot/block for the life of the process) — the dominant steady memory
+    /// leak on a long-running node.
+    ///
+    /// The side trackers keep the whole current window (not just the frontier
+    /// slot) because `ParentReadyTracker::mark_skipped` backward-walks within
+    /// the marked slot's window, and the finality recursion must find the
+    /// frontier's own status entry to stop at.
     fn prune(&mut self) {
         let last_slot = self.finalized_slot();
         self.slot_states = self.slot_states.split_off(&last_slot);
+
+        let window_start = last_slot.first_slot_in_window();
+        self.finality_tracker.prune(window_start);
+        self.parent_ready_tracker.prune(window_start);
+        // A child waiting for its parent's notar cert can never be satisfied
+        // once the parent slot is below the frontier window: certs that old are
+        // rejected by the bounds checks before reaching the pool.
+        self.s2n_waiting_parent_cert
+            .retain(|(parent_slot, _), _| *parent_slot >= window_start);
     }
 
     /// Returns `true` iff the given parent is ready for the given slot.
@@ -1811,6 +1849,61 @@ mod tests {
             saw_epoch_0,
             "epoch-boundary event for epoch 0 must fire when slot {boundary} is \
              finalized only implicitly"
+        );
+    }
+
+    /// Finalization must prune the pool's side trackers, not just
+    /// `slot_states`: `FinalityTracker` (status + parent links),
+    /// `ParentReadyTracker`, and `s2n_waiting_parent_cert` previously grew one
+    /// entry per slot/block forever — the dominant steady memory leak on a
+    /// long-running node. After fast-finalizing slot 5 (window 4..8), no
+    /// tracker entry below the window start (slot 4) may survive.
+    #[tokio::test]
+    async fn prune_shrinks_side_trackers() {
+        let (sks, epoch_info) = generate_validators(11);
+        let (votor_tx, _votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let db_path = format!(
+            "{}/bunkerglow-pool-prune-trackers-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let mut pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
+
+        // Build a parent chain 1 <- 2 <- 3 <- 4 <- 5 (one block per slot).
+        let hashes: Vec<BlockHash> = (0..=5).map(|_| Hash::random_for_test().into()).collect();
+        for slot in 2..=5u64 {
+            pool.add_block(
+                (Slot::new(slot), hashes[slot as usize].clone()),
+                (Slot::new(slot - 1), hashes[slot as usize - 1].clone()),
+            )
+            .await;
+        }
+        assert_eq!(pool.finality_tracker.parents_len(), 4);
+
+        // Fast-finalize slot 5 (strong quorum of notar votes). This implicitly
+        // finalizes the whole chain below and then prunes at the window start
+        // (slot 4, SLOTS_PER_WINDOW = 4).
+        for v in 0..11 {
+            let vote = Vote::new_notar(Slot::new(5), hashes[5].clone(), &sks[v as usize], v);
+            assert_eq!(pool.add_vote(vote).await, Ok(()));
+        }
+        assert_eq!(pool.finalized_slot(), Slot::new(5));
+
+        // Only the current window's entries survive: parent links for children
+        // in slots >= 4 (4->3, 5->4), status for slots >= 4 (4, 5).
+        assert_eq!(pool.finality_tracker.parents_len(), 2);
+        assert_eq!(pool.finality_tracker.status_len(), 2);
+        // Parent-ready states for slots below 4 (incl. genesis) are gone.
+        assert!(pool.parent_ready_tracker.len() <= 3);
+        // Waiting-for-parent-cert entries with parents below the window start
+        // are gone; only the (parent slot 4 -> child slot 5) entry may remain.
+        assert!(pool.s2n_waiting_parent_cert.len() <= 1);
+        assert!(
+            pool.s2n_waiting_parent_cert
+                .keys()
+                .all(|(parent_slot, _)| *parent_slot >= Slot::new(4))
         );
     }
 

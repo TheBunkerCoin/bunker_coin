@@ -93,13 +93,10 @@ impl ParentReadyState {
         self.notar_fallbacks.iter().cloned()
     }
 
-    /// Adds a [`BlockId`] to the parents ready list.
+    /// Adds a [`BlockId`] to the parents ready list. Idempotent: re-adding an
+    /// already-ready parent is a no-op.
     ///
     /// Additionally, will inform any waiters.
-    ///
-    /// # Panics
-    ///
-    /// If the specific parent is already marked ready for this slot.
     pub(super) fn add_to_ready(&mut self, id: BlockId) {
         match &mut self.is_ready {
             IsReady::NotReady(sender) => {
@@ -116,8 +113,14 @@ impl ParentReadyState {
                 self.is_ready = IsReady::Ready(smallvec![id]);
             }
             IsReady::Ready(ready_ids) => {
-                assert!(!ready_ids.contains(&id));
-                ready_ids.push(id);
+                // Idempotent: a parent can be legitimately re-derived (e.g. a
+                // finalization walk crossing the prune floor re-reports an
+                // ancestor whose dedup flag was pruned). Re-adding a ready
+                // parent is semantically a no-op — asserting here turned that
+                // into a consensus-task crash.
+                if !ready_ids.contains(&id) {
+                    ready_ids.push(id);
+                }
             }
         }
     }
