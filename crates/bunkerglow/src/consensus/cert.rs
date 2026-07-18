@@ -37,6 +37,18 @@ pub enum Cert {
 }
 
 impl Cert {
+    /// Short human-readable certificate kind, for log lines.
+    #[must_use]
+    pub const fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Notar(_) => "notar",
+            Self::NotarFallback(_) => "notar-fallback",
+            Self::Skip(_) => "skip",
+            Self::FastFinal(_) => "fast-final",
+            Self::Final(_) => "final",
+        }
+    }
+
     /// Checks that the stake threshold is met.
     #[must_use]
     pub fn check_threshold(&self, epoch_info: &EpochInfo) -> bool {

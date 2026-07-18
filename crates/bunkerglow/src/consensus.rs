@@ -39,7 +39,7 @@ pub use epoch_info::EpochInfo;
 use fastrace::Span;
 use fastrace::future::FutureExt;
 pub use link_liveness::{LinkLiveness, NoLiveness, SwappableLiveness};
-use log::{info, trace, warn};
+use log::{error, info, trace, warn};
 pub use pool::{
     AddVoteError, EpochBoundaryEvent, FinalizedSlotEvent, Pool, PoolError, PoolImpl, SlashingReport,
 };
@@ -494,12 +494,36 @@ where
     /// [`All2All`]: Handles incoming votes and certificates. Adds them to the [`Pool`].
     /// [`Disseminator`]: Handles incoming shreds. Adds them to the [`Blockstore`].
     async fn message_loop(self: &Arc<Self>) -> Result<()> {
+        // A receive/handle error must NOT kill this loop: it is the ONLY
+        // ingestion path for votes, certs, and disseminated shreds. It is
+        // spawned detached and its JoinHandle is inspected only at teardown, so
+        // an early `?`-return here used to silently and permanently stop all
+        // vote counting while the producer/repair/standstill loops kept running
+        // — the node looked alive but could never form another cert. Log loudly
+        // and keep receiving; back off briefly so a persistently-failing source
+        // (e.g. a closed channel) cannot hot-loop.
         loop {
             tokio::select! {
                 // handle incoming votes and certificates
-                res = self.all2all.receive() => self.handle_all2all_message(res?).await,
+                res = self.all2all.receive() => match res {
+                    Ok(msg) => self.handle_all2all_message(msg).await,
+                    Err(e) => {
+                        error!("all2all receive failed (vote/cert ingestion degraded): {e}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                },
                 // handle shreds received by block dissemination protocol
-                res = self.disseminator.receive() => self.handle_disseminator_shred(res?).await?,
+                res = self.disseminator.receive() => match res {
+                    Ok(shred) => {
+                        if let Err(e) = self.handle_disseminator_shred(shred).await {
+                            error!("disseminator shred handling failed: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        error!("disseminator receive failed (shred ingestion degraded): {e}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                },
 
                 () = self.cancel_token.cancelled() => return Ok(()),
             };
@@ -533,17 +557,31 @@ where
     async fn handle_all2all_message(&self, msg: ConsensusMessage) {
         trace!("received all2all msg: {msg:?}");
         match msg {
-            ConsensusMessage::Vote(v) => match self.pool.write().await.add_vote(v).await {
-                Ok(()) => {}
-                Err(AddVoteError::Slashable(offence)) => {
-                    warn!("slashable offence detected: {offence}");
+            ConsensusMessage::Vote(v) => {
+                // Log at info/warn (not trace): votes are low-rate and this is
+                // the ONLY on-air evidence of whether the peer's votes are
+                // arriving and being counted. An hour-long finalization stall
+                // was undiagnosable because rejected votes vanished at trace
+                // level — the log showed blocks crossing while certs silently
+                // never formed.
+                let (slot, signer) = (v.slot(), v.signer());
+                match self.pool.write().await.add_vote(v).await {
+                    Ok(()) => info!("counted vote for slot {slot} from validator {signer}"),
+                    Err(AddVoteError::Slashable(offence)) => {
+                        warn!("slashable offence detected: {offence}");
+                    }
+                    Err(err) => {
+                        warn!("ignoring vote for slot {slot} from validator {signer}: {err}");
+                    }
                 }
-                Err(err) => trace!("ignoring invalid vote: {err}"),
-            },
-            ConsensusMessage::Cert(c) => match self.pool.write().await.add_cert(c).await {
-                Ok(()) => {}
-                Err(err) => trace!("ignoring invalid cert: {err}"),
-            },
+            }
+            ConsensusMessage::Cert(c) => {
+                let (slot, kind) = (c.slot(), c.kind_str());
+                match self.pool.write().await.add_cert(c).await {
+                    Ok(()) => info!("ingested {kind} cert for slot {slot}"),
+                    Err(err) => warn!("ignoring {kind} cert for slot {slot}: {err}"),
+                }
+            }
         }
     }
 
