@@ -752,18 +752,25 @@ impl Pool for PoolImpl {
     async fn recover_from_standstill(&self) {
         let slot = self.finalized_slot();
         let mut certs = self.get_final_certs(slot);
-        // If nothing has been finalized yet (finalized slot is genesis with no
-        // cert), there is no final cert to re-broadcast. This is reachable over a
-        // slow/marginal link where consensus can stall at slot 0 before the first
-        // finalization; treat it as a no-op recovery rather than asserting.
+        // No final cert for the floor is possible (genesis before the first
+        // finalization, or the floor's cert was purged as invalid on load).
+        // Do NOT return early: the higher certs and own votes below are the
+        // only periodic re-send mechanism for consensus traffic lost on the
+        // link — an early return here disabled standstill recovery entirely
+        // on both nodes once the poison floor certs were purged, leaving
+        // nothing re-transmitting votes over a lossy link.
         if certs.is_empty() {
             warn!(
-                "standstill recovery at slot {slot} with no final cert yet; nothing to re-broadcast"
+                "standstill recovery at slot {slot} with no final cert for the floor; \
+                 re-broadcasting higher certs and votes only"
             );
-            return;
         }
         certs.extend(self.get_certs(slot.next()..));
         let votes = self.get_own_votes(slot.next()..);
+        if certs.is_empty() && votes.is_empty() {
+            warn!("standstill recovery at slot {slot}: nothing at all to re-broadcast");
+            return;
+        }
 
         warn!("recovering from standstill at slot {slot}");
         debug!(
