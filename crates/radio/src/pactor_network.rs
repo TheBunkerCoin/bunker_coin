@@ -60,7 +60,10 @@ impl<S, R> PactorNetwork<S, R> {
         Self {
             transport,
             max_read_len: DEFAULT_MAX_READ_LEN,
-            message_counter: AtomicU64::new(0),
+            // Session-unique id namespace (see PactorMux::build): random high
+            // 32 bits, counting low 32 bits — stale-partial merges across
+            // session restarts become improbable.
+            message_counter: AtomicU64::new(u64::from(rand::random::<u32>()) << 32),
             reassembly: Mutex::new(Reassembler::new()),
             _msg_types: PhantomData,
         }

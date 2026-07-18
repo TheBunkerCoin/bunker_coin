@@ -272,7 +272,15 @@ impl PactorMux {
             outbound_rx: Some(outbound_rx),
             inbound_tx,
             inbound_rx,
-            message_counter: Arc::new(AtomicU64::new(0)),
+            // Session-unique message-id namespace: the low 32 bits count
+            // messages, the high 32 bits are a per-mux random nonce. With a
+            // plain 0-based counter, a peer whose session restarts reuses ids
+            // that may still key stale partials in OUR reassembler — fragments
+            // of two different messages then merge into one corrupt payload
+            // (observed on-air as Repair-channel deserialize failures). The
+            // nonce makes cross-session (and cross-direction, for full-duplex
+            // transports) collisions improbable.
+            message_counter: Arc::new(AtomicU64::new(u64::from(rand::random::<u32>()) << 32)),
             last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
             turn,
             queued_gauge: None,
@@ -843,9 +851,18 @@ where
             match wincode::deserialize(&bytes) {
                 Ok(msg) => return Ok(msg),
                 Err(err) => {
+                    // Include length + a bounded hex prefix of the payload:
+                    // distinguishes a TRUNCATED message (short, clean prefix of
+                    // a valid message) from a MERGED one (fragment-id collision;
+                    // mixed content) from a wrong-type/wire-mismatch message —
+                    // the on-air repair failures needed exactly this evidence.
+                    let prefix_len = bytes.len().min(48);
                     warn!(
-                        "MuxChannel({:?}) deserialize failed ({err:?}); waiting for next message",
-                        self.channel
+                        "MuxChannel({:?}) deserialize failed ({err:?}); payload {} bytes, \
+                         prefix {:02x?}; waiting for next message",
+                        self.channel,
+                        bytes.len(),
+                        &bytes[..prefix_len],
                     );
                     continue;
                 }
