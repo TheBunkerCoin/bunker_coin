@@ -158,6 +158,9 @@ struct TxContext {
     mempool: Arc<tokio::sync::RwLock<Vec<rpc::MempoolEntry>>>,
     /// Finalized/failed outcome per tx hash, populated by the executor.
     tx_results: Arc<tokio::sync::RwLock<HashMap<String, rpc::TxResult>>>,
+    /// Insertion order of `tx_results`, so the map can be capped FIFO (it
+    /// previously grew by one entry per finalized tx, forever).
+    tx_results_order: Arc<tokio::sync::RwLock<std::collections::VecDeque<String>>>,
     /// Genesis ed25519 key, so the RPC can server-side-sign transactions whose
     /// sender is the genesis account (submit with an all-zero signature).
     genesis_signing_key: Arc<SigningKey>,
@@ -185,6 +188,9 @@ impl TxContext {
             execution_state,
             mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             tx_results: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            tx_results_order: Arc::new(tokio::sync::RwLock::new(
+                std::collections::VecDeque::new(),
+            )),
             genesis_signing_key: Arc::new(cluster.genesis_key.clone()),
             // Both validators of the two-node cluster, so `/nodes` is populated
             // from startup (finalized_slot advances via the block executor).
@@ -227,6 +233,7 @@ impl TxContext {
             execution_state,
             mempool: self.mempool.clone(),
             tx_results: self.tx_results.clone(),
+            tx_results_order: self.tx_results_order.clone(),
             genesis_signing_key: self.genesis_signing_key.clone(),
             nodes: self.nodes.clone(),
             updates: self.updates.clone(),
@@ -715,8 +722,14 @@ async fn record_tx_results(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
+    /// FIFO cap on retained tx results: uncapped, the map grew by one entry per
+    /// finalized tx for the life of the process. Old results age out of
+    /// `/tx/{hash}` once the cap is reached; the chain itself stays in RocksDB.
+    const MAX_TX_RESULTS: usize = 10_000;
+
     let mut mempool = tx.mempool.write().await;
     let mut results_map = tx.tx_results.write().await;
+    let mut results_order = tx.tx_results_order.write().await;
     for (core_tx, exec_result) in core_txs.iter().zip(results.iter()) {
         let hash = hex::encode(core_tx.hash());
         let (status, error) = match exec_result {
@@ -728,14 +741,25 @@ async fn record_tx_results(
         // duplicate then fails on nonce mismatch. Overwriting here made a
         // SUCCESSFUL transfer report "failed" (observed on-air: nonce-0 tx
         // succeeded in slot 23, its slot-24 duplicate's failure clobbered it).
-        results_map.entry(hash.clone()).or_insert(rpc::TxResult {
-            hash: hash.clone(),
-            slot,
-            block_hash: block_hash_hex.to_string(),
-            status,
-            error,
-            executed_at: now,
-        });
+        if !results_map.contains_key(&hash) {
+            results_map.insert(
+                hash.clone(),
+                rpc::TxResult {
+                    hash: hash.clone(),
+                    slot,
+                    block_hash: block_hash_hex.to_string(),
+                    status,
+                    error,
+                    executed_at: now,
+                },
+            );
+            results_order.push_back(hash.clone());
+            while results_order.len() > MAX_TX_RESULTS {
+                if let Some(oldest) = results_order.pop_front() {
+                    results_map.remove(&oldest);
+                }
+            }
+        }
         mempool.retain(|e| e.hash != hash);
     }
 }

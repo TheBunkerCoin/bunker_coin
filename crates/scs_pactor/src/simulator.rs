@@ -517,14 +517,16 @@ impl PactorTransport for SimulatedPactorTransport {
                 self.stats
                     .bytes_delivered
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
-                let _ = self
-                    .local
-                    .event_tx
-                    .send(PactorLinkEvent::LinkQuality {
-                        speed_level: speed.level(),
-                        retries,
-                    })
-                    .await;
+                // Best-effort telemetry: use try_send, NEVER a blocking send.
+                // The event channel is bounded (1024) and only drained when a
+                // link-quality poller is attached; in the simulated two-node
+                // run only node 0 has one, so a blocking send here wedged
+                // node 1's write_data forever after 1024 writes (~100 slots) —
+                // silently stalling consensus.
+                let _ = self.local.event_tx.try_send(PactorLinkEvent::LinkQuality {
+                    speed_level: speed.level(),
+                    retries,
+                });
                 return Ok(());
             }
 
