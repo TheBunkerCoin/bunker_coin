@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
@@ -702,11 +702,63 @@ async fn route_terminal_line(
             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
             .await;
         link_down = true;
+    } else if let Some(event) = parse_quality_banner(body) {
+        // Spontaneous link-quality banner (speed level / retry report). The
+        // live session runs in the firmware's terminal mode, where the host
+        // must NOT inject status polls (typed text transmits over the air) —
+        // so quality telemetry is parse-only: whatever the firmware volunteers.
+        let _ = event_tx.send(event).await;
+    } else {
+        // Unrecognized status banner: log it distinctively so on-air runs
+        // collect the firmware's actual status vocabulary — exact parsers
+        // (e.g. for retry/quality reports) get added from this evidence
+        // rather than guessed formats.
+        info!("[status-line?] unrecognized modem banner: {body:?}");
     }
 
     // Always forward the raw line so callers polling read_status_line() see it.
     let _ = command_tx.send(body.to_owned()).await;
     link_down
+}
+
+/// Parse a spontaneous link-quality banner into a [`PactorLinkEvent`], if the
+/// line looks like one. Tolerant across the formats SCS firmwares use for
+/// speed/quality reports (`LINK QUALITY SPEED=x RETRIES=y`, `SPEED-LEVEL n`,
+/// `SPEEDLEVEL n`); returns `None` for anything unrecognized. Parse-only: the
+/// host never solicits these mid-session (converse mode transmits typed text).
+fn parse_quality_banner(body: &str) -> Option<PactorLinkEvent> {
+    let upper = body.to_ascii_uppercase();
+
+    if let Some(rest) = upper.strip_prefix("LINK QUALITY") {
+        let mut speed_level = 0u8;
+        let mut retries = 0u32;
+        for field in rest.split_whitespace() {
+            if let Some(value) = field.strip_prefix("SPEED=") {
+                speed_level = value.parse().unwrap_or_default();
+            } else if let Some(value) = field.strip_prefix("RETRIES=") {
+                retries = value.parse().unwrap_or_default();
+            }
+        }
+        return Some(PactorLinkEvent::LinkQuality {
+            speed_level,
+            retries,
+        });
+    }
+
+    // "SPEED-LEVEL n" / "SPEEDLEVEL n" / "SPEED LEVEL n" style banners: a bare
+    // speed report with no retry figure.
+    for prefix in ["SPEED-LEVEL", "SPEEDLEVEL", "SPEED LEVEL"] {
+        if let Some(rest) = upper.strip_prefix(prefix) {
+            if let Ok(level) = rest.trim().parse::<u8>() {
+                return Some(PactorLinkEvent::LinkQuality {
+                    speed_level: level,
+                    retries: 0,
+                });
+            }
+        }
+    }
+
+    None
 }
 
 #[async_trait]
@@ -1248,6 +1300,58 @@ mod tests {
         let channels = transport.poll_pending_channels().await.unwrap();
         assert_eq!(channels, vec![2, 3]);
         modem.await.unwrap();
+    }
+
+    /// Spontaneous quality banners must parse into LinkQuality events (the
+    /// live session is terminal-mode, so parse-only telemetry is all we get —
+    /// the host must never solicit status mid-session). Unknown banners parse
+    /// to None (and are logged for vocabulary collection).
+    #[test]
+    fn quality_banners_parse_tolerantly() {
+        match parse_quality_banner("LINK QUALITY SPEED=3 RETRIES=7") {
+            Some(PactorLinkEvent::LinkQuality {
+                speed_level,
+                retries,
+            }) => {
+                assert_eq!(speed_level, 3);
+                assert_eq!(retries, 7);
+            }
+            other => panic!("expected LinkQuality, got {other:?}"),
+        }
+        match parse_quality_banner("Speed-Level 2") {
+            Some(PactorLinkEvent::LinkQuality {
+                speed_level,
+                retries,
+            }) => {
+                assert_eq!(speed_level, 2);
+                assert_eq!(retries, 0);
+            }
+            other => panic!("expected LinkQuality, got {other:?}"),
+        }
+        assert!(parse_quality_banner("SOME UNKNOWN BANNER").is_none());
+        assert!(parse_quality_banner("SPEED-LEVEL notanumber").is_none());
+    }
+
+    /// A quality banner arriving as a terminal line mid-session must reach the
+    /// event stream (this is the on-air path: `***` banners, not hostmode).
+    #[tokio::test]
+    async fn terminal_quality_banner_routes_to_events() {
+        let (command_tx, _command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let link_down =
+            route_terminal_line("*** LINK QUALITY SPEED=4 RETRIES=2", &command_tx, &event_tx)
+                .await;
+        assert!(!link_down);
+        match event_rx.try_recv().unwrap() {
+            PactorLinkEvent::LinkQuality {
+                speed_level,
+                retries,
+            } => {
+                assert_eq!(speed_level, 4);
+                assert_eq!(retries, 2);
+            }
+            other => panic!("expected LinkQuality, got {other:?}"),
+        }
     }
 
     #[tokio::test]
