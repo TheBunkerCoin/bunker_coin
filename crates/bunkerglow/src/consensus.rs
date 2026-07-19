@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use block_producer::BlockProducer;
 pub use blockstore::{BlockInfo, BlockMetadata, Blockstore, BlockstoreImpl};
-pub use cert::Cert;
+pub use cert::{Cert, FinalCert, NotarCert};
 use color_eyre::Result;
 pub use epoch_info::EpochInfo;
 use fastrace::Span;
