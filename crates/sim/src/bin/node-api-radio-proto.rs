@@ -40,6 +40,7 @@ async fn main() {
         jitter_ms: 50,
         packets_sent: 0,
         packets_dropped: 0,
+        packets_queued: 0,
         current_throughput_bps: 0.0,
         link_speed_level: 0,
     }));
