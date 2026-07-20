@@ -445,8 +445,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bunker_coin_core::transaction::TransactionBody;
+
+    use super::*;
 
     /// A network that is permanently closed: every receive errors immediately.
     struct ClosedNet;
