@@ -264,7 +264,7 @@ impl StakingLedger {
     ///   operator tx + min self-stake satisfied).
     /// - `Downtime`: 0% slash, `DOWNTIME_JAIL_PERIOD_EPOCHS` jail.
     pub fn process_slashes(&mut self, current_epoch: u64) -> Vec<JailRecord> {
-        let events: Vec<SlashingEvent> = self.pending_slashes.drain(..).collect();
+        let events: Vec<SlashingEvent> = std::mem::take(&mut self.pending_slashes);
         let mut records = Vec::new();
 
         for event in events {
@@ -397,7 +397,7 @@ impl StakingLedger {
     /// to validated_locations. Returns the list of validators whose locations
     /// were validated.
     pub fn process_location_claims(&mut self, current_epoch: u64) -> Vec<PublicKey> {
-        let claims: Vec<_> = self.pending_location_claims.drain(..).collect();
+        let claims: Vec<_> = std::mem::take(&mut self.pending_location_claims);
         let mut validated = Vec::new();
 
         for (claim, attestations) in claims {
