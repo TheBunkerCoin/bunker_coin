@@ -229,7 +229,8 @@ impl FinalityTracker {
     /// stored field, unaffected.
     pub fn prune(&mut self, below: Slot) {
         self.status = self.status.split_off(&below);
-        self.parents.retain(|(child_slot, _), _| *child_slot >= below);
+        self.parents
+            .retain(|(child_slot, _), _| *child_slot >= below);
     }
 
     /// Number of tracked per-slot status entries (test-only, for prune assertions).

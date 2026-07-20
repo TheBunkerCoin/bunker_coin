@@ -57,13 +57,13 @@ use std::path::PathBuf;
 
 use bunkerglow::consensus::{Cert, EpochInfo, FinalCert, NotarCert, Vote};
 use bunkerglow::crypto::merkle::BlockHash;
-use bunkerglow::crypto::{Hash, aggsig, signature};
+use bunkerglow::crypto::{aggsig, signature, Hash};
 use bunkerglow::types::Slot;
 use bunkerglow::ValidatorInfo;
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
-use rocksdb::{DB, IteratorMode};
+use rocksdb::{IteratorMode, DB};
 
 #[derive(Parser)]
 #[command(about = "Operator checkpoint: sign real certs for a damaged slot range")]
@@ -111,9 +111,14 @@ struct BlockRows {
 fn find_block(db: &DB, slot: u64) -> Option<BlockRows> {
     let prefix = format!("{slot:016X}");
     let mut rows: Option<BlockRows> = None;
-    for item in db.iterator(IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward)) {
+    for item in db.iterator(IteratorMode::From(
+        prefix.as_bytes(),
+        rocksdb::Direction::Forward,
+    )) {
         let Ok((k, v)) = item else { break };
-        let Ok(key) = std::str::from_utf8(&k) else { break };
+        let Ok(key) = std::str::from_utf8(&k) else {
+            break;
+        };
         if !key.starts_with(&prefix) {
             break;
         }
@@ -202,9 +207,9 @@ fn main() {
             }
             (Some(a), None) => (a.hash_hex.clone(), None, Some(a)),
             (None, Some(b)) => (b.hash_hex.clone(), Some(b), None),
-            (None, None) => panic!(
-                "block for slot {slot} missing from BOTH stores — aborting, nothing written"
-            ),
+            (None, None) => {
+                panic!("block for slot {slot} missing from BOTH stores — aborting, nothing written")
+            }
         };
 
         let mut hash_bytes = [0u8; 32];
@@ -310,5 +315,8 @@ fn main() {
     for pool in [&pool0, &pool1] {
         pool.put(b"meta|final_slot", args.to.to_be_bytes()).unwrap();
     }
-    println!("floor set to {} in both pool DBs. Restart both nodes.", args.to);
+    println!(
+        "floor set to {} in both pool DBs. Restart both nodes.",
+        args.to
+    );
 }

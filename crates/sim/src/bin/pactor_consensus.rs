@@ -195,9 +195,7 @@ impl TxContext {
             execution_state,
             mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             tx_results: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            tx_results_order: Arc::new(tokio::sync::RwLock::new(
-                std::collections::VecDeque::new(),
-            )),
+            tx_results_order: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
             genesis_signing_key: Arc::new(cluster.genesis_key.clone()),
             // Both validators of the two-node cluster, so `/nodes` is populated
             // from startup (finalized_slot advances via the block executor).
@@ -1275,8 +1273,7 @@ async fn run_simulated(
         turn_a,
         link_counters.outbound_queued.clone(),
     );
-    let (node_b, handle_b, mempool_b, exec_b) =
-        build_node(tb, 1, &cluster, turn_b, Arc::default());
+    let (node_b, handle_b, mempool_b, exec_b) = build_node(tb, 1, &cluster, turn_b, Arc::default());
     spawn_link_quality_poller(ta, node_a.get_cancel_token());
 
     // Per-node transaction contexts (each over its own genesis-funded state).

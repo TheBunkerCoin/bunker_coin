@@ -1313,7 +1313,10 @@ mod tests {
         assert_eq!(got, b"request");
 
         // ...and B's response must come back to A's requester channel.
-        b_repair_req.send(&b"response".to_vec(), addr).await.unwrap();
+        b_repair_req
+            .send(&b"response".to_vec(), addr)
+            .await
+            .unwrap();
         let got = tokio::time::timeout(Duration::from_secs(5), a_repair.receive())
             .await
             .expect("response must arrive on the requester's Repair channel")

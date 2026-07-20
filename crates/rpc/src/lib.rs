@@ -1834,7 +1834,9 @@ mod tests {
     fn decode_pubkey_invalid_hex() {
         let result = decode_pubkey("not_valid_hex");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("neither 64-char hex nor base58"));
+        assert!(result
+            .unwrap_err()
+            .contains("neither 64-char hex nor base58"));
     }
 
     #[test]
@@ -2806,8 +2808,7 @@ async fn handle_rpc_call(
             Ok(pk) => {
                 let slot = current_slot(state).await;
                 Ok(
-                    match rest_dispatch(rest, M::GET, &format!("/accounts/{pk}/tokens"), None)
-                        .await
+                    match rest_dispatch(rest, M::GET, &format!("/accounts/{pk}/tokens"), None).await
                     {
                         Ok(v) => Ok(ctx_value(slot, v)),
                         Err(e) => Err(e),
@@ -2831,9 +2832,9 @@ async fn handle_rpc_call(
                 Ok(list) => list
                     .as_array()
                     .and_then(|blocks| {
-                        blocks.iter().find(|b| {
-                            b.get("type").and_then(|t| t.as_str()) == Some("block")
-                        })
+                        blocks
+                            .iter()
+                            .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("block"))
                     })
                     .and_then(|b| b.get("hash").and_then(|h| h.as_str()))
                     .and_then(|h| decode_bytes_any::<32>(h).ok())

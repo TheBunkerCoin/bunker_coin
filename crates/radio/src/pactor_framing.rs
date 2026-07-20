@@ -156,8 +156,7 @@ impl Reassembler {
 
         // Corrupt/hostile headers can claim absurd fragment counts or oversized
         // chunks; both bound the memory a single message_id may pin.
-        if header.total_fragments > MAX_FRAGMENTS_PER_MESSAGE
-            || chunk.len() > effective_chunk_len()
+        if header.total_fragments > MAX_FRAGMENTS_PER_MESSAGE || chunk.len() > effective_chunk_len()
         {
             return None;
         }

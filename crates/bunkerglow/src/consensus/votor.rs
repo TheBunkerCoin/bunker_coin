@@ -1165,7 +1165,12 @@ mod tests {
         }
         assert_eq!(votor.voted_notar.len(), 3);
         assert_eq!(votor.block_notarized.len(), 3);
-        assert!(votor.parents_ready.iter().all(|(s, _, _)| *s >= Slot::new(4)));
+        assert!(
+            votor
+                .parents_ready
+                .iter()
+                .all(|(s, _, _)| *s >= Slot::new(4))
+        );
 
         // A lower floor must be a no-op (floor is monotone).
         votor.prune_below_floor(Slot::new(0));
@@ -1198,7 +1203,9 @@ mod tests {
             hash: hash.clone(),
             parent: (Slot::genesis(), GENESIS_BLOCK_HASH),
         };
-        tx.send(VotorEvent::Block { slot, block_info }).await.unwrap();
+        tx.send(VotorEvent::Block { slot, block_info })
+            .await
+            .unwrap();
         let notar = match other_a2a.receive().await.unwrap() {
             ConsensusMessage::Vote(v) => v,
             m => panic!("expected notar vote, got {m:?}"),
@@ -1207,17 +1214,14 @@ mod tests {
 
         // Fast-final slot 5 (next window, 4..8): raises the floor to 4 and
         // prunes slot 1's voting state (including its `voted` entry).
-        let slot5_vote = Vote::new_notar(
-            Slot::new(5),
-            Hash::random_for_test().into(),
-            &sks[0],
-            0,
-        );
+        let slot5_vote = Vote::new_notar(Slot::new(5), Hash::random_for_test().into(), &sks[0], 0);
         let ff = Cert::FastFinal(FastFinalCert::new_unchecked(
             std::slice::from_ref(&slot5_vote),
             &epoch_info.validators,
         ));
-        tx.send(VotorEvent::CertCreated(Box::new(ff))).await.unwrap();
+        tx.send(VotorEvent::CertCreated(Box::new(ff)))
+            .await
+            .unwrap();
         // The fast-final cert is re-broadcast; consume it.
         match other_a2a.receive().await.unwrap() {
             ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::FastFinal(_))),

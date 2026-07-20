@@ -1348,8 +1348,7 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let link_down =
-            route_terminal_line("*** LINK QUALITY SPEED=4 RETRIES=2", &command_tx, &event_tx)
-                .await;
+            route_terminal_line("*** LINK QUALITY SPEED=4 RETRIES=2", &command_tx, &event_tx).await;
         assert!(!link_down);
         match event_rx.try_recv().unwrap() {
             PactorLinkEvent::LinkQuality {
