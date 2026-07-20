@@ -138,11 +138,9 @@ impl SlotState {
     /// The creation gates in the `count_*_stake` methods use the running
     /// stake TALLY, but the cert embeds the actual collected votes. If those
     /// ever disagree (tally double-count, vote-list gap), emitting the cert
-    /// poisons this node's pool and DB with unprovable finality that every
-    /// peer will reject — observed on-air as a sub-80% FastFinal that pinned
-    /// the node's finalized floor to a slot the peer could never accept,
-    /// permanently diverging the two nodes. Suppress it and log loudly
-    /// instead: the divergence itself is a bug this tripwire makes visible.
+    /// would poison this node's pool and DB with unprovable finality that
+    /// peers reject. Suppress it and log loudly instead: the divergence
+    /// itself is a bug this tripwire makes visible.
     fn push_cert_checked(&self, new_certs: &mut SmallVec<[Cert; 2]>, cert: Cert) {
         if cert.check_threshold(&self.epoch_info) {
             new_certs.push(cert);
@@ -183,17 +181,12 @@ impl SlotState {
         let v = voter as usize;
 
         let (certs_created, mut votor_events, mut blocks_to_repair) = match vote.kind() {
-            // Store the vote BEFORE counting its stake. The count_* methods
+            // Store the vote BEFORE counting its stake: the count_* methods
             // build certificates from the STORED votes the moment the running
-            // tally reaches quorum — counting first minted every cert WITHOUT
-            // the vote that tipped it over the threshold. In a 2-validator
-            // set that made every locally-created notar/fast-final cert
-            // permanently sub-threshold (1 of 2 votes = 50%): trusted locally
-            // (finalizing slots on unprovable certs), correctly rejected by
-            // the peer on every rebroadcast — the on-air poison certs that
-            // pinned the two nodes' finalized floors apart. The skip and
-            // final arms below always stored first, which is why skip/final
-            // certs were valid on the wire all along.
+            // tally reaches quorum, so counting first would mint every cert
+            // WITHOUT the vote that tipped it over the threshold — invalid on
+            // the wire while trusted locally. The skip and final arms below
+            // follow the same store-then-count order.
             VoteKind::Notar(_, block_hash) => {
                 let block_hash = block_hash.clone();
                 self.votes.notar[v] = Some(vote);
@@ -681,12 +674,9 @@ mod tests {
     /// Locally-created certs must contain the vote that tipped their quorum
     /// and pass their own stake-threshold validation.
     ///
-    /// Regression test for the on-air poison certs: `add_vote` used to count
-    /// stake BEFORE storing the vote, so certs were built from the stored
-    /// votes MINUS the tipping vote. In this minimal 2-validator set every
-    /// notar/fast-final cert then carried 1-of-2 signatures (50%) — trusted
-    /// locally, permanently rejected by the peer ("stake threshold not met"),
-    /// pinning the two nodes' finalized floors apart. Fails if the
+    /// In this minimal 2-validator set, counting stake before storing the
+    /// vote would build every notar/fast-final cert with 1-of-2 signatures
+    /// (50%) — below threshold, rejected by any peer. Fails if the
     /// store-before-count order in `add_vote` regresses.
     #[test]
     fn locally_created_certs_meet_their_threshold() {

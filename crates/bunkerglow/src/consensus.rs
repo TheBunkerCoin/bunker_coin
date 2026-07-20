@@ -96,11 +96,10 @@ fn delta_timeout() -> Duration {
 /// Deliberately NOT scaled by `BUNKER_DELTA_MULT`: standstill recovery is a
 /// small cert+vote rebroadcast that only fires when finalization has made no
 /// progress at all, so a short period is safe even on a slow link. Scaled,
-/// this was 30 minutes on the hardware profile — and a link outage that
-/// loses in-flight votes (both nodes voted, votes were lost, the
+/// this would be 30 minutes on the hardware profile — and a link outage
+/// that loses in-flight votes (both nodes voted, votes were lost, the
 /// double-vote guard stops re-voting) deadlocks the chain until standstill
-/// recovery rebroadcasts them (observed on-air at slot 760). Override with
-/// `BUNKER_STANDSTILL_SECS`.
+/// recovery rebroadcasts them. Override with `BUNKER_STANDSTILL_SECS`.
 fn delta_standstill() -> Duration {
     std::env::var("BUNKER_STANDSTILL_SECS")
         .ok()
@@ -495,13 +494,13 @@ where
     /// [`Disseminator`]: Handles incoming shreds. Adds them to the [`Blockstore`].
     async fn message_loop(self: &Arc<Self>) -> Result<()> {
         // A receive/handle error must NOT kill this loop: it is the ONLY
-        // ingestion path for votes, certs, and disseminated shreds. It is
-        // spawned detached and its JoinHandle is inspected only at teardown, so
-        // an early `?`-return here used to silently and permanently stop all
-        // vote counting while the producer/repair/standstill loops kept running
-        // — the node looked alive but could never form another cert. Log loudly
-        // and keep receiving; back off briefly so a persistently-failing source
-        // (e.g. a closed channel) cannot hot-loop.
+        // ingestion path for votes, certs, and disseminated shreds, it is
+        // spawned detached, and its JoinHandle is inspected only at teardown —
+        // an early return here silently and permanently stops all vote
+        // counting while the producer/repair/standstill loops keep running,
+        // leaving a node that looks alive but can never form another cert.
+        // Log loudly and keep receiving; back off briefly so a persistently-
+        // failing source (e.g. a closed channel) cannot hot-loop.
         loop {
             tokio::select! {
                 // handle incoming votes and certificates
@@ -558,12 +557,11 @@ where
         trace!("received all2all msg: {msg:?}");
         match msg {
             ConsensusMessage::Vote(v) => {
-                // Log at info/warn (not trace): votes are low-rate and this is
-                // the ONLY on-air evidence of whether the peer's votes are
-                // arriving and being counted. An hour-long finalization stall
-                // was undiagnosable because rejected votes vanished at trace
-                // level — the log showed blocks crossing while certs silently
-                // never formed.
+                // Log at info/warn (not trace): votes are low-rate and this
+                // is the only operational evidence of whether the peer's
+                // votes are arriving and being counted — at trace level a
+                // rejected vote is invisible and a finalization stall is
+                // undiagnosable from the logs.
                 let (slot, signer) = (v.slot(), v.signer());
                 match self.pool.write().await.add_vote(v).await {
                     Ok(()) => info!("counted vote for slot {slot} from validator {signer}"),

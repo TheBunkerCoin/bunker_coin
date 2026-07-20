@@ -155,13 +155,13 @@ where
             let last_slot_in_window = first_slot_in_window.last_slot_in_window();
 
             // Skip windows already behind the finalized frontier. After a
-            // restart the pool restores the frontier (e.g. slot 619), but this
-            // loop starts at genesis — and `wait_for_first_slot` reports old
-            // windows Ready (their parents are in the blockstore), so the
-            // leader RE-produced and re-disseminated every historical window
-            // at full block cadence (hours of radio time at frontier 619)
-            // before producing anything new. Deterministic re-production made
-            // this harmless to state, but it stalled fresh blocks entirely.
+            // restart the pool restores the frontier, but this loop starts at
+            // genesis — and `wait_for_first_slot` reports old windows Ready
+            // (their parents are in the blockstore), so without this check the
+            // leader re-produces and re-disseminates every historical window
+            // at full block cadence before producing anything new. Harmless to
+            // state (re-production is deterministic) but it stalls fresh
+            // blocks entirely.
             let finalized = self.pool.read().await.finalized_slot();
             if last_slot_in_window <= finalized {
                 debug!(
@@ -583,11 +583,10 @@ where
     if bloat_target > packed_bytes {
         use rand::{RngCore, SeedableRng};
         // DETERMINISTIC padding, seeded by the slot: a leader that crashes and
-        // re-produces the same slot must emit byte-identical padding. With
-        // fresh random bytes each production, a crash-restart re-production
-        // hashed differently and FORKED the slot (observed on-air: two slot-3
-        // blocks, consensus deadlocked). Slot-seeded pseudo-random bytes are
-        // reproducible while still incompressible to the modem's PMC.
+        // re-produces the same slot must emit byte-identical padding, or the
+        // re-production hashes differently and forks the slot. Slot-seeded
+        // pseudo-random bytes are reproducible while still incompressible to
+        // the modem's PMC.
         let mut rng = rand::rngs::StdRng::seed_from_u64(slot.inner());
         while packed_bytes < bloat_target && slice_capacity_left > 8 {
             let chunk = (bloat_target - packed_bytes)

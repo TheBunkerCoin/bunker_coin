@@ -874,12 +874,11 @@ async fn blocks(
 
     // A finalized block finalizes all its ancestors, but only the slot with
     // the explicit certificate gets a finalized timestamp written — adopted
-    // ancestors otherwise display as eternal "proposed" HOLES inside the
-    // finalized chain (observed on-air: 752-755 shown proposed while
-    // finalized 756 chained through them). Walk parent links down from the
-    // highest finalized block and mark every visited block finalized. (A
-    // naive "below the frontier" rule would wrongly bless skip-certified
-    // slots whose produced-but-dead blocks are still stored.)
+    // ancestors would otherwise display as eternal "proposed" HOLES inside
+    // the finalized chain. Walk parent links down from the highest finalized
+    // block and mark every visited block finalized. (A naive "below the
+    // frontier" rule would wrongly bless skip-certified slots whose
+    // produced-but-dead blocks are still stored.)
     {
         let mut index_by_hash: HashMap<String, usize> = HashMap::new();
         for (i, b) in all_blocks.iter().enumerate() {

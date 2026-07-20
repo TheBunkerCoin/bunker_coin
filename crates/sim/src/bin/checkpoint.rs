@@ -2,22 +2,18 @@
 //!
 //! ## Why this exists
 //!
-//! Slots 8808..=8815 were produced under a build whose locally-created
-//! notarization/fast-final certificates were minted missing their
-//! quorum-tipping vote (fixed in fba5b2b) — invalid on the wire, trusted
-//! locally. The purge of those poison certs (fba5b2b) left the range without
-//! provable finality, and the one-shot notar votes that could rebuild the
-//! certs were consumed in that era: vote histories pruned them, the "already
-//! voted" safety guard (correctly) forbids re-voting, and below-floor bounds
-//! reject rebroadcasts. In-protocol recovery of the range is impossible.
+//! A slot range can lose provable finality: certificates purged as invalid
+//! while the one-shot notar votes that could rebuild them are gone (vote
+//! histories pruned, the "already voted" safety guard forbids re-casting,
+//! below-floor bounds reject rebroadcasts). In-protocol recovery of such a
+//! range is impossible.
 //!
 //! ## What it does
 //!
 //! Both validators' voting keys derive from the shared `--seed`, and both
 //! nodes are operated by the same party — so the operator can sign a
 //! checkpoint. For each slot in the canonical chain of the damaged range
-//! (default 8809..=8815, skipping the orphaned 8811, whose valid skip cert is
-//! left in place):
+//! (skipping orphaned slots, whose valid skip certs are left in place):
 //!
 //! 1. locate the block in either node's blockstore (by slot-prefixed key),
 //!    verify the two stores agree on the hash, and copy block + metadata rows

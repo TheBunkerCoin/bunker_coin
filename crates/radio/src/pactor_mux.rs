@@ -138,8 +138,7 @@ fn turn_reclaim_silence() -> Duration {
 /// (the *listener*). Both sides reclaiming at the same instant grab the turn
 /// together, then both grant it away — their grants collide on the half-duplex
 /// channel, no inbound refreshes either silence clock, and the link latches into
-/// a mutual-reclaim livelock it cannot escape (observed on-air after ~2 days:
-/// both nodes reclaiming every ~55-63s, zero data crossing, finalization frozen).
+/// a mutual-reclaim livelock it cannot escape.
 ///
 /// The stagger makes the caller reclaim FIRST and, crucially, must exceed a full
 /// changeover round-trip (a grant/keepalive takes 15-20s to clear the slow
@@ -313,11 +312,9 @@ impl Channel {
     /// channel the PEER should route it to. The repair pair is asymmetric —
     /// `Repair` sends `RepairRequest`s that must arrive at the peer's
     /// `RepairRequest` handler, and vice versa — so those two cross over.
-    /// (Previously every channel tagged with itself, which delivered repair
-    /// requests to the peer's response queue and responses to its request
-    /// queue: mutual deserialize failures, and repair NEVER worked over the
-    /// mux — first observed on-air once real block loss finally exercised it.)
-    /// All other channels are symmetric.
+    /// Tagging every channel with itself would deliver repair requests to the
+    /// peer's response queue and responses to its request queue: mutual
+    /// deserialize failures. All other channels are symmetric.
     fn outbound_tag(self) -> Channel {
         match self {
             Channel::Repair => Channel::RepairRequest,
@@ -408,10 +405,9 @@ impl PactorMux {
             // messages, the high 32 bits are a per-mux random nonce. With a
             // plain 0-based counter, a peer whose session restarts reuses ids
             // that may still key stale partials in OUR reassembler — fragments
-            // of two different messages then merge into one corrupt payload
-            // (observed on-air as Repair-channel deserialize failures). The
-            // nonce makes cross-session (and cross-direction, for full-duplex
-            // transports) collisions improbable.
+            // of two different messages then merge into one corrupt payload.
+            // The nonce makes cross-session (and cross-direction, for
+            // full-duplex transports) collisions improbable.
             message_counter: Arc::new(AtomicU64::new(u64::from(rand::random::<u32>()) << 32)),
             last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
             turn,
@@ -627,9 +623,8 @@ impl PactorMux {
             // Millis-since-start of the last reclaim, so a reclaim fires at most
             // once per reclaim window: during a sustained outage the silence
             // clock never resets (no inbound), and without this floor the writer
-            // re-reclaimed within seconds of granting — each cycle burning an
-            // extra changeover + grant on a link that is already struggling
-            // (observed on-air: reclaims 3s apart with silence climbing 66s→271s).
+            // would re-reclaim within seconds of granting — each cycle burning
+            // an extra changeover + grant on a link that is already struggling.
             let mut last_reclaim_ms = 0u64;
             // The listener detects a mutual-reclaim livelock by counting reclaims
             // that occur with NO inbound activity since the previous reclaim: if
@@ -1036,8 +1031,7 @@ where
                     // Include length + a bounded hex prefix of the payload:
                     // distinguishes a TRUNCATED message (short, clean prefix of
                     // a valid message) from a MERGED one (fragment-id collision;
-                    // mixed content) from a wrong-type/wire-mismatch message —
-                    // the on-air repair failures needed exactly this evidence.
+                    // mixed content) from a wrong-type/wire-mismatch message.
                     let prefix_len = bytes.len().min(48);
                     warn!(
                         "MuxChannel({:?}) deserialize failed ({err:?}); payload {} bytes, \
@@ -1221,8 +1215,8 @@ mod tests {
     async fn idle_turn_holder_keepalives_immediately_and_repeatedly() {
         // The turn-holder must feed the ARQ link during a quiet period — both the
         // instant it acquires the turn (closing the post-changeover gap) and then
-        // periodically — so the modem never sees the multi-minute inter-block
-        // silence that dropped the on-air link to STBY. RecordingTransport's
+        // periodically — so the modem never sees a multi-minute inter-block
+        // silence that would drop the link to STBY. RecordingTransport's
         // read_data never returns a grant, so this side keeps the turn and idles.
         let transport = Arc::new(RecordingTransport::new());
         let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
@@ -1286,10 +1280,9 @@ mod tests {
     /// `Repair` channel (a RepairRequest) must arrive on B's `RepairRequest`
     /// channel (the request handler), and a message sent on B's
     /// `RepairRequest` channel (a RepairResponse) must arrive on A's `Repair`
-    /// channel (the requester). Previously both tagged with their own channel,
-    /// so requests landed in the peer's response queue and vice versa —
-    /// mutual deserialize failures; repair NEVER worked over the mux
-    /// (observed on-air as endless ReadSizeLimit warnings on both nodes).
+    /// channel (the requester). If both tagged with their own channel,
+    /// requests would land in the peer's response queue and vice versa —
+    /// mutual deserialize failures on every repair message.
     #[tokio::test]
     async fn repair_channels_cross_over_the_link() {
         let (a, b) = LoopbackTransport::pair();
@@ -1549,10 +1542,9 @@ mod tests {
 
     /// The listener takes the turn for the first `LISTENER_LIVELOCK_RECLAIMS`
     /// blind reclaims, then yields — this is what breaks the mutual-reclaim
-    /// livelock (both sides reclaiming-and-granting into each other, observed
-    /// on-air after ~2 days: both nodes reclaiming every ~55-63s, finalization
-    /// frozen). After yielding, its reclaim window is extended so the caller gets
-    /// several changeover round-trips to become sole driver.
+    /// livelock (both sides reclaiming-and-granting into each other). After
+    /// yielding, its reclaim window is extended so the caller gets several
+    /// changeover round-trips to become sole driver.
     #[test]
     fn listener_yields_after_blind_reclaims_then_extends_window() {
         assert!(

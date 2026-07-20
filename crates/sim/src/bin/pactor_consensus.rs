@@ -165,8 +165,8 @@ struct TxContext {
     mempool: Arc<tokio::sync::RwLock<Vec<rpc::MempoolEntry>>>,
     /// Finalized/failed outcome per tx hash, populated by the executor.
     tx_results: Arc<tokio::sync::RwLock<HashMap<String, rpc::TxResult>>>,
-    /// Insertion order of `tx_results`, so the map can be capped FIFO (it
-    /// previously grew by one entry per finalized tx, forever).
+    /// Insertion order of `tx_results`, so the map can be capped FIFO
+    /// instead of growing by one entry per finalized tx forever.
     tx_results_order: Arc<tokio::sync::RwLock<std::collections::VecDeque<String>>>,
     /// Genesis ed25519 key, so the RPC can server-side-sign transactions whose
     /// sender is the genesis account (submit with an all-zero signature).
@@ -273,10 +273,9 @@ struct LinkCounters {
 
 /// Consecutive `write_data` failures after which the link is declared dead.
 /// A wedged modem (hostmode transactions timing out) never sends an explicit
-/// disconnect event, so `is_link_up` stayed true and the session stalled
-/// FOREVER (observed on-air: 40+ minutes at a frozen frontier while every
-/// transaction timed out). Three consecutive failed writes ≈ several minutes
-/// of a dead exchange — tear the session down and let the reconnect + --reset
+/// disconnect event, so `is_link_up` would stay true and the session stall
+/// forever. Three consecutive failed writes ≈ several minutes of a dead
+/// exchange — tear the session down and let the reconnect + --reset
 /// machinery recover it.
 const WRITE_FAILURES_LINK_DOWN: u64 = 3;
 
@@ -284,10 +283,9 @@ const WRITE_FAILURES_LINK_DOWN: u64 = 3;
 /// dead (override with BUNKER_RX_STALL_SECS). Catches the BLACK-HOLED link the
 /// write watchdog cannot see: a modem stuck in a stale "connected" state
 /// accepts writes into its buffer while nothing crosses the air — and also
-/// refuses the peer's reconnect calls (observed on-air: node0 failed 35
-/// connect sessions while node1 sat "connected" for hours at a frozen
-/// frontier). On this network there is no legitimate 10-minute radio silence:
-/// blocks, votes, or standstill rebroadcasts cross every couple of minutes.
+/// refuses the peer's reconnect calls. On this network there is no legitimate
+/// 10-minute radio silence: blocks, votes, or standstill rebroadcasts cross
+/// every couple of minutes.
 fn rx_stall_link_down_secs() -> u64 {
     std::env::var("BUNKER_RX_STALL_SECS")
         .ok()
@@ -673,13 +671,9 @@ fn spawn_block_executor(
 
             let finalized = pool.read().await.finalized_slot().inner();
 
-            // Advance `/nodes` to the finalized frontier EVERY tick, before and
-            // independent of execution. Previously this ran only when there was
-            // new work AND sat before a loop that could panic and kill this
-            // task — which froze /nodes forever (observed on-air: a bloat-tx
-            // decode panic at slot 3899 killed the executor; /nodes stuck,
-            // /blocks capped at frontier+200). Now the frontier tracks
-            // consensus even if execution stalls.
+            // Advance `/nodes` to the finalized frontier EVERY tick, before
+            // and independent of execution, so the frontier tracks consensus
+            // even if execution stalls or the executor loop dies.
             for node in tx.nodes.write().await.iter_mut() {
                 node.finalized_slot = finalized;
             }
@@ -788,9 +782,8 @@ async fn record_tx_results(
         };
         // First execution wins: the same tx can land in two blocks (each
         // node's mempool packs it before finalization evicts it), and the
-        // duplicate then fails on nonce mismatch. Overwriting here made a
-        // SUCCESSFUL transfer report "failed" (observed on-air: nonce-0 tx
-        // succeeded in slot 23, its slot-24 duplicate's failure clobbered it).
+        // duplicate then fails on nonce mismatch. Overwriting here would make
+        // a SUCCESSFUL transfer report "failed".
         if !results_map.contains_key(&hash) {
             results_map.insert(
                 hash.clone(),

@@ -769,12 +769,10 @@ impl Pool for PoolImpl {
         // certs/votes are exactly what a lagging peer needs to notarize the
         // floor slot and parent-ready the window above it — and after the
         // invalid-cert purge the floor's finality may only be provable by
-        // re-aggregating votes. With `slot.next()..` the floor-slot votes were
-        // sent once (startup restored-vote burst) and never again: observed
-        // on-air as 9 hours of standstill cycles where node1 re-sent votes
-        // 8811..8815 every 5 minutes while node0 waited forever for the one
-        // notar(8810) vote that would unlock parent-ready(8812). Duplicates
-        // are cheap (peer dedups); a missing vote is a permanent wedge.
+        // re-aggregating votes. With `slot.next()..` the floor-slot votes
+        // would be sent once (startup restored-vote burst) and never again.
+        // Duplicates are cheap (peer dedups); a missing vote is a permanent
+        // wedge.
         certs.extend(self.get_certs(slot..));
         let votes = self.get_own_votes(slot..);
         if certs.is_empty() && votes.is_empty() {
@@ -801,11 +799,10 @@ impl Pool for PoolImpl {
     ///
     /// Includes the persisted frontier restored by `load_from_db`: the
     /// finality tracker only advances on live finalization events, so after a
-    /// restart it reports genesis even though the reload restored e.g. slot
-    /// 288 — which made `Alpenglow::run()`'s `clean_beyond_finalized(0)` WIPE
-    /// the whole persisted chain, the producer re-produce from slot 1, and the
-    /// executor/RPC report a zero frontier (observed on-air). Both sources are
-    /// monotonic, so taking the max is safe.
+    /// restart it reports genesis even though the reload restored a higher
+    /// frontier — `Alpenglow::run()`'s `clean_beyond_finalized` would then
+    /// WIPE the persisted chain and the producer would restart from slot 1.
+    /// Both sources are monotonic, so taking the max is safe.
     fn finalized_slot(&self) -> Slot {
         self.finality_tracker
             .highest_finalized_slot()
@@ -872,14 +869,12 @@ impl PoolImpl {
                     if let Ok(cert) = wincode::deserialize::<Cert>(&v) {
                         // Certs received over the network are threshold-checked
                         // before entering the pool, but locally-created certs
-                        // were persisted unvalidated — an invalid cert written
-                        // here once is restored as truth on every restart.
-                        // Observed on-air: a sub-80% FastFinal "finalized" a
-                        // slot locally, pinned this node's floor there forever,
-                        // and every standstill rebroadcast of it was correctly
-                        // rejected by the peer — permanently diverged floors.
-                        // Drop (and delete) anything that fails validation so
-                        // the floor re-derives from certs the peer will accept.
+                        // are persisted as-is — an invalid cert written here
+                        // once would be restored as truth on every restart,
+                        // pinning this node's floor to finality no peer
+                        // accepts. Drop (and delete) anything that fails
+                        // validation so the floor re-derives from certs the
+                        // peer will accept.
                         if !cert.check_threshold(&self.epoch_info) {
                             warn!(
                                 "dropping persisted {} cert for slot {} failing stake \
@@ -957,12 +952,11 @@ impl PoolImpl {
 
             match &cert {
                 // A fast-final cert is ≥80% notar votes — strictly stronger
-                // than a notar cert — but was not marked in the parent-ready
-                // tracker on reload. A slot whose only stored cert is FastFinal
-                // then vanished from the parent-ready chain after a restart,
-                // and the next window re-anchored on its parent — orphaning a
-                // FINALIZED block (observed on-air: slot 8 produced with
-                // parent 3, skipping finalized slot 4).
+                // than a notar cert — so it must mark the parent-ready
+                // tracker on reload too. A slot whose only stored cert is
+                // FastFinal would otherwise vanish from the parent-ready
+                // chain after a restart, re-anchoring the next window on its
+                // parent and orphaning a FINALIZED block.
                 Cert::Notar(_) | Cert::NotarFallback(_) | Cert::FastFinal(_) => {
                     if let Some(hash) = cert.block_hash() {
                         let block_id = (slot, hash.clone());
@@ -1810,8 +1804,8 @@ mod tests {
 
     /// A block whose parent slot is not strictly earlier than its own slot
     /// (equal, or in the future) must be dropped by `add_block`, not panic the
-    /// consensus task. Previously this was `assert!(block_id.0 > parent_id.0)`,
-    /// so a single malformed/hostile block from a peer crashed the node.
+    /// consensus task — asserting instead would let a single malformed or
+    /// hostile block from a peer crash the node.
     #[tokio::test]
     async fn add_block_rejects_non_earlier_parent_without_panic() {
         let (_sks, epoch_info) = generate_validators(11);
@@ -1842,10 +1836,10 @@ mod tests {
 
     /// The last slot of an epoch is also the last slot of a window, so it can be
     /// finalized only *implicitly* (a later slot fast-finalizes and finalizes it
-    /// by descent). The epoch-boundary event must still fire in that case — it
-    /// used to be checked only for the directly finalized cert slot, silently
-    /// skipping the epoch transition. Here slot 17999 (last in epoch 0) is
-    /// implicitly finalized by fast-finalizing slot 18000, and we assert an
+    /// by descent). The epoch-boundary event must still fire in that case —
+    /// checking it only for the directly finalized cert slot silently skips
+    /// the epoch transition. Here slot 17999 (last in epoch 0) is implicitly
+    /// finalized by fast-finalizing slot 18000, and we assert an
     /// `EpochBoundaryEvent` for epoch 0 is emitted.
     #[tokio::test]
     async fn epoch_boundary_fires_on_implicit_finalization() {
@@ -1912,7 +1906,7 @@ mod tests {
 
     /// Finalization must prune the pool's side trackers, not just
     /// `slot_states`: `FinalityTracker` (status + parent links),
-    /// `ParentReadyTracker`, and `s2n_waiting_parent_cert` previously grew one
+    /// `ParentReadyTracker`, and `s2n_waiting_parent_cert` otherwise grow one
     /// entry per slot/block forever — the dominant steady memory leak on a
     /// long-running node. After fast-finalizing slot 5 (window 4..8), no
     /// tracker entry below the window start (slot 4) may survive.

@@ -66,8 +66,7 @@ impl NetworkMessage {
         // length guard is a no-op (`claim_container_read` only checks when a
         // limit is configured), so a corrupted length field in bytes coming off
         // the radio (e.g. a fragment desync) makes `Vec::with_capacity` attempt
-        // an absurd allocation and ABORTS the process — observed on-air as
-        // `memory allocation of 2267094656207993638 bytes failed`. With the
+        // an absurd allocation and ABORTS the process. With the
         // limit, corruption is a decode `Err` and the message is dropped
         // (repair/ARQ recovers). The limit is decode-side only: the wire format
         // is unchanged and encode still uses the standard config.

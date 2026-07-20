@@ -364,11 +364,11 @@ mod tests {
     use crate::crypto::Hash;
 
     /// A notar (or final) cert arriving AFTER a slot finalized must not
-    /// downgrade its status: `mark_notarized`/`mark_finalized` insert first and
-    /// previously returned without restoring `Finalized`. Combined with state
-    /// pruning, the downgraded slot let a descendant's finalization walk
-    /// re-descend through it and re-report pruned, already-finalized ancestors
-    /// (observed live: duplicate parent-ready add → consensus task panic).
+    /// downgrade its status: `mark_notarized`/`mark_finalized` insert first
+    /// and must restore `Finalized` afterwards. A downgraded slot, combined
+    /// with state pruning, lets a descendant's finalization walk re-descend
+    /// through it and re-report pruned, already-finalized ancestors
+    /// (duplicate parent-ready add → consensus task panic).
     #[test]
     fn late_certs_do_not_downgrade_finalized_status() {
         let mut tracker = FinalityTracker::default();

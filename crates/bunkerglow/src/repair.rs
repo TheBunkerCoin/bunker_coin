@@ -295,7 +295,7 @@ where
         let Some(pending) = self.outstanding_requests.remove(&request_hash) else {
             // Late duplicates are routine on a half-duplex radio link (ARQ
             // retries + our own timeout re-requests cross in flight), so this
-            // is debug, not warn — it flooded on-air logs for hours.
+            // is debug, not warn.
             debug!("received repair response for already-settled request");
             return;
         };

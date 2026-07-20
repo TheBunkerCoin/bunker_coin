@@ -709,7 +709,7 @@ async fn route_terminal_line(
         // so quality telemetry is parse-only: whatever the firmware volunteers.
         let _ = event_tx.send(event).await;
     } else if !is_prompt_echo(body) {
-        // Unrecognized status banner: log it distinctively so on-air runs
+        // Unrecognized status banner: log it distinctively so live runs
         // collect the firmware's actual status vocabulary — exact parsers
         // (e.g. for retry/quality reports) get added from this evidence
         // rather than guessed formats.
@@ -723,8 +723,7 @@ async fn route_terminal_line(
 
 /// The modem's terminal command prompt (and prompt-suffixed lines). Emitted in
 /// response to every CR nudge during connect-wait (one per 2s), so it floods
-/// the vocabulary log with zero information — filter it out. Observed on-air:
-/// a bare `cmd:` every nudge interval while awaiting a link.
+/// the vocabulary log with zero information — filter it out.
 fn is_prompt_echo(body: &str) -> bool {
     let b = body.trim();
     b.is_empty() || b == "cmd:" || b.ends_with("cmd:")
