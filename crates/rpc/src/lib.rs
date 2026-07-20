@@ -394,16 +394,32 @@ pub struct SharedState {
 
 // -- hex decode helpers --
 
-fn decode_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
-    <[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| format!("expected 32 bytes, got {}", bytes.len()))
+/// Decode a fixed-size byte string given as hex OR base58.
+///
+/// Solana wallets and their tooling encode addresses/signatures/hashes as
+/// base58; this node's native REST surface historically used hex. Every
+/// decoder accepts both so wallet-originating requests (base58) and existing
+/// tooling (hex) hit the same handlers. Hex is tried first when the length
+/// matches exactly (2*N chars of hex digits), base58 otherwise.
+fn decode_bytes_any<const N: usize>(s: &str) -> Result<[u8; N], String> {
+    if s.len() == 2 * N && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {e}"))?;
+        return <[u8; N]>::try_from(bytes.as_slice())
+            .map_err(|_| format!("expected {N} bytes, got {}", bytes.len()));
+    }
+    let bytes = bs58::decode(s)
+        .into_vec()
+        .map_err(|e| format!("neither {}-char hex nor base58: {e}", 2 * N))?;
+    <[u8; N]>::try_from(bytes.as_slice())
+        .map_err(|_| format!("expected {N} bytes, got {}", bytes.len()))
 }
 
-fn decode_signature(hex_str: &str) -> Result<[u8; 64], String> {
-    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
-    <[u8; 64]>::try_from(bytes.as_slice())
-        .map_err(|_| format!("expected 64 bytes, got {}", bytes.len()))
+fn decode_pubkey(s: &str) -> Result<[u8; 32], String> {
+    decode_bytes_any::<32>(s)
+}
+
+fn decode_signature(s: &str) -> Result<[u8; 64], String> {
+    decode_bytes_any::<64>(s)
 }
 
 fn decode_token_id(hex_str: &str) -> Result<[u8; 4], String> {
@@ -1761,6 +1777,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decode_pubkey_accepts_base58() {
+        // Wallets send base58; the same decoder must accept it alongside hex.
+        let key: [u8; 32] = [7u8; 32];
+        let b58_str = bs58::encode(key).into_string();
+        assert_eq!(decode_pubkey(&b58_str).unwrap(), key);
+        assert_eq!(decode_pubkey(&hex::encode(key)).unwrap(), key);
+        // A 64-char string of hex digits must decode as hex, never base58.
+        let hexy = "aa".repeat(32);
+        assert_eq!(decode_pubkey(&hexy).unwrap(), [0xaa; 32]);
+    }
+
+    #[test]
+    fn decode_signature_accepts_base58() {
+        let sig: [u8; 64] = [9u8; 64];
+        let b58_str = bs58::encode(sig).into_string();
+        assert_eq!(decode_signature(&b58_str).unwrap(), sig);
+        assert_eq!(decode_signature(&hex::encode(sig)).unwrap(), sig);
+        assert!(decode_signature("not-a-signature").is_err());
+    }
+
+    #[test]
+    fn tx_id_roundtrips_base58_and_hex() {
+        let id: [u8; 32] = [3u8; 32];
+        let b58_str = bs58::encode(id).into_string();
+        assert_eq!(tx_id_to_hex(&b58_str).unwrap(), hex::encode(id));
+        assert_eq!(tx_id_to_hex(&hex::encode(id)).unwrap(), hex::encode(id));
+    }
+
+    #[test]
+    fn ctx_value_matches_solana_rpcresponse_shape() {
+        let v = ctx_value(42, serde_json::json!(1000));
+        assert_eq!(v["context"]["slot"], 42);
+        assert_eq!(v["value"], 1000);
+    }
+
+    #[test]
     fn decode_pubkey_valid() {
         let hex_str = "00".repeat(32);
         let result = decode_pubkey(&hex_str);
@@ -1782,15 +1834,16 @@ mod tests {
     fn decode_pubkey_invalid_hex() {
         let result = decode_pubkey("not_valid_hex");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid hex"));
+        assert!(result.unwrap_err().contains("neither 64-char hex nor base58"));
     }
 
     #[test]
     fn decode_pubkey_wrong_length() {
+        // 32 hex chars: no longer exact-length hex, decodes as base58 to the
+        // wrong byte count — still rejected.
         let hex_str = "00".repeat(16);
         let result = decode_pubkey(&hex_str);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expected 32 bytes"));
     }
 
     #[test]
@@ -1812,7 +1865,6 @@ mod tests {
         let hex_str = "00".repeat(32);
         let result = decode_signature(&hex_str);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expected 64 bytes"));
     }
 
     #[test]
@@ -2466,6 +2518,133 @@ fn rpc_ok(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value
     serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
+/// Solana's `RpcResponse<T>` envelope: `{ context: { slot }, value: T }`.
+/// Wallet code universally reads `.value` off account/balance/status results,
+/// so every method that Solana wraps must be wrapped here too.
+fn ctx_value(slot: u64, value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "context": { "slot": slot, "apiVersion": "bunkercoin-1.0" }, "value": value })
+}
+
+fn b58(bytes: &[u8]) -> String {
+    bs58::encode(bytes).into_string()
+}
+
+/// Highest finalized slot across the known nodes (the "current slot" wallets
+/// see in response contexts).
+async fn current_slot(state: &SharedState) -> u64 {
+    state
+        .nodes
+        .read()
+        .await
+        .iter()
+        .map(|n| n.finalized_slot)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Parse a transaction id (Solana calls it a "signature") given as base58 or
+/// hex, returning the node's native lowercase-hex form used by the tx stores.
+fn tx_id_to_hex(s: &str) -> Result<String, String> {
+    decode_bytes_any::<32>(s).map(|b| hex::encode(b))
+}
+
+/// Fee wallets should attach to an ordinary transaction (surfaced through
+/// getFeeForMessage). Matches what the demo tooling has always used; the
+/// chain enforces only that the account can afford fee + amount.
+const RECOMMENDED_TX_FEE: u64 = 100;
+
+/// Preflight a wallet transaction without submitting it: signature (when
+/// verifiable), nonce, and balance checks against current execution state.
+/// Returns `None` when the transaction would be accepted, else a message.
+async fn simulate_tx(state: &SharedState, tx_json: &serde_json::Value) -> Option<String> {
+    let req: SubmitTransactionRequest = match serde_json::from_value(tx_json.clone()) {
+        Ok(r) => r,
+        Err(e) => return Some(format!("malformed transaction: {e}")),
+    };
+    let sender = match decode_pubkey(&req.sender) {
+        Ok(k) => k,
+        Err(e) => return Some(format!("invalid sender: {e}")),
+    };
+    let signature = match decode_signature(&req.signature) {
+        Ok(s) => s,
+        Err(e) => return Some(format!("invalid signature: {e}")),
+    };
+    let body = match convert_body(req.body) {
+        Ok(b) => b,
+        Err(e) => return Some(format!("invalid body: {e}")),
+    };
+    let tx = CoreTransaction {
+        sender,
+        nonce: req.nonce,
+        fee: req.fee,
+        body,
+        signature,
+    };
+
+    // A zero signature from the genesis account takes the server-sign path on
+    // submission; anything else must verify against the sender key.
+    let genesis_pk = state
+        .genesis_signing_key
+        .as_ref()
+        .map(|sk| sk.verifying_key().to_bytes());
+    let server_signed = tx.signature == [0u8; 64] && Some(tx.sender) == genesis_pk;
+    if !server_signed {
+        use ed25519_dalek::Verifier;
+        let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&tx.sender) else {
+            return Some("sender is not a valid ed25519 public key".into());
+        };
+        let sig = ed25519_dalek::Signature::from_bytes(&tx.signature);
+        if vk.verify(&tx.signing_hash(), &sig).is_err() {
+            return Some("signature verification failed".into());
+        }
+    }
+
+    let exec = state.execution_state.read().await;
+    let account = exec.get_account(&tx.sender);
+    let (balance, expected_nonce) = account
+        .map(|a| (a.native_balance, a.nonce))
+        .unwrap_or((0, 0));
+    if !server_signed && tx.nonce != expected_nonce {
+        return Some(format!(
+            "nonce mismatch: transaction has {}, account is at {expected_nonce}",
+            tx.nonce
+        ));
+    }
+    let needed = match &tx.body {
+        TransactionBody::Transfer { amount, .. } => tx.fee.saturating_add(*amount),
+        _ => tx.fee,
+    };
+    if balance < needed {
+        return Some(format!(
+            "insufficient balance: have {balance}, need {needed}"
+        ));
+    }
+    None
+}
+
+/// Build the REST-shaped JSON for a faucet transfer from the genesis account.
+/// Uses the zero-signature server-sign path (the submit handler fills the
+/// nonce from current state and signs with the node's genesis key), so this
+/// works without duplicating signing logic — but only on a node configured
+/// with the genesis keypair.
+async fn build_airdrop_tx(
+    state: &SharedState,
+    recipient: [u8; 32],
+    amount: u64,
+) -> Result<serde_json::Value, String> {
+    let Some(sk) = &state.genesis_signing_key else {
+        return Err("airdrop unavailable: node has no genesis keypair".into());
+    };
+    let genesis_pk = sk.verifying_key().to_bytes();
+    Ok(serde_json::json!({
+        "sender": hex::encode(genesis_pk),
+        "nonce": 0,
+        "fee": RECOMMENDED_TX_FEE,
+        "signature": hex::encode([0u8; 64]),
+        "body": { "Transfer": { "to": hex::encode(recipient), "amount": amount } },
+    }))
+}
+
 fn param_str(params: &[serde_json::Value], i: usize) -> Result<&str, ()> {
     params
         .get(i)
@@ -2527,7 +2706,11 @@ async fn rest_dispatch(
     }
 }
 
-async fn handle_rpc_call(rest: &Router, call: JsonRpcRequest) -> serde_json::Value {
+async fn handle_rpc_call(
+    rest: &Router,
+    state: &SharedState,
+    call: JsonRpcRequest,
+) -> serde_json::Value {
     let id = call.id.unwrap_or(serde_json::Value::Null);
     if call.jsonrpc.as_deref() != Some("2.0") || call.method.is_none() {
         return rpc_error(id, -32600, "Invalid request");
@@ -2570,27 +2753,169 @@ async fn handle_rpc_call(rest: &Router, call: JsonRpcRequest) -> serde_json::Val
             .await),
             _ => Err(()),
         },
-        "getBalance" => match param_str(p, 0) {
-            Ok(pk) => Ok(
-                match rest_dispatch(rest, M::GET, &format!("/accounts/{pk}"), None).await {
-                    Ok(acct) => Ok(acct
-                        .get("native_balance")
-                        .cloned()
-                        .unwrap_or(serde_json::json!(0))),
-                    Err(e) => Err(e),
-                },
-            ),
-            Err(()) => Err(()),
+        // Solana contract: getBalance returns RpcResponse<u64>; a missing
+        // account is balance 0, not an error.
+        "getBalance" => match param_str(p, 0).map(decode_pubkey) {
+            Ok(Ok(pk)) => {
+                let slot = current_slot(state).await;
+                let balance = state
+                    .execution_state
+                    .read()
+                    .await
+                    .get_account(&pk)
+                    .map(|a| a.native_balance)
+                    .unwrap_or(0);
+                Ok(Ok(ctx_value(slot, serde_json::json!(balance))))
+            }
+            _ => Err(()),
         },
-        "getAccountInfo" => match param_str(p, 0) {
-            Ok(pk) => Ok(rest_dispatch(rest, M::GET, &format!("/accounts/{pk}"), None).await),
-            Err(()) => Err(()),
+        // Solana contract: RpcResponse<AccountInfo|null> — `value` is null for
+        // a nonexistent account (wallets branch on that). Solana-shaped fields
+        // (lamports/owner/executable/rentEpoch) plus this chain's extras under
+        // `data` (most importantly `nonce`, which replaces recent-blockhash in
+        // transaction construction).
+        "getAccountInfo" => match param_str(p, 0).map(decode_pubkey) {
+            Ok(Ok(pk)) => {
+                let slot = current_slot(state).await;
+                let value = match state.execution_state.read().await.get_account(&pk) {
+                    None => serde_json::Value::Null,
+                    Some(account) => {
+                        let tokens: serde_json::Map<String, serde_json::Value> = account
+                            .token_balances
+                            .iter()
+                            .map(|(tid, bal)| (hex::encode(tid), serde_json::json!(*bal)))
+                            .collect();
+                        serde_json::json!({
+                            "lamports": account.native_balance,
+                            "owner": b58(&[0u8; 32]),
+                            "executable": false,
+                            "rentEpoch": 0,
+                            "space": 0,
+                            "data": {
+                                "nonce": account.nonce,
+                                "tokenBalances": tokens,
+                            },
+                        })
+                    }
+                };
+                Ok(Ok(ctx_value(slot, value)))
+            }
+            _ => Err(()),
         },
         "getTokenAccountsByOwner" => match param_str(p, 0) {
             Ok(pk) => {
-                Ok(rest_dispatch(rest, M::GET, &format!("/accounts/{pk}/tokens"), None).await)
+                let slot = current_slot(state).await;
+                Ok(
+                    match rest_dispatch(rest, M::GET, &format!("/accounts/{pk}/tokens"), None)
+                        .await
+                    {
+                        Ok(v) => Ok(ctx_value(slot, v)),
+                        Err(e) => Err(e),
+                    },
+                )
             }
             Err(()) => Err(()),
+        },
+        // Wallet flow-compat: Solana wallets fetch a recent blockhash before
+        // building a transaction. This chain's transactions are nonce-based
+        // (see getAccountInfo -> data.nonce), so the value is informational —
+        // returned in the exact Solana shape so ported wallet code runs
+        // unchanged.
+        "getLatestBlockhash" => {
+            let slot = current_slot(state).await;
+            // Newest real (non-skip) block via the REST handler, which merges
+            // the in-memory list with the blockstore — the in-memory list
+            // alone stays empty on the persistent-node path. Skip entries
+            // carry placeholder hashes, hence the type filter.
+            let blockhash = match rest_dispatch(rest, M::GET, "/blocks?limit=8", None).await {
+                Ok(list) => list
+                    .as_array()
+                    .and_then(|blocks| {
+                        blocks.iter().find(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("block")
+                        })
+                    })
+                    .and_then(|b| b.get("hash").and_then(|h| h.as_str()))
+                    .and_then(|h| decode_bytes_any::<32>(h).ok())
+                    .map(|bytes| b58(&bytes))
+                    .unwrap_or_else(|| b58(&[0u8; 32])),
+                Err(_) => b58(&[0u8; 32]),
+            };
+            Ok(Ok(ctx_value(
+                slot,
+                serde_json::json!({ "blockhash": blockhash, "lastValidBlockHeight": slot + 300 }),
+            )))
+        }
+        "getBlockHeight" => Ok(Ok(serde_json::json!(current_slot(state).await))),
+        "getVersion" => Ok(Ok(
+            serde_json::json!({ "solana-core": "2.0.0-bunkercoin", "feature-set": 1 }),
+        )),
+        "getGenesisHash" => {
+            // Stable cluster identifier (wallets use it to tell networks
+            // apart): the genesis account's pubkey in base58. Falls back to
+            // the zero key on nodes without a configured genesis key.
+            let gh = state
+                .genesis_signing_key
+                .as_ref()
+                .map(|sk| b58(&sk.verifying_key().to_bytes()))
+                .unwrap_or_else(|| b58(&[0u8; 32]));
+            Ok(Ok(serde_json::json!(gh)))
+        }
+        "getMinimumBalanceForRentExemption" => Ok(Ok(serde_json::json!(0))),
+        "getFeeForMessage" => {
+            let slot = current_slot(state).await;
+            Ok(Ok(ctx_value(slot, serde_json::json!(RECOMMENDED_TX_FEE))))
+        }
+        // Solana contract: RpcResponse<Vec<SignatureStatus|null>>, one entry
+        // per requested id, null when the id is unknown. Status mapping:
+        // in-mempool = "processed", executed in a finalized block =
+        // "finalized" (this chain has no observable in-between), execution
+        // failure carries `err`.
+        "getSignatureStatuses" => match p.first().and_then(|v| v.as_array()) {
+            Some(ids) => {
+                let slot = current_slot(state).await;
+                let results = state.tx_results.read().await;
+                let mempool = state.mempool.read().await;
+                let statuses: Vec<serde_json::Value> = ids
+                    .iter()
+                    .map(|idv| {
+                        let Some(hex_id) = idv.as_str().and_then(|s| tx_id_to_hex(s).ok()) else {
+                            return serde_json::Value::Null;
+                        };
+                        if let Some(res) = results.get(&hex_id) {
+                            let err = match res.status {
+                                TxFinalStatus::Finalized => serde_json::Value::Null,
+                                TxFinalStatus::Failed => serde_json::json!({
+                                    "message": res.error.clone().unwrap_or_default()
+                                }),
+                            };
+                            return serde_json::json!({
+                                "slot": res.slot,
+                                "confirmations": serde_json::Value::Null,
+                                "confirmationStatus": "finalized",
+                                "err": err,
+                                "status": if err.is_null() {
+                                    serde_json::json!({ "Ok": null })
+                                } else {
+                                    serde_json::json!({ "Err": err })
+                                },
+                            });
+                        }
+                        if mempool.iter().any(|e| e.hash == hex_id) {
+                            return serde_json::json!({
+                                "slot": slot,
+                                "confirmations": 0,
+                                "confirmationStatus": "processed",
+                                "err": serde_json::Value::Null,
+                                "status": { "Ok": null },
+                            });
+                        }
+                        serde_json::Value::Null
+                    })
+                    .collect();
+                Ok(Ok(ctx_value(slot, serde_json::json!(statuses))))
+            }
+            None => Err(()),
         },
         "getToken" => match param_str(p, 0) {
             Ok(tid) => Ok(rest_dispatch(rest, M::GET, &format!("/tokens/{tid}"), None).await),
@@ -2602,9 +2927,98 @@ async fn handle_rpc_call(rest: &Router, call: JsonRpcRequest) -> serde_json::Val
             }
             Err(()) => Err(()),
         },
-        "sendTransaction" => match p.first() {
-            Some(tx) if tx.is_object() => {
-                Ok(rest_dispatch(rest, M::POST, "/transactions", Some(tx)).await)
+        // Solana contract: params[0] is the signed transaction as a base64
+        // string; the result is the transaction id ("signature") in base58.
+        // The payload inside the base64 is this chain's native JSON
+        // transaction ({sender, nonce, fee, body, signature}) — same schema
+        // as REST POST /transactions, which is also still accepted directly
+        // as an object param for existing tooling.
+        "sendTransaction" => {
+            let tx_json: Option<serde_json::Value> = match p.first() {
+                Some(serde_json::Value::String(b64)) => {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                }
+                Some(tx) if tx.is_object() => Some(tx.clone()),
+                _ => None,
+            };
+            match tx_json {
+                Some(tx) => Ok(
+                    match rest_dispatch(rest, M::POST, "/transactions", Some(&tx)).await {
+                        Ok(resp) => {
+                            // REST returns {"hash": "<hex>"}; wallets expect the
+                            // bare id in base58.
+                            match resp
+                                .get("hash")
+                                .and_then(|h| h.as_str())
+                                .and_then(|h| decode_bytes_any::<32>(h).ok())
+                            {
+                                Some(bytes) => Ok(serde_json::json!(b58(&bytes))),
+                                None => Ok(resp),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    },
+                ),
+                None => Err(()),
+            }
+        }
+        // Preflight without submission: signature, nonce, fee-balance checks
+        // against current state. Wallets call this before sendTransaction;
+        // shape follows Solana's RpcResponse<{err, logs}>.
+        "simulateTransaction" => {
+            let tx_json: Option<serde_json::Value> = match p.first() {
+                Some(serde_json::Value::String(b64)) => {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                }
+                Some(tx) if tx.is_object() => Some(tx.clone()),
+                _ => None,
+            };
+            match tx_json {
+                Some(tx) => {
+                    let slot = current_slot(state).await;
+                    let err = simulate_tx(state, &tx).await;
+                    Ok(Ok(ctx_value(
+                        slot,
+                        serde_json::json!({
+                            "err": err.map(|e| serde_json::json!({ "message": e }))
+                                      .unwrap_or(serde_json::Value::Null),
+                            "logs": [],
+                            "unitsConsumed": 0,
+                        }),
+                    )))
+                }
+                None => Err(()),
+            }
+        }
+        // Devnet faucet, same contract as Solana's requestAirdrop: params are
+        // [recipient, amount]; result is the funding transaction id in base58.
+        // Only available on a node configured with the genesis signing key.
+        "requestAirdrop" => match (param_str(p, 0).map(decode_pubkey), param_u64(p, 1, 0)) {
+            (Ok(Ok(recipient)), Ok(amount)) if amount > 0 => {
+                match build_airdrop_tx(state, recipient, amount).await {
+                    Ok(tx) => Ok(
+                        match rest_dispatch(rest, M::POST, "/transactions", Some(&tx)).await {
+                            Ok(resp) => match resp
+                                .get("hash")
+                                .and_then(|h| h.as_str())
+                                .and_then(|h| decode_bytes_any::<32>(h).ok())
+                            {
+                                Some(bytes) => Ok(serde_json::json!(b58(&bytes))),
+                                None => Ok(resp),
+                            },
+                            Err(e) => Err(e),
+                        },
+                    ),
+                    Err(msg) => Ok(Err((-32601, msg))),
+                }
             }
             _ => Err(()),
         },
@@ -2646,6 +3060,7 @@ async fn handle_rpc_call(rest: &Router, call: JsonRpcRequest) -> serde_json::Val
 
 async fn jsonrpc_handler(
     axum::extract::Extension(rest): axum::extract::Extension<Router>,
+    axum::extract::Extension(state): axum::extract::Extension<SharedState>,
     body: String,
 ) -> Json<serde_json::Value> {
     let payload: serde_json::Value = match serde_json::from_str(&body) {
@@ -2669,7 +3084,7 @@ async fn jsonrpc_handler(
                 method: None,
                 params: Vec::new(),
             });
-            out.push(handle_rpc_call(&rest, parsed).await);
+            out.push(handle_rpc_call(&rest, &state, parsed).await);
         }
         return Json(serde_json::Value::Array(out));
     }
@@ -2684,7 +3099,7 @@ async fn jsonrpc_handler(
             ))
         }
     };
-    Json(handle_rpc_call(&rest, parsed).await)
+    Json(handle_rpc_call(&rest, &state, parsed).await)
 }
 
 pub async fn run_api(state: SharedState) {
@@ -2723,12 +3138,14 @@ pub async fn run_api(state: SharedState) {
         .route("/genesis", get(get_genesis))
         .route("/ws", get(websocket_handler))
         .layer(cors.clone())
-        .with_state(state);
+        .with_state(state.clone());
+    let jsonrpc_state = state;
     // Solana-style JSON-RPC 2.0 at POST / — dispatches into the REST router
     // internally, so every method reuses the exact same handlers.
     let app = Router::new()
         .route("/", axum::routing::post(jsonrpc_handler))
         .layer(axum::extract::Extension(app.clone()))
+        .layer(axum::extract::Extension(jsonrpc_state))
         .layer(cors)
         .merge(app);
     // Bind address is overridable via BUNKER_RPC_ADDR (default loopback-only).
