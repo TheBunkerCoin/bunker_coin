@@ -192,6 +192,10 @@ lockstep without exchanging state. Watch for this line on startup:
 genesis account (funded 1000000000000): 3f3c247ae6a099e87547278e83d2b51ad6b8fb85ff1d7265e849cf782a871d70
 ```
 
+The node also exposes a Solana-style JSON-RPC 2.0 endpoint at `POST /`
+(getBalance, sendTransaction, getSignatureStatuses, requestAirdrop, …) for
+wallet integration — see `docs/WALLET_RPC.md` for the full contract.
+
 Submit a transfer to the node running `--rpc` (POST `/transactions`). Leave the
 `signature` all-zero and set `sender` to the genesis pubkey — the RPC
 **server-signs** it and auto-fills the nonce:
@@ -338,6 +342,21 @@ experiments):
   disseminate, so raise `--delta-mult` if slots stop finalizing. Start around
   `BUNKER_BLOAT_BYTES=2000` on a healthy band and dial up/down from there.
   Unset / `0` = disabled (default).
+- `BUNKER_TURN_RECLAIM_MS` — how long the half-duplex mux tolerates total
+  inbound silence with no transmit turn before reclaiming it (default 60000).
+  Recovery path for a turn-grant frame lost on the air.
+- `BUNKER_RECLAIM_STAGGER_MS` — extra reclaim delay on the listener side
+  (default 40000) so only the caller reclaims in the common case. Must exceed
+  a full changeover round-trip, or both sides reclaim together and their
+  grants collide.
+- `BUNKER_RX_STALL_SECS` — seconds without a single received byte before the
+  whole modem session is declared dead and rebuilt (default 600). Catches a
+  modem stuck in a stale "connected" state that accepts writes but passes
+  nothing.
+- `BUNKER_STANDSTILL_SECS` — period of the standstill recovery rebroadcast
+  (certs + own votes from the finalized floor upward; default 300).
+  Deliberately not delta-scaled: it is the only re-send mechanism for
+  consensus traffic lost on the link.
 
 ---
 
