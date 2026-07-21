@@ -17,7 +17,6 @@ path = "src/bin/pactor_consensus.rs"
 bunker_coin_core = { workspace = true }
 bunker_coin_radio = { workspace = true }
 bunkerglow = { workspace = true }
-rocksdb = { version = "0.23", default-features = false, features = ["lz4"] }
 scs_pactor = { path = "../scs_pactor" }
 
 tokio = { workspace = true }

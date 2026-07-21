@@ -645,7 +645,6 @@ dependencies = [
  "indicatif",
  "log",
  "rand 0.9.1",
- "rocksdb",
  "rpc",
  "scs_pactor",
  "serde",
