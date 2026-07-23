@@ -15,7 +15,7 @@
 //! Only the relay→peers fan-out benefits from broadcast.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;

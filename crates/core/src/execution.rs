@@ -1405,7 +1405,7 @@ mod tests {
         state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
 
         state.staking.queue_commission_change(validator, 500);
-        assert!(state.staking.commission_rates.get(&validator).is_none());
+        assert!(!state.staking.commission_rates.contains_key(&validator));
 
         state.process_epoch_transition(0);
         assert_eq!(

@@ -38,7 +38,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 /// Decode a hex line back to bytes, returning None on malformed input.
 fn decode_hex_line(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.trim();
-    if hex.is_empty() || hex.len() % 2 != 0 {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

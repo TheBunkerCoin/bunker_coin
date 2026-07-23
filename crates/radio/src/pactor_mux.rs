@@ -1090,7 +1090,7 @@ mod tests {
         }
         async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
             assert!(
-                1 + data.len() * 2 + 1 <= crate::pactor_framing::RADIO_MTU,
+                1 + data.len() * 2 < crate::pactor_framing::RADIO_MTU,
                 "fragment line exceeds MTU"
             );
             self.out_tx

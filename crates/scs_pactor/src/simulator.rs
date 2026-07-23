@@ -282,6 +282,9 @@ pub struct SimulatedPactorTransport {
 pub struct SimulatedPactorPair;
 
 impl SimulatedPactorPair {
+    // A factory for a connected pair of endpoints; returning a tuple rather
+    // than Self is the point.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         config: SimulatedPactorConfig,
     ) -> (SimulatedPactorTransport, SimulatedPactorTransport) {
@@ -361,35 +364,23 @@ impl SimulatedPactorTransport {
     }
 
     pub async fn read_status_line(&self) -> Result<String, ScsPactorError> {
-        loop {
-            match self.next_event(self.config.read_timeout).await? {
-                PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
-                    return Ok(format!("CONNECTED {remote_call}"));
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::Connecting { remote_call }) => {
-                    return Ok(format!("CONNECTING {remote_call}"));
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::Disconnected) => {
-                    return Ok("DISCONNECTED".to_owned());
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::LinkFailure) => {
-                    return Ok("LINK FAILURE".to_owned());
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::Busy) => return Ok("BUSY".to_owned()),
-                PactorLinkEvent::Status(PactorLinkStatus::Queued) => {
-                    return Ok("QUEUED".to_owned());
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::Idle) => return Ok("IDLE".to_owned()),
-                PactorLinkEvent::LinkQuality {
-                    speed_level,
-                    retries,
-                } => {
-                    return Ok(format!(
-                        "LINK QUALITY SPEED={speed_level} RETRIES={retries}"
-                    ))
-                }
+        Ok(match self.next_event(self.config.read_timeout).await? {
+            PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
+                format!("CONNECTED {remote_call}")
             }
-        }
+            PactorLinkEvent::Status(PactorLinkStatus::Connecting { remote_call }) => {
+                format!("CONNECTING {remote_call}")
+            }
+            PactorLinkEvent::Status(PactorLinkStatus::Disconnected) => "DISCONNECTED".to_owned(),
+            PactorLinkEvent::Status(PactorLinkStatus::LinkFailure) => "LINK FAILURE".to_owned(),
+            PactorLinkEvent::Status(PactorLinkStatus::Busy) => "BUSY".to_owned(),
+            PactorLinkEvent::Status(PactorLinkStatus::Queued) => "QUEUED".to_owned(),
+            PactorLinkEvent::Status(PactorLinkStatus::Idle) => "IDLE".to_owned(),
+            PactorLinkEvent::LinkQuality {
+                speed_level,
+                retries,
+            } => format!("LINK QUALITY SPEED={speed_level} RETRIES={retries}"),
+        })
     }
 
     async fn emit_status_line(&self, line: &str) {

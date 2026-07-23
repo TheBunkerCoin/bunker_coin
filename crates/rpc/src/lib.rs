@@ -5,7 +5,7 @@ use axum::{
         Path, Query, WebSocketUpgrade,
     },
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use bunker_coin_core::execution::State as ExecutionState;
@@ -18,7 +18,6 @@ use bunkerglow::snapshot::{SnapshotManifest, SnapshotStore};
 use bunkerglow::Slot;
 use ed25519_dalek::SigningKey;
 use futures::{sink::SinkExt, stream::StreamExt};
-use hex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -923,7 +922,7 @@ async fn blocks(
         }
     }
 
-    all_blocks.sort_by(|a, b| b.slot().cmp(&a.slot()));
+    all_blocks.sort_by_key(|b| std::cmp::Reverse(b.slot()));
 
     let total = all_blocks.len();
     if offset >= total {
@@ -2546,7 +2545,7 @@ async fn current_slot(state: &SharedState) -> u64 {
 /// Parse a transaction id (Solana calls it a "signature") given as base58 or
 /// hex, returning the node's native lowercase-hex form used by the tx stores.
 fn tx_id_to_hex(s: &str) -> Result<String, String> {
-    decode_bytes_any::<32>(s).map(|b| hex::encode(b))
+    decode_bytes_any::<32>(s).map(hex::encode)
 }
 
 /// Fee wallets should attach to an ordinary transaction (surfaced through

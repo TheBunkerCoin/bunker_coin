@@ -219,7 +219,7 @@ mod tests {
         }
         async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
             assert!(
-                1 + data.len() * 2 + 1 <= RADIO_MTU,
+                1 + data.len() * 2 < RADIO_MTU,
                 "fragment line exceeds MTU: {} payload bytes",
                 data.len()
             );

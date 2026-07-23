@@ -153,18 +153,12 @@ mod tests {
         // Reverse order: send continuations first, then first fragment
         frags.reverse();
 
-        let mut completed = false;
+        // A continuation without its first fragment is dropped, so reassembly
+        // is not guaranteed to complete here; when it does, it must match.
         for frag in frags {
             if let Some((_, reassembled, _)) = r.feed(frag) {
                 assert_eq!(reassembled, body);
-                completed = true;
             }
-        }
-        // Out-of-order: continuation without first fragment is dropped,
-        // so it may not complete. That's expected behavior.
-        if !completed {
-            // This is fine — continuations without first fragment are dropped
-            assert!(true);
         }
     }
 

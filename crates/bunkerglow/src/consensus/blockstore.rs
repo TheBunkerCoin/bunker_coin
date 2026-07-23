@@ -431,11 +431,11 @@ impl Blockstore for BlockstoreImpl {
     }
 
     fn get_block(&self, block_id: &BlockId) -> Option<Block> {
-        if let Some(block_data) = self.get_block_data(block_id) {
-            if let Some((hash, block)) = block_data.completed.as_ref() {
-                debug_assert_eq!(*hash, block_id.1);
-                return Some(block.clone());
-            }
+        if let Some(block_data) = self.get_block_data(block_id)
+            && let Some((hash, block)) = block_data.completed.as_ref()
+        {
+            debug_assert_eq!(*hash, block_id.1);
+            return Some(block.clone());
         }
         // Fall back to the persisted copy (in-memory `block_data` is empty after a
         // restart or in `--inspect` mode, but the block is durable in RocksDB).
@@ -485,12 +485,11 @@ impl Blockstore for BlockstoreImpl {
 
     fn load_block_from_db(&self, slot: Slot, hash: Hash) -> Option<Block> {
         let key = format!("{:016X}{}", slot, hex::encode(hash));
-        if let Ok(Some(val)) = self.db.get(key.as_bytes()) {
-            if let Ok((block, _)) =
+        if let Ok(Some(val)) = self.db.get(key.as_bytes())
+            && let Ok((block, _)) =
                 bincode::serde::decode_from_slice::<Block, _>(&val, bincode::config::standard())
-            {
-                return Some(block);
-            }
+        {
+            return Some(block);
         }
         None
     }
@@ -510,10 +509,10 @@ impl Blockstore for BlockstoreImpl {
             }
             // key = meta|{16 hex slot}{64 hex hash}
             let hex_hash = &k[prefix_bytes.len()..];
-            if let Ok(bytes) = hex::decode(hex_hash) {
-                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                    return Some(Hash::from(arr));
-                }
+            if let Ok(bytes) = hex::decode(hex_hash)
+                && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
+            {
+                return Some(Hash::from(arr));
             }
         }
         None
@@ -523,18 +522,16 @@ impl Blockstore for BlockstoreImpl {
         let suffix = hex::encode(hash);
         let suffix_bytes = suffix.as_bytes();
         for item in self.db.iterator(IteratorMode::Start) {
-            if let Ok((k, v)) = item {
-                if k.len() >= 16 + suffix_bytes.len()
-                    && &k[k.len() - suffix_bytes.len()..] == suffix_bytes
+            if let Ok((k, v)) = item
+                && k.len() >= 16 + suffix_bytes.len()
+                && &k[k.len() - suffix_bytes.len()..] == suffix_bytes
+            {
+                let slot_str = std::str::from_utf8(&k[0..16]).ok()?;
+                let slot = Slot::new(u64::from_str_radix(slot_str, 16).ok()?);
+                if let Ok((block, _)) =
+                    bincode::serde::decode_from_slice::<Block, _>(&v, bincode::config::standard())
                 {
-                    let slot_str = std::str::from_utf8(&k[0..16]).ok()?;
-                    let slot = Slot::new(u64::from_str_radix(slot_str, 16).ok()?);
-                    if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(
-                        &v,
-                        bincode::config::standard(),
-                    ) {
-                        return Some((slot, block));
-                    }
+                    return Some((slot, block));
                 }
             }
         }
@@ -543,13 +540,13 @@ impl Blockstore for BlockstoreImpl {
 
     fn load_block_metadata(&self, slot: Slot, hash: Hash) -> Option<BlockMetadata> {
         let key = format!("meta|{:016X}{}", slot, hex::encode(hash));
-        if let Ok(Some(val)) = self.db.get(key.as_bytes()) {
-            if let Ok((metadata, _)) = bincode::serde::decode_from_slice::<BlockMetadata, _>(
+        if let Ok(Some(val)) = self.db.get(key.as_bytes())
+            && let Ok((metadata, _)) = bincode::serde::decode_from_slice::<BlockMetadata, _>(
                 &val,
                 bincode::config::standard(),
-            ) {
-                return Some(metadata);
-            }
+            )
+        {
+            return Some(metadata);
         }
         None
     }
@@ -579,30 +576,24 @@ impl Blockstore for BlockstoreImpl {
         let mut batch = WriteBatch::default();
         let mut deleted_count = 0;
         let mut deleted_meta_count = 0;
-        for item in self.db.iterator(IteratorMode::Start) {
-            if let Ok((k, _v)) = item {
-                let finalized = highest_finalized_slot.inner();
-                if k.starts_with(b"meta|") {
-                    if k.len() >= 21 {
-                        if let Ok(slot_hex) = std::str::from_utf8(&k[5..21]) {
-                            if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
-                                if slot_val > finalized {
-                                    batch.delete(&k);
-                                    deleted_meta_count += 1;
-                                }
-                            }
-                        }
-                    }
-                } else if k.len() >= 16 {
-                    if let Ok(slot_hex) = std::str::from_utf8(&k[0..16]) {
-                        if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
-                            if slot_val > finalized {
-                                batch.delete(&k);
-                                deleted_count += 1;
-                            }
-                        }
-                    }
+        for (k, _v) in self.db.iterator(IteratorMode::Start).flatten() {
+            let finalized = highest_finalized_slot.inner();
+            if k.starts_with(b"meta|") {
+                if k.len() >= 21
+                    && let Ok(slot_hex) = std::str::from_utf8(&k[5..21])
+                    && let Ok(slot_val) = u64::from_str_radix(slot_hex, 16)
+                    && slot_val > finalized
+                {
+                    batch.delete(&k);
+                    deleted_meta_count += 1;
                 }
+            } else if k.len() >= 16
+                && let Ok(slot_hex) = std::str::from_utf8(&k[0..16])
+                && let Ok(slot_val) = u64::from_str_radix(slot_hex, 16)
+                && slot_val > finalized
+            {
+                batch.delete(&k);
+                deleted_count += 1;
             }
         }
         let _ = self.db.write(batch);

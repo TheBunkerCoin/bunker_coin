@@ -136,7 +136,7 @@ pub struct PoolImpl {
     epoch_info: Arc<EpochInfo>,
     /// Channel for sending events related to voting logic to Votor.
     pub(super) votor_event_channel: Sender<VotorEvent>,
-    ///
+    /// Channel for requesting repair of a missing block by id.
     repair_channel: Sender<BlockId>,
 
     /// RocksDB handle for persisting certificates & metadata.
@@ -362,28 +362,28 @@ impl PoolImpl {
                     self.handle_finalization(finalization_event).await;
                 }
 
-                if let Some(ref blockstore) = self.blockstore {
-                    if let Some(hash) = cert.block_hash() {
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as u64;
-                        // Use a blocking read, not try_read: a momentarily-held lock
-                        // must not silently drop the finalized-status write (that left
-                        // finalized slots showing "proposed" on disk / via --inspect).
-                        blockstore.read().await.update_finalized_timestamp(
-                            slot,
-                            hash.as_hash().clone(),
-                            timestamp,
-                        );
-                    }
-                    // NOTE: do NOT take `blockstore.write()` here — the pool
-                    // lock is held by our caller, and the shred-ingest path
-                    // holds the blockstore write lock across an await on the
-                    // bounded votor channel; the combination deadlocks. The
-                    // in-memory blockstore prune runs in
-                    // `finalized_checkpoint_loop` instead (no locks held).
+                if let Some(ref blockstore) = self.blockstore
+                    && let Some(hash) = cert.block_hash()
+                {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    // Use a blocking read, not try_read: a momentarily-held lock
+                    // must not silently drop the finalized-status write (that left
+                    // finalized slots showing "proposed" on disk / via --inspect).
+                    blockstore.read().await.update_finalized_timestamp(
+                        slot,
+                        hash.as_hash().clone(),
+                        timestamp,
+                    );
                 }
+                // NOTE: do NOT take `blockstore.write()` here — the pool
+                // lock is held by our caller, and the shred-ingest path
+                // holds the blockstore write lock across an await on the
+                // bounded votor channel; the combination deadlocks. The
+                // in-memory blockstore prune runs in
+                // `finalized_checkpoint_loop` instead (no locks held).
 
                 // Epoch-boundary check now happens in `notify_finalization_event`
                 // (line above), covering both this slot and any implicitly
@@ -397,25 +397,22 @@ impl PoolImpl {
                 self.notify_finalization_event(&finalization_event).await;
                 self.handle_finalization(finalization_event).await;
 
-                if let Some(ref blockstore) = self.blockstore {
-                    if let Some(state) = self.slot_states.get(&slot) {
-                        if let Some(ref notar_cert) = state.certificates.notar {
-                            if let Some(hash) = Cert::Notar(notar_cert.clone()).block_hash() {
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis()
-                                    as u64;
-                                // Blocking read, not try_read: do not silently drop
-                                // the finalized-status write under lock contention.
-                                blockstore.read().await.update_finalized_timestamp(
-                                    slot,
-                                    hash.as_hash().clone(),
-                                    timestamp,
-                                );
-                            }
-                        }
-                    }
+                if let Some(ref blockstore) = self.blockstore
+                    && let Some(state) = self.slot_states.get(&slot)
+                    && let Some(ref notar_cert) = state.certificates.notar
+                    && let Some(hash) = Cert::Notar(notar_cert.clone()).block_hash()
+                {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    // Blocking read, not try_read: do not silently drop
+                    // the finalized-status write under lock contention.
+                    blockstore.read().await.update_finalized_timestamp(
+                        slot,
+                        hash.as_hash().clone(),
+                        timestamp,
+                    );
                 }
 
                 // Epoch-boundary check happens in `notify_finalization_event`
@@ -512,11 +509,11 @@ impl PoolImpl {
     ///
     /// After this, [`Self::slot_states`] will only contain entries for slots
     /// >= [`Self::finalized_slot`], and the side trackers only entries for
-    /// slots >= the finalized slot's window start. Without the side-tracker
-    /// pruning, [`FinalityTracker`], [`ParentReadyTracker`], and
-    /// [`Self::s2n_waiting_parent_cert`] each grow forever (one entry per
-    /// slot/block for the life of the process) — the dominant steady memory
-    /// leak on a long-running node.
+    /// > slots >= the finalized slot's window start. Without the side-tracker
+    /// > pruning, [`FinalityTracker`], [`ParentReadyTracker`], and
+    /// > [`Self::s2n_waiting_parent_cert`] each grow forever (one entry per
+    /// > slot/block for the life of the process) — the dominant steady memory
+    /// > leak on a long-running node.
     ///
     /// The side trackers keep the whole current window (not just the frontier
     /// slot) because `ParentReadyTracker::mark_skipped` backward-walks within
@@ -667,7 +664,7 @@ impl Pool for PoolImpl {
             if let Some(ref tx) = self.slashing_channel {
                 let report = SlashingReport {
                     validator_id: voter,
-                    offence: offence.clone(),
+                    offence,
                     slot,
                 };
                 let _ = tx.try_send(report);
@@ -854,50 +851,48 @@ impl PoolImpl {
         // may have persisted an invalid cert, so on its own it can pin the
         // floor to finality that never really happened.
         let mut meta_final_slot = None;
-        if let Ok(Some(val)) = self.db.get(b"meta|final_slot") {
-            if val.len() == 8 {
-                let arr: [u8; 8] = val[..8].try_into().unwrap();
-                meta_final_slot = Some(Slot::new(u64::from_be_bytes(arr)));
-            }
+        if let Ok(Some(val)) = self.db.get(b"meta|final_slot")
+            && val.len() == 8
+        {
+            let arr: [u8; 8] = val[..8].try_into().unwrap();
+            meta_final_slot = Some(Slot::new(u64::from_be_bytes(arr)));
         }
         let mut raw_certs: Vec<Cert> = Vec::new();
         let mut highest_nf_slot = Slot::genesis();
         let mut invalid_keys: Vec<Box<[u8]>> = Vec::new();
         for item in self.db.iterator(IteratorMode::Start) {
-            if let Ok((k, v)) = item {
-                if k.starts_with(b"cert|") {
-                    if let Ok(cert) = wincode::deserialize::<Cert>(&v) {
-                        // Certs received over the network are threshold-checked
-                        // before entering the pool, but locally-created certs
-                        // are persisted as-is — an invalid cert written here
-                        // once would be restored as truth on every restart,
-                        // pinning this node's floor to finality no peer
-                        // accepts. Drop (and delete) anything that fails
-                        // validation so the floor re-derives from certs the
-                        // peer will accept.
-                        if !cert.check_threshold(&self.epoch_info) {
-                            warn!(
-                                "dropping persisted {} cert for slot {} failing stake \
+            if let Ok((k, v)) = item
+                && k.starts_with(b"cert|")
+                && let Ok(cert) = wincode::deserialize::<Cert>(&v)
+            {
+                // Certs received over the network are threshold-checked
+                // before entering the pool, but locally-created certs
+                // are persisted as-is — an invalid cert written here
+                // once would be restored as truth on every restart,
+                // pinning this node's floor to finality no peer
+                // accepts. Drop (and delete) anything that fails
+                // validation so the floor re-derives from certs the
+                // peer will accept.
+                if !cert.check_threshold(&self.epoch_info) {
+                    warn!(
+                        "dropping persisted {} cert for slot {} failing stake \
                                  threshold — was never valid finality",
-                                cert.kind_str(),
-                                cert.slot()
-                            );
-                            invalid_keys.push(k);
-                            continue;
-                        }
-                        match cert {
-                            Cert::FastFinal(_) | Cert::Final(_) => {
-                                self.highest_finalized_slot =
-                                    self.highest_finalized_slot.max(cert.slot());
-                            }
-                            Cert::Notar(_) | Cert::NotarFallback(_) => {
-                                highest_nf_slot = highest_nf_slot.max(cert.slot());
-                            }
-                            _ => {}
-                        }
-                        raw_certs.push(cert);
-                    }
+                        cert.kind_str(),
+                        cert.slot()
+                    );
+                    invalid_keys.push(k);
+                    continue;
                 }
+                match cert {
+                    Cert::FastFinal(_) | Cert::Final(_) => {
+                        self.highest_finalized_slot = self.highest_finalized_slot.max(cert.slot());
+                    }
+                    Cert::Notar(_) | Cert::NotarFallback(_) => {
+                        highest_nf_slot = highest_nf_slot.max(cert.slot());
+                    }
+                    _ => {}
+                }
+                raw_certs.push(cert);
             }
         }
         for k in invalid_keys {
@@ -930,16 +925,14 @@ impl PoolImpl {
 
         let retain_up_to_inner = retain_up_to.inner();
         for item in self.db.iterator(IteratorMode::Start) {
-            if let Ok((k, _v)) = item {
-                if k.starts_with(b"cert|") && k.len() >= 21 {
-                    if let Ok(slot_hex) = std::str::from_utf8(&k[5..21]) {
-                        if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
-                            if slot_val > retain_up_to_inner {
-                                let _ = self.db.delete(k);
-                            }
-                        }
-                    }
-                }
+            if let Ok((k, _v)) = item
+                && k.starts_with(b"cert|")
+                && k.len() >= 21
+                && let Ok(slot_hex) = std::str::from_utf8(&k[5..21])
+                && let Ok(slot_val) = u64::from_str_radix(slot_hex, 16)
+                && slot_val > retain_up_to_inner
+            {
+                let _ = self.db.delete(k);
             }
         }
 

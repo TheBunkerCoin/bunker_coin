@@ -212,11 +212,11 @@ impl Inner {
         let now = Instant::now();
         let mut n = 0;
         for e in self.entries.values_mut() {
-            if let Some(since) = e.inflight_since {
-                if now.duration_since(since) >= after {
-                    e.inflight_since = None;
-                    n += 1;
-                }
+            if let Some(since) = e.inflight_since
+                && now.duration_since(since) >= after
+            {
+                e.inflight_since = None;
+                n += 1;
             }
         }
         n
@@ -315,14 +315,14 @@ where
     /// convergence is identical regardless of origin.
     async fn admit_and_gossip(&self, wire: Transaction) -> bool {
         let admitted = self.inner.lock().await.admit(wire.clone());
-        if admitted && !self.peers.is_empty() {
-            if let Err(e) = self
+        if admitted
+            && !self.peers.is_empty()
+            && let Err(e) = self
                 .net
                 .send_to_many(&wire, self.peers.iter().copied())
                 .await
-            {
-                debug!("[mempool] gossip failed: {e}");
-            }
+        {
+            debug!("[mempool] gossip failed: {e}");
         }
         admitted
     }

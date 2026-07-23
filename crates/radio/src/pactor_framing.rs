@@ -73,7 +73,7 @@ pub(crate) fn parse_fragment(bytes: &[u8]) -> Option<(FragmentHeader, Vec<u8>)> 
 pub(crate) fn fragment_message(message_id: u64, bytes: &[u8]) -> Vec<Vec<u8>> {
     let chunk_len = effective_chunk_len();
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
-        vec![&bytes[..]]
+        vec![bytes]
     } else {
         bytes.chunks(chunk_len).collect()
     };
@@ -229,7 +229,7 @@ mod tests {
         assert!(fragment_header_len() >= 4);
         let chunk = effective_chunk_len();
         assert!(chunk >= 64, "chunk too small: {chunk}");
-        assert!(1 + (fragment_header_len() + chunk) * 2 + 1 <= RADIO_MTU);
+        assert!(1 + (fragment_header_len() + chunk) * 2 < RADIO_MTU);
     }
 
     #[test]

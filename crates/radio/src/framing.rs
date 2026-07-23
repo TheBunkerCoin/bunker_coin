@@ -63,7 +63,7 @@ impl RadioFramer {
         }
 
         let mut shards: Vec<Vec<u8>> = vec![vec![]; 96];
-        let mut shard_present = vec![false; 96];
+        let mut shard_present = [false; 96];
 
         for frame in frames {
             if frame.frame_index < shards.len() {
@@ -73,7 +73,7 @@ impl RadioFramer {
         }
 
         let mut option_shards: Vec<Option<Vec<u8>>> = Vec::new();
-        for (_i, (shard, present)) in shards.into_iter().zip(shard_present.iter()).enumerate() {
+        for (shard, present) in shards.into_iter().zip(shard_present.iter()) {
             if *present && !shard.is_empty() {
                 option_shards.push(Some(shard));
             } else {
@@ -88,7 +88,7 @@ impl RadioFramer {
     }
 
     fn encode_data(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, RadioError> {
-        let shard_size = (data.len() + 31) / 32;
+        let shard_size = data.len().div_ceil(32);
         let mut shards = Vec::with_capacity(96);
 
         for i in 0..32 {

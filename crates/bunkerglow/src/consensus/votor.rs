@@ -271,6 +271,7 @@ impl<A: All2All> Votor<A> {
     /// reverse path whenever a slot fast-finalizes within the grace window. Safe:
     /// it only ever delays (never fabricates) a finalization vote, and falls back
     /// to slow-final if fast-final does not occur in time.
+    #[cfg(test)]
     pub fn set_defer_final_vote(&mut self, defer: bool) {
         self.defer_final_vote = defer;
     }

@@ -1,7 +1,7 @@
 //! Radio network core for routing messages between nodes with realistic HF radio constraints
 
 use crate::{Network, NetworkError, NetworkMessage, ValidatorId};
-use log::{debug, trace, warn};
+use log::{trace, warn};
 use rand::Rng;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use serde::{Deserialize, Serialize};
@@ -133,7 +133,7 @@ impl RadioNetworkCore {
                 let total_delay = Duration::from_millis(10) + random_jitter + transmission_time;
                 packets_processed += 1;
 
-                if packets_processed % 100 == 0 {
+                if packets_processed.is_multiple_of(100) {
                     log::info!("Radio queue processed {} packets", packets_processed);
                 }
 
@@ -503,8 +503,9 @@ impl RadioNode {
         let max_shard_payload_size = mtu.saturating_sub(header_size);
         let min_total_size = DATA_SHARDS * MIN_SHARD_SIZE;
         let required_total_size = data.len().max(min_total_size);
-        let shard_payload_size =
-            ((required_total_size + DATA_SHARDS - 1) / DATA_SHARDS).max(MIN_SHARD_SIZE);
+        let shard_payload_size = required_total_size
+            .div_ceil(DATA_SHARDS)
+            .max(MIN_SHARD_SIZE);
 
         if shard_payload_size > max_shard_payload_size {
             log::warn!(
@@ -697,8 +698,9 @@ impl RadioNode {
         let max_shard_payload_size = mtu.saturating_sub(header_size);
         let min_total_size = DATA_SHARDS * MIN_SHARD_SIZE;
         let required_total_size = data.len().max(min_total_size);
-        let shard_payload_size =
-            ((required_total_size + DATA_SHARDS - 1) / DATA_SHARDS).max(MIN_SHARD_SIZE);
+        let shard_payload_size = required_total_size
+            .div_ceil(DATA_SHARDS)
+            .max(MIN_SHARD_SIZE);
 
         if shard_payload_size > max_shard_payload_size {
             log::warn!("Message too large for erasure coding with MTU {}, falling back to fragmented broadcast", mtu);

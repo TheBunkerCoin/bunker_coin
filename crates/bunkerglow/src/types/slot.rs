@@ -119,11 +119,11 @@ impl Slot {
     }
 
     pub fn is_last_in_epoch(self) -> bool {
-        (self.0 + 1) % SLOTS_PER_EPOCH == 0
+        (self.0 + 1).is_multiple_of(SLOTS_PER_EPOCH)
     }
 
     pub fn is_first_in_epoch(self) -> bool {
-        self.0 % SLOTS_PER_EPOCH == 0
+        self.0.is_multiple_of(SLOTS_PER_EPOCH)
     }
 }
 
