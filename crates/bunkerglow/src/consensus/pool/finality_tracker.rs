@@ -439,7 +439,6 @@ mod tests {
     fn basic() {
         let mut tracker = FinalityTracker::default();
 
-        // slow finalize a block
         let slot1 = Slot::genesis().next();
         let hash1: BlockHash = Hash::random_for_test().into();
         let event = tracker.mark_notarized(slot1, hash1.clone());
@@ -449,7 +448,6 @@ mod tests {
         assert_eq!(event.implicitly_finalized, vec![]);
         assert_eq!(event.implicitly_skipped, vec![]);
 
-        // fast finalize a block
         let slot2 = slot1.next();
         let hash2: BlockHash = Hash::random_for_test().into();
         let event = tracker.mark_fast_finalized(slot2, hash2.clone());
@@ -457,7 +455,6 @@ mod tests {
         assert_eq!(event.implicitly_finalized, vec![]);
         assert_eq!(event.implicitly_skipped, vec![]);
 
-        // implicitly finalize a block WITHOUT skips
         let slot4 = slot2.next().next();
         let hash3: BlockHash = Hash::random_for_test().into();
         let hash4: BlockHash = Hash::random_for_test().into();
@@ -468,7 +465,6 @@ mod tests {
         assert_eq!(event.implicitly_finalized, vec![(slot4.prev(), hash3)]);
         assert_eq!(event.implicitly_skipped, vec![]);
 
-        // implicitly finalize a block WITH skips
         let slot7 = slot4.next().next().next();
         let hash5: BlockHash = Hash::random_for_test().into();
         let hash7: BlockHash = Hash::random_for_test().into();
@@ -488,7 +484,6 @@ mod tests {
     fn no_duplicates() {
         let mut tracker = FinalityTracker::default();
 
-        // slow finalize + fast finalize a block
         let slot1 = Slot::genesis().next();
         let hash1: BlockHash = Hash::random_for_test().into();
         let event = tracker.mark_finalized(slot1);
@@ -510,7 +505,6 @@ mod tests {
         assert_eq!(event.implicitly_finalized, vec![]);
         assert_eq!(event.implicitly_skipped, vec![]);
 
-        // implicitly finalize a block WITHOUT skips
         let slot4 = slot2.next().next();
         let hash3: BlockHash = Hash::random_for_test().into();
         let hash4: BlockHash = Hash::random_for_test().into();

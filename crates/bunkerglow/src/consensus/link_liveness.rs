@@ -3,28 +3,24 @@
 //!
 //! Alpenglow's crashed-leader timeout assumes network synchrony: if no shred
 //! arrives within the timeout, the leader is presumed crashed and the window is
-//! skipped (a *liveness* mechanism). Over a half-duplex PACTOR link that goes
-//! quiet for minutes while still up (the slow reverse ARQ path), that assumption
-//! breaks: the leader is alive and its block is merely crawling across, but the
-//! timeout fires and the window is skipped irreversibly — leaving a permanent
-//! chain gap and forcing a jump-ahead when the peer's catch-up cert arrives.
+//! skipped. Over a half-duplex PACTOR link that goes quiet for minutes while
+//! still up (the slow reverse ARQ path), that assumption breaks: the leader is
+//! alive and its block is merely crawling across, yet the window is skipped
+//! irreversibly, leaving a permanent chain gap.
 //!
 //! [`LinkLiveness`] lets the transport tell Votor whether the link is actually
-//! up (e.g. keepalives are still being received). When it is, Votor *pauses*
-//! (re-arms the timeout) instead of skipping — see the crashed-leader handling
-//! in [`super::votor`]. This only ever makes skipping *more* conservative, so it
-//! cannot violate safety; it trades a bounded amount of skip-promptness for not
-//! gapping the chain on a slow link.
+//! up (e.g. keepalives are still arriving). When it is, Votor *pauses* (re-arms
+//! the timeout) instead of skipping. This only ever makes skipping *more*
+//! conservative, so it cannot violate safety.
 
 use std::sync::Arc;
 
 /// Reports whether there is *positive evidence* the link to peers is up.
 ///
-/// The crashed-leader timeout only pauses (instead of skipping) when this returns
-/// `true`. So the default must be `false`: absent a real liveness source, behave
-/// exactly as before (skip on timeout). Only a transport that can affirmatively
-/// observe liveness — e.g. radio keepalive receipt — returns `true`, and only
-/// while it actually sees that evidence.
+/// The crashed-leader timeout only pauses (instead of skipping) when this
+/// returns `true`, so the default must be `false`: absent a real liveness
+/// source, behave exactly as before. Only a transport that can affirmatively
+/// observe liveness — e.g. radio keepalive receipt — returns `true`.
 pub trait LinkLiveness: Send + Sync {
     /// `true` only if there is recent positive evidence the link is alive.
     fn is_link_alive(&self) -> bool;
@@ -33,9 +29,8 @@ pub trait LinkLiveness: Send + Sync {
 /// Default: no liveness evidence available → never pauses the crashed-leader
 /// timeout (preserves the original skip-on-timeout behavior).
 ///
-/// Used for the simulator and UDP paths, which have no half-duplex quiet periods
-/// to ride out: there, a peer that stops sending really is gone, so the timeout
-/// should skip as before. This impl changes nothing for those paths.
+/// Used for the simulator and UDP paths, where a peer that stops sending really
+/// is gone, so the timeout should skip as before.
 pub struct NoLiveness;
 
 impl LinkLiveness for NoLiveness {
