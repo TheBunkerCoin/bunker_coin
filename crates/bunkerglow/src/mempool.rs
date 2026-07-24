@@ -278,11 +278,8 @@ where
                         }
                     }
                     Err(e) => {
-                        // A permanently closed inner network must END the loop:
-                        // previously this arm looped forever, leaking a
-                        // 200ms-spinning task plus the full mempool it holds on
-                        // EVERY radio reconnect (the old comment claimed the
-                        // loop ends; the code never did).
+                        // A permanently closed network must end the loop, else it
+                        // spins and leaks the mempool it holds on every reconnect.
                         consecutive_errors += 1;
                         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                             warn!(
@@ -473,9 +470,8 @@ mod tests {
         }
     }
 
-    /// The admit loop must EXIT once its network is permanently closed —
-    /// previously the error arm looped forever, leaking a spinning task plus
-    /// the entire mempool it holds on every radio reconnect.
+    /// The admit loop must exit once its network is permanently closed, rather
+    /// than spinning and leaking the mempool it holds on every reconnect.
     #[tokio::test]
     async fn admit_loop_exits_when_network_closed() {
         let mempool = Mempool::new(ClosedNet, vec![]);
