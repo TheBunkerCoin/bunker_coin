@@ -282,7 +282,6 @@ impl FinalityTracker {
         // kept Finalized/ImplicitlyFinalized status, and `mark_notarized`/
         // `mark_finalized` restore (never downgrade) those statuses.
 
-        // implicitly skip slots in between
         for slot in implicitly_finalized.0.future_slots() {
             if slot == source_slot {
                 break;
@@ -306,7 +305,6 @@ impl FinalityTracker {
             event.implicitly_skipped.push(slot);
         }
 
-        // mark block as implicitly finalized
         let (slot, block_hash) = implicitly_finalized.clone();
         let old = self.status.insert(
             slot,
@@ -330,7 +328,6 @@ impl FinalityTracker {
             .implicitly_finalized
             .push(implicitly_finalized.clone());
 
-        // recurse through ancestors
         if let Some(parent) = self.parents.get(&implicitly_finalized).cloned() {
             self.handle_implicitly_finalized(implicitly_finalized.0, parent, event);
         }

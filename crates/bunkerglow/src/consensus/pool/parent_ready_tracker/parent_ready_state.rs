@@ -113,11 +113,10 @@ impl ParentReadyState {
                 self.is_ready = IsReady::Ready(smallvec![id]);
             }
             IsReady::Ready(ready_ids) => {
-                // Idempotent: a parent can be legitimately re-derived (e.g. a
-                // finalization walk crossing the prune floor re-reports an
-                // ancestor whose dedup flag was pruned). Re-adding a ready
-                // parent is semantically a no-op — asserting here turned that
-                // into a consensus-task crash.
+                // A parent can be legitimately re-derived (e.g. a finalization
+                // walk crossing the prune floor re-reports an ancestor whose
+                // dedup flag was pruned), so re-adding a ready parent must be a
+                // no-op rather than an assertion.
                 if !ready_ids.contains(&id) {
                     ready_ids.push(id);
                 }

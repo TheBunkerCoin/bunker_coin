@@ -280,7 +280,6 @@ impl BlockData {
             return ReconstructSliceResult::Error;
         }
 
-        // insert reconstructed slice and shreds
         entry.insert(reconstructed_slice);
         let mut reconstructed_shreds = reconstructed_shreds.map(Some);
         std::mem::swap(slice_shreds, &mut reconstructed_shreds);
@@ -305,7 +304,6 @@ impl BlockData {
             return ReconstructBlockResult::NoAction;
         }
 
-        // calculate double-Merkle tree & block hash
         let merkle_roots = self
             .slices
             .values()
@@ -314,7 +312,6 @@ impl BlockData {
         let block_hash = tree.get_root();
         self.double_merkle_tree = Some(tree);
 
-        // reconstruct block header
         let first_slice = self.slices.get(&SliceIndex::first()).unwrap();
         // based on the logic in `try_reconstruct_slice`, first_slice should be valid i.e. it must contain a parent.
         let mut parent = first_slice.parent.clone().unwrap();
@@ -323,11 +320,8 @@ impl BlockData {
         let mut epoch_transition = None;
         let mut transactions = vec![];
         for (ind, slice) in &self.slices {
-            // Every slice must belong to the slot we are reconstructing. The slot
-            // is part of each slice's signed/Merkle-committed payload (and was
-            // cross-checked against the shred header at deshred), so a mismatch
-            // here means slices from different slots were combined — reject rather
-            // than silently produce a block whose hash/identity is ambiguous.
+            // A slot mismatch means slices from different slots were combined;
+            // reject rather than produce a block with ambiguous identity.
             if slice.slot != self.slot {
                 warn!(
                     "slice {ind} claims slot {} but reconstructing slot {}",
@@ -335,7 +329,6 @@ impl BlockData {
                 );
                 return ReconstructBlockResult::Error;
             }
-            // handle optimistic handover
             if !ind.is_first()
                 && let Some(new_parent) = slice.parent.clone()
             {
@@ -405,7 +398,6 @@ impl BlockData {
         let block_info = BlockInfo::from(&block);
         self.completed = Some((block_hash, block));
 
-        // clean up raw slices
         self.slices.clear();
 
         ReconstructBlockResult::Complete(block_info)
@@ -456,7 +448,6 @@ mod tests {
         let pk = sk.to_pk();
         let slot = Slot::new(123);
 
-        // manage to construct block from just enough shreds
         let slices = create_random_block(slot, 1);
         let mut block_data = BlockData::new(slot);
         let mut shredder = RegularShredder::default();
@@ -472,7 +463,6 @@ mod tests {
         }
         assert!(block_data.completed.is_some());
 
-        // all shreds should have been reconstructed
         let slice_shreds = block_data.shreds.get(&SliceIndex::first()).unwrap();
         assert_eq!(slice_shreds.len(), TOTAL_SHREDS);
         for shred_index in ShredIndex::all() {
@@ -485,7 +475,6 @@ mod tests {
         let sk = SecretKey::new(&mut rand::rng());
         let slot = Slot::new(123);
 
-        // manage to construct a valid block
         let slices = create_random_block(slot, 1);
         let (events, res) =
             handle_slice(&mut BlockData::new(slices[0].slot), slices[0].clone(), &sk);
@@ -503,7 +492,6 @@ mod tests {
         };
         assert_votor_events_match(events[1].clone(), block_event);
 
-        // do not construct a valid block when slice is invalid
         let mut slices = create_random_block(slot, 1);
         slices[0].parent = None;
         let (events, res) =
@@ -514,14 +502,9 @@ mod tests {
         assert_votor_events_match(events[0].clone(), first_shred_event);
     }
 
-    /// A block whose parent slot is not strictly earlier than its own slot is
-    /// malformed (a hostile/buggy leader) and must be rejected at
-    /// reconstruction — returning `InvalidShred` — rather than producing a
-    /// `Block` event that would later panic `Pool::add_block`.
-    ///
-    /// Builds the (single, empty-tx) slice directly rather than via
-    /// `create_random_block`, so it does not depend on that helper's payload
-    /// sizing.
+    /// A parent slot not strictly earlier than its own slot must reject as
+    /// `InvalidShred` rather than emit a `Block`. Builds the slice directly to
+    /// avoid depending on `create_random_block`'s payload sizing.
     #[test]
     fn reconstruct_block_rejects_non_earlier_parent() {
         use crate::BlockPayload;

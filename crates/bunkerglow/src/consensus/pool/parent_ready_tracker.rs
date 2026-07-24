@@ -42,7 +42,6 @@ impl ParentReadyTracker {
             return SmallVec::new();
         }
 
-        // add this block as valid parent to any skip-connected future windows
         let mut newly_certified = SmallVec::new();
         for slot in slot.future_slots() {
             let state = self.slot_state(slot);
@@ -66,38 +65,32 @@ impl ParentReadyTracker {
             return SmallVec::new();
         }
 
-        // find possible parents for future windows
         let mut potential_parents = SmallVec::<[BlockId; 1]>::new();
         let window_slots = marked_slot.slots_in_window();
-        // going back from `marked_slot` find any skip-connected parents
+        // Walk backward from `marked_slot` collecting skip-connected parents,
+        // stopping at the first non-skipped slot.
         for slot in window_slots.filter(|s| *s <= marked_slot).rev() {
             let state = self.slot_state(slot);
-            // add any notarized-fallback blocks from this slot
             if slot != marked_slot {
                 for nf in state.notar_fallback_blocks() {
                     potential_parents.push((slot, nf));
                 }
             }
-            // stop as soon as we see any non-skipped slot
             if !state.is_skip_certified() {
                 break;
             }
-            // if the slot is skipped, add its parents as well
             potential_parents.extend(state.ready_block_ids().iter().cloned());
         }
 
-        // add these as valid parents to any skip-connected future windows
         let mut newly_certified = SmallVec::new();
         for slot in marked_slot.future_slots() {
             let state = self.slot_state(slot);
-            // add parents to this window
             if slot.is_start_of_window() {
                 for parent in &potential_parents {
                     state.add_to_ready(parent.clone());
                     newly_certified.push((slot, parent.clone()));
                 }
             }
-            // stop as soon as we see any non-skipped slot
             if !state.is_skip_certified() {
                 break;
             }
@@ -126,7 +119,6 @@ impl ParentReadyTracker {
             parents_ready.extend(self.mark_skipped(slot));
         }
 
-        // keep only highest slot ParentReady
         let maybe_parent = parents_ready.iter().max_by_key(|(slot, _)| slot);
         maybe_parent.into_iter().cloned().collect()
     }
