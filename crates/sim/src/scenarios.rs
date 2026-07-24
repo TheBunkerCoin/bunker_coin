@@ -1,4 +1,4 @@
-//! Simulation scenarios for testing BunkerCoin over radio
+//! Simulation scenarios for BunkerCoin radio tests.
 
 use bincode;
 use bunker_coin_radio::{
@@ -389,9 +389,7 @@ pub async fn bandwidth_test(config: RadioConfig) {
             if let Ok(serialized) = wincode::serialize(&**shred) {
                 total_bytes += serialized.len();
                 for (i, chunk) in serialized.chunks(config.mtu).enumerate() {
-                    //println!("  [DEBUG] Sending chunk {} of size {}...", i, chunk.len());
                     let _ = radio.send_serialized(chunk, "broadcast").await;
-                    //println!("  [DEBUG] Sent chunk {}", i);
                 }
             }
         }
@@ -706,13 +704,13 @@ pub async fn multi_node_consensus_simulation_with_api(
         pools_and_blockstores.push((*i, node.get_pool(), node.blockstore()));
     }
 
-    // first node's blockstore is used for api
+    // Expose node 0's blockstore to the API.
     if let Some((_, _, blockstore)) = pools_and_blockstores.first() {
         let mut bs_ref = blockstore_ref.write().await;
         *bs_ref = Some(blockstore.clone());
     }
 
-    // RPC → consensus bridge: inject transactions from the API into the tx network
+    // Bridge API transactions into the consensus tx network.
     {
         let injector_id = num_nodes as u64; // id beyond the validator range
         let injector_net: SimulatedNetwork<Transaction, Transaction> =
@@ -721,21 +719,17 @@ pub async fn multi_node_consensus_simulation_with_api(
         let (tx_send, mut tx_recv) =
             tokio::sync::mpsc::unbounded_channel::<bunker_coin_core::transaction::Transaction>();
 
-        // Store the sender so the API can forward transactions
         *tx_sender_slot.write().await = Some(tx_send);
 
-        // Collect all validator txs_net addresses (port = validator id)
         let all_validator_addrs: Vec<std::net::SocketAddr> = (0..num_nodes)
             .map(|i| localhost_ip_sockaddr(i as u16))
             .collect();
 
-        // Bridge task: encode CoreTransaction → bunkerglow::Transaction, broadcast to all nodes.
-        // Also periodically re-broadcasts pending mempool txs so they get picked up by block producers.
+        // Re-broadcast pending mempool txs until block producers include them.
         let tx_results_for_bridge = tx_results.clone();
         tokio::spawn(async move {
             use tokio::time::{interval, Duration};
 
-            // Keep encoded txs for re-broadcasting until they're finalized
             let mut pending_txs: Vec<(String, Transaction)> = Vec::new();
 
             let mut rebroadcast_interval = interval(Duration::from_secs(10));
@@ -763,7 +757,6 @@ pub async fn multi_node_consensus_simulation_with_api(
                         }
                     }
                     _ = rebroadcast_interval.tick() => {
-                        // Remove txs that have been finalized
                         let results = tx_results_for_bridge.read().await;
                         pending_txs.retain(|(hash, _)| !results.contains_key(hash));
                         drop(results);
@@ -1095,7 +1088,7 @@ pub async fn multi_node_consensus_simulation_with_api(
                                         .as_millis()
                                         as u64;
 
-                                    // for now only copying metadata -> todo @elia for persistence: take care of data as well
+                                    // API block records currently persist metadata only.
                                     blocks_guard.push(rpc::Block::Block {
                                         slot,
                                         hash: h,
@@ -1149,7 +1142,7 @@ pub async fn multi_node_consensus_simulation_with_api(
                         .join(", ")
                 );
 
-                // execute transactions from newly finalized blocks
+                // Execute newly finalized blocks.
                 if consensus_finalized_slot > last_executed_slot {
                     let (_i, _pool, blockstore) = &pools_and_blockstores[0];
                     if let Ok(bs) = blockstore.try_read() {
@@ -1165,9 +1158,8 @@ pub async fn multi_node_consensus_simulation_with_api(
                                         raw_txs
                                             .iter()
                                             .filter_map(|raw| {
-                                                // Transaction.0 may have a wincode Vec<u8> length
-                                                // prefix (8-byte LE u64) wrapping the bincode payload.
-                                                // Try raw first, then try skipping the prefix.
+                                                // Transaction.0 may wrap bincode bytes in an 8-byte wincode Vec prefix.
+                                                // Try raw bytes first, then the prefixed form.
                                                 let data = &raw.0;
                                                 bincode::serde::decode_from_slice(
                                                     data,
@@ -1209,7 +1201,7 @@ pub async fn multi_node_consensus_simulation_with_api(
                                             .as_millis()
                                             as u64;
 
-                                        // record tx results, prune mempool, send WS events
+                                        // Publish execution results and prune finalized txs.
                                         let mut pool = mempool.write().await;
                                         let mut results_map = tx_results.write().await;
 
@@ -1240,10 +1232,8 @@ pub async fn multi_node_consensus_simulation_with_api(
                                                 },
                                             );
 
-                                            // prune from mempool
                                             pool.retain(|entry| entry.hash != tx_hash);
 
-                                            // send WS event
                                             let _ = updates_tx.send(
                                                 rpc::WebSocketUpdate::TransactionFinalized {
                                                     hash: tx_hash,

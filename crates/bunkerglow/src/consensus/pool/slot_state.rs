@@ -1,12 +1,7 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Data structures handling votes and certificates for a single slot.
-//!
-//! The main data structure defined here is [`SlotState`], which has components:
-//! - [`SlotVotes`] for all votes in a single slot.
-//! - [`SlotVotedStake`] for all running stake totals in a single slot.
-//! - [`SlotCertificates`] for all certificates in a single slot.
+//! Per-slot pool state for votes, stake totals, and certificates.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,73 +18,45 @@ use crate::consensus::{Cert, EpochInfo, Vote};
 use crate::crypto::merkle::BlockHash;
 use crate::{BlockId, Slot, Stake};
 
-/// Data structure holding pool state for a single slot.
+/// Pool state for one slot.
 pub struct SlotState {
-    /// Votes for this slot, contains all vote types and validators.
     pub(super) votes: SlotVotes,
-    /// Running stake totals for different types of votes.
     pub(super) voted_stakes: SlotVotedStake,
-    /// Certificates for this slot, contains all certificate types and validators.
     pub(super) certificates: SlotCertificates,
-    /// Indicates blocks for which we already know their parents.
     parents: BTreeMap<BlockHash, ParentStatus>,
-    /// Hashes of blocks that have reached the necessary votes for safe-to-notar
-    /// and are only waiting for our only vote to arrive.
     pending_safe_to_notar: BTreeSet<BlockHash>,
-    /// Hashes of blocks for which safe-to-notar has already been reached.
     sent_safe_to_notar: BTreeSet<BlockHash>,
-    /// Indicates if safe-to-skip has already been sent for this slot.
     sent_safe_to_skip: bool,
 
-    /// The slot this state is for.
     slot: Slot,
-    /// Information about all validators active in this slot.
     pub(super) epoch_info: Arc<EpochInfo>,
 }
 
-// PERF: replace storing Votes (50% size overhead) with storing only signatures?
 pub struct SlotVotes {
-    /// Notarization votes for all validators (indexed by `ValidatorId`).
     pub(super) notar: Vec<Option<Vote>>,
-    /// Notar-fallback votes for all validators (indexed by `ValidatorId`).
     pub(super) notar_fallback: Vec<BTreeMap<BlockHash, Vote>>,
-    /// Skip votes for all validators (indexed by `ValidatorId`).
     pub(super) skip: Vec<Option<Vote>>,
-    /// Skip-fallback votes for all validators (indexed by `ValidatorId`).
     pub(super) skip_fallback: Vec<Option<Vote>>,
-    /// Finalization votes for all validators (indexed by `ValidatorId`).
     pub(super) finalize: Vec<Option<Vote>>,
 }
 
 #[derive(Default)]
 pub struct SlotVotedStake {
-    /// Amount of stake for each block has for which we have a notarization vote.
     pub(super) notar: BTreeMap<BlockHash, Stake>,
-    /// Amount of stake for each block hash for which we have a notar-fallback vote.
     pub(super) notar_fallback: BTreeMap<BlockHash, Stake>,
-    /// Amount of stake for which we have a skip vote.
     pub(super) skip: Stake,
-    /// Amount of stake for which we have a skip-fallback vote.
     pub(super) skip_fallback: Stake,
-    /// Amount of stake for which we have a finalization vote.
     pub(super) finalize: Stake,
-    /// Amount of stake for which we have either notar or skip vote.
     pub(super) notar_or_skip: Stake,
-    /// Maximum amount of stake that voted notar on the same block.
     pub(super) top_notar: Stake,
 }
 
 #[derive(Default)]
 pub struct SlotCertificates {
-    /// Notarization certificate for this slot, if it exists.
     pub(super) notar: Option<NotarCert>,
-    /// Notar-fallback certificates for this slot, if any.
     pub(super) notar_fallback: Vec<NotarFallbackCert>,
-    /// Skip certificate for this slot, if it exists.
     pub(super) skip: Option<SkipCert>,
-    /// Fast finalization certificate for this slot, if it exists.
     pub(super) fast_finalize: Option<FastFinalCert>,
-    /// Finalization certificate for this slot, if it exists.
     pub(super) finalize: Option<FinalCert>,
 }
 
@@ -114,9 +81,7 @@ type SlotStateOutputs = (
 );
 
 impl SlotState {
-    /// Creates a new container for votes and certificates for a single slot.
-    ///
-    /// Initially, it is completely empty.
+    /// Creates empty state for one slot.
     pub fn new(slot: Slot, epoch_info: Arc<EpochInfo>) -> Self {
         Self {
             votes: SlotVotes::new(epoch_info.validators.len()),
@@ -132,15 +97,7 @@ impl SlotState {
         }
     }
 
-    /// Emit a locally-aggregated cert only if its own signer set actually
-    /// meets its stake threshold.
-    ///
-    /// The creation gates in the `count_*_stake` methods use the running
-    /// stake TALLY, but the cert embeds the actual collected votes. If those
-    /// ever disagree (tally double-count, vote-list gap), emitting the cert
-    /// would poison this node's pool and DB with unprovable finality that
-    /// peers reject. Suppress it and log loudly instead: the divergence
-    /// itself is a bug this tripwire makes visible.
+    /// Emit locally-built certs only when collected votes meet the threshold.
     fn push_cert_checked(&self, new_certs: &mut SmallVec<[Cert; 2]>, cert: Cert) {
         if cert.check_threshold(&self.epoch_info) {
             new_certs.push(cert);
@@ -169,24 +126,14 @@ impl SlotState {
         }
     }
 
-    /// Adds a vote to this slot.
-    ///
-    /// Handles updating the corresponding running stake totals, creating any
-    /// new certificates and checking other conditions, like safe-to-notar.
-    ///
-    /// Returns potentially created certificates and newly emitted votor events.
+    /// Adds a vote and returns any resulting certs, Votor events, or repairs.
     pub fn add_vote(&mut self, vote: Vote, voter_stake: Stake) -> SlotStateOutputs {
         let slot = vote.slot();
         let voter = vote.signer();
         let v = voter as usize;
 
         let (certs_created, mut votor_events, mut blocks_to_repair) = match vote.kind() {
-            // Store the vote BEFORE counting its stake: the count_* methods
-            // build certificates from the STORED votes the moment the running
-            // tally reaches quorum, so counting first would mint every cert
-            // WITHOUT the vote that tipped it over the threshold — invalid on
-            // the wire while trusted locally. The skip and final arms below
-            // follow the same store-then-count order.
+            // Store before counting: cert creation reads stored votes at quorum.
             VoteKind::Notar(_, block_hash) => {
                 let block_hash = block_hash.clone();
                 self.votes.notar[v] = Some(vote);
@@ -213,7 +160,6 @@ impl SlotState {
             }
         };
 
-        // own vote might have made a block safe-to-notar
         if voter == self.epoch_info.own_id {
             for hash in self.pending_safe_to_notar.clone() {
                 if self.sent_safe_to_notar.contains(&hash) {
@@ -232,12 +178,12 @@ impl SlotState {
         (certs_created, votor_events, blocks_to_repair)
     }
 
-    /// Mark the parent of the block given by `hash` as known (in Blokstor).
+    /// Mark the parent of `hash` as known.
     pub fn notify_parent_known(&mut self, hash: BlockHash) {
         self.parents.entry(hash).or_insert(ParentStatus::Known);
     }
 
-    /// Mark the parent of the block given by `hash` as notarized-fallback.
+    /// Mark the parent of `hash` as notarized-fallback.
     ///
     /// # Panics
     ///
@@ -251,7 +197,6 @@ impl SlotState {
         };
         *parent_info = ParentStatus::Certified;
 
-        // potentially emit safe-to-notar
         if self.sent_safe_to_notar.contains(&hash) {
             return None;
         }
@@ -280,10 +225,6 @@ impl SlotState {
         stake >= (self.epoch_info.total_stake() * 4).div_ceil(5)
     }
 
-    /// Adds a given amount of `stake` to notarization counter for `block_hash`.
-    /// Then, checks if a new notarization certificate can be created.
-    ///
-    /// Returns potentially created certificates and newly emitted votor events.
     fn count_notar_stake(
         &mut self,
         slot: Slot,
@@ -294,7 +235,6 @@ impl SlotState {
         let mut votor_events = SmallVec::new();
         let mut blocks_to_repair = SmallVec::new();
 
-        // increment stake
         let notar_stake = self
             .voted_stakes
             .notar
@@ -305,7 +245,6 @@ impl SlotState {
         let notar_stake = *notar_stake;
         self.voted_stakes.top_notar = notar_stake.max(self.voted_stakes.top_notar);
 
-        // check quorums
         if !self.sent_safe_to_notar.contains(block_hash) {
             match self.check_safe_to_notar(block_hash.clone()) {
                 SafeToNotarStatus::SafeToNotar => {
@@ -349,10 +288,6 @@ impl SlotState {
         (new_certs, votor_events, blocks_to_repair)
     }
 
-    /// Adds a given amount of `stake` to notar-fallback counter for `block_hash`.
-    /// Then, checks if a new notar-fallback certificate can be created.
-    ///
-    /// Returns potentially created certificates and newly emitted votor events.
     fn count_notar_fallback_stake(
         &mut self,
         block_hash: &BlockHash,
@@ -373,10 +308,6 @@ impl SlotState {
         (new_certs, SmallVec::new(), SmallVec::new())
     }
 
-    /// Adds a given amount of `stake` to skip counter for `slot`.
-    /// Then, checks if a new skip certificate can be created.
-    ///
-    /// Returns potentially created certificates and newly emitted votor events.
     fn count_skip_stake(&mut self, slot: Slot, stake: Stake, fallback: bool) -> SlotStateOutputs {
         let mut new_certs = SmallVec::new();
         let mut votor_events = SmallVec::new();
@@ -386,7 +317,6 @@ impl SlotState {
         } else {
             self.voted_stakes.skip += stake;
         }
-        // PERF: clone on every skip vote
         for hash in self.pending_safe_to_notar.clone() {
             if self.sent_safe_to_notar.contains(&hash) {
                 continue;
@@ -416,10 +346,6 @@ impl SlotState {
         (new_certs, votor_events, blocks_to_repair)
     }
 
-    /// Adds a given amount of `stake` to finalization counter for `slot`.
-    /// Then, checks if a new finalization certificate can be created.
-    ///
-    /// Returns potentially created certificates and newly emitted votor events.
     fn count_finalize_stake(&mut self, stake: Stake) -> SlotStateOutputs {
         let mut new_certs = SmallVec::new();
         self.voted_stakes.finalize += stake;
@@ -431,10 +357,7 @@ impl SlotState {
         (new_certs, SmallVec::new(), SmallVec::new())
     }
 
-    /// Checks whether the given vote constitutes a slashable offence.
-    ///
-    /// This has to be called before dismissing potential duplicates, as
-    /// according to `should_ignore_vote()`.
+    /// Checks slashable offences before duplicate filtering.
     pub fn check_slashable_offence(&self, vote: &Vote) -> Option<SlashableOffence> {
         let slot = vote.slot();
         let voter = vote.signer();
@@ -478,10 +401,7 @@ impl SlotState {
         None
     }
 
-    /// Checks whether the given vote should be ignored as a duplicate.
-    ///
-    /// Votes for which this returns `true` should never be counted.
-    /// Doing so could lead to double counting.
+    /// Returns whether `vote` is a duplicate that must not be counted.
     pub fn should_ignore_vote(&self, vote: &Vote) -> bool {
         let v = vote.signer() as usize;
         match vote.kind() {
@@ -497,7 +417,6 @@ impl SlotState {
     }
 
     fn check_safe_to_notar(&mut self, block_hash: BlockHash) -> SafeToNotarStatus {
-        // check general voted stake conditions
         let notar_stake = *self.voted_stakes.notar.get(&block_hash).unwrap_or(&0);
         let skip_stake = self.voted_stakes.skip;
         if !self.is_weakest_quorum(notar_stake) {
@@ -508,7 +427,6 @@ impl SlotState {
             return SafeToNotarStatus::AwaitingVotes;
         }
 
-        // check parent condition
         match self.parents.entry(block_hash.clone()) {
             Entry::Vacant(_) => return SafeToNotarStatus::MissingBlock,
             Entry::Occupied(entry) => {
@@ -518,7 +436,6 @@ impl SlotState {
             }
         }
 
-        // check own vote
         let own_id = self.epoch_info.own_id;
         let skip = &self.votes.skip[own_id as usize];
         let notar = &self.votes.notar[own_id as usize];
@@ -545,7 +462,7 @@ impl SlotState {
         }
     }
 
-    /// Checks whether the given block hash has a notar-fallback cert in this slot.
+    /// Returns whether `block_hash` has a notar-fallback cert in this slot.
     pub fn is_notar_fallback(&self, block_hash: &BlockHash) -> bool {
         self.certificates
             .notar_fallback
@@ -555,9 +472,7 @@ impl SlotState {
 }
 
 impl SlotVotes {
-    /// Creates a new container for votes for the given number of validators.
-    ///
-    /// Initially, it contains no votes.
+    /// Creates an empty vote table for `num_validators`.
     pub fn new(num_validators: usize) -> Self {
         Self {
             notar: vec![None; num_validators],
@@ -569,7 +484,6 @@ impl SlotVotes {
     }
 
     /// Returns all notarization votes for the given block hash.
-    // PERF: return iterators here (to avoid memory allocation)?
     pub fn notar_votes(&self, block_hash: &BlockHash) -> Vec<Vote> {
         self.notar
             .iter()
@@ -582,7 +496,6 @@ impl SlotVotes {
     }
 
     /// Returns all notar-fallback votes for the given block hash.
-    // PERF: return iterators here (to avoid memory allocation)?
     pub fn notar_fallback_votes(&self, block_hash: &BlockHash) -> Vec<Vote> {
         self.notar_fallback
             .iter()
@@ -591,19 +504,16 @@ impl SlotVotes {
     }
 
     /// Returns all skip votes for this slot.
-    // PERF: return iterators here (to avoid memory allocation)?
     pub fn skip_votes(&self) -> Vec<Vote> {
         self.skip.iter().filter_map(Clone::clone).collect()
     }
 
     /// Returns all skip-fallback votes for this slot.
-    // PERF: return iterators here (to avoid memory allocation)?
     pub fn skip_fallback_votes(&self) -> Vec<Vote> {
         self.skip_fallback.iter().filter_map(Clone::clone).collect()
     }
 
     /// Returns all finalization votes for this slot.
-    // PERF: return iterators here (to avoid memory allocation)?
     pub fn final_votes(&self) -> Vec<Vote> {
         self.finalize.iter().filter_map(Clone::clone).collect()
     }
@@ -671,13 +581,7 @@ mod tests {
         }
     }
 
-    /// Locally-created certs must contain the vote that tipped their quorum
-    /// and pass their own stake-threshold validation.
-    ///
-    /// In this minimal 2-validator set, counting stake before storing the
-    /// vote would build every notar/fast-final cert with 1-of-2 signatures
-    /// (50%) — below threshold, rejected by any peer. Fails if the
-    /// store-before-count order in `add_vote` regresses.
+    /// Locally-created certs must include the quorum-tipping vote and validate.
     #[test]
     fn locally_created_certs_meet_their_threshold() {
         let (sks, epoch_info) = generate_validators(2);
@@ -692,8 +596,6 @@ mod tests {
             all_certs.extend(certs);
         }
 
-        // Both votes are in: notar (60%) and fast-final (80%) quorums are met,
-        // so both certs must have been created — not suppressed as invalid.
         assert!(
             all_certs.iter().any(|c| matches!(c, Cert::Notar(_))),
             "notar cert must be created once both votes are counted"
@@ -702,8 +604,7 @@ mod tests {
             all_certs.iter().any(|c| matches!(c, Cert::FastFinal(_))),
             "fast-final cert must be created once both votes are counted"
         );
-        // And every emitted cert must validate exactly as a peer would
-        // validate it on receive.
+
         for cert in &all_certs {
             assert!(
                 cert.check_threshold(&epoch_info),
@@ -720,11 +621,9 @@ mod tests {
         let (slot, hash): BlockId = (Slot::new(1), Hash::random_for_test().into());
         let mut slot_state = SlotState::new(slot, epoch_info.clone());
 
-        // mark parent as notarized(-fallback)
         slot_state.notify_parent_known(hash.clone());
         slot_state.notify_parent_certified(hash.clone());
 
-        // 33% notar alone has no effect
         let vote = Vote::new_notar(slot, hash.clone(), &sks[1], 1);
         let voter_stake = epoch_info.validator(1).stake;
         let (certs, events, blocks) = slot_state.add_vote(vote.clone(), voter_stake);
@@ -732,7 +631,6 @@ mod tests {
         assert!(events.is_empty());
         assert!(blocks.is_empty());
 
-        // additional 33% skip should lead to safe-to-notar
         let vote = Vote::new_skip(slot, &sks[0], 0);
         let voter_stake = epoch_info.validator(0).stake;
         let (certs, events, blocks) = slot_state.add_vote(vote.clone(), voter_stake);

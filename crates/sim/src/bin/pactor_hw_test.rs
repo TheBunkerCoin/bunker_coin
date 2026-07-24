@@ -1,31 +1,6 @@
-//! Hardware PACTOR radio-proto demo.
+//! Hardware PACTOR radio-proto smoke test over two USB SCS modems.
 //!
-//! Runs the Ping/Shred/Pong exchange over two real SCS PACTOR modems
-//! connected via USB serial.
-//!
-//! ```text
-//! cargo run --bin pactor_hw_test -- \
-//!   --port-a /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR83NDYP-if00-port0 \
-//!   --port-b /dev/serial/by-id/usb-SCS_SCS_DRAGON_7400_DR752ZE5-if00-port0 \
-//!   --frequency 14079.0
-//! ```
-//!
-//! For debug logging of hostmode frames:
-//! ```text
-//! RUST_LOG=scs_pactor=debug cargo run --bin pactor_hw_test -- ...
-//! ```
-//!
-//! For full trace (includes raw serial bytes):
-//! ```text
-//! RUST_LOG=scs_pactor=trace cargo run --bin pactor_hw_test -- ...
-//! ```
-//!
-//! SCS DRAGON 7400/P4dragon USB serial uses 829440 baud by default.
-//!
-//! **Note:** The `--frequency` flag tunes both radios via the modem's TRX
-//! CI-V interface. PACTOR still requires an RF path between the modems
-//! (antennas, band conditions). Without a physical connection,
-//! `connect_peer` will time out.
+//! `--frequency` tunes via TRX CI-V, but PACTOR still requires a real RF path.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,60 +16,51 @@ use tokio_serial::{DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderE
 #[command(name = "pactor_hw_test")]
 #[command(about = "Run radio-proto exchange over two real USB PACTOR modems")]
 struct Args {
-    /// Serial port for modem A (sender)
+    /// Serial port for modem A.
     #[arg(long)]
     port_a: String,
 
-    /// Serial port for modem B (receiver)
+    /// Serial port for modem B.
     #[arg(long)]
     port_b: String,
 
-    /// Callsign for modem A
+    /// Callsign for modem A.
     #[arg(long, default_value = "CLIENT")]
     call_a: String,
 
-    /// Callsign for modem B
+    /// Callsign for modem B.
     #[arg(long, default_value = "NODE")]
     call_b: String,
 
-    /// Baud rate for serial ports (SCS Dragon DR-7400 uses 829440)
+    /// Serial baud rate; SCS Dragon DR-7400 defaults to 829440.
     #[arg(long, default_value_t = 829_440)]
     baud: u32,
 
-    /// Maximum time to wait for PACTOR link establishment
+    /// Link-establishment timeout in seconds.
     #[arg(long, default_value_t = 90)]
     connect_timeout_secs: u64,
 
-    /// Number of connect attempts before giving up (HF calls intermittently
-    /// abort to standby; a retry usually succeeds).
+    /// Connect attempts before giving up.
     #[arg(long, default_value_t = 3)]
     connect_attempts: u32,
 
-    /// Send RESTART to both modems during init to clear stale link/call state.
+    /// Clear stale link/call state during init.
     #[arg(long)]
     reset: bool,
 
-    /// Consensus smoke test: after connect, send one Alpenglow ConsensusMessage
-    /// A -> B over PactorNetwork (the bunkerglow Network impl) and verify it.
-    /// First increment toward running the consensus simulation over the modems.
+    /// Exchange Alpenglow consensus messages over the PACTOR network wrapper.
     #[arg(long)]
     consensus_smoke: bool,
 
-    /// In the consensus smoke test, also exercise the reverse B -> A direction
-    /// (requires the ARQ changeover). When false, only the proven one-way A -> B
-    /// exchange is performed (the morning-working path).
+    /// Also exercise reverse B -> A traffic via ARQ changeover.
     #[arg(long)]
     bidirectional: bool,
 
-    /// Number of consensus message rounds to exchange in the smoke test. Each
-    /// round is one A->B vote (plus a B->A counter-vote when --bidirectional).
-    /// Used to characterize sustained throughput/stability over the link.
+    /// Consensus message rounds to exchange.
     #[arg(long, default_value_t = 1)]
     rounds: u32,
 
-    /// Messages per transmit turn (batch size). Each round sends this many votes
-    /// in a single transmit direction before any changeover, amortizing the
-    /// expensive half-duplex turnaround across the batch.
+    /// Messages per transmit turn, amortizing half-duplex turnaround.
     #[arg(long, default_value_t = 1)]
     batch: u32,
 
@@ -106,18 +72,15 @@ struct Args {
     #[arg(long)]
     diagnose_connect_reset: bool,
 
-    /// Radio frequency in kHz (e.g. 14079.0). Sent to both modems via TRX CI-V control.
-    /// If omitted, TRX tuning is skipped (useful with --diagnose-connect).
+    /// Radio frequency in kHz; omitted skips TRX tuning.
     #[arg(long)]
     frequency: Option<f64>,
 
-    /// Override frequency for modem A only in kHz (e.g. 97000.0 for 97 MHz).
-    /// Takes precedence over --frequency for modem A.
+    /// Modem A frequency override in kHz.
     #[arg(long)]
     frequency_a: Option<f64>,
 
-    /// Override frequency for modem B only in kHz (e.g. 97000.0 for 97 MHz).
-    /// Takes precedence over --frequency for modem B.
+    /// Modem B frequency override in kHz.
     #[arg(long)]
     frequency_b: Option<f64>,
 
@@ -146,8 +109,7 @@ struct Args {
     trx_addr_b: Option<String>,
 }
 
-/// Read all pending bytes from the serial port, printing hex + ASCII.
-/// Returns all bytes collected.
+/// Drains pending serial bytes while printing hex and ASCII.
 async fn drain_serial(serial: &mut tokio_serial::SerialStream) -> Vec<u8> {
     let mut all = Vec::new();
     let mut buf = [0u8; 1024];
@@ -174,7 +136,7 @@ async fn drain_serial(serial: &mut tokio_serial::SerialStream) -> Vec<u8> {
     all
 }
 
-/// Read bytes with a generous timeout, collecting everything the modem sends.
+/// Reads all modem bytes until timeout.
 async fn read_all(serial: &mut tokio_serial::SerialStream, timeout_ms: u64) -> Vec<u8> {
     let mut all = Vec::new();
     let mut buf = [0u8; 1024];
@@ -212,7 +174,6 @@ async fn read_all(serial: &mut tokio_serial::SerialStream, timeout_ms: u64) -> V
     all
 }
 
-/// Open a serial port.
 fn open_serial(port: &str, baud: u32) -> anyhow::Result<tokio_serial::SerialStream> {
     let mut serial = tokio_serial::new(port, baud)
         .data_bits(DataBits::Eight)
@@ -227,7 +188,7 @@ fn open_serial(port: &str, baud: u32) -> anyhow::Result<tokio_serial::SerialStre
     Ok(serial)
 }
 
-/// Send an ASCII command (terminal mode) and read response.
+/// Sends a terminal-mode ASCII command and reads its response.
 async fn send_ascii(serial: &mut tokio_serial::SerialStream, cmd: &str) -> anyhow::Result<Vec<u8>> {
     println!("  >> {cmd}");
     serial.write_all(cmd.as_bytes()).await?;
@@ -237,7 +198,7 @@ async fn send_ascii(serial: &mut tokio_serial::SerialStream, cmd: &str) -> anyho
     Ok(read_all(serial, 800).await)
 }
 
-/// Try to verify hostmode is active on an already-wrapped transport.
+/// Verifies hostmode through the wrapped transport.
 async fn verify_hostmode(transport: &UsbPactorTransport) -> bool {
     let status = HostmodeFrame::command(PACTOR_CHANNEL, b"L".to_vec());
     match tokio::time::timeout(
@@ -276,9 +237,7 @@ async fn diagnose_connect(
             "  note: --diagnose-connect-reset is ignored; transport-managed counters are required"
         );
     }
-    // The post-init verify advanced the packet-counter toggle; reset it so the
-    // connect goes out at parity 0 (the modem expects the connect to be the
-    // first parity-0 channel command — matches ptc-go and connect_peer).
+    // Reset the post-init packet counter so connect starts at parity 0.
     modem.reset_packet_counter().await;
 
     let connect_frame =
@@ -300,11 +259,7 @@ async fn diagnose_connect(
         None => println!("  C sent (no ACK within 3s, counter advanced)"),
     }
 
-    // DECISIVE PROBE: is the modem still in hostmode after C, or did it drop to
-    // terminal mode? Send a bare CR (raw terminal byte). If the modem replies
-    // with a "cmd:" prompt (visible in the reader's "[reader] got" log), it has
-    // LEFT hostmode. If it stays silent, it is still in hostmode (busy/TX) and
-    // simply not answering polls.
+    // Bare CR distinguishes terminal fallback (`cmd:` prompt) from silent hostmode busy/TX.
     println!("  >> raw-probe: sending bare CR to detect terminal-mode fallback ...");
     if let Err(e) = modem.write_raw(b"\r").await {
         println!("  raw-probe write error: {e}");
@@ -319,10 +274,7 @@ async fn diagnose_connect(
     while Instant::now() < deadline {
         attempt += 1;
 
-        // Probe the extended-poll channel (255). SCS hostmode answers the G
-        // poll on 255 even while a data channel is busy with an ARQ connect,
-        // so this reveals whether the modem is alive and which channel has
-        // activity, vs. the L poll on 31 going silent during connect.
+        // Channel 255 `G` can answer while channel 31 is busy with ARQ connect.
         let g_probe = HostmodeFrame::command(255, b"G".to_vec());
         match modem
             .send_command_best_effort_ack(g_probe, poll_timeout)
@@ -359,7 +311,6 @@ async fn diagnose_connect(
     Ok(())
 }
 
-/// Try to decode any hostmode frames from raw bytes.
 fn try_decode_hostmode(bytes: &[u8]) -> Vec<HostmodePacket> {
     let mut decoder = HostmodeDecoder::new();
     decoder.push(bytes);
@@ -373,13 +324,7 @@ fn try_decode_hostmode(bytes: &[u8]) -> Vec<HostmodePacket> {
     packets
 }
 
-/// Initialize an SCS modem into JHOST4 CRC hostmode.
-///
-/// Strategy:
-/// 1. Send CRC-framed JHOST0 to exit any existing hostmode (matching ptc-go)
-/// 2. Send terminal-mode ASCII commands for configuration
-/// 3. Enter JHOST4 CRC hostmode
-/// 4. Verify with a CRC-framed status poll with bit 6 (sequence reset) set
+/// Initializes an SCS modem into JHOST4 CRC hostmode.
 async fn init_hostmode(
     port: &str,
     baud: u32,
@@ -393,21 +338,12 @@ async fn init_hostmode(
 ) -> anyhow::Result<UsbPactorTransport> {
     let mut serial = open_serial(port, baud)?;
 
-    // Drain any leftover data in the serial buffer
     println!("  draining ...");
     drain_serial(&mut serial).await;
 
-    // === Step 1: Exit any existing hostmode ===
-    // Send an ASCII "JHOST0\r" — if the modem is in terminal mode this is
-    // just an unrecognized command (harmless); if it somehow ended up in
-    // hostmode the ASCII text won't be a valid CRC frame but the modem
-    // typically exits hostmode on any non-framed input after a timeout.
-    // We avoid sending CRC-framed JHOST0 because that would consume a
-    // packet-counter slot and desynchronize the transport later.
+    // Exit hostmode with terminal text so no packet-counter slot is consumed.
     println!("  step 1: exit any existing hostmode / converse ...");
-    // If a prior data session left the modem in CONVerse mode, terminal commands
-    // (including JHOST0) are ignored until ESC (0x1B) returns it to command mode.
-    // Send ESC first so init reliably recovers a converse-stuck modem.
+    // ESC recovers modems left in CONVerse before terminal commands.
     serial.write_all(&[0x1b]).await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -417,19 +353,10 @@ async fn init_hostmode(
     tokio::time::sleep(Duration::from_millis(1000)).await;
     drain_serial(&mut serial).await;
 
-    // === Step 1b: Optional clear of stale link/call state ===
-    // A modem left in a degraded state after a prior session (e.g. a lingering
-    // connect/standby state that makes new calls abort to STBY) is cleared by a
-    // force-disconnect. We deliberately do NOT use RESTART here: on this firmware
-    // RESTART reboots toward defaults and wipes settings like LISTEN/MYcall, so
-    // the answering modem would stop accepting calls. A disconnect drops any
-    // stuck link while preserving config (which step 2 re-applies anyway).
+    // Clear stale link state with disconnect, not RESTART, so LISTEN/MYcall survive.
     if reset {
         println!("  step 1b: clearing stale link state (ESC + disconnect) ...");
-        // If the modem was left in CONVerse mode by a prior data session, plain
-        // terminal commands are ignored — ESC (0x1B) returns it to command mode
-        // first. Then DD force-disconnects any lingering link. Settings are
-        // preserved (re-applied in step 2 regardless).
+        // ESC leaves CONVerse before DD force-disconnects lingering state.
         serial.write_all(&[0x1b]).await?;
         serial.flush().await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -439,26 +366,20 @@ async fn init_hostmode(
         drain_serial(&mut serial).await;
     }
 
-    // === Step 2: Terminal-mode ASCII init ===
-    // ptc-go sends an empty command first, then "Quit"
+    // Terminal-mode init follows the ptc-go sequence.
     println!("  step 2: terminal-mode init ...");
 
-    // Send CR to sync terminal
     send_ascii(&mut serial, "").await?;
 
-    // Quit to main menu (ptc-go does this; harmless error if already there)
     send_ascii(&mut serial, "Quit").await?;
 
-    // Pre-hostmode config commands (matching ptc-go)
     let commands = [
         format!("MYcall {callsign}"),
         format!("PTCH {PACTOR_CHANNEL}"),
         "MAXE 35".to_owned(),
         "REM 0".to_owned(),
         "CHOB 0".to_owned(),
-        // Set the CHANGEOVER character to Ctrl-Z (26). In converse mode, the ISS
-        // (master) hands the transmit turn to the peer when this char is sent —
-        // required for the answering side (slave) to transmit back (B -> A).
+        // Ctrl-Z lets the ISS hand the transmit turn to the peer in converse mode.
         "CHO 26".to_owned(),
         "TONES 4".to_owned(),
         "MARK 1600".to_owned(),
@@ -471,22 +392,18 @@ async fn init_hostmode(
         send_ascii(&mut serial, command).await?;
     }
 
-    // The answering modem must be in listen mode to accept an incoming PACTOR
-    // connect request; without it the originator's `C <CALL>` never links.
+    // The answerer must listen or the originator's `C <CALL>` never links.
     if listen {
         println!("  enabling listen mode (LISTEN 1) ...");
         send_ascii(&mut serial, "LISTEN 1").await?;
     }
 
-    // === Step 2b: TRX CI-V frequency control ===
     if let Some(frequency) = frequency {
         println!("  step 2b: TRX frequency control ...");
 
-        // Query the modem's current TRX config (type, baud, CI-V address)
         send_ascii(&mut serial, "TRX TYpe").await?;
 
-        // Only override TRX settings if the user explicitly requested it.
-        // Require both baud and addr together to avoid hardcoding either value.
+        // TRX overrides require baud and CI-V address together.
         match (trx_baud, trx_addr) {
             (Some(baud_override), Some(addr_override)) => {
                 println!("  overriding TRX config: baud={baud_override} addr=${addr_override}");
@@ -505,10 +422,7 @@ async fn init_hostmode(
             (None, None) => { /* use modem's stored config */ }
         }
 
-        // Tune the radio to the requested frequency.
-        // A successful tune returns "*** TRX FREQUENCY CHANGED".
-        // If CI-V is dead (cable disconnected, radio off, wrong address), the
-        // modem returns just "cmd: " with no confirmation.
+        // Require explicit tune confirmation; bare `cmd:` means CI-V did not respond.
         let set_resp = send_ascii(&mut serial, &format!("TRX Frequency {frequency}")).await?;
         let set_str = String::from_utf8_lossy(&set_resp);
         if !set_str.contains("FREQUENCY CHANGED") {
@@ -523,12 +437,11 @@ async fn init_hostmode(
         println!("  step 2b: TRX skipped (no --frequency given)");
     }
 
-    // === Step 3: Enter JHOST4 CRC hostmode ===
-    // ptc-go sends this as a terminal-mode ASCII command
+    // Enter JHOST4 as a terminal-mode command.
     println!("  step 3: entering JHOST4 ...");
     send_ascii(&mut serial, "JHOST4").await?;
 
-    // ptc-go does an extra read after JHOST4 to consume the startup banner
+    // Consume the JHOST4 startup banner before wrapping the transport.
     tokio::time::sleep(Duration::from_millis(1000)).await;
     let banner = read_all(&mut serial, 2000).await;
     if !banner.is_empty() {
@@ -541,17 +454,11 @@ async fn init_hostmode(
         }
     }
 
-    // === Step 4: Wrap in transport and verify via hostmode_transaction ===
-    // The transport handles packet counter (reset bit on first frame, toggling
-    // on subsequent frames). We skip raw verification to avoid desynchronizing
-    // the counter — let the transport's first transaction be the verification.
+    // Let the transport perform first verification so packet counters stay aligned.
     println!("  step 4: verifying hostmode via transport ...");
     let mut config = UsbPactorConfig::new(port);
     config.command_timeout = command_timeout;
-    // ARQ data transfer over a marginal HF link at 200 Bd can take far longer
-    // than the 10s default; give received data a generous window to arrive. The
-    // reverse (slave -> master) direction after a changeover is notably slower,
-    // so allow several minutes.
+    // Slow HF ARQ, especially reverse after changeover, needs a long data read window.
     config.read_timeout = Some(Duration::from_secs(180));
     let transport = UsbPactorTransport::from_stream(serial, config);
 
@@ -568,10 +475,7 @@ async fn init_hostmode(
     ))
 }
 
-/// First increment of running the consensus simulation over the modems: send a
-/// single Alpenglow `ConsensusMessage` from A to B via `PactorNetwork` (the
-/// `bunkerglow::network::Network` impl the simulation is generic over) and verify
-/// it deserializes correctly on the other side.
+/// Exchanges Alpenglow consensus messages over both modems.
 async fn consensus_smoke_test(
     transport_a: Arc<dyn PactorTransport>,
     transport_b: Arc<dyn PactorTransport>,
@@ -598,8 +502,6 @@ async fn consensus_smoke_test(
         }
     );
 
-    // PactorNetwork is point-to-point, so the SocketAddr is ignored; pass a dummy
-    // one to satisfy the trait. Keep Arc clones so we can disconnect afterwards.
     let net_a: PactorNetwork<ConsensusMessage, ConsensusMessage> =
         PactorNetwork::new(Arc::clone(&transport_a));
     let net_b: PactorNetwork<ConsensusMessage, ConsensusMessage> =
@@ -608,15 +510,13 @@ async fn consensus_smoke_test(
     let sk_a = SecretKey::new(&mut rand::rng());
     let sk_b = SecretKey::new(&mut rand::rng());
 
-    // B enters converse mode once, up front, only when we will need the reverse
-    // direction. (For one-way A->B, B stays a passive receiver throughout.)
+    // B enters converse only when reverse traffic is needed.
     let mut b_in_converse = false;
 
     let exchange_start = Instant::now();
     let mut messages_ok: u32 = 0;
     let mut slot: u64 = 0;
 
-    // Receive and verify `count` votes from `net`, all expected to be in `sent`.
     async fn recv_batch(
         net: &PactorNetwork<ConsensusMessage, ConsensusMessage>,
         sent: &[ConsensusMessage],
@@ -627,7 +527,6 @@ async fn consensus_smoke_test(
                 .receive()
                 .await
                 .map_err(|e| anyhow::anyhow!("{label} receive {i} failed: {e}"))?;
-            // Messages within a turn arrive in order, so compare positionally.
             match (&sent[i], &got) {
                 (ConsensusMessage::Vote(s), ConsensusMessage::Vote(g)) if s == g => {}
                 _ => return Err(anyhow::anyhow!("{label} message {i} mismatch")),
@@ -637,9 +536,7 @@ async fn consensus_smoke_test(
     }
 
     for round in 1..=rounds {
-        // --- A -> B (one transmit turn, `batch` votes) ---
-        // A is the ISS; B receives as a passive slave. Don't put B in converse
-        // before this leg — it disrupts B's reception.
+        // A is ISS for A->B; B must remain a passive receiver for this leg.
         let a_batch: Vec<ConsensusMessage> = (0..batch)
             .map(|_| {
                 slot += 1;
@@ -664,7 +561,7 @@ async fn consensus_smoke_test(
             continue;
         }
 
-        // --- B -> A (ARQ changeover, one transmit turn, `batch` votes) ---
+        // B->A requires ARQ changeover and one transmit turn.
         if !b_in_converse {
             transport_b
                 .accept_incoming(None)
@@ -696,8 +593,7 @@ async fn consensus_smoke_test(
             t.elapsed() / batch
         );
 
-        // B held the transmit turn for its batch; A has now received it, so B's
-        // send is complete — hand the turn back to A for the next round's A->B.
+        // Hand the transmit turn back to A before the next round.
         if round < rounds {
             println!("[round {round}] B handing transmit turn back to A (changeover) ...");
             let _ = transport_b.changeover().await;
@@ -808,8 +704,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("  attempt {attempt} failed: {e}");
                 last_err = Some(e);
                 if attempt < args.connect_attempts {
-                    // Brief pause before retrying so the modem returns to a
-                    // clean standby state before the next call.
+                    // Let the modem settle into standby before retrying.
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
@@ -833,9 +728,7 @@ async fn main() -> anyhow::Result<()> {
     let link_elapsed = link_start.elapsed();
     println!("Link established in {link_elapsed:.2?}");
 
-    // Let both ends settle into the connected/converse state before pushing data.
-    // The answering modem needs a moment after CONNECTED before it will reliably
-    // carry data over the ARQ link.
+    // Let the answerer settle after CONNECTED before data transfer.
     println!("Settling link before data exchange ...");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -862,11 +755,7 @@ async fn main() -> anyhow::Result<()> {
         NetworkMessage::Pong,
     ];
 
-    // Interleave send -> receive per message. Over a marginal HF ARQ link,
-    // bursting all messages then reading risks the link exhausting its retry
-    // budget (MAXErr -> STBY) before everything transfers; sending one small
-    // payload and confirming it arrived before the next keeps the working set
-    // small and makes partial progress visible.
+    // Interleave small sends and receives so marginal ARQ links avoid retry exhaustion.
     println!(
         "Exchanging {} messages A -> B (interleaved) ...",
         messages.len()

@@ -481,7 +481,6 @@ impl RadioNode {
     }
 
     async fn send_with_erasure(&self, data: &[u8], to: ValidatorId) -> Result<(), NetworkError> {
-        // for now 2:6 due to empty blocks
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 4;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
@@ -840,9 +839,6 @@ impl Network for RadioNode {
                 let data = packet.payload[header_len..].to_vec();
                 if let Some(complete) = self.try_reassemble_erasure(packet.from, header, data).await
                 {
-                    if packet.from != self.id {
-                        // println!("RadioNode {} received broadcast from {} (reassembled message)", self.id, packet.from);
-                    }
                     match NetworkMessage::from_bytes(&complete) {
                         Ok(msg) => return Ok(msg),
                         Err(_) => {

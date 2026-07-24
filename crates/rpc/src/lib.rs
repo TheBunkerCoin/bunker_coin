@@ -27,8 +27,6 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 const MAX_MEMPOOL_SIZE: usize = 10_000;
 
-// -- block types --
-
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum SlotStatus {
@@ -146,8 +144,6 @@ pub enum BlockUpdate {
     },
 }
 
-// -- websocket types --
-
 #[derive(Serialize, Clone)]
 #[serde(tag = "type")]
 pub enum WebSocketUpdate {
@@ -162,13 +158,9 @@ pub enum WebSocketUpdate {
         effective_throughput_bps_2s: f64,
         packet_loss_rate_2s: f64,
         packets_queued: u64,
-        /// Modem-reported PACTOR speed level (from LinkQuality status events);
-        /// 0 = not yet reported. The live band-health signal: drops when the
-        /// band degrades, climbs as it clears.
+        /// Modem-reported PACTOR speed level; 0 means not yet reported.
         link_speed_level: u64,
-        /// Bytes heard from the peer over the window. On a half-duplex link a
-        /// node spends whole windows only receiving; without this the panel
-        /// showed 0 transmitted alongside nonzero (two-way) throughput.
+        /// Bytes received over the window, separate from local transmit counts.
         bytes_received_2s: u64,
     },
     #[serde(rename = "transaction_received")]
@@ -187,8 +179,6 @@ pub enum WebSocketUpdate {
         error: Option<String>,
     },
 }
-
-// -- node / radio types --
 
 #[derive(Serialize, Clone)]
 pub struct NodeStatus {
@@ -213,8 +203,6 @@ pub struct RadioStats {
     pub link_speed_level: u64,
 }
 
-// -- transaction / mempool types --
-
 #[derive(Serialize, Clone)]
 pub struct MempoolEntry {
     pub hash: String,
@@ -225,8 +213,6 @@ pub struct MempoolEntry {
     pub body: TransactionBodyResponse,
     pub received_at: u64,
 }
-
-// -- transaction result types --
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -244,8 +230,6 @@ pub struct TxResult {
     pub error: Option<String>,
     pub executed_at: u64,
 }
-
-// -- transaction response types --
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type")]
@@ -308,8 +292,6 @@ pub struct TransactionSummary {
     pub fee: u64,
     pub body: TransactionBodyResponse,
 }
-
-// -- block detail response --
 
 #[derive(Serialize, Clone)]
 pub struct BlockDetailResponse {
@@ -374,8 +356,6 @@ enum TransactionBodyRequest {
     },
 }
 
-// -- shared state --
-
 #[derive(Clone)]
 pub struct SharedState {
     pub blocks: Arc<RwLock<Vec<Block>>>,
@@ -391,15 +371,8 @@ pub struct SharedState {
     pub snapshot_store: Option<Arc<SnapshotStore>>,
 }
 
-// -- hex decode helpers --
-
-/// Decode a fixed-size byte string given as hex OR base58.
-///
-/// Solana wallets and their tooling encode addresses/signatures/hashes as
-/// base58; this node's native REST surface historically used hex. Every
-/// decoder accepts both so wallet-originating requests (base58) and existing
-/// tooling (hex) hit the same handlers. Hex is tried first when the length
-/// matches exactly (2*N chars of hex digits), base58 otherwise.
+/// Decodes fixed-size bytes from native hex or wallet-style base58.
+/// Exact-length hex wins before falling back to base58.
 fn decode_bytes_any<const N: usize>(s: &str) -> Result<[u8; N], String> {
     if s.len() == 2 * N && s.chars().all(|c| c.is_ascii_hexdigit()) {
         let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {e}"))?;
@@ -509,14 +482,9 @@ fn body_type_name(body: &TransactionBody) -> &'static str {
     }
 }
 
-// -- decode / conversion helpers --
-
 fn decode_raw_transaction(raw: &bunkerglow::Transaction) -> Option<CoreTransaction> {
-    // Transaction.0 may have a wincode Vec<u8> length prefix (8-byte LE u64)
-    // wrapping the bincode payload. Try raw first, then skip the prefix.
-    // Limit-guarded: block payloads include BUNKER_BLOAT_BYTES random padding,
-    // and without a limit bincode skips its length check — a random u64 read as
-    // a Vec length would abort the process on allocation. Real txs are < 4 KiB.
+    // Accept raw bincode or legacy 8-byte length-prefixed bincode.
+    // Limit decode so random padding cannot become an unbounded Vec allocation.
     let config = bincode::config::standard().with_limit::<4096>();
     let data = &raw.0;
     bincode::serde::decode_from_slice(data, config)
@@ -647,15 +615,11 @@ fn build_api_block(
     }
 }
 
-// -- query params --
-
 #[derive(Deserialize)]
 struct Pagination {
     limit: Option<usize>,
     offset: Option<usize>,
 }
-
-// -- transaction handlers --
 
 async fn submit_transaction(
     state: axum::extract::State<SharedState>,
@@ -702,13 +666,11 @@ async fn submit_transaction(
         signature,
     };
 
-    // server-side signing: if signature is all zeros and sender matches genesis pubkey,
-    // auto-fill the nonce from current execution state and sign it
+    // Zero-signature genesis txs are nonce-filled and signed server-side.
     if tx.signature == [0u8; 64] {
         if let Some(sk) = &state.genesis_signing_key {
             let genesis_pk = sk.verifying_key().to_bytes();
             if tx.sender == genesis_pk {
-                // auto-fill nonce from current account state
                 let exec = state.execution_state.read().await;
                 let current_nonce = exec.get_account(&genesis_pk).map(|a| a.nonce).unwrap_or(0);
                 drop(exec);
@@ -724,7 +686,6 @@ async fn submit_transaction(
     let hash = hex::encode(tx.hash());
     let body_type = body_type_name(&tx.body);
 
-    // duplicate check + size limit
     {
         let mempool = state.mempool.read().await;
         if mempool.iter().any(|e| e.hash == hash) {
@@ -814,9 +775,6 @@ async fn mempool_transaction(
     axum::http::StatusCode::NOT_FOUND.into_response()
 }
 
-// -- block handlers --
-
-// this probably qualifies for a rewrite soon:tm:
 async fn blocks(
     Query(p): Query<Pagination>,
     state: axum::extract::State<SharedState>,
@@ -833,22 +791,16 @@ async fn blocks(
         let bs = bs_arc.read().await;
 
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
-        // The in-memory list stays empty on the persistent-node path (e.g.
-        // pactor_consensus), which used to freeze this scan at slot 200 while
-        // the chain kept climbing. The validators' finalized frontier (kept
-        // current in `state.nodes` by the block executor) tracks the real
-        // chain height; +200 headroom covers produced-but-unfinalized slots.
+        // Persistent-node paths may have no in-memory blocks; finalized frontier
+        // tracks chain height, with headroom for produced-but-unfinalized slots.
         let highest_finalized_slot = {
             let nodes = state.nodes.read().await;
             nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
         };
         let top = highest_mem_slot.max(highest_finalized_slot) + 200;
 
-        // Only scan the window this page needs, newest-first — NOT from slot 0.
-        // Blocks sort descending and we return [offset, offset+limit); scanning
-        // the whole chain from genesis on every request was O(chain length)
-        // RocksDB lookups (seconds-to-minutes per call on a month-long chain).
-        // Extra headroom absorbs skip-certified slots that yield no block.
+        // Scan only the newest window needed for this page; genesis-to-tip scans
+        // are too expensive on long chains. Extra headroom covers skip slots.
         let want = offset + limit;
         let window = (want * 3).max(400) as u64;
         let low = top.saturating_sub(window);
@@ -871,13 +823,8 @@ async fn blocks(
         }
     }
 
-    // A finalized block finalizes all its ancestors, but only the slot with
-    // the explicit certificate gets a finalized timestamp written — adopted
-    // ancestors would otherwise display as eternal "proposed" HOLES inside
-    // the finalized chain. Walk parent links down from the highest finalized
-    // block and mark every visited block finalized. (A naive "below the
-    // frontier" rule would wrongly bless skip-certified slots whose
-    // produced-but-dead blocks are still stored.)
+    // Finalized blocks finalize ancestors; walk parent links instead of using a
+    // slot frontier so skip-certified dead blocks are not falsely finalized.
     {
         let mut index_by_hash: HashMap<String, usize> = HashMap::new();
         for (i, b) in all_blocks.iter().enumerate() {
@@ -905,8 +852,7 @@ async fn blocks(
             let Some(&i) = index_by_hash.get(&h) else {
                 break;
             };
-            // Guard against parent-hash cycles (corrupt data): each hop is
-            // removed from the map, so the walk visits each block once.
+            // Removing each hash guards against corrupt parent cycles.
             index_by_hash.remove(&h);
             cursor = match &mut all_blocks[i] {
                 Block::Block {
@@ -999,7 +945,6 @@ async fn block_by_slot(
 ) -> impl IntoResponse {
     let include_txs = params.include_transactions.unwrap_or(false);
 
-    // check in-memory blocks first
     {
         let blocks = state.blocks.read().await;
         if let Some(block) = blocks.iter().find(|b| b.slot() == slot_num) {
@@ -1011,7 +956,6 @@ async fn block_by_slot(
         }
     }
 
-    // fall back to blockstore
     if let Some(bs_arc) = &state.blockstore {
         let bs = bs_arc.read().await;
         let slot = Slot::new(slot_num);
@@ -1041,11 +985,9 @@ async fn get_transaction(
     Path(hash): Path<String>,
     state: axum::extract::State<SharedState>,
 ) -> impl IntoResponse {
-    // check tx_results first (finalized transactions)
     {
         let results = state.tx_results.read().await;
         if let Some(result) = results.get(&hash) {
-            // find the original tx details from blockstore
             let (sender, nonce, fee, body) = find_tx_details_in_blockstore(&state, &hash)
                 .await
                 .unwrap_or_else(|| ("unknown".to_string(), 0, 0, None));
@@ -1072,7 +1014,6 @@ async fn get_transaction(
         }
     }
 
-    // check mempool (in-memory)
     {
         let pool = state.mempool.read().await;
         if let Some(entry) = pool.iter().find(|e| e.hash == hash) {
@@ -1088,7 +1029,6 @@ async fn get_transaction(
         }
     }
 
-    // scan blockstore (confirmed but not yet finalized/executed)
     if let Some((sender, nonce, fee, body, slot_u64, blk_hash)) =
         find_tx_in_blockstore(&state, &hash).await
     {
@@ -1112,11 +1052,8 @@ async fn get_transaction(
     axum::http::StatusCode::NOT_FOUND.into_response()
 }
 
-/// `GET /transactions` — list transactions across the finalized chain,
-/// newest-first, paginated. Mirrors `/blocks`. Walks the blockstore up to the
-/// finalized frontier (`state.nodes`), decodes each block's real transactions
-/// (bloat padding is undecodable and skipped), and annotates finalized ones
-/// with their execution outcome from `tx_results`.
+/// Lists finalized-chain transactions newest-first, paginated like `/blocks`.
+/// Real transactions are decoded from blockstore and annotated from `tx_results`.
 async fn list_transactions(
     Query(p): Query<Pagination>,
     state: axum::extract::State<SharedState>,
@@ -1135,16 +1072,8 @@ async fn list_transactions(
             nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
         };
 
-        // Newest-first: scan slots high→low. The same tx can land in two
-        // blocks (each node's mempool packs it before finalization evicts
-        // it) with the duplicate failing on nonce mismatch; list each tx
-        // once, at its canonical inclusion — the one that actually executed
-        // (per tx_results).
-        // Bounded newest-first scan: collect enough for this page, then stop —
-        // and never scan more than `max_scan` slots back, so a month-long chain
-        // (hundreds of thousands of slots) can't turn one request into a
-        // full-chain sweep. `total` is therefore "known so far", not the whole
-        // chain's tx count.
+        // Scan newest-first and emit duplicate inclusions only at the executed slot.
+        // Bound scans by page need and `max_scan`; `total` is known-so-far.
         let need = offset + limit;
         let max_scan: u64 = 20_000;
         let scan_floor = highest_finalized_slot.saturating_sub(max_scan);
@@ -1168,7 +1097,7 @@ async fn list_transactions(
                 };
                 let tx_hash = hex::encode(core_tx.hash());
                 if let Some(r) = results.get(&tx_hash) {
-                    // Skip duplicate inclusions: emit only where it executed.
+                    // Emit duplicate inclusions only where they executed.
                     if r.slot != slot_u64 {
                         continue;
                     }
@@ -1240,18 +1169,13 @@ async fn find_tx_in_blockstore(
     let blocks = state.blocks.read().await;
     let highest_mem_slot = blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
     drop(blocks);
-    // Same frontier-aware bound as `blocks()`: the in-memory list is empty on
-    // the persistent-node path, so without the finalized frontier this scan
-    // would stop finding transactions past slot 200.
+    // Use the finalized frontier when in-memory blocks are absent.
     let highest_finalized_slot = {
         let nodes = state.nodes.read().await;
         nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
     };
 
-    // Newest-first, bounded: a hash lookup backs "did my tx land" for a wallet,
-    // so the tx is recent — scan from the tip down, and no further than
-    // `max_scan` slots, so this stays O(1)-ish on a month-long chain instead of
-    // sweeping from genesis.
+    // Wallet tx lookups are recent; scan tip-down within a fixed window.
     let top = highest_mem_slot.max(highest_finalized_slot) + 200;
     let max_scan: u64 = 20_000;
     let floor = top.saturating_sub(max_scan);
@@ -1281,8 +1205,6 @@ async fn find_tx_in_blockstore(
     }
     None
 }
-
-// -- websocket --
 
 async fn websocket_handler(
     ws: WebSocketUpgrade,
@@ -1318,8 +1240,6 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
         _ = &mut recv_task => send_task.abort(),
     }
 }
-
-// -- account / token handlers --
 
 async fn get_account(
     Path(pubkey_hex): Path<String>,
@@ -1381,8 +1301,6 @@ async fn get_tokens(state: axum::extract::State<SharedState>) -> Json<serde_json
     Json(serde_json::json!({ "tokens": tokens }))
 }
 
-// -- single token handler --
-
 async fn get_token(
     Path(id_hex): Path<String>,
     state: axum::extract::State<SharedState>,
@@ -1417,8 +1335,6 @@ async fn get_token(
             .into_response()
     }
 }
-
-// -- token holders handler --
 
 async fn get_token_holders(
     Path(id_hex): Path<String>,
@@ -1458,7 +1374,7 @@ async fn get_token_holders(
         })
         .collect();
 
-    // sort by balance descending for deterministic output
+    // Sort by balance for deterministic output.
     holders.sort_by(|a, b| {
         b["balance"]
             .as_u64()
@@ -1480,8 +1396,6 @@ async fn get_token_holders(
     }))
     .into_response()
 }
-
-// -- account tokens handler --
 
 async fn get_account_tokens(
     Path(pubkey_hex): Path<String>,
@@ -1532,8 +1446,6 @@ async fn get_account_tokens(
     .into_response()
 }
 
-// -- staking overview handler --
-
 async fn get_staking(state: axum::extract::State<SharedState>) -> Json<serde_json::Value> {
     let exec = state.execution_state.read().await;
     let validator_set: Vec<serde_json::Value> = exec
@@ -1561,8 +1473,6 @@ async fn get_staking(state: axum::extract::State<SharedState>) -> Json<serde_jso
         "current_epoch": current_epoch,
     }))
 }
-
-// -- snapshot bootstrap handlers --
 
 fn manifest_json(manifest: &SnapshotManifest) -> serde_json::Value {
     serde_json::json!({
@@ -1743,8 +1653,6 @@ async fn get_snapshot_chunk(
     }
 }
 
-// -- genesis handler --
-
 async fn get_genesis(state: axum::extract::State<SharedState>) -> impl IntoResponse {
     let Some(sk) = &state.genesis_signing_key else {
         return (
@@ -1768,20 +1676,16 @@ async fn get_genesis(state: axum::extract::State<SharedState>) -> impl IntoRespo
     .into_response()
 }
 
-// -- server --
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn decode_pubkey_accepts_base58() {
-        // Wallets send base58; the same decoder must accept it alongside hex.
         let key: [u8; 32] = [7u8; 32];
         let b58_str = bs58::encode(key).into_string();
         assert_eq!(decode_pubkey(&b58_str).unwrap(), key);
         assert_eq!(decode_pubkey(&hex::encode(key)).unwrap(), key);
-        // A 64-char string of hex digits must decode as hex, never base58.
         let hexy = "aa".repeat(32);
         assert_eq!(decode_pubkey(&hexy).unwrap(), [0xaa; 32]);
     }
@@ -1839,8 +1743,6 @@ mod tests {
 
     #[test]
     fn decode_pubkey_wrong_length() {
-        // 32 hex chars: no longer exact-length hex, decodes as base58 to the
-        // wrong byte count — still rejected.
         let hex_str = "00".repeat(16);
         let result = decode_pubkey(&hex_str);
         assert!(result.is_err());
@@ -1991,7 +1893,6 @@ mod tests {
     #[test]
     fn convert_body_mint_ticker_at_bounds() {
         let hash = "00".repeat(32);
-        // exactly 3 chars (min)
         let body = TransactionBodyRequest::Mint {
             ticker: "ABC".to_string(),
             max_supply: 100,
@@ -1999,7 +1900,6 @@ mod tests {
         };
         assert!(convert_body(body).is_ok());
 
-        // exactly MAX_TICKER_LEN chars (max)
         let body = TransactionBodyRequest::Mint {
             ticker: "A".repeat(MAX_TICKER_LEN),
             max_supply: 100,
@@ -2252,8 +2152,6 @@ mod tests {
         assert!(json.contains("\"type\":\"skip\""));
     }
 
-    // -- decode_raw_transaction tests --
-
     fn make_core_tx(body: TransactionBody) -> CoreTransaction {
         CoreTransaction {
             sender: [0xAA; 32],
@@ -2291,8 +2189,6 @@ mod tests {
         let raw = bunkerglow::Transaction(vec![]);
         assert!(decode_raw_transaction(&raw).is_none());
     }
-
-    // -- core_tx_to_body_response tests --
 
     #[test]
     fn core_tx_to_body_response_transfer() {
@@ -2416,8 +2312,6 @@ mod tests {
         }
     }
 
-    // -- BlockDetailResponse serialization tests --
-
     #[test]
     fn block_detail_response_without_transactions() {
         let block = Block::Block {
@@ -2435,9 +2329,7 @@ mod tests {
             transactions: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
-        // without transactions, should look the same as a plain Block
         let plain_json = serde_json::to_string(&block).unwrap();
-        // both should parse to same value (no extra "transactions" key)
         let resp_val: serde_json::Value = serde_json::from_str(&json).unwrap();
         let plain_val: serde_json::Value = serde_json::from_str(&plain_json).unwrap();
         assert_eq!(resp_val, plain_val);
@@ -2477,8 +2369,6 @@ mod tests {
         assert_eq!(val["slot"], 5);
     }
 
-    // -- TransactionBodyResponse serialization --
-
     #[test]
     fn transaction_body_response_json_has_type_tag() {
         let resp = TransactionBodyResponse::Transfer {
@@ -2494,13 +2384,7 @@ mod tests {
     }
 }
 
-// -- Solana-style JSON-RPC 2.0 (wallet interface) --
-//
-// Wallets POST envelopes to "/" — {"jsonrpc":"2.0","id":1,"method":"getBalance",
-// "params":["<pubkey>"]} — single or batch. Method names follow Solana's
-// conventions, mapped onto this node's native REST surface by dispatching
-// internally through the same Router (no re-implementation of handlers).
-
+// Solana-style JSON-RPC adapter; methods dispatch through REST handlers.
 #[derive(serde::Deserialize)]
 struct JsonRpcRequest {
     jsonrpc: Option<String>,
@@ -2518,9 +2402,7 @@ fn rpc_ok(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value
     serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-/// Solana's `RpcResponse<T>` envelope: `{ context: { slot }, value: T }`.
-/// Wallet code universally reads `.value` off account/balance/status results,
-/// so every method that Solana wraps must be wrapped here too.
+/// Solana `RpcResponse<T>` envelope; wallets read results from `.value`.
 fn ctx_value(slot: u64, value: serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "context": { "slot": slot, "apiVersion": "bunkercoin-1.0" }, "value": value })
 }
@@ -2529,8 +2411,7 @@ fn b58(bytes: &[u8]) -> String {
     bs58::encode(bytes).into_string()
 }
 
-/// Highest finalized slot across the known nodes (the "current slot" wallets
-/// see in response contexts).
+/// Highest finalized slot exposed as wallet-visible context.
 async fn current_slot(state: &SharedState) -> u64 {
     state
         .nodes
@@ -2542,20 +2423,15 @@ async fn current_slot(state: &SharedState) -> u64 {
         .unwrap_or(0)
 }
 
-/// Parse a transaction id (Solana calls it a "signature") given as base58 or
-/// hex, returning the node's native lowercase-hex form used by the tx stores.
+/// Parses a wallet transaction id into the node's lowercase hex key.
 fn tx_id_to_hex(s: &str) -> Result<String, String> {
     decode_bytes_any::<32>(s).map(hex::encode)
 }
 
-/// Fee wallets should attach to an ordinary transaction (surfaced through
-/// getFeeForMessage). Matches what the demo tooling has always used; the
-/// chain enforces only that the account can afford fee + amount.
+/// Recommended fee surfaced through `getFeeForMessage`; chain checks affordability.
 const RECOMMENDED_TX_FEE: u64 = 100;
 
-/// Preflight a wallet transaction without submitting it: signature (when
-/// verifiable), nonce, and balance checks against current execution state.
-/// Returns `None` when the transaction would be accepted, else a message.
+/// Preflights wallet transactions against signature, nonce, and balance state.
 async fn simulate_tx(state: &SharedState, tx_json: &serde_json::Value) -> Option<String> {
     let req: SubmitTransactionRequest = match serde_json::from_value(tx_json.clone()) {
         Ok(r) => r,
@@ -2581,8 +2457,7 @@ async fn simulate_tx(state: &SharedState, tx_json: &serde_json::Value) -> Option
         signature,
     };
 
-    // A zero signature from the genesis account takes the server-sign path on
-    // submission; anything else must verify against the sender key.
+    // Genesis zero-signature txs are server-signed; all others verify normally.
     let genesis_pk = state
         .genesis_signing_key
         .as_ref()
@@ -2622,11 +2497,7 @@ async fn simulate_tx(state: &SharedState, tx_json: &serde_json::Value) -> Option
     None
 }
 
-/// Build the REST-shaped JSON for a faucet transfer from the genesis account.
-/// Uses the zero-signature server-sign path (the submit handler fills the
-/// nonce from current state and signs with the node's genesis key), so this
-/// works without duplicating signing logic — but only on a node configured
-/// with the genesis keypair.
+/// Builds faucet transfer JSON that reuses the zero-signature server-sign path.
 async fn build_airdrop_tx(
     state: &SharedState,
     recipient: [u8; 32],
@@ -2660,7 +2531,7 @@ fn param_u64(params: &[serde_json::Value], i: usize, fallback: u64) -> Result<u6
     }
 }
 
-/// Dispatch an internal request through the REST router and parse the JSON body.
+/// Dispatches through the REST router and parses the JSON body.
 async fn rest_dispatch(
     rest: &Router,
     method: axum::http::Method,
@@ -2719,7 +2590,7 @@ async fn handle_rpc_call(
     let p = &call.params;
     use axum::http::Method as M;
 
-    // Map the Solana-style method onto a REST dispatch (or answer locally).
+    // Map each wallet method to REST dispatch or a local compatibility response.
     let dispatched: Result<Result<serde_json::Value, (i64, String)>, ()> = match method.as_str() {
         "getHealth" => Ok(Ok(serde_json::json!("ok"))),
         "getSlot" => Ok(match rest_dispatch(rest, M::GET, "/nodes", None).await {
@@ -2753,8 +2624,7 @@ async fn handle_rpc_call(
             .await),
             _ => Err(()),
         },
-        // Solana contract: getBalance returns RpcResponse<u64>; a missing
-        // account is balance 0, not an error.
+        // Missing accounts return balance 0 inside Solana's RpcResponse shape.
         "getBalance" => match param_str(p, 0).map(decode_pubkey) {
             Ok(Ok(pk)) => {
                 let slot = current_slot(state).await;
@@ -2769,11 +2639,7 @@ async fn handle_rpc_call(
             }
             _ => Err(()),
         },
-        // Solana contract: RpcResponse<AccountInfo|null> — `value` is null for
-        // a nonexistent account (wallets branch on that). Solana-shaped fields
-        // (lamports/owner/executable/rentEpoch) plus this chain's extras under
-        // `data` (most importantly `nonce`, which replaces recent-blockhash in
-        // transaction construction).
+        // Nonexistent accounts return `value: null`; chain extras live under `data`.
         "getAccountInfo" => match param_str(p, 0).map(decode_pubkey) {
             Ok(Ok(pk)) => {
                 let slot = current_slot(state).await;
@@ -2815,17 +2681,10 @@ async fn handle_rpc_call(
             }
             Err(()) => Err(()),
         },
-        // Wallet flow-compat: Solana wallets fetch a recent blockhash before
-        // building a transaction. This chain's transactions are nonce-based
-        // (see getAccountInfo -> data.nonce), so the value is informational —
-        // returned in the exact Solana shape so ported wallet code runs
-        // unchanged.
+        // Wallets expect this Solana shape even though transactions are nonce-based.
         "getLatestBlockhash" => {
             let slot = current_slot(state).await;
-            // Newest real (non-skip) block via the REST handler, which merges
-            // the in-memory list with the blockstore — the in-memory list
-            // alone stays empty on the persistent-node path. Skip entries
-            // carry placeholder hashes, hence the type filter.
+            // Use REST's merged block view and ignore skip entries with placeholder hashes.
             let blockhash = match rest_dispatch(rest, M::GET, "/blocks?limit=8", None).await {
                 Ok(list) => list
                     .as_array()
@@ -2850,9 +2709,7 @@ async fn handle_rpc_call(
             serde_json::json!({ "solana-core": "2.0.0-bunkercoin", "feature-set": 1 }),
         )),
         "getGenesisHash" => {
-            // Stable cluster identifier (wallets use it to tell networks
-            // apart): the genesis account's pubkey in base58. Falls back to
-            // the zero key on nodes without a configured genesis key.
+            // Stable wallet-visible cluster id: genesis pubkey, or zero key fallback.
             let gh = state
                 .genesis_signing_key
                 .as_ref()
@@ -2865,11 +2722,7 @@ async fn handle_rpc_call(
             let slot = current_slot(state).await;
             Ok(Ok(ctx_value(slot, serde_json::json!(RECOMMENDED_TX_FEE))))
         }
-        // Solana contract: RpcResponse<Vec<SignatureStatus|null>>, one entry
-        // per requested id, null when the id is unknown. Status mapping:
-        // in-mempool = "processed", executed in a finalized block =
-        // "finalized" (this chain has no observable in-between), execution
-        // failure carries `err`.
+        // Mempool maps to processed; executed finalized blocks map to finalized.
         "getSignatureStatuses" => match p.first().and_then(|v| v.as_array()) {
             Some(ids) => {
                 let slot = current_slot(state).await;
@@ -2926,12 +2779,7 @@ async fn handle_rpc_call(
             }
             Err(()) => Err(()),
         },
-        // Solana contract: params[0] is the signed transaction as a base64
-        // string; the result is the transaction id ("signature") in base58.
-        // The payload inside the base64 is this chain's native JSON
-        // transaction ({sender, nonce, fee, body, signature}) — same schema
-        // as REST POST /transactions, which is also still accepted directly
-        // as an object param for existing tooling.
+        // Base64 native transaction in, base58 transaction id out.
         "sendTransaction" => {
             let tx_json: Option<serde_json::Value> = match p.first() {
                 Some(serde_json::Value::String(b64)) => {
@@ -2948,8 +2796,7 @@ async fn handle_rpc_call(
                 Some(tx) => Ok(
                     match rest_dispatch(rest, M::POST, "/transactions", Some(&tx)).await {
                         Ok(resp) => {
-                            // REST returns {"hash": "<hex>"}; wallets expect the
-                            // bare id in base58.
+                            // REST returns hex; wallets expect bare base58 id.
                             match resp
                                 .get("hash")
                                 .and_then(|h| h.as_str())
@@ -2965,9 +2812,7 @@ async fn handle_rpc_call(
                 None => Err(()),
             }
         }
-        // Preflight without submission: signature, nonce, fee-balance checks
-        // against current state. Wallets call this before sendTransaction;
-        // shape follows Solana's RpcResponse<{err, logs}>.
+        // Preflight shape follows Solana `RpcResponse<{err, logs}>`.
         "simulateTransaction" => {
             let tx_json: Option<serde_json::Value> = match p.first() {
                 Some(serde_json::Value::String(b64)) => {
@@ -2997,9 +2842,7 @@ async fn handle_rpc_call(
                 None => Err(()),
             }
         }
-        // Devnet faucet, same contract as Solana's requestAirdrop: params are
-        // [recipient, amount]; result is the funding transaction id in base58.
-        // Only available on a node configured with the genesis signing key.
+        // Devnet faucet mirrors Solana requestAirdrop and returns a base58 tx id.
         "requestAirdrop" => match (param_str(p, 0).map(decode_pubkey), param_u64(p, 1, 0)) {
             (Ok(Ok(recipient)), Ok(amount)) if amount > 0 => {
                 match build_airdrop_tx(state, recipient, amount).await {
@@ -3139,18 +2982,14 @@ pub async fn run_api(state: SharedState) {
         .layer(cors.clone())
         .with_state(state.clone());
     let jsonrpc_state = state;
-    // Solana-style JSON-RPC 2.0 at POST / — dispatches into the REST router
-    // internally, so every method reuses the exact same handlers.
+    // JSON-RPC at POST / reuses the REST router for native behavior.
     let app = Router::new()
         .route("/", axum::routing::post(jsonrpc_handler))
         .layer(axum::extract::Extension(app.clone()))
         .layer(axum::extract::Extension(jsonrpc_state))
         .layer(cors)
         .merge(app);
-    // Bind address is overridable via BUNKER_RPC_ADDR (default loopback-only).
-    // Set it to e.g. `0.0.0.0:3001` (or `<tailnet-ip>:3001`) when the API must
-    // be reachable from another machine, such as the bastion proxying the
-    // explorer's chain queries over Tailscale.
+    // `BUNKER_RPC_ADDR` overrides the default loopback bind for remote access.
     let bind_addr =
         std::env::var("BUNKER_RPC_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".to_owned());
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {

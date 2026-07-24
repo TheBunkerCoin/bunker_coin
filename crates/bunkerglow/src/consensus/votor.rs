@@ -3,13 +3,8 @@
 
 //! Main voting logic for the consensus protocol.
 //!
-//! Besides [`super::Pool`], [`Votor`] is the other main internal component Alpenglow.
-//! It handles the main voting decisions for the consensus protocol. As input it
-//! receives events of type [`VotorEvent`] over a channel, depending on the event
-//! type these were emitted by  [`super::Pool`], [`super::Blockstore`] and itself.
-//! Votor keeps its own internal state for each slot based on previous events and votes.
-//!
-//! Votor has access to an instance of [`All2All`] for broadcasting votes.
+//! [`Votor`] keeps per-slot voting state, consumes [`VotorEvent`]s, and
+//! broadcasts votes over [`All2All`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -27,126 +22,67 @@ use crate::crypto::aggsig::SecretKey;
 use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH, MerkleRoot};
 use crate::{All2All, Slot, ValidatorId};
 
-/// Events that Votor is interested in.
-///
-/// These are emitted by [`super::Pool`], [`super::Blockstore`] and [`Votor`] itself.
-/// They are the inputs that drive the voting loop of Votor.
+/// Inputs that drive Votor's voting loop.
 #[derive(Clone, Debug)]
 pub enum VotorEvent {
-    /// The pool has newly marked the given block as a ready parent for `slot`.
-    ///
-    /// This event is only emitted per window, `slot` is always the first slot.
-    /// The parent block is identified by `parent_slot` and `parent_hash`.
+    /// Pool marked a ready parent; `slot` is the window's first slot.
     ParentReady {
         slot: Slot,
         parent_slot: Slot,
         parent_hash: BlockHash,
     },
-    /// The given block has reached the safe-to-notar status.
+    /// The block reached safe-to-notar status.
     SafeToNotar(Slot, BlockHash),
-    /// The given slot has reached the safe-to-skip status.
+    /// The slot reached safe-to-skip status.
     SafeToSkip(Slot),
-    /// New certificated created in pool (should then be broadcast by Votor).
+    /// New cert created in pool; Votor should broadcast it.
     CertCreated(Box<Cert>),
-    /// Standstill timeout has fired.
-    ///
-    /// The provided slot indicates the highest finalized slot as seen by Pool.
-    /// The provided certificates and votes should be re-broadcast.
+    /// Standstill fired; re-broadcast the provided certs and votes.
     Standstill(Slot, Vec<Cert>, Vec<Vote>),
 
-    /// First valid shred of the leader's block was received for the block.
+    /// First valid shred of the leader's block was received.
     FirstShred(Slot),
-    /// New (complete) block was received in blockstore.
+    /// A complete block was received in blockstore.
     Block { slot: Slot, block_info: BlockInfo },
 
-    /// Regular timeout for the given slot has fired.
+    /// Regular slot timeout fired.
     Timeout(Slot),
-    /// Early timeout for a crashed leader (nothing was received) has fired.
+    /// Crashed-leader timeout fired (nothing received).
     TimeoutCrashedLeader(Slot),
-    /// The grace period for deferring a finalization vote has elapsed (see
-    /// [`Votor::defer_final_vote`]). If the slot has not fast-finalized by now,
-    /// the (slow-path) finalization vote should be sent for the given block.
+    /// Deferred-final grace elapsed; fall back to slow-path final if needed.
     FinalVoteDeadline(Slot, BlockHash),
 }
 
-/// Votor implements the decision process of which votes to cast.
-///
-/// It keeps some state for each slot and checks the conditions for voting.
-/// On [`Votor::event_receiver`], it receives events from [`super::Pool`],
-/// [`super::Blockstore`] and itself.
-/// Informed by these events Votor updates its state and generates votes.
-/// Votes are signed with [`Votor::voting_key`] and broadcast using [`Votor::all2all`].
+/// Decides which votes to cast from per-slot state and incoming events.
 pub struct Votor<A: All2All> {
-    // TODO: merge all of these into `SlotState` struct?
-    /// Indicates for which slots we already voted notar or skip.
     voted: BTreeSet<Slot>,
-    /// Indicates for which slots we already voted notar and for what hash.
     voted_notar: BTreeMap<Slot, BlockHash>,
-    /// Indicates for which slots we set the 'bad window' flag.
     bad_window: BTreeSet<Slot>,
-    /// How many times each window's crashed-leader timeout has been re-armed
-    /// (paused) because the link was alive but the leader's block had not yet
-    /// crawled across. Bounds the pause so a genuinely gone peer is still skipped.
+    /// Bounds crashed-leader timeout re-arms while an alive link is still slow.
     crashed_leader_rearms: BTreeMap<Slot, u32>,
-    /// Blocks that have a notarization certificate (not notar-fallback).
     block_notarized: BTreeMap<Slot, BlockHash>,
-    /// Indicates for which slots the given (slot, hash) pair is a valid parent.
     parents_ready: BTreeSet<(Slot, Slot, BlockHash)>,
-    /// Indicates for which slots we received at least one shred.
     received_shred: BTreeSet<Slot>,
-    /// Blocks that are waiting for previous slots to be notarized.
     pending_blocks: BTreeMap<Slot, BlockInfo>,
-    /// Slots that Votor is done with.
     retired_slots: BTreeSet<Slot>,
 
-    /// Own validator ID.
     validator_id: ValidatorId,
-    /// Secret key used to sign votes.
     voting_key: SecretKey,
-    /// Channel for receiving events from pool, blockstore and Votor itself.
     event_receiver: Receiver<VotorEvent>,
-    /// Sender side of event channel. Used for sending events to self.
     event_sender: Sender<VotorEvent>,
-    /// [`All2All`] instance used to broadcast votes.
     all2all: Arc<A>,
-    /// Reports whether the link to peers is up, so a crashed-leader timeout on a
-    /// merely-slow (but alive) link pauses instead of skipping. Defaults to
-    /// [`NoLiveness`] (sim/UDP); the radio path injects a keepalive-driven impl.
+    /// Slow-but-alive links pause crashed-leader timeout instead of skipping.
     link_liveness: Arc<dyn LinkLiveness>,
-    /// When `true`, the (slow-path) finalization vote is **deferred** by a grace
-    /// period instead of being broadcast eagerly alongside the notar vote. If the
-    /// slot fast-finalizes within the grace window (the common case when all
-    /// validators are reachable — e.g. a 2-node link where both notar votes meet
-    /// the 80% strong quorum), the finalization vote, notar cert, and final cert
-    /// are never sent — saving three messages per slot over the expensive reverse
-    /// path. If fast-final does *not* happen in time, the vote is sent when the
-    /// grace elapses, falling back to slow-final exactly as before. Defaults to
-    /// `false` (eager, original behavior); the radio half-duplex path enables it.
+    /// Defers slow-path final votes so fast-finalized slots send fewer radio messages.
     defer_final_vote: bool,
-    /// Slots for which a fast-final cert has been observed (so a deferred
-    /// finalization vote can be suppressed — fast-final already finalized them).
     fast_finalized: BTreeSet<Slot>,
-    /// Durable log of own votes, written before each broadcast so a restarted
-    /// node can never cast a vote conflicting with one sent before the crash.
-    /// Disabled by default; wired up with [`Self::set_vote_history`].
+    /// Durable own-vote log prevents conflicting votes after restart.
     vote_history: VoteHistory,
-    /// Votes restored from [`Self::vote_history`], rebroadcast once when the
-    /// voting loop starts: if the pre-crash vote was lost in flight (a link
-    /// drop and a crash often coincide), the double-vote guard would otherwise
-    /// leave the peer waiting for a vote that never comes again until
-    /// standstill recovery. Identical votes are deduplicated by peers.
+    /// Replayed once at startup so in-flight pre-crash votes are not lost forever.
     restored_votes: Vec<Vote>,
-    /// Deferred-final intents restored from [`Self::vote_history`] after a crash
-    /// during the grace window. Re-armed as `FinalVoteDeadline` timers when the
-    /// voting loop starts, so slow-final liveness survives the crash.
+    /// Re-armed after restart so slow-final liveness survives a grace-window crash.
     restored_final_deadlines: Vec<(Slot, BlockHash)>,
-    /// First slot of the window containing the highest finalized slot. All
-    /// per-slot state below this floor has been pruned (see
-    /// [`Self::prune_below_floor`]); events for slots below it are dropped at
-    /// the top of the voting loop. The drop is what makes the pruning safe: a
-    /// stale timer firing for a pruned slot must never reach `try_skip_window`
-    /// (the pruned `voted` set would no longer prevent a conflicting skip vote
-    /// for a slot we already notar-voted — a slashable offence).
+    /// Events below this pruned floor are dropped to avoid conflicting stale votes.
     finalized_floor: Slot,
 }
 
@@ -159,7 +95,7 @@ impl<A: All2All> Votor<A> {
         event_receiver: Receiver<VotorEvent>,
         all2all: Arc<A>,
     ) -> Self {
-        // add dummy genesis block to some of the data structures
+        // Seed genesis state.
         let voted = [Slot::genesis()].into_iter().collect();
         let voted_notar = [(Slot::genesis(), GENESIS_BLOCK_HASH)]
             .into_iter()
@@ -188,11 +124,7 @@ impl<A: All2All> Votor<A> {
             event_sender,
             all2all,
             link_liveness: Arc::new(NoLiveness),
-            // Off by default (eager finalization vote — original behavior for
-            // sim/UDP/full-duplex and all existing tests). The radio half-duplex
-            // path opts in via `BUNKER_DEFER_FINAL_VOTE=1` (set in `pactor_init`),
-            // matching the `BUNKER_DELTA_MULT` env-config pattern, so `Alpenglow::new`
-            // keeps a stable signature.
+            // Env-gated so radio can opt in without changing the Alpenglow API.
             defer_final_vote: std::env::var("BUNKER_DEFER_FINAL_VOTE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -206,29 +138,15 @@ impl<A: All2All> Votor<A> {
         votor
     }
 
-    /// Inject a link-liveness signal (defaults to [`NoLiveness`]).
-    ///
-    /// Radio transports pass a keepalive-driven impl so a crashed-leader timeout
-    /// on a slow-but-alive link pauses instead of skipping the window.
+    /// Inject a link-liveness signal; defaults to [`NoLiveness`].
     pub fn set_link_liveness(&mut self, liveness: Arc<dyn LinkLiveness>) {
         self.link_liveness = liveness;
     }
 
-    /// Inject the durable own-vote log and rebuild voting state from it.
-    ///
-    /// Replays every persisted vote for slots at or after `finalized_slot`
-    /// into `voted` / `voted_notar` / `bad_window` / `retired_slots`, so the
-    /// voting rules hold across a crash-restart exactly as they would have in
-    /// a single uninterrupted run: a slot notar-voted before the crash cannot
-    /// be skip-voted after it (and vice versa), and a slot with a fallback
-    /// vote cannot receive a finalization vote. Records below the finalized
-    /// frontier are pruned — peers reject votes for finalized slots, so no
-    /// conflict is possible there.
+    /// Inject the durable own-vote log and rebuild restart voting guards from it.
     pub fn set_vote_history(&mut self, history: VoteHistory, finalized_slot: Slot) {
         self.vote_history = history;
-        // Everything below the restored frontier is settled; the vote history
-        // for those slots is pruned on load, so the floor guard must drop any
-        // stale event for them (the restored `voted` set no longer covers them).
+        // The floor guard must drop stale events for slots pruned from history.
         self.finalized_floor = finalized_slot;
         for vote in self.vote_history.load_and_prune(finalized_slot) {
             let slot = vote.slot();
@@ -248,11 +166,7 @@ impl<A: All2All> Votor<A> {
             self.restored_votes.push(vote);
         }
 
-        // Restore deferred-final intents (see `defer_final_vote`). A crash during
-        // the grace window leaves a `pendfinal|` marker with no live timer to
-        // drive it; re-arm the deadline here so slow-final liveness survives the
-        // crash. Skip any slot already retired (its final vote was sent before
-        // the crash and replayed above) — that marker is stale.
+        // Re-arm pending-final markers; retired-slot markers are stale.
         for (slot, hash) in self
             .vote_history
             .load_and_prune_pending_finals(finalized_slot)
@@ -265,26 +179,13 @@ impl<A: All2All> Votor<A> {
         }
     }
 
-    /// Enable deferring the slow-path finalization vote (see [`Self::defer_final_vote`]).
-    ///
-    /// Saves the finalization vote + notar cert + final cert per slot over the
-    /// reverse path whenever a slot fast-finalizes within the grace window. Safe:
-    /// it only ever delays (never fabricates) a finalization vote, and falls back
-    /// to slow-final if fast-final does not occur in time.
+    /// Enable deferred slow-path finalization votes.
     #[cfg(test)]
     pub fn set_defer_final_vote(&mut self, defer: bool) {
         self.defer_final_vote = defer;
     }
 
-    /// Drops all per-slot voting state for slots strictly below `floor` and
-    /// raises [`Self::finalized_floor`].
-    ///
-    /// Called as finalization advances (with `floor` = the finalized slot's
-    /// window start). Without this sweep, Votor's ten per-slot collections grow
-    /// one entry per slot for the life of the process. Safe ONLY together with
-    /// the floor guard at the top of [`Self::voting_loop`]: pruning `voted`
-    /// removes the double-vote protection for those slots, so events for slots
-    /// below the floor must never reach a voting path again.
+    /// Drop state below `floor`; safe only with the voting-loop floor guard.
     fn prune_below_floor(&mut self, floor: Slot) {
         if floor <= self.finalized_floor {
             return;
@@ -302,30 +203,18 @@ impl<A: All2All> Votor<A> {
         self.parents_ready.retain(|(slot, _, _)| *slot >= floor);
     }
 
-    /// Max times a window's crashed-leader timeout may be re-armed (paused) while
-    /// the link is alive before we skip anyway. Bounds the pause so a genuinely
-    /// gone peer (whose transport still reports "up") is eventually skipped,
-    /// preserving liveness. With `delta_timeout` per re-arm this is a generous
-    /// multi-window wait on a slow link.
+    /// Re-arm cap for slow-but-alive crashed-leader timeouts.
     const MAX_CRASHED_LEADER_REARMS: u32 = 5;
 
-    /// Handles the voting (leader and non-leader) side of consensus protocol.
-    ///
-    /// Checks consensus conditions and broadcasts new votes.
+    /// Handle consensus voting events and broadcast resulting votes.
     #[fastrace::trace]
     pub async fn voting_loop(&mut self) -> Result<()> {
-        // Rebroadcast votes restored after a crash-restart (see `restored_votes`).
+        // Re-send restored votes once; peers deduplicate identical votes.
         for vote in std::mem::take(&mut self.restored_votes) {
             debug!("rebroadcasting restored vote for slot {}", vote.slot());
             self.all2all.broadcast(&vote.into()).await.unwrap();
         }
-        // Re-arm deferred-final deadlines restored after a crash during the grace
-        // window (see `restored_final_deadlines`). Spawn the same grace-delayed
-        // timer as the original notar path rather than firing immediately: the
-        // block-notarized cert that makes `try_final` actionable may not have
-        // arrived yet on restart, so the deadline must give it time (exactly as
-        // in the uninterrupted run). If the slot fast-finalizes first, the
-        // deadline is a no-op.
+        // Use the live-path grace delay; the enabling notar cert may arrive after restart.
         for (slot, hash) in std::mem::take(&mut self.restored_final_deadlines) {
             debug!("re-arming deferred-final deadline for slot {slot} after restart");
             let sender = self.event_sender.clone();
@@ -335,14 +224,7 @@ impl<A: All2All> Votor<A> {
             });
         }
         while let Some(event) = self.event_receiver.recv().await {
-            //println!("[Votor {}] event: {:?}", self.validator_id, event);
-            // Drop events for slots below the finalized floor. Per-slot state
-            // below the floor has been pruned (see `prune_below_floor`), so a
-            // stale timer or late blockstore event for such a slot must never
-            // reach a voting path — with the `voted` guard pruned it could cast
-            // a conflicting (slashable) vote. Cert re-broadcasts and standstill
-            // recovery are exempt: they carry no voting decision and dropping
-            // them could starve a lagging peer of a cert it still needs.
+            // Drop stale voting events below the pruned floor; cert rebroadcasts are safe.
             if event.slot() < self.finalized_floor
                 && !matches!(
                     event,
@@ -361,7 +243,6 @@ impl<A: All2All> Votor<A> {
             }
             trace!("votor event: {event:?}");
             match event {
-                // events from Pool
                 VotorEvent::ParentReady {
                     slot,
                     parent_slot,
@@ -374,7 +255,6 @@ impl<A: All2All> Votor<A> {
                     self.set_timeouts(slot);
                 }
                 VotorEvent::SafeToNotar(slot, hash) => {
-                    //println!("[Votor {}] SAFE_TO_NOTAR slot {}", self.validator_id, slot);
                     debug!("voted notar-fallback in slot {slot}");
                     let vote =
                         Vote::new_notar_fallback(slot, hash, &self.voting_key, self.validator_id);
@@ -384,7 +264,6 @@ impl<A: All2All> Votor<A> {
                     self.bad_window.insert(slot);
                 }
                 VotorEvent::SafeToSkip(slot) => {
-                    //println!("[Votor {}] SAFE_TO_SKIP slot {}", self.validator_id, slot);
                     debug!("voted skip-fallback in slot {slot}");
                     let vote = Vote::new_skip_fallback(slot, &self.voting_key, self.validator_id);
                     self.vote_history.record(&vote);
@@ -393,26 +272,20 @@ impl<A: All2All> Votor<A> {
                     self.bad_window.insert(slot);
                 }
                 VotorEvent::CertCreated(cert) => {
-                    //println!("[Votor {}] CERT_CREATED {:?}", self.validator_id, cert);
                     match cert.as_ref() {
                         Cert::Notar(_) => {
                             self.block_notarized
                                 .insert(cert.slot(), cert.block_hash().cloned().unwrap());
-                            // When deferring, do NOT send the finalization vote on the
-                            // notar cert; the FinalVoteDeadline path sends it later only
-                            // if fast-final has not finalized the slot by then.
+                            // Deferred mode waits for the grace deadline before slow-final voting.
                             if !self.defer_final_vote {
                                 self.try_final(cert.slot(), cert.block_hash().cloned().unwrap())
                                     .await;
                             }
                         }
                         Cert::FastFinal(_) => {
-                            // Record so a deferred (or pending) finalization vote is
-                            // suppressed — fast-final already finalized this slot.
+                            // Fast-final suppresses any deferred slow-path final vote.
                             self.fast_finalized.insert(cert.slot());
-                            // The deferred-final intent for this slot is now moot
-                            // (fast-final finalized it); drop its marker so a
-                            // restart doesn't re-arm a redundant deadline.
+                            // Drop the pending marker so restart does not re-arm it.
                             if let Some(hash) = cert.block_hash() {
                                 self.vote_history.clear_pending_final(cert.slot(), hash);
                             }
@@ -432,7 +305,6 @@ impl<A: All2All> Votor<A> {
                     self.all2all.broadcast(&(*cert).into()).await.unwrap();
                 }
                 VotorEvent::Standstill(_, certs, votes) => {
-                    //println!("[Votor {}] STANDSTILL event", self.validator_id);
                     for cert in certs {
                         self.all2all.broadcast(&cert.into()).await.unwrap();
                     }
@@ -441,9 +313,7 @@ impl<A: All2All> Votor<A> {
                     }
                 }
 
-                // events from Blockstore
                 VotorEvent::FirstShred(slot) => {
-                    //println!("[Votor {}] FIRST_SHRED slot {}", self.validator_id, slot);
                     self.received_shred.insert(slot);
                 }
                 VotorEvent::Block { slot, block_info } => {
@@ -463,9 +333,7 @@ impl<A: All2All> Votor<A> {
                     }
                 }
 
-                // events from Votor itself
                 VotorEvent::Timeout(slot) => {
-                    //println!("[Votor {}] TIMEOUT slot {}", self.validator_id, slot);
                     trace!("timeout for slot {slot}");
                     if !self.voted.contains(&slot) {
                         self.try_skip_window(slot).await;
@@ -474,14 +342,7 @@ impl<A: All2All> Votor<A> {
                 VotorEvent::TimeoutCrashedLeader(slot) => {
                     trace!("timeout (crashed leader) for slot {slot}");
                     if !self.received_shred.contains(&slot) && !self.voted.contains(&slot) {
-                        // The leader's first shred has not arrived. Normally this
-                        // means the leader crashed → skip the window. But over a
-                        // half-duplex link that has merely gone quiet (the slow
-                        // reverse ARQ path), the leader is alive and its block is
-                        // still crawling across; skipping would gap the chain
-                        // irreversibly. If the link is alive and we have not
-                        // exhausted the re-arm budget, PAUSE: re-arm the timeout
-                        // and wait, rather than skip.
+                        // On slow live links, pause before skipping to avoid gapping the chain.
                         let rearms = self.crashed_leader_rearms.entry(slot).or_insert(0);
                         if self.link_liveness.is_link_alive()
                             && *rearms < Self::MAX_CRASHED_LEADER_REARMS
@@ -500,8 +361,7 @@ impl<A: All2All> Votor<A> {
                                 let _ = sender.send(VotorEvent::TimeoutCrashedLeader(slot)).await;
                             });
                         } else {
-                            // Link is down (peer gone) or we have paused long
-                            // enough — treat as a genuine crashed leader and skip.
+                            // Link is down or the pause budget is exhausted; skip.
                             println!(
                                 "[Votor {}] EARLY_TIMEOUT slot {} — skipping window",
                                 self.validator_id, slot
@@ -511,10 +371,7 @@ impl<A: All2All> Votor<A> {
                     }
                 }
                 VotorEvent::FinalVoteDeadline(slot, hash) => {
-                    // The deferral grace has elapsed. If fast-final already
-                    // finalized the slot, `try_final` is a no-op (the savings).
-                    // Otherwise, send the slow-path finalization vote now, exactly
-                    // as the eager path would have — preserving slow-final liveness.
+                    // Grace elapsed; `try_final` is a no-op if fast-final already landed.
                     self.try_final(slot, hash).await;
                 }
             }
@@ -538,7 +395,7 @@ impl<A: All2All> Votor<A> {
         let sender = self.event_sender.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delta_timeout() + delta_first_slice()).await;
-            // HACK: ignoring errors to prevent panic when shutting down votor
+            // Ignore send errors during shutdown.
             let event = VotorEvent::TimeoutCrashedLeader(slot);
             let _ = sender.send(event).await;
             for s in slot.slots_in_window() {
@@ -581,16 +438,7 @@ impl<A: All2All> Votor<A> {
         self.voted_notar.insert(slot, hash.clone());
         self.pending_blocks.remove(&slot);
         if self.defer_final_vote {
-            // Defer the slow-path finalization vote: give fast-final a chance to
-            // fire from the notar votes alone (saving the final vote + notar cert
-            // + final cert over the slow reverse path). If it has not fired by the
-            // deadline, `FinalVoteDeadline` triggers the vote as a fallback.
-            //
-            // Persist the *intent* before spawning the in-memory timer: a crash
-            // during the grace window would otherwise lose the deadline entirely
-            // (the timer is memory-only), and slow-final for this slot would
-            // never be driven again. The marker is cleared when the final vote is
-            // sent (`try_final`) or the slot fast-finalizes.
+            // Persist the deferred-final intent before spawning the memory-only timer.
             self.vote_history.record_pending_final(slot, &hash);
             let sender = self.event_sender.clone();
             let h = hash.clone();
@@ -606,10 +454,7 @@ impl<A: All2All> Votor<A> {
 
     /// Sends a finalization vote for the given block if the conditions are met.
     async fn try_final(&mut self, slot: Slot, hash: BlockHash) {
-        // If the slot already fast-finalized, the slow-path finalization vote is
-        // redundant — skip it (this is the whole point of deferring it). The
-        // pending marker is cleared by the fast-final handler; clear here too in
-        // case this path is reached first.
+        // Fast-final makes the slow-path final vote redundant.
         if self.fast_finalized.contains(&slot) {
             self.vote_history.clear_pending_final(slot, &hash);
             return;
@@ -622,8 +467,7 @@ impl<A: All2All> Votor<A> {
             self.vote_history.record(&vote);
             self.all2all.broadcast(&vote.into()).await.unwrap();
             self.retired_slots.insert(slot);
-            // The deferred-final intent has now been fulfilled — drop its marker
-            // so a later restart does not re-arm a redundant deadline.
+            // Fulfilled intent; restart must not re-arm it.
             self.vote_history.clear_pending_final(slot, &hash);
         }
     }
@@ -690,7 +534,6 @@ mod tests {
         start_votor_with_liveness(None).await
     }
 
-    /// Fixed-value [`LinkLiveness`] for tests.
     struct TestLiveness(bool);
     impl LinkLiveness for TestLiveness {
         fn is_link_alive(&self) -> bool {
@@ -698,14 +541,12 @@ mod tests {
         }
     }
 
-    /// Start a votor; if `liveness` is given, inject it (else default NoLiveness).
     async fn start_votor_with_liveness(
         liveness: Option<Arc<dyn LinkLiveness>>,
     ) -> (A2A, mpsc::Sender<VotorEvent>, Arc<EpochInfo>) {
         start_votor_full(liveness, false).await
     }
 
-    /// Start a votor with explicit liveness and `defer_final_vote` settings.
     async fn start_votor_full(
         liveness: Option<Arc<dyn LinkLiveness>>,
         defer_final_vote: bool,
@@ -726,22 +567,19 @@ mod tests {
         (other_a2a, tx, epoch_info)
     }
 
-    /// A crashed-leader timeout with the link reported DOWN must skip the window
-    /// (the leader is presumed gone — original behavior, liveness = false).
+    /// Crashed-leader timeout skips when the link is down.
     #[tokio::test]
     async fn crashed_leader_skips_when_link_down() {
         let (other_a2a, tx, _) =
             start_votor_with_liveness(Some(Arc::new(TestLiveness(false)))).await;
 
-        // Start of a non-genesis window (slot 4; SLOTS_PER_WINDOW=4) we have not
-        // voted on / seen a shred for; the genesis window is pre-seeded as voted.
+        // Pick an unvoted non-genesis window.
         let slot = Slot::new(4);
         assert!(slot.is_start_of_window());
         tx.send(VotorEvent::TimeoutCrashedLeader(slot))
             .await
             .unwrap();
 
-        // Should skip the whole window.
         match tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await {
             Ok(Ok(ConsensusMessage::Vote(v))) => {
                 assert!(v.is_skip(), "expected skip vote, got {v:?}");
@@ -750,9 +588,7 @@ mod tests {
         }
     }
 
-    /// A crashed-leader timeout with the link reported ALIVE must NOT skip — it
-    /// pauses (re-arms the timeout), waiting for the slow reverse path to deliver
-    /// the leader's block instead of irreversibly gapping the chain.
+    /// Crashed-leader timeout pauses when the link is alive.
     #[tokio::test]
     async fn crashed_leader_pauses_when_link_alive() {
         let (other_a2a, tx, _) =
@@ -763,8 +599,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Must NOT see any skip vote promptly: the re-arm waits delta_timeout (long),
-        // so a short window proves it paused rather than skipped.
+        // A short receive timeout proves the handler paused instead of skipped.
         let got = tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await;
         assert!(
             got.is_err(),
@@ -776,7 +611,6 @@ mod tests {
     async fn timeouts() {
         let (other_a2a, _, _) = start_votor().await;
 
-        // should vote skip for all slots
         let mut skipped_slots = Vec::new();
         let mut slots = Slot::genesis().slots_in_window().collect::<Vec<_>>();
         slots.remove(0);
@@ -798,7 +632,6 @@ mod tests {
     async fn notar_and_final() {
         let (other_a2a, tx, epoch_info) = start_votor().await;
 
-        // vote notar after seeing block
         let slot = Slot::genesis().next();
         let event = VotorEvent::FirstShred(slot);
         tx.send(event).await.unwrap();
@@ -815,7 +648,6 @@ mod tests {
         assert!(vote.is_notar());
         assert_eq!(vote.slot(), slot);
 
-        // vote finalize after seeing branch-certified
         let cert = Cert::Notar(NotarCert::new_unchecked(&[vote], &epoch_info.validators));
         let event = VotorEvent::CertCreated(Box::new(cert));
         tx.send(event).await.unwrap();
@@ -828,11 +660,7 @@ mod tests {
         }
     }
 
-    /// With `defer_final_vote` enabled, after a node notar-votes it must NOT emit
-    /// a finalization vote on the notar cert. If a fast-final cert then arrives,
-    /// the finalization vote must be suppressed entirely (the reverse-path saving):
-    /// the only consensus messages over the link are the notar vote and the
-    /// re-broadcast certs — never a `Final` vote.
+    /// Deferred final vote is suppressed when fast-final arrives.
     #[tokio::test]
     async fn defer_final_vote_suppressed_on_fast_final() {
         let (other_a2a, tx, epoch_info) = start_votor_full(None, true).await;
@@ -848,14 +676,12 @@ mod tests {
             .await
             .unwrap();
 
-        // First message must be the notar vote.
         let notar = match other_a2a.receive().await.unwrap() {
             ConsensusMessage::Vote(v) => v,
             m => panic!("expected notar vote, got {m:?}"),
         };
         assert!(notar.is_notar());
 
-        // Deliver a Notar cert: in deferred mode this must NOT trigger a final vote.
         let notar_cert = Cert::Notar(NotarCert::new_unchecked(
             std::slice::from_ref(&notar),
             &epoch_info.validators,
@@ -863,14 +689,12 @@ mod tests {
         tx.send(VotorEvent::CertCreated(Box::new(notar_cert)))
             .await
             .unwrap();
-        // The notar cert is re-broadcast, but no final vote rides along.
         match other_a2a.receive().await.unwrap() {
             ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::Notar(_))),
             ConsensusMessage::Vote(v) => panic!("unexpected vote in deferred mode: {v:?}"),
         }
 
-        // Now fast-final fires. After this, the deferred finalization-vote deadline
-        // must find the slot already fast-finalized and send nothing.
+        // The later deadline must see fast-final and emit no vote.
         let ff = Cert::FastFinal(FastFinalCert::new_unchecked(
             std::slice::from_ref(&notar),
             &epoch_info.validators,
@@ -878,15 +702,11 @@ mod tests {
         tx.send(VotorEvent::CertCreated(Box::new(ff)))
             .await
             .unwrap();
-        // The fast-final cert is re-broadcast (a cert, not a vote)...
         match other_a2a.receive().await.unwrap() {
             ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::FastFinal(_))),
             ConsensusMessage::Vote(v) => panic!("unexpected vote: {v:?}"),
         }
 
-        // Fire the deferral deadline explicitly (rather than waiting the full grace):
-        // because the slot already fast-finalized, it must emit NOTHING. This is the
-        // reverse-path saving — the final vote is suppressed.
         tx.send(VotorEvent::FinalVoteDeadline(slot, hash))
             .await
             .unwrap();
@@ -897,9 +717,7 @@ mod tests {
         );
     }
 
-    /// With `defer_final_vote` enabled but fast-final NOT occurring, the deferral
-    /// deadline must still send the finalization vote (slow-final fallback) — so a
-    /// flaky peer that prevents the 80% strong quorum cannot stall finalization.
+    /// Deferred final vote falls back to slow-final when fast-final does not arrive.
     #[tokio::test]
     async fn defer_final_vote_falls_back_to_slow_final() {
         let (other_a2a, tx, epoch_info) = start_votor_full(None, true).await;
@@ -921,7 +739,6 @@ mod tests {
         };
         assert!(notar.is_notar());
 
-        // A notar cert forms (60%) but never a fast-final (no 80% strong quorum).
         let notar_cert = Cert::Notar(NotarCert::new_unchecked(
             std::slice::from_ref(&notar),
             &epoch_info.validators,
@@ -929,13 +746,11 @@ mod tests {
         tx.send(VotorEvent::CertCreated(Box::new(notar_cert)))
             .await
             .unwrap();
-        // Re-broadcast of the notar cert, no final vote yet (deferred).
         match other_a2a.receive().await.unwrap() {
             ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::Notar(_))),
             ConsensusMessage::Vote(v) => panic!("premature final vote: {v:?}"),
         }
 
-        // Deadline fires without a fast-final: must now send the final vote.
         tx.send(VotorEvent::FinalVoteDeadline(slot, hash))
             .await
             .unwrap();
@@ -948,12 +763,7 @@ mod tests {
         }
     }
 
-    /// Crash-restart voting safety: a Votor that notar-voted a slot, then
-    /// "crashed" (state dropped) and was rebuilt with the same [`VoteHistory`],
-    /// must NOT cast a skip vote for that slot when the restart path fires its
-    /// timeout — that would be a slashable conflicting vote. Without the
-    /// restored history the same timeout provably produces skip votes (see the
-    /// `timeouts` test).
+    /// Restored vote history prevents conflicting skip votes after restart.
     #[tokio::test]
     async fn vote_history_prevents_conflicting_skip_after_restart() {
         let db_path = format!(
@@ -967,7 +777,7 @@ mod tests {
         let slot = Slot::genesis().next();
         let hash: BlockHash = Hash::random_for_test().into();
 
-        // --- First life: notar-vote `slot`, recording into the history.
+        // First run records a notar vote.
         {
             let mut a2a = generate_all2all_instances(_epoch_info.validators.clone()).await;
             let (tx, rx) = mpsc::channel(100);
@@ -995,7 +805,7 @@ mod tests {
             assert_eq!(vote.slot(), slot);
         } // votor task's channel sender drops → first life ends ("crash")
 
-        // --- Second life: fresh Votor, same history, empty in-memory state.
+        // Restart with the same history.
         let mut a2a = generate_all2all_instances(_epoch_info.validators.clone()).await;
         let (tx, rx) = mpsc::channel(100);
         let other_a2a = a2a.pop().unwrap();
@@ -1006,8 +816,6 @@ mod tests {
             votor.voting_loop().await.unwrap();
         });
 
-        // Liveness: the restored notar vote is rebroadcast on startup (byte-
-        // identical to the pre-crash vote, in case it was lost in flight).
         match other_a2a.receive().await.unwrap() {
             ConsensusMessage::Vote(v) => {
                 assert!(v.is_notar(), "expected rebroadcast notar vote, got {v:?}");
@@ -1017,8 +825,7 @@ mod tests {
             m => panic!("expected rebroadcast notar vote, got {m:?}"),
         }
 
-        // Safety: the restart path fires a timeout for the unfinished slot.
-        // With the restored history the slot counts as voted → no skip vote.
+        // The restored guard must block a conflicting skip vote.
         tx.send(VotorEvent::Timeout(slot)).await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await;
         assert!(
@@ -1027,13 +834,7 @@ mod tests {
         );
     }
 
-    /// Crash-during-grace liveness: with `defer_final_vote` on, a node
-    /// notar-votes and defers its finalization vote behind a grace timer. If it
-    /// crashes during the grace window, the in-memory timer is lost — but the
-    /// persisted pending-final marker lets the restarted node re-arm the
-    /// deadline, so the slow-path finalization vote is still eventually sent.
-    /// Without the marker (pre-fix) the slot would never get a final vote and
-    /// finalization would stall whenever fast-final could not complete.
+    /// Pending-final markers re-arm slow-final liveness after restart.
     #[tokio::test]
     async fn deferred_final_vote_rearmed_after_crash() {
         let db_path = format!(
@@ -1047,7 +848,7 @@ mod tests {
         let slot = Slot::genesis().next();
         let hash: BlockHash = Hash::random_for_test().into();
 
-        // --- First life: notar-vote with deferral on, then "crash" mid-grace.
+        // First run persists a deferred-final intent.
         {
             let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
             let (tx, rx) = mpsc::channel(100);
@@ -1068,17 +869,15 @@ mod tests {
             tx.send(VotorEvent::Block { slot, block_info })
                 .await
                 .unwrap();
-            // Only the notar vote is emitted (final vote is deferred). The
-            // pending-final marker is now persisted.
+
             let vote = match other_a2a.receive().await.unwrap() {
                 ConsensusMessage::Vote(v) => v,
                 m => panic!("expected notar vote, got {m:?}"),
             };
             assert!(vote.is_notar());
-            // Crash before the grace deadline fires (we never wait it out).
         }
 
-        // --- Second life: fresh Votor, same DB, deferral still on.
+        // Restart with the same DB and deferred-final mode.
         let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
         let (tx, rx) = mpsc::channel(100);
         let other_a2a = a2a.pop().unwrap();
@@ -1097,7 +896,6 @@ mod tests {
         };
         assert!(rebroadcast.is_notar());
 
-        // Deliver a notar cert so `try_final`'s condition (block_notarized) holds.
         let notar_cert = Cert::Notar(NotarCert::new_unchecked(
             std::slice::from_ref(&rebroadcast),
             &epoch_info.validators,
@@ -1105,16 +903,12 @@ mod tests {
         tx.send(VotorEvent::CertCreated(Box::new(notar_cert)))
             .await
             .unwrap();
-        // The notar cert is re-broadcast (deferred mode → no final vote on it).
         match other_a2a.receive().await.unwrap() {
             ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::Notar(_))),
             ConsensusMessage::Vote(v) => panic!("unexpected vote before deadline: {v:?}"),
         }
 
-        // The re-armed deadline (fired on startup) must now drive the final vote,
-        // even though the original in-memory timer was lost in the crash. The
-        // re-armed timer waits `delta_final_vote_grace()` (~16s unscaled), so
-        // allow generously beyond that.
+        // Allow for the re-armed grace timer to drive the final vote.
         let final_vote = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match other_a2a.receive().await.unwrap() {
@@ -1130,8 +924,7 @@ mod tests {
         assert_eq!(final_vote.slot(), slot);
     }
 
-    /// `prune_below_floor` must drop all per-slot state below the floor and
-    /// never lower an already-raised floor.
+    /// `prune_below_floor` prunes below the floor and keeps the floor monotone.
     #[tokio::test]
     async fn prune_below_floor_sweeps_per_slot_state() {
         let (sks, epoch_info) = generate_validators(2);
@@ -1139,7 +932,6 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let mut votor = Votor::new(0, sks[0].clone(), tx, rx, Arc::new(a2a.pop().unwrap()));
 
-        // Populate per-slot state across two windows (0..4 and 4..8).
         for s in 1..=6u64 {
             let slot = Slot::new(s);
             let hash: BlockHash = Hash::random_for_test().into();
@@ -1173,16 +965,11 @@ mod tests {
                 .all(|(s, _, _)| *s >= Slot::new(4))
         );
 
-        // A lower floor must be a no-op (floor is monotone).
         votor.prune_below_floor(Slot::new(0));
         assert_eq!(votor.finalized_floor, Slot::new(4));
     }
 
-    /// The floor guard invariant: after finalization prunes a window, a stale
-    /// timer firing for a pruned slot that we notar-voted must produce NO vote.
-    /// Without the guard, the pruned `voted` set would no longer block
-    /// `try_skip_window`, and the skip vote would conflict with the earlier
-    /// notar vote — a slashable offence.
+    /// Floor guard prevents stale timers from voting below pruned state.
     #[tokio::test]
     async fn stale_timeout_below_floor_casts_no_vote() {
         let (sks, epoch_info) = generate_validators(2);
@@ -1196,7 +983,6 @@ mod tests {
             votor.voting_loop().await.unwrap();
         });
 
-        // Notar-vote slot 1.
         let slot = Slot::genesis().next();
         tx.send(VotorEvent::FirstShred(slot)).await.unwrap();
         let hash: BlockHash = Hash::random_for_test().into();
@@ -1213,8 +999,7 @@ mod tests {
         };
         assert!(notar.is_notar());
 
-        // Fast-final slot 5 (next window, 4..8): raises the floor to 4 and
-        // prunes slot 1's voting state (including its `voted` entry).
+        // Finalization in the next window prunes slot 1 state.
         let slot5_vote = Vote::new_notar(Slot::new(5), Hash::random_for_test().into(), &sks[0], 0);
         let ff = Cert::FastFinal(FastFinalCert::new_unchecked(
             std::slice::from_ref(&slot5_vote),
@@ -1223,14 +1008,12 @@ mod tests {
         tx.send(VotorEvent::CertCreated(Box::new(ff)))
             .await
             .unwrap();
-        // The fast-final cert is re-broadcast; consume it.
         match other_a2a.receive().await.unwrap() {
             ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::FastFinal(_))),
             ConsensusMessage::Vote(v) => panic!("unexpected vote: {v:?}"),
         }
 
-        // A stale timer fires for the pruned slot 1. The floor guard must drop
-        // it — any emitted vote here would be a conflicting skip.
+        // A stale timeout below the floor must be dropped.
         tx.send(VotorEvent::Timeout(slot)).await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await;
         assert!(
@@ -1245,7 +1028,6 @@ mod tests {
         let (slot1, hash1) = (Slot::genesis().next(), Hash::random_for_test());
         let (slot2, hash2) = (slot1.next(), Hash::random_for_test());
 
-        // give later block to votor first
         let event = VotorEvent::FirstShred(slot2);
         tx.send(event).await.unwrap();
         let block_info = BlockInfo {
@@ -1258,14 +1040,12 @@ mod tests {
         };
         tx.send(event).await.unwrap();
 
-        // should not vote yet
         assert!(
             tokio::time::timeout(Duration::from_secs(1), other_a2a.receive())
                 .await
                 .is_err()
         );
 
-        // now notify votor of earlier block
         let event = VotorEvent::FirstShred(slot1);
         tx.send(event).await.unwrap();
         let block_info = BlockInfo {
@@ -1278,7 +1058,6 @@ mod tests {
         };
         tx.send(event).await.unwrap();
 
-        // should now see notar votes
         for _ in 0..2 {
             match other_a2a.receive().await.unwrap() {
                 ConsensusMessage::Vote(vote) => {
@@ -1295,7 +1074,6 @@ mod tests {
         let (other_a2a, tx, _) = start_votor().await;
         let slot = Slot::genesis().next();
 
-        // wait for skip votes
         for slot in slot.slots_in_window() {
             if slot.is_genesis() {
                 continue;
@@ -1308,7 +1086,6 @@ mod tests {
             }
         }
 
-        // vote notar-fallback after safe-to-notar
         let hash = Hash::random_for_test();
         let event = VotorEvent::SafeToNotar(slot, hash.clone().into());
         tx.send(event).await.unwrap();
@@ -1327,7 +1104,6 @@ mod tests {
         let (other_a2a, tx, _) = start_votor().await;
         let slot = Slot::genesis().next();
 
-        // vote notar after seeing block
         let event = VotorEvent::FirstShred(slot);
         tx.send(event).await.unwrap();
         let block_info = BlockInfo {
@@ -1343,7 +1119,6 @@ mod tests {
         assert!(vote.is_notar());
         assert_eq!(vote.slot(), slot);
 
-        // vote skip-fallback after safe-to-skip
         let event = VotorEvent::SafeToSkip(slot);
         tx.send(event).await.unwrap();
         match other_a2a.receive().await.unwrap() {

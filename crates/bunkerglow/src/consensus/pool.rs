@@ -1,10 +1,7 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Data structure handling votes and certificates.
-//!
-//! Any received votes or certificates are placed into the pool.
-//! The pool then tracks status for each slot and sends notification to votor.
+//! Pool for consensus votes, certificates, slot status, and Votor notifications.
 
 mod finality_tracker;
 mod parent_ready_tracker;
@@ -96,9 +93,7 @@ pub enum SlashableOffence {
 
 pub type AddVoteError = PoolError;
 
-/// Interface for the Pool.
-///
-/// This is only used for mocking of [`PoolImpl`].
+/// Mockable pool interface.
 #[async_trait]
 #[automock]
 pub trait Pool {
@@ -117,52 +112,32 @@ pub trait Pool {
     fn wait_for_parent_ready(&mut self, slot: Slot) -> Either<BlockId, oneshot::Receiver<BlockId>>;
 }
 
-/// Pool is the central consensus data structure.
-///
-/// It holds votes and certificates for each slot.
-///
-/// This is the main implementation to use when you require the [`Pool`] trait.
+/// Central consensus pool for per-slot votes and certificates.
 pub struct PoolImpl {
-    /// State for each slot. Stores all votes and certificates.
     slot_states: BTreeMap<Slot, SlotState>,
-    /// Keeps track of which slots have a parent ready.
     parent_ready_tracker: ParentReadyTracker,
-    /// Keeps track of which slots are finalized.
     finality_tracker: FinalityTracker,
-    /// Keeps track of safe-to-notar blocks waiting for a parent certificate.
     s2n_waiting_parent_cert: BTreeMap<BlockId, BlockId>,
 
-    /// Information about all active validators.
     epoch_info: Arc<EpochInfo>,
-    /// Channel for sending events related to voting logic to Votor.
     pub(super) votor_event_channel: Sender<VotorEvent>,
-    /// Channel for requesting repair of a missing block by id.
     repair_channel: Sender<BlockId>,
 
-    /// RocksDB handle for persisting certificates & metadata.
-    ///
-    /// Shared (`Arc`) and cached process-wide by path, so a node rebuilt across a
-    /// reconnect reuses the same handle instead of re-acquiring the file lock.
+    /// Shared RocksDB handle for persisted certs and metadata.
     db: Arc<DB>,
-    /// Reference to blockstore for updating finalized timestamps.
     blockstore: Option<Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>>,
-    /// Channel for signaling epoch boundary crossings.
     epoch_boundary_channel: Option<Sender<EpochBoundaryEvent>>,
     finalized_slot_channel: Option<Sender<FinalizedSlotEvent>>,
-    /// Channel for reporting slashable offences to execution layer.
     slashing_channel: Option<Sender<SlashingReport>>,
 
     highest_finalized_slot: Slot,
     highest_notarized_fallback_slot: Slot,
-    /// Epoch for which an [`EpochBoundaryEvent`] has already been emitted, so
-    /// the boundary fires at most once per epoch (see `check_epoch_boundary`).
+    /// Last epoch boundary emitted; prevents duplicate epoch transitions.
     last_epoch_boundary_fired: Option<u64>,
 }
 
 impl PoolImpl {
-    /// Creates a new empty pool containing no votes or certificates.
-    ///
-    /// Any later emitted events will be sent on provided `votor_event_channel`.
+    /// Creates a new empty pool.
     pub fn new(
         epoch_info: Arc<EpochInfo>,
         votor_event_channel: Sender<VotorEvent>,
@@ -174,11 +149,6 @@ impl PoolImpl {
     }
 
     /// Creates a new pool backed by RocksDB at an explicit path.
-    ///
-    /// Same handle-cache semantics as [`Self::new`]. Lets tests that persist
-    /// state at unusual slots (e.g. epoch boundaries) use an isolated DB
-    /// instead of contaminating the shared `data/pool/{id}` path that every
-    /// other pool test reloads via `load_from_db`.
     pub fn new_at(
         epoch_info: Arc<EpochInfo>,
         votor_event_channel: Sender<VotorEvent>,
@@ -227,10 +197,7 @@ impl PoolImpl {
 
     async fn check_epoch_boundary(&mut self, slot: Slot) {
         if slot.is_last_in_epoch() {
-            // Fire at most once per epoch: finalization events can re-report a
-            // slot in rare out-of-order/re-derivation corners, and a duplicate
-            // boundary event would re-run the epoch transition (double reward
-            // distribution).
+            // Fire at most once per epoch; duplicate events rerun epoch transition.
             let epoch = slot.epoch();
             if self.last_epoch_boundary_fired == Some(epoch) {
                 return;
@@ -258,12 +225,7 @@ impl PoolImpl {
     }
 
     async fn notify_finalization_event(&mut self, event: &FinalizationEvent) {
-        // Check every finalized slot for an epoch boundary — the directly
-        // finalized slot AND every implicitly finalized ancestor. The last slot
-        // of an epoch is also the last slot of a window, so it can be finalized
-        // only *implicitly* (a later slot fast-finalizes and finalizes it by
-        // descent). Checking only the direct cert slot then silently skipped the
-        // epoch transition (validator-set update / rewards) for that epoch.
+        // Check direct and implicit finalizations; epoch ends can finalize only by descent.
         if let Some((slot, _)) = &event.finalized {
             self.notify_finalized_slot(*slot).await;
             self.check_epoch_boundary(*slot).await;
@@ -279,12 +241,7 @@ impl PoolImpl {
         self.blockstore = Some(blockstore);
     }
 
-    /// Adds a new certificate to the pool. Certificate is assumed to be valid.
-    ///
-    /// Caller needs to ensure that the certificate passes all validity checks:
-    /// - slot is not too old or too far in the future
-    /// - signature is valid
-    /// - certificate is not a duplicate
+    /// Adds a certificate that has already passed pool-level validity checks.
     async fn add_valid_cert(&mut self, cert: Cert) {
         let slot = cert.slot();
 
@@ -300,11 +257,9 @@ impl PoolImpl {
             let _ = self.db.put(key.as_bytes(), val);
         }
 
-        // actually add certificate
         trace!("adding cert to pool: {cert:?}");
         self.slot_state(slot).add_cert(cert.clone());
 
-        // handle resulting state updates
         match &cert {
             Cert::Notar(_) | Cert::NotarFallback(_) => {
                 let block_hash = cert.block_hash().cloned().unwrap();
@@ -322,7 +277,6 @@ impl PoolImpl {
                     self.handle_finalization(finalization_event).await;
                 }
 
-                // potentially notify child waiting for safe-to-notar
                 if let Some((child_slot, child_hash)) =
                     self.s2n_waiting_parent_cert.remove(&block_id)
                     && let Some(output) = self
@@ -339,11 +293,9 @@ impl PoolImpl {
                     }
                 }
 
-                // add block to parent-ready tracker, send any new parents to Votor.
                 let new_parents_ready = self.parent_ready_tracker.mark_notar_fallback(&block_id);
                 self.send_parent_ready_events(new_parents_ready).await;
 
-                // repair this block, if necessary
                 self.repair_channel.send((slot, block_hash)).await.unwrap();
             }
             Cert::Skip(_) => {
@@ -369,25 +321,14 @@ impl PoolImpl {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64;
-                    // Use a blocking read, not try_read: a momentarily-held lock
-                    // must not silently drop the finalized-status write (that left
-                    // finalized slots showing "proposed" on disk / via --inspect).
+                    // Do not drop finalized-status writes under transient lock contention.
                     blockstore.read().await.update_finalized_timestamp(
                         slot,
                         hash.as_hash().clone(),
                         timestamp,
                     );
                 }
-                // NOTE: do NOT take `blockstore.write()` here — the pool
-                // lock is held by our caller, and the shred-ingest path
-                // holds the blockstore write lock across an await on the
-                // bounded votor channel; the combination deadlocks. The
-                // in-memory blockstore prune runs in
-                // `finalized_checkpoint_loop` instead (no locks held).
-
-                // Epoch-boundary check now happens in `notify_finalization_event`
-                // (line above), covering both this slot and any implicitly
-                // finalized ancestors.
+                // Avoid blockstore.write() here: pool lock + shred-ingest await can deadlock.
                 self.prune();
             }
             Cert::Final(_) => {
@@ -406,8 +347,7 @@ impl PoolImpl {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64;
-                    // Blocking read, not try_read: do not silently drop
-                    // the finalized-status write under lock contention.
+                    // Do not drop finalized-status writes under transient lock contention.
                     blockstore.read().await.update_finalized_timestamp(
                         slot,
                         hash.as_hash().clone(),
@@ -415,20 +355,15 @@ impl PoolImpl {
                     );
                 }
 
-                // Epoch-boundary check happens in `notify_finalization_event`
-                // above (covers this slot + implicitly finalized ancestors).
                 self.prune();
             }
         }
 
-        // send to votor for broadcasting
         let event = VotorEvent::CertCreated(Box::new(cert));
         self.votor_event_channel.send(event).await.unwrap();
     }
 
-    /// Mutably accesses the [`SlotState`] for the given `slot`.
-    ///
-    /// Creates a new [`SlotState`] if none exists yet.
+    /// Mutably accesses or creates the [`SlotState`] for `slot`.
     fn slot_state(&mut self, slot: Slot) -> &mut SlotState {
         self.slot_states
             .entry(slot)
@@ -458,11 +393,7 @@ impl PoolImpl {
         certs
     }
 
-    /// Fetches finalization certficates for given `slot`, if any.
-    ///
-    /// Prefers fast-finalization over slow-finalization, if it's available.
-    /// In that case this returns only the fast-finalization certificate.
-    /// Otherwise, returns the finalization and notarization certificates.
+    /// Fetches finalization certs, preferring fast-final over slow-final+notar.
     fn get_final_certs(&self, slot: Slot) -> Vec<Cert> {
         let Some(slot_state) = self.slot_states.get(&slot) else {
             return Vec::new();
@@ -505,20 +436,10 @@ impl PoolImpl {
         votes
     }
 
-    /// Cleans up old finalized slots from the pool.
-    ///
-    /// After this, [`Self::slot_states`] will only contain entries for slots
-    /// >= [`Self::finalized_slot`], and the side trackers only entries for
-    /// > slots >= the finalized slot's window start. Without the side-tracker
-    /// > pruning, [`FinalityTracker`], [`ParentReadyTracker`], and
-    /// > [`Self::s2n_waiting_parent_cert`] each grow forever (one entry per
-    /// > slot/block for the life of the process) — the dominant steady memory
-    /// > leak on a long-running node.
-    ///
-    /// The side trackers keep the whole current window (not just the frontier
-    /// slot) because `ParentReadyTracker::mark_skipped` backward-walks within
-    /// the marked slot's window, and the finality recursion must find the
-    /// frontier's own status entry to stop at.
+    /// Drops finalized slots below the frontier from `slot_states` and the side
+    /// trackers (which would otherwise leak one entry per slot forever). Trackers
+    /// keep the whole current window, not just the frontier slot: `mark_skipped`
+    /// backward-walks the window and the finality recursion stops at the frontier.
     fn prune(&mut self) {
         let last_slot = self.finalized_slot();
         self.slot_states = self.slot_states.split_off(&last_slot);
@@ -526,18 +447,12 @@ impl PoolImpl {
         let window_start = last_slot.first_slot_in_window();
         self.finality_tracker.prune(window_start);
         self.parent_ready_tracker.prune(window_start);
-        // A child waiting for its parent's notar cert can never be satisfied
-        // once the parent slot is below the frontier window: certs that old are
-        // rejected by the bounds checks before reaching the pool.
+        // Waiting children below the frontier window can no longer be satisfied.
         self.s2n_waiting_parent_cert
             .retain(|(parent_slot, _), _| *parent_slot >= window_start);
     }
 
-    /// Returns `true` iff the given parent is ready for the given slot.
-    ///
-    /// This requires that the parent is at least notarized-fallback.
-    /// Also, if the parent is in a slot before `slot-1`, then all slots in
-    /// `parent+1..slot-1` (inclusive) must be skip-certified.
+    /// Returns `true` iff `parent` is ready for `slot`.
     pub fn is_parent_ready(&self, slot: Slot, parent: &BlockId) -> bool {
         self.parent_ready_tracker
             .parents_ready(slot)
@@ -601,27 +516,21 @@ impl PoolImpl {
 impl Pool for PoolImpl {
     /// Adds a new certificate to the pool. Checks validity of the certificate.
     async fn add_cert(&mut self, cert: Cert) -> Result<(), AddCertError> {
-        // ignore old and far-in-the-future certificates
         let slot = cert.slot();
-        // TODO: set bounds exactly correctly,
-        //       use correct validator set & stake distribution
         let slot_far_in_future = Slot::new(self.finalized_slot().inner() + 2 * SLOTS_PER_EPOCH);
-        // NOTE: This needs to be `< finalize_slot` to allow for later notarization.
+        // Allow the finalized slot itself so later notarization can arrive.
         if slot < self.finalized_slot() || slot >= slot_far_in_future {
             return Err(AddCertError::SlotOutOfBounds);
         }
 
-        // verify stake threshold & signature
         if !cert.check_threshold(&self.epoch_info) {
             return Err(AddCertError::ThresholdNotMet);
         } else if !cert.check_sig(&self.epoch_info.validators) {
             return Err(AddCertError::InvalidSignature);
         }
 
-        // get `SlotCertificates`, initialize if it doesn't exist yet
         let certs = &mut self.slot_state(slot).certificates;
 
-        // check if the certificate is a duplicate
         let duplicate = match cert {
             Cert::Notar(_) => certs.notar.is_some(),
             Cert::NotarFallback(_) => certs
@@ -642,22 +551,17 @@ impl Pool for PoolImpl {
 
     /// Adds a new vote to the pool. Checks validity of the vote.
     async fn add_vote(&mut self, vote: Vote) -> Result<(), AddVoteError> {
-        // ignore old and far-in-the-future votes
         let slot = vote.slot();
-        // TODO: set bounds exactly correctly,
-        //       use correct validator set & stake distribution
         let slot_far_in_future = Slot::new(self.finalized_slot().inner() + 2 * SLOTS_PER_EPOCH);
         if slot < self.finalized_slot() || slot >= slot_far_in_future {
             return Err(AddVoteError::SlotOutOfBounds);
         }
 
-        // verify signature
         let pk = &self.epoch_info.validator(vote.signer()).voting_pubkey;
         if !vote.check_sig(pk) {
             return Err(AddVoteError::InvalidSignature);
         }
 
-        // check if vote is valid and should be counted
         let voter = vote.signer();
         let voter_stake = self.epoch_info.validator(voter).stake;
         if let Some(offence) = self.slot_state(slot).check_slashable_offence(&vote) {
@@ -674,12 +578,10 @@ impl Pool for PoolImpl {
             return Err(AddVoteError::Duplicate);
         }
 
-        // actually add the vote
         trace!("adding vote to pool: {vote:?}");
         let (new_certs, votor_events, blocks_to_repair) =
             self.slot_state(slot).add_vote(vote, voter_stake);
 
-        // handle any resulting events
         for cert in new_certs {
             self.add_valid_cert(cert).await;
         }
@@ -692,15 +594,9 @@ impl Pool for PoolImpl {
         Ok(())
     }
 
-    /// Registers a new block with its respective parent in the pool.
-    ///
-    /// This should be called once for every valid block (e.g. directly by blockstore).
-    /// Ensures that the parent information is available for safe-to-notar checks.
+    /// Registers a valid block's parent for safe-to-notar checks.
     async fn add_block(&mut self, block_id: BlockId, parent_id: BlockId) {
-        // A block's parent must be a strictly earlier slot. Callers
-        // (blockstore reconstruction, repair) already reject malformed blocks
-        // before this point; this is defense-in-depth so a bad (block, parent)
-        // pair can never panic the consensus task — it is dropped instead.
+        // Defense-in-depth: malformed parent links must not panic consensus.
         if block_id.0 <= parent_id.0 {
             warn!(
                 "add_block: block slot {} not greater than parent slot {} — dropping",
@@ -741,35 +637,18 @@ impl Pool for PoolImpl {
         self.s2n_waiting_parent_cert.insert(parent_id, block_id);
     }
 
-    /// Triggers a recovery from a standstill.
-    ///
-    /// Determines which certificates and votes need to be re-broadcast.
-    /// Emits the corresponding [`VotorEvent::Standstill`] event for Votor.
-    /// Should be called after not seeing any progress for the standstill duration.
+    /// Re-broadcasts certs and own votes after a standstill.
     async fn recover_from_standstill(&self) {
         let slot = self.finalized_slot();
         let mut certs = self.get_final_certs(slot);
-        // No final cert for the floor is possible (genesis before the first
-        // finalization, or the floor's cert was purged as invalid on load).
-        // Do NOT return early: the higher certs and own votes below are the
-        // only periodic re-send mechanism for consensus traffic lost on the
-        // link — an early return here disabled standstill recovery entirely
-        // on both nodes once the poison floor certs were purged, leaving
-        // nothing re-transmitting votes over a lossy link.
+        // Even without a floor cert, higher certs/votes may unwedge a lossy link.
         if certs.is_empty() {
             warn!(
                 "standstill recovery at slot {slot} with no final cert for the floor; \
                  re-broadcasting higher certs and votes only"
             );
         }
-        // Rebroadcast from the floor slot itself, NOT floor+1. The floor's own
-        // certs/votes are exactly what a lagging peer needs to notarize the
-        // floor slot and parent-ready the window above it — and after the
-        // invalid-cert purge the floor's finality may only be provable by
-        // re-aggregating votes. With `slot.next()..` the floor-slot votes
-        // would be sent once (startup restored-vote burst) and never again.
-        // Duplicates are cheap (peer dedups); a missing vote is a permanent
-        // wedge.
+        // Include the floor slot itself; lagging peers may need its certs/votes.
         certs.extend(self.get_certs(slot..));
         let votes = self.get_own_votes(slot..);
         if certs.is_empty() && votes.is_empty() {
@@ -784,22 +663,13 @@ impl Pool for PoolImpl {
             votes.len()
         );
 
-        // NOTE: This event corresponds to the slot after the last finalized one.
-        // This way it is ignored by `Votor` iff a new slot was finalized.
+        // Target the next slot so Votor ignores it if finality advanced.
         let event = VotorEvent::Standstill(slot.next(), certs, votes);
 
-        // send to votor for broadcasting
         self.votor_event_channel.send(event).await.unwrap();
     }
 
-    /// Gives the currently highest finalized (fast or slow) slot.
-    ///
-    /// Includes the persisted frontier restored by `load_from_db`: the
-    /// finality tracker only advances on live finalization events, so after a
-    /// restart it reports genesis even though the reload restored a higher
-    /// frontier — `Alpenglow::run()`'s `clean_beyond_finalized` would then
-    /// WIPE the persisted chain and the producer would restart from slot 1.
-    /// Both sources are monotonic, so taking the max is safe.
+    /// Highest finalized slot, maxing live tracker and persisted restart frontier.
     fn finalized_slot(&self) -> Slot {
         self.finality_tracker
             .highest_finalized_slot()
@@ -830,7 +700,6 @@ impl Pool for PoolImpl {
         self.prune();
     }
 
-    /// Returns all possible parents for the given slot that are ready.
     fn parents_ready(&self, slot: Slot) -> &[BlockId] {
         self.parent_ready_tracker.parents_ready(slot)
     }
@@ -846,10 +715,7 @@ impl PoolImpl {
     }
 
     fn load_from_db(&mut self) {
-        // Restore the persisted floor, but treat it as a CLAIM to be verified
-        // against the valid certs below — it was written by the same run that
-        // may have persisted an invalid cert, so on its own it can pin the
-        // floor to finality that never really happened.
+        // Verify the persisted floor against the valid certs below.
         let mut meta_final_slot = None;
         if let Ok(Some(val)) = self.db.get(b"meta|final_slot")
             && val.len() == 8
@@ -865,14 +731,7 @@ impl PoolImpl {
                 && k.starts_with(b"cert|")
                 && let Ok(cert) = wincode::deserialize::<Cert>(&v)
             {
-                // Certs received over the network are threshold-checked
-                // before entering the pool, but locally-created certs
-                // are persisted as-is — an invalid cert written here
-                // once would be restored as truth on every restart,
-                // pinning this node's floor to finality no peer
-                // accepts. Drop (and delete) anything that fails
-                // validation so the floor re-derives from certs the
-                // peer will accept.
+                // Drop invalid persisted certs so they cannot pin unaccepted finality.
                 if !cert.check_threshold(&self.epoch_info) {
                     warn!(
                         "dropping persisted {} cert for slot {} failing stake \
@@ -899,14 +758,7 @@ impl PoolImpl {
             let _ = self.db.delete(k);
         }
 
-        // Keep honoring the persisted floor even where the invalid-cert purge
-        // above removed the cert that once "finalized" it. Rolling the floor
-        // back would make `clean_beyond_finalized` DELETE real chain history
-        // above the rolled-back floor. Instead the floor divergence heals by
-        // leapfrog: with cert creation fixed (votes stored before counting,
-        // see SlotState::add_vote), the next NEW finalization produces a cert
-        // the peer accepts, and finalizing that slot implicitly finalizes the
-        // whole ancestry on both nodes.
+        // Do not roll back the persisted floor; that can delete real chain history.
         if let Some(meta_slot) = meta_final_slot {
             self.highest_finalized_slot = self.highest_finalized_slot.max(meta_slot);
         }
@@ -944,12 +796,7 @@ impl PoolImpl {
             self.slot_state(slot).add_cert(cert.clone());
 
             match &cert {
-                // A fast-final cert is ≥80% notar votes — strictly stronger
-                // than a notar cert — so it must mark the parent-ready
-                // tracker on reload too. A slot whose only stored cert is
-                // FastFinal would otherwise vanish from the parent-ready
-                // chain after a restart, re-anchoring the next window on its
-                // parent and orphaning a FINALIZED block.
+                // Fast-final is stronger than notar and must rebuild parent-ready state.
                 Cert::Notar(_) | Cert::NotarFallback(_) | Cert::FastFinal(_) => {
                     if let Some(hash) = cert.block_hash() {
                         let block_id = (slot, hash.clone());
@@ -995,10 +842,7 @@ impl PoolImpl {
         let current_window_end = current_window_start + SLOTS_PER_WINDOW - 1;
 
         if fin < current_window_end && fin > 0 {
-            // Only emit mid-window timeouts for a genuine restart (fin > 0).
-            // At genesis (fin == 0), the first window hasn't started yet —
-            // emitting timeouts would skip-certify slots before the block
-            // producer has a chance to run.
+            // Do not emit genesis-window timeouts before the producer can run.
             println!(
                 "[Pool::load_from_db] Mid-window restart detected, emitting timeouts for slots {}..{}",
                 next_slot, current_window_end
@@ -1075,7 +919,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // all nodes notarize block in slot 0
         assert!(!pool.has_notar_cert(Slot::new(0)));
         for v in 0..11 {
             let vote = Vote::new_notar(Slot::new(0), GENESIS_BLOCK_HASH, &sks[v as usize], v);
@@ -1083,7 +926,6 @@ mod tests {
         }
         assert!(pool.has_notar_cert(Slot::new(0)));
 
-        // just enough nodes notarize block in slot 1
         assert!(!pool.has_notar_cert(Slot::new(1)));
         for v in 0..7 {
             let vote = Vote::new_notar(Slot::new(1), GENESIS_BLOCK_HASH, &sks[v as usize], v);
@@ -1091,7 +933,6 @@ mod tests {
         }
         assert!(pool.has_notar_cert(Slot::new(1)));
 
-        // just NOT enough nodes notarize block in slot 2
         assert!(!pool.has_notar_cert(Slot::new(2)));
         for v in 0..6 {
             let vote = Vote::new_notar(Slot::new(2), GENESIS_BLOCK_HASH, &sks[v as usize], v);
@@ -1107,7 +948,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // all nodes vote skip on slot 0
         assert!(!pool.has_skip_cert(Slot::new(0)));
         for v in 0..11 {
             let vote = Vote::new_skip(Slot::new(0), &sks[v as usize], v);
@@ -1115,7 +955,6 @@ mod tests {
         }
         assert!(pool.has_skip_cert(Slot::new(0)));
 
-        // just enough nodes vote skip on slot 1
         assert!(!pool.has_skip_cert(Slot::new(1)));
         for v in 0..7 {
             let vote = Vote::new_skip(Slot::new(1), &sks[v as usize], v);
@@ -1123,7 +962,6 @@ mod tests {
         }
         assert!(pool.has_skip_cert(Slot::new(1)));
 
-        // just NOT enough nodes notarize block in slot 2
         assert!(!pool.has_skip_cert(Slot::new(2)));
         for v in 0..6 {
             let vote = Vote::new_skip(Slot::new(2), &sks[v as usize], v);
@@ -1139,7 +977,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // just enough nodes vote notar, this is NOT enough on its own to finalize
         let slot1 = Slot::genesis().next();
         let hash1: BlockHash = Hash::random_for_test().into();
         for v in 0..7 {
@@ -1149,7 +986,6 @@ mod tests {
         assert!(!pool.has_final_cert(slot1));
         assert_eq!(pool.finalized_slot(), Slot::genesis());
 
-        // just enough nodes vote final, NOW slot 1 should be finalized
         for v in 0..7 {
             let vote = Vote::new_final(slot1, &sks[v as usize], v);
             assert_eq!(pool.add_vote(vote).await, Ok(()));
@@ -1157,7 +993,6 @@ mod tests {
         assert!(pool.has_final_cert(slot1));
         assert_eq!(pool.finalized_slot(), slot1);
 
-        // just enough nodes vote final, this is NOT enough on its own to finalize
         let slot2 = slot1.next();
         for v in 0..7 {
             let vote = Vote::new_final(slot2, &sks[v as usize], v);
@@ -1166,7 +1001,6 @@ mod tests {
         assert!(pool.has_final_cert(slot2));
         assert_eq!(pool.finalized_slot(), slot1);
 
-        // just enough nodes vote notar, NOW slot 2 should be finalized
         let hash2: BlockHash = Hash::random_for_test().into();
         for v in 0..7 {
             let vote = Vote::new_notar(slot2, hash2.clone(), &sks[v as usize], v);
@@ -1175,7 +1009,6 @@ mod tests {
         assert!(pool.has_final_cert(slot2));
         assert_eq!(pool.finalized_slot(), slot2);
 
-        // just NOT enough nodes vote notar + final on slot 3
         let slot3 = slot2.next();
         let hash3: BlockHash = Hash::random_for_test().into();
         for v in 0..6 {
@@ -1195,7 +1028,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // all nodes vote notarize on slot 0
         assert!(!pool.has_final_cert(Slot::new(0)));
         for v in 0..11 {
             let vote = Vote::new_notar(Slot::new(0), GENESIS_BLOCK_HASH, &sks[v as usize], v);
@@ -1204,7 +1036,6 @@ mod tests {
         assert!(pool.has_final_cert(Slot::new(0)));
         assert_eq!(pool.finalized_slot(), Slot::new(0));
 
-        // just enough nodes to fast finalize slot 1
         assert!(!pool.has_final_cert(Slot::new(1)));
         for v in 0..9 {
             let vote = Vote::new_notar(Slot::new(1), GENESIS_BLOCK_HASH, &sks[v as usize], v);
@@ -1213,7 +1044,6 @@ mod tests {
         assert!(pool.has_final_cert(Slot::new(1)));
         assert_eq!(pool.finalized_slot(), Slot::new(1));
 
-        // just NOT enough nodes to fast finalize slot 2
         assert!(!pool.has_final_cert(Slot::new(2)));
         for v in 0..8 {
             let vote = Vote::new_notar(Slot::new(2), GENESIS_BLOCK_HASH, &sks[v as usize], v);
@@ -1258,7 +1088,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // receive mixed notar & notar-fallback votes
         let window = Slot::genesis().slots_in_window().collect::<Vec<_>>();
         let hashes: Vec<BlockHash> = window
             .iter()
@@ -1289,7 +1118,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // first see skip votes for later slots
         let mut window = Slot::new(0).slots_in_window().collect::<Vec<_>>();
         assert!(window.len() > 2);
         window.remove(0);
@@ -1302,10 +1130,8 @@ mod tests {
         }
 
         let next = window.last().unwrap().next();
-        // no blocks are valid parents yet
         assert!(pool.parents_ready(next).is_empty());
 
-        // then see notarization votes for slot 1
         let slot1 = Slot::new(1);
         let hash1: BlockHash = Hash::random_for_test().into();
         for v in 0..7 {
@@ -1313,9 +1139,7 @@ mod tests {
             assert_eq!(pool.add_vote(vote).await, Ok(()));
         }
 
-        // branch can only be certified once we saw votes other slots in window
         assert!(pool.is_parent_ready(next, &(slot1, hash1)));
-        // no other blocks are valid parents
         assert_eq!(pool.parents_ready(next).len(), 1);
     }
 
@@ -1326,7 +1150,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info.clone(), votor_tx, repair_tx);
 
-        // first see skip votes for later slots
         let window = Slot::genesis().slots_in_window().collect::<Vec<_>>();
         assert!(window.len() > 2);
         for slot in window.iter().skip(2) {
@@ -1336,11 +1159,9 @@ mod tests {
             }
         }
 
-        // no blocks are valid parents yet
         let next = window.last().unwrap().next();
         assert!(pool.parents_ready(next).is_empty());
 
-        // then receive notarization cert for slot 1
         let slot1 = Slot::new(1);
         let hash1: BlockHash = Hash::random_for_test().into();
         let mut votes = Vec::new();
@@ -1350,7 +1171,6 @@ mod tests {
         let cert = NotarCert::try_new(&votes, &epoch_info.validators).unwrap();
         pool.add_cert(Cert::Notar(cert)).await.unwrap();
 
-        // branch can only be certified once we saw votes for parent
         assert!(pool.is_parent_ready(next, &(slot1, hash1)));
     }
 
@@ -1365,7 +1185,6 @@ mod tests {
             .map(|_| Hash::random_for_test().into())
             .collect();
 
-        // notarize all slots of first window
         for slot in 1..SLOTS_PER_WINDOW {
             let hash = &hashes[slot as usize];
             for v in 0..7 {
@@ -1394,7 +1213,6 @@ mod tests {
             .map(|_| Hash::random_for_test().into())
             .collect();
 
-        // notarize all slots but last one
         for slot in 1..SLOTS_PER_WINDOW - 1 {
             for v in 0..7 {
                 let vote = Vote::new_notar(
@@ -1407,7 +1225,6 @@ mod tests {
             }
         }
 
-        // skip last slot
         for v in 0..7 {
             let vote = Vote::new_skip(Slot::new(SLOTS_PER_WINDOW - 1), &sks[v as usize], v);
             assert_eq!(pool.add_vote(vote).await, Ok(()));
@@ -1433,7 +1250,6 @@ mod tests {
             .map(|_| Hash::random_for_test().into())
             .collect::<Vec<_>>();
 
-        // notarize all slots but last two
         for slot in 1..SLOTS_PER_WINDOW - 2 {
             for v in 0..7 {
                 let vote = Vote::new_notar(
@@ -1446,7 +1262,6 @@ mod tests {
             }
         }
 
-        // skip last 2 slots
         for v in 0..7 {
             let vote = Vote::new_skip(Slot::new(SLOTS_PER_WINDOW - 2), &sks[v as usize], v);
             assert_eq!(pool.add_vote(vote).await, Ok(()));
@@ -1476,7 +1291,6 @@ mod tests {
             .map(|_| Hash::random_for_test().into())
             .collect();
 
-        // notarize all slots in first window
         for slot in 1..SLOTS_PER_WINDOW {
             for v in 0..7 {
                 let vote = Vote::new_notar(
@@ -1489,7 +1303,6 @@ mod tests {
             }
         }
 
-        // skip all slots in second window
         for slot in 0..SLOTS_PER_WINDOW {
             for v in 0..7 {
                 let vote = Vote::new_skip(Slot::new(SLOTS_PER_WINDOW + slot), &sks[v as usize], v);
@@ -1517,7 +1330,6 @@ mod tests {
             .map(|_| Hash::random_for_test().into())
             .collect();
 
-        // all nodes vote to fast finalize 3 leader windows
         for slot in 1..3 * SLOTS_PER_WINDOW {
             let slot = Slot::new(slot);
             let hash: &BlockHash = &hashes[slot.inner() as usize];
@@ -1531,14 +1343,12 @@ mod tests {
         let last_slot = Slot::new(3 * SLOTS_PER_WINDOW - 1);
         assert_eq!(pool.finalized_slot(), last_slot);
 
-        // finalization triggers pruning, only last slot should be there
         for slot in 0..last_slot.inner() {
             let slot = Slot::new(slot);
             assert!(!pool.slot_states.contains_key(&slot));
         }
         assert!(pool.slot_states.contains_key(&(last_slot)));
 
-        // NOT enough nodes vote to fast finalize next 10 slots
         for s in 1..=10 {
             let slot = Slot::new(last_slot.inner() + s);
             let hash: &BlockHash = &hashes[slot.inner() as usize];
@@ -1550,13 +1360,11 @@ mod tests {
         }
         assert_eq!(pool.finalized_slot(), last_slot);
 
-        // these slots should still be there
         for s in 0..=10 {
             let slot = Slot::new(last_slot.inner() + s);
             assert!(pool.slot_states.contains_key(&slot));
         }
 
-        // add one more vote each to finalize next 10 slots
         for s in 1..=10 {
             let slot = Slot::new(last_slot.inner() + s);
             let hash: &BlockHash = &hashes[slot.inner() as usize];
@@ -1566,7 +1374,6 @@ mod tests {
         }
         assert_eq!(pool.finalized_slot().inner(), last_slot.inner() + 10);
 
-        // NOW next 10 slots should be gone
         for s in 0..10 {
             let slot = Slot::new(last_slot.inner() + s);
             assert!(!pool.slot_states.contains_key(&slot));
@@ -1582,15 +1389,12 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // insert a notar vote from validator 0
         let vote = Vote::new_notar(Slot::new(0), GENESIS_BLOCK_HASH, &sks[0], 0);
         assert_eq!(pool.add_vote(vote).await, Ok(()));
 
-        // insert a skip vote from validator 1
         let vote = Vote::new_skip(Slot::new(0), &sks[1], 1);
         assert_eq!(pool.add_vote(vote).await, Ok(()));
 
-        // inserting same votes again should fail
         let vote = Vote::new_notar(Slot::new(0), GENESIS_BLOCK_HASH, &sks[0], 0);
         assert_eq!(pool.add_vote(vote).await, Err(AddVoteError::Duplicate));
         let vote = Vote::new_skip(Slot::new(0), &sks[1], 1);
@@ -1604,7 +1408,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info.clone(), votor_tx, repair_tx);
 
-        // insert a notar cert for first slot
         let mut votes = Vec::new();
         let first_slot = Slot::genesis().next();
         let hash: BlockHash = Hash::random_for_test().into();
@@ -1619,7 +1422,6 @@ mod tests {
         let notar_cert = NotarCert::try_new(&votes, &epoch_info.validators).unwrap();
         assert_eq!(pool.add_cert(Cert::Notar(notar_cert.clone())).await, Ok(()));
 
-        // insert a skip cert for slot 1
         let mut votes = Vec::new();
         let second_slot = first_slot.next();
         for v in 0..11 {
@@ -1628,7 +1430,6 @@ mod tests {
         let skip_cert = SkipCert::try_new(&votes, &epoch_info.validators).unwrap();
         assert_eq!(pool.add_cert(Cert::Skip(skip_cert.clone())).await, Ok(()));
 
-        // inserting same certs again should fail
         assert_eq!(
             pool.add_cert(Cert::Notar(notar_cert)).await,
             Err(AddCertError::Duplicate)
@@ -1646,7 +1447,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // all nodes vote finalize last slot of 3rd leader windows
         let slot = Slot::new(3 * SLOTS_PER_WINDOW - 1);
         for v in 0..11 {
             let vote = Vote::new_notar(slot, GENESIS_BLOCK_HASH, &sks[v as usize], v);
@@ -1654,7 +1454,6 @@ mod tests {
         }
         assert_eq!(pool.finalized_slot(), slot);
 
-        // dismiss old votes
         for slot in 0..3 * SLOTS_PER_WINDOW - 1 {
             for v in 0..11 {
                 let vote = Vote::new_final(Slot::new(slot), &sks[v as usize], v);
@@ -1665,7 +1464,6 @@ mod tests {
             }
         }
 
-        // dismiss far-in-the-future vote
         let slot = Slot::new(5 * SLOTS_PER_EPOCH);
         for v in 0..11 {
             let vote = Vote::new_final(slot, &sks[v as usize], v);
@@ -1683,7 +1481,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info.clone(), votor_tx, repair_tx);
 
-        // insert a notar cert for last slot of 3rd leader window
         let slot = Slot::new(3 * SLOTS_PER_WINDOW - 1);
         let mut votes = Vec::new();
         for v in 0..11 {
@@ -1700,7 +1497,6 @@ mod tests {
             Ok(())
         );
 
-        // dismiss old certs
         for slot in 0..3 * SLOTS_PER_WINDOW - 1 {
             let mut votes = Vec::new();
             for v in 0..11 {
@@ -1713,7 +1509,6 @@ mod tests {
             );
         }
 
-        // dismiss far-in-the-future certs
         let slot = Slot::new(3 * SLOTS_PER_EPOCH);
         let mut votes = Vec::new();
         for v in 0..11 {
@@ -1733,7 +1528,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // all nodes vote for first slot (it's fast finalized)
         let slot1 = Slot::genesis().next();
         let hash1: BlockHash = Hash::random_for_test().into();
         for v in 0..11 {
@@ -1741,22 +1535,18 @@ mod tests {
             assert_eq!(pool.add_vote(vote).await, Ok(()));
         }
 
-        // we also vote for next slot, see only final votes (it's missing notar)
         let slot2 = slot1.next();
         for v in 0..7 {
             let vote = Vote::new_final(slot2, &sks[v as usize], v);
             assert_eq!(pool.add_vote(vote).await, Ok(()));
         }
 
-        // we also vote for next slot, see no other votes
         let slot3 = slot2.next();
         let vote = Vote::new_notar(slot3, Hash::random_for_test().into(), &sks[0], 0);
         assert_eq!(pool.add_vote(vote).await, Ok(()));
 
-        // initiate standstill
         pool.recover_from_standstill().await;
 
-        // wait for standstill event
         let (slot, certs, votes) = loop {
             let event = votor_rx.recv().await.unwrap();
             match event {
@@ -1770,7 +1560,6 @@ mod tests {
             }
         };
 
-        // check against expected response
         assert_eq!(slot, slot2);
         assert_eq!(certs.len(), 2);
         for cert in certs {
@@ -1795,10 +1584,7 @@ mod tests {
         }
     }
 
-    /// A block whose parent slot is not strictly earlier than its own slot
-    /// (equal, or in the future) must be dropped by `add_block`, not panic the
-    /// consensus task — asserting instead would let a single malformed or
-    /// hostile block from a peer crash the node.
+    /// Malformed parent links must be dropped without panicking consensus.
     #[tokio::test]
     async fn add_block_rejects_non_earlier_parent_without_panic() {
         let (_sks, epoch_info) = generate_validators(11);
@@ -1812,38 +1598,26 @@ mod tests {
             Hash::random_for_test().into(),
         );
 
-        // parent == self: must be dropped (no panic, no events emitted).
         pool.add_block((slot, hash.clone()), (slot, parent_hash.clone()))
             .await;
-        // parent in the future: likewise dropped.
         pool.add_block((slot, hash), (slot.next(), parent_hash))
             .await;
 
-        // No consensus event may be emitted for a dropped malformed block, and
-        // crucially the two calls above must not have panicked.
+        // Dropped malformed blocks must not emit consensus events.
         assert!(
             matches!(votor_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
             "a malformed block must not drive any consensus events"
         );
     }
 
-    /// The last slot of an epoch is also the last slot of a window, so it can be
-    /// finalized only *implicitly* (a later slot fast-finalizes and finalizes it
-    /// by descent). The epoch-boundary event must still fire in that case —
-    /// checking it only for the directly finalized cert slot silently skips
-    /// the epoch transition. Here slot 17999 (last in epoch 0) is implicitly
-    /// finalized by fast-finalizing slot 18000, and we assert an
-    /// `EpochBoundaryEvent` for epoch 0 is emitted.
+    /// Epoch-boundary events fire even when the boundary slot finalizes implicitly.
     #[tokio::test]
     async fn epoch_boundary_fires_on_implicit_finalization() {
         let (sks, epoch_info) = generate_validators(11);
         let (votor_tx, _votor_rx) = mpsc::channel(1024);
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let (epoch_tx, mut epoch_rx) = mpsc::channel(16);
-        // Isolated DB: this test persists certs at slots 17999/18000, which
-        // would otherwise poison every later pool test that reloads the shared
-        // `data/pool/{id}` DB (their slot-0..2 votes get rejected as below the
-        // restored frontier).
+        // Isolate the DB because this test persists far-future certs.
         let db_path = format!(
             "{}/bunkerglow-pool-epoch-boundary-{}",
             std::env::temp_dir().display(),
@@ -1853,8 +1627,6 @@ mod tests {
         let mut pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
         pool.set_epoch_boundary_channel(epoch_tx);
 
-        // Last slot of epoch 0 (== last slot of its window) and first slot of
-        // epoch 1.
         let boundary = Slot::new(SLOTS_PER_EPOCH - 1);
         assert!(boundary.is_last_in_epoch());
         let next = boundary.next();
@@ -1864,15 +1636,13 @@ mod tests {
             Hash::random_for_test().into(),
         );
 
-        // Notarize the boundary slot (so the tracker holds a Notarized status it
-        // can later upgrade to ImplicitlyFinalized), but do NOT finalize it.
+        // Leave the boundary notarized, not directly finalized.
         for v in 0..7 {
             let vote = Vote::new_notar(boundary, bhash.clone(), &sks[v as usize], v);
             assert_eq!(pool.add_vote(vote).await, Ok(()));
         }
         assert!(pool.has_notar_cert(boundary));
 
-        // Register the parent link next -> boundary, then fast-finalize `next`.
         // Fast-finalizing `next` finalizes `boundary` implicitly by descent.
         pool.add_block((next, nhash.clone()), (boundary, bhash.clone()))
             .await;
@@ -1882,7 +1652,6 @@ mod tests {
         }
         assert!(pool.has_final_cert(next));
 
-        // Drain the epoch-boundary channel: an event for epoch 0 must be present.
         let mut saw_epoch_0 = false;
         while let Ok(ev) = epoch_rx.try_recv() {
             if ev.epoch == 0 {
@@ -1897,12 +1666,7 @@ mod tests {
         );
     }
 
-    /// Finalization must prune the pool's side trackers, not just
-    /// `slot_states`: `FinalityTracker` (status + parent links),
-    /// `ParentReadyTracker`, and `s2n_waiting_parent_cert` otherwise grow one
-    /// entry per slot/block forever — the dominant steady memory leak on a
-    /// long-running node. After fast-finalizing slot 5 (window 4..8), no
-    /// tracker entry below the window start (slot 4) may survive.
+    /// Finalization prunes side trackers, not just `slot_states`.
     #[tokio::test]
     async fn prune_shrinks_side_trackers() {
         let (sks, epoch_info) = generate_validators(11);
@@ -1916,7 +1680,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&db_path);
         let mut pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
 
-        // Build a parent chain 1 <- 2 <- 3 <- 4 <- 5 (one block per slot).
         let hashes: Vec<BlockHash> = (0..=5).map(|_| Hash::random_for_test().into()).collect();
         for slot in 2..=5u64 {
             pool.add_block(
@@ -1927,23 +1690,16 @@ mod tests {
         }
         assert_eq!(pool.finality_tracker.parents_len(), 4);
 
-        // Fast-finalize slot 5 (strong quorum of notar votes). This implicitly
-        // finalizes the whole chain below and then prunes at the window start
-        // (slot 4, SLOTS_PER_WINDOW = 4).
+        // Slot 5 fast-finalizes the chain and prunes at window start 4.
         for v in 0..11 {
             let vote = Vote::new_notar(Slot::new(5), hashes[5].clone(), &sks[v as usize], v);
             assert_eq!(pool.add_vote(vote).await, Ok(()));
         }
         assert_eq!(pool.finalized_slot(), Slot::new(5));
 
-        // Only the current window's entries survive: parent links for children
-        // in slots >= 4 (4->3, 5->4), status for slots >= 4 (4, 5).
         assert_eq!(pool.finality_tracker.parents_len(), 2);
         assert_eq!(pool.finality_tracker.status_len(), 2);
-        // Parent-ready states for slots below 4 (incl. genesis) are gone.
         assert!(pool.parent_ready_tracker.len() <= 3);
-        // Waiting-for-parent-cert entries with parents below the window start
-        // are gone; only the (parent slot 4 -> child slot 5) entry may remain.
         assert!(pool.s2n_waiting_parent_cert.len() <= 1);
         assert!(
             pool.s2n_waiting_parent_cert
@@ -1959,7 +1715,6 @@ mod tests {
         let (repair_tx, _repair_rx) = mpsc::channel(1024);
         let mut pool = PoolImpl::new(epoch_info, votor_tx, repair_tx);
 
-        // fast finalize block in 2nd slot of 2nd window
         let slot1 = Slot::windows().nth(1).unwrap();
         let slot0 = slot1.prev();
         let slot2 = slot1.next();
@@ -1973,25 +1728,21 @@ mod tests {
             assert_eq!(pool.add_vote(vote).await, Ok(()));
         }
 
-        // should construct 3 certs (notar-fallback + notar + fast-final)
         for _ in 0..3 {
             let event = votor_rx.recv().await;
             assert!(matches!(event, Some(VotorEvent::CertCreated(_))));
         }
 
-        // no ParentReady yet
         assert_eq!(
             votor_rx.try_recv().err(),
             Some(mpsc::error::TryRecvError::Empty)
         );
 
-        // add its ancestors
         pool.add_block((slot2, hash2.clone()), (slot1, hash1.clone()))
             .await;
         pool.add_block((slot1, hash1.clone()), (slot0, hash0.clone()))
             .await;
 
-        // should emit ParentReady as a result
         let Ok(event) = votor_rx.try_recv() else {
             panic!("expected to receive ParentReady event");
         };

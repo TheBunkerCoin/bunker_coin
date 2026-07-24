@@ -1,23 +1,8 @@
-//! Empty-block Alpenglow consensus over a single PACTOR link.
+//! Two-validator Alpenglow consensus over one PACTOR link.
 //!
-//! Runs the real Alpenglow consensus loop (block production → shred
-//! dissemination → Votor voting → certification → finalization) between **two**
-//! validators, producing **empty blocks** (no transactions), with all five
-//! logical networks multiplexed over **one** half-duplex PACTOR link via
-//! [`PactorMux`].
-//!
-//! ## Modes
-//!
-//! - `--simulated` — builds *both* nodes in-process over a [`SimulatedPactorPair`]
-//!   and runs them against each other. Proves the consensus-over-mux wiring end
-//!   to end with no radio (CI-friendly). This is the focus of the current
-//!   increment.
-//! - `--port <dev> --node <0|1>` — runs *one* node over a real modem. **Modem
-//!   bring-up is not yet wired here**; the proven init/connect flow lives in the
-//!   `pactor_hw_test` binary and will be factored into a shared module next.
-//!
-//! Both nodes derive the same 2-validator set from a fixed `--seed` so keys and
-//! stake match; they differ only in which `own_id` they run.
+//! Simulated mode runs both validators in-process; hardware mode runs one
+//! validator per modem. Both derive membership from `--seed` and multiplex all
+//! logical networks through [`PactorMux`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -49,39 +34,32 @@ use rand::{RngCore, SeedableRng};
 use scs_pactor::{PactorTransport, SimulatedPactorConfig, SimulatedPactorPair, UsbPactorTransport};
 use std::collections::HashMap;
 
-/// The five logical networks, each a [`MuxChannel`] sharing one PACTOR link.
+/// Logical networks multiplexed over one PACTOR link.
 type MuxAll2All = MuxChannel<ConsensusMessage, ConsensusMessage>;
 type MuxShred = MuxChannel<Shred, Shred>;
 type MuxRepair = MuxChannel<RepairRequest, RepairResponse>;
 type MuxRepairReq = MuxChannel<RepairResponse, RepairRequest>;
 type MuxTxs = MuxChannel<Transaction, Transaction>;
 
-/// Per-node mempool over the Txs mux channel. Shared (`Arc`) between the node
-/// (as the producer's `txs_receiver`) and this binary (for `submit`/`evict`).
+/// Per-node mempool over the Txs mux channel.
 type NodeMempool = Arc<Mempool<MuxTxs>>;
 
-/// A full Alpenglow node whose networks are all multiplexed over PACTOR. The
-/// transactions network is the per-node [`Mempool`], not the raw Txs channel, so
-/// the block producer packs from mempool-ordered pending txs.
+/// Alpenglow node whose consensus networks share the PACTOR mux.
 type Node =
     Alpenglow<TrivialAll2All<MuxAll2All>, Rotor<MuxShred, StakeWeightedSampler>, NodeMempool>;
 
 #[derive(Parser)]
 #[command(version, about = "Empty-block Alpenglow consensus over PACTOR", long_about = None)]
 struct Args {
-    /// Run both nodes in-process over a simulated PACTOR pair (no radio).
+    /// Run both validators in-process over a simulated PACTOR pair.
     #[arg(long)]
     simulated: bool,
 
-    /// With --simulated, enable half-duplex turn discipline (exercises the
-    /// turn-grant/changeover handoff that real PACTOR needs).
+    /// In simulated mode, exercise half-duplex turn handoff.
     #[arg(long)]
     half_duplex: bool,
 
-    /// With --simulated, per-frame packet loss percentage (0-90). Lost frames
-    /// are retransmitted by the simulated link (as real PACTOR ARQ would), so
-    /// consensus still converges — but the radio-stats panel shows real,
-    /// changing dropped/loss/queued figures instead of a lossless link's zeros.
+    /// Simulated per-frame packet loss percentage; ARQ retries preserve delivery.
     #[arg(long, default_value_t = 0.0)]
     packet_loss: f32,
 
@@ -109,9 +87,7 @@ struct Args {
     #[arg(long)]
     frequency: Option<f64>,
 
-    /// Consensus timing multiplier (stretches block cadence / timeouts to match
-    /// a slow link). Hardware defaults to 6; override for a faster/slower link.
-    /// Sets BUNKER_DELTA_MULT before consensus starts.
+    /// Consensus timing multiplier for slow links; sets `BUNKER_DELTA_MULT`.
     #[arg(long)]
     delta_mult: Option<f64>,
 
@@ -127,64 +103,42 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     seed: u64,
 
-    /// How long to run before shutting down, in seconds. Omit to run
-    /// continuously until Ctrl-C (graceful shutdown on signal).
+    /// Run duration in seconds; omitted means run until Ctrl-C.
     #[arg(long)]
     duration: Option<u64>,
 
-    /// Serve the HTTP RPC API (same endpoints as the simulation) on
-    /// 127.0.0.1:3001, reading blocks from this node's live block store. Query
-    /// e.g. `curl localhost:3001/block/slot/4` or `curl localhost:3001/blocks`.
+    /// Serve the HTTP RPC API on 127.0.0.1:3001.
     #[arg(long)]
     rpc: bool,
 
-    /// Inspect the persisted chain WITHOUT touching the modem: open this node's
-    /// on-disk block store (under the current dir's `data/`) and serve the RPC API
-    /// so `/blocks` etc. are queryable offline. Needs `--node <id>` to pick which
-    /// node's store to read. Runs until Ctrl-C (or `--duration`).
+    /// Serve RPC over the persisted chain without touching the modem.
     #[arg(long)]
     inspect: bool,
 }
 
-/// Block-store handle type shared between a node and the RPC server.
+/// Block store shared by a node and the RPC server.
 type SharedBlockstore =
     Arc<tokio::sync::RwLock<Box<dyn bunkerglow::consensus::Blockstore + Send + Sync>>>;
 
-/// The shared RPC surfaces threaded through the node: transaction submission,
-/// mempool, execution state, and per-tx results. Constructed once per node and
-/// handed to both the RPC server and the finalized-block executor so the API
-/// reflects real transaction processing.
+/// RPC-facing transaction, execution, node, and radio state.
 #[derive(Clone)]
 struct TxContext {
-    /// Sender the RPC `/submit` handler pushes client transactions onto; drained
-    /// by the tx-bridge task, which injects them into consensus.
     tx_sender: tokio::sync::mpsc::UnboundedSender<CoreTransaction>,
-    /// Genesis-funded execution state, updated as finalized blocks are executed.
     execution_state: Arc<tokio::sync::RwLock<ExecutionState>>,
-    /// Pending client transactions awaiting inclusion (for the RPC mempool view).
     mempool: Arc<tokio::sync::RwLock<Vec<rpc::MempoolEntry>>>,
-    /// Finalized/failed outcome per tx hash, populated by the executor.
     tx_results: Arc<tokio::sync::RwLock<HashMap<String, rpc::TxResult>>>,
-    /// Insertion order of `tx_results`, so the map can be capped FIFO
-    /// instead of growing by one entry per finalized tx forever.
+    /// FIFO order for capping retained `/tx/{hash}` results.
     tx_results_order: Arc<tokio::sync::RwLock<std::collections::VecDeque<String>>>,
-    /// Genesis ed25519 key, so the RPC can server-side-sign transactions whose
-    /// sender is the genesis account (submit with an all-zero signature).
+    /// Genesis key used to server-side-sign zero-signature account transactions.
     genesis_signing_key: Arc<SigningKey>,
-    /// Validator statuses served by `/nodes`, updated by the block executor.
-    /// In this two-node setup finalization requires both validators' votes, so
-    /// the local finalized frontier is (modulo reverse-path lag) the network's.
+    /// `/nodes` follows the local finalized frontier in this two-validator network.
     nodes: Arc<tokio::sync::RwLock<Vec<rpc::NodeStatus>>>,
-    /// WebSocket update channel shared with the RPC server, so long-lived tasks
-    /// (e.g. the radio-stats sampler) can push updates to connected clients.
     updates: tokio::sync::broadcast::Sender<rpc::WebSocketUpdate>,
-    /// Radio link stats served by `/radio`, updated by the radio-stats sampler.
     radio_stats: Arc<tokio::sync::RwLock<rpc::RadioStats>>,
 }
 
 impl TxContext {
-    /// Build a fresh context around this node's genesis-funded execution state.
-    /// The returned `UnboundedReceiver` is consumed by the tx-bridge task.
+    /// Build a context and return the RPC transaction receiver.
     fn new(
         cluster: &Cluster,
         execution_state: Arc<tokio::sync::RwLock<ExecutionState>>,
@@ -197,8 +151,6 @@ impl TxContext {
             tx_results: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             tx_results_order: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
             genesis_signing_key: Arc::new(cluster.genesis_key.clone()),
-            // Both validators of the two-node cluster, so `/nodes` is populated
-            // from startup (finalized_slot advances via the block executor).
             nodes: Arc::new(tokio::sync::RwLock::new(vec![
                 rpc::NodeStatus {
                     node_id: 0,
@@ -225,11 +177,7 @@ impl TxContext {
         (ctx, tx_rx)
     }
 
-    /// Rebind this context to a new session's execution state, keeping the same
-    /// `tx_sender`, mempool, tx_results, and genesis key. Used on the hardware
-    /// path, where each reconnect builds a fresh (genesis) execution state that
-    /// the block executor rebuilds by replaying the persisted finalized chain,
-    /// while the client-facing mempool/results persist across the drop.
+    /// Rebind execution state for a reconnect while preserving RPC-facing state.
     fn with_execution_state(
         &self,
         execution_state: Arc<tokio::sync::RwLock<ExecutionState>>,
@@ -248,44 +196,25 @@ impl TxContext {
     }
 }
 
-/// Cumulative I/O counters observed at the PACTOR transport boundary. Created
-/// once per process and shared across reconnect sessions, so the radio-stats
-/// sampler sees one continuous byte stream regardless of link drops.
+/// Cumulative PACTOR I/O counters shared across reconnect sessions.
 #[derive(Default)]
 struct LinkCounters {
     frames_sent: AtomicU64,
     bytes_sent: AtomicU64,
     frames_received: AtomicU64,
     bytes_received: AtomicU64,
-    /// Last modem-reported PACTOR speed level (passive LinkQuality status
-    /// events, recorded as they pass through `next_event`). 0 = none yet.
+    /// Last modem-reported PACTOR speed level; 0 means none yet.
     speed_level: AtomicU64,
-    /// Cumulative frame retransmissions reported by the link (LinkQuality
-    /// events carry the retry count a frame needed before delivery). Each
-    /// retry is a frame the channel lost and had to resend — the honest
-    /// "dropped"/loss signal where the transport reports it (the simulator
-    /// does; PACTOR hardware ARQ retransmits below the observable layer).
+    /// Cumulative frame retransmissions reported by transports that expose them.
     frames_retried: AtomicU64,
-    /// Live outbound-queue depth (messages enqueued in the mux but not yet
-    /// transmitted), published by the mux's gauge sampler.
+    /// Live mux outbound-queue depth.
     outbound_queued: Arc<AtomicU64>,
 }
 
-/// Consecutive `write_data` failures after which the link is declared dead.
-/// A wedged modem (hostmode transactions timing out) never sends an explicit
-/// disconnect event, so `is_link_up` would stay true and the session stall
-/// forever. Three consecutive failed writes ≈ several minutes of a dead
-/// exchange — tear the session down and let the reconnect + --reset
-/// machinery recover it.
+/// Consecutive `write_data` failures after which a wedged link is reconnected.
 const WRITE_FAILURES_LINK_DOWN: u64 = 3;
 
-/// Seconds without a single received byte after which the link is declared
-/// dead (override with BUNKER_RX_STALL_SECS). Catches the BLACK-HOLED link the
-/// write watchdog cannot see: a modem stuck in a stale "connected" state
-/// accepts writes into its buffer while nothing crosses the air — and also
-/// refuses the peer's reconnect calls. On this network there is no legitimate
-/// 10-minute radio silence: blocks, votes, or standstill rebroadcasts cross
-/// every couple of minutes.
+/// Receive-stall watchdog threshold; catches links that accept writes but deliver no bytes.
 fn rx_stall_link_down_secs() -> u64 {
     std::env::var("BUNKER_RX_STALL_SECS")
         .ok()
@@ -293,18 +222,13 @@ fn rx_stall_link_down_secs() -> u64 {
         .unwrap_or(600)
 }
 
-/// Transparent [`PactorTransport`] wrapper that counts frames and bytes going
-/// over the modem, so the RPC can serve real link throughput (`/radio` and the
-/// `radio_stats` WebSocket update the explorer's live stats panel waits for).
-/// Also watchdogs the link: consecutive write failures flip `is_link_up`.
+/// Transport wrapper that counts I/O and exposes link watchdog state.
 struct CountingTransport {
     inner: Arc<dyn PactorTransport>,
     counters: Arc<LinkCounters>,
-    /// Per-session (this wrapper wraps one session's transport), so a fresh
-    /// reconnect never inherits a stale failure count.
+    /// Session-local, so reconnects do not inherit stale failures.
     consecutive_write_failures: AtomicU64,
-    /// When we last received bytes (session start seeds it, so bring-up gets
-    /// the full grace period). Drives the rx-stall link watchdog.
+    /// Last receive time for the rx-stall watchdog.
     last_rx: std::sync::Mutex<Instant>,
 }
 
@@ -375,9 +299,7 @@ impl PactorTransport for CountingTransport {
             return false;
         }
         if self.consecutive_write_failures.load(Ordering::Relaxed) >= WRITE_FAILURES_LINK_DOWN {
-            // Wedged modem: transactions time out but no disconnect event ever
-            // arrives. Declare the link down so the session watch tears it
-            // down and the reconnect path (--reset) recovers.
+            // A wedged modem may not emit disconnect; force reconnect.
             return false;
         }
         self.inner.is_link_up()
@@ -388,9 +310,7 @@ impl PactorTransport for CountingTransport {
         timeout_after: Option<Duration>,
     ) -> Result<scs_pactor::PactorLinkEvent, scs_pactor::ScsPactorError> {
         let event = self.inner.next_event(timeout_after).await;
-        // Record the modem's negotiated speed level and any frame retries as
-        // events pass through — the honest live band-health signals for the
-        // radio-stats panel.
+        // Capture passive link-quality events for radio stats.
         if let Ok(scs_pactor::PactorLinkEvent::LinkQuality {
             speed_level,
             retries,
@@ -413,12 +333,7 @@ impl PactorTransport for CountingTransport {
     }
 }
 
-/// Drive the transport's passive event stream so LinkQuality status events
-/// (modem speed level) are observed. Nothing else on this path consumes
-/// `next_event`, so without a driver the events would sit unread; the
-/// recording itself happens inside [`CountingTransport::next_event`]. Ends
-/// when the session's cancel token fires (each session wraps a fresh
-/// transport).
+/// Drive passive link-quality events so [`CountingTransport`] can record them.
 fn spawn_link_quality_poller(
     transport: Arc<dyn PactorTransport>,
     cancel: tokio_util::sync::CancellationToken,
@@ -429,7 +344,7 @@ fn spawn_link_quality_poller(
                 () = cancel.cancelled() => break,
                 ev = transport.next_event(Some(Duration::from_secs(5))) => {
                     if ev.is_err() {
-                        // Timeout (no event) or torn-down transport: don't spin.
+                        // Avoid spinning on timeout or torn-down transport.
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
@@ -438,20 +353,11 @@ fn spawn_link_quality_poller(
     });
 }
 
-/// Number of 2s samples in the radio-stats rolling window (15 × 2s = 30s).
+/// Number of 2s samples in the 30s radio-stats window.
 const RADIO_STATS_WINDOW_SAMPLES: usize = 15;
 
-/// Every 2s, turn the transport counters into the `radio_stats` WebSocket
-/// update (which the explorer's live stats panel renders) and the `/radio`
-/// REST stats. Reports a ROLLING 30s WINDOW rather than raw 2s deltas: on a
-/// half-duplex HF link traffic comes in bursts with long quiet gaps, so most
-/// 2s snapshots are genuinely zero and the panel strobed 0 between bursts.
-/// The windowed figures show the link's recent activity at any moment.
-/// Only counters we actually observe are reported: dropped/loss come from the
-/// transport's LinkQuality retry reports (real on the simulated link; PACTOR
-/// hardware ARQ retransmits below the observable layer, so on-air they stay 0
-/// rather than being fabricated), and queued is the live mux outbound-queue
-/// depth.
+/// Publish a rolling 30s radio-stats window for `/radio` and WebSocket clients.
+/// Dropped/loss are reported only when the transport exposes retry counts.
 fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
     let updates = tx.updates.clone();
     let radio_stats = tx.radio_stats.clone();
@@ -460,8 +366,7 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
         let mut last_sent_bytes = 0u64;
         let mut last_recv_bytes = 0u64;
         let mut last_retried = 0u64;
-        // Ring of (frames_sent, bytes_sent, bytes_received, frames_retried)
-        // per 2s tick.
+        // Per-sample deltas: frames sent, bytes sent, bytes received, retries.
         let mut window: std::collections::VecDeque<(u64, u64, u64, u64)> =
             std::collections::VecDeque::with_capacity(RADIO_STATS_WINDOW_SAMPLES);
         loop {
@@ -492,8 +397,7 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
             let w_retried: u64 = window.iter().map(|s| s.3).sum();
             let window_secs = (window.len() * 2) as f64;
 
-            // Loss rate over the window: retransmitted frames as a fraction of
-            // all frame transmissions (delivered + retried attempts).
+            // Loss is retries over delivered-plus-retried frame attempts.
             let loss_rate = if w_frames + w_retried > 0 {
                 w_retried as f64 / (w_frames + w_retried) as f64
             } else {
@@ -501,9 +405,7 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
             };
             let queued = counters.outbound_queued.load(Ordering::Relaxed);
 
-            // Throughput counts both directions: this node's transmissions and
-            // what it hears from the peer — i.e. traffic on the shared channel,
-            // averaged over the window.
+            // Throughput counts both directions on the shared channel.
             let throughput_bps = ((w_sent + w_recv) * 8) as f64 / window_secs;
 
             let speed_level = counters.speed_level.load(Ordering::Relaxed);
@@ -518,14 +420,8 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
                 stats.link_speed_level = speed_level;
             }
 
-            // Windowed totals in the *_2s fields (the wire names are historic;
-            // the explorer labels the panel with the actual window length).
-            // Dropped/loss come from LinkQuality retry reports (each retry is a
-            // frame the channel lost and had to resend) — real where the
-            // transport reports them (the simulator does; PACTOR hardware ARQ
-            // retransmits below the observable layer, so on-air they stay 0
-            // rather than being fabricated). Queued is the mux outbound-queue
-            // depth. No WS client connected is fine; send() just returns Err.
+            // Wire field names still say 2s, but values are windowed totals.
+            // No WebSocket client connected is fine; send() just returns Err.
             let _ = updates.send(rpc::WebSocketUpdate::RadioStats {
                 packets_sent_2s: w_frames,
                 packets_dropped_2s: w_retried,
@@ -541,15 +437,7 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
     });
 }
 
-/// Build an RPC [`SharedState`](rpc::SharedState) backed by `blockstore` and the
-/// node's live transaction context.
-///
-/// Reuses `rpc::run_api` (the exact server the simulations expose) so the chain
-/// AND its transaction state are queryable through the same endpoints —
-/// `/blocks`, `/block/slot/{n}`, `/transactions` (submit), `/account/{pk}`,
-/// `/tx/{hash}`, `/ws`, … Transactions submitted here are injected into
-/// consensus, packed into blocks, and executed on finalization (see
-/// [`spawn_tx_bridge`] and [`spawn_block_executor`]).
+/// Build RPC state backed by the live blockstore and transaction context.
 fn rpc_state_for(blockstore: SharedBlockstore, tx: &TxContext) -> rpc::SharedState {
     rpc::SharedState {
         blocks: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -566,26 +454,17 @@ fn rpc_state_for(blockstore: SharedBlockstore, tx: &TxContext) -> rpc::SharedSta
     }
 }
 
-/// Spawn the RPC server over `blockstore` + `tx` context (used by the simulated,
-/// never-reconnect path; the hardware path spawns/aborts it per session inline).
+/// Spawn RPC for the simulated, non-reconnect path.
 fn spawn_rpc(blockstore: SharedBlockstore, tx: &TxContext) {
     println!("RPC API serving on http://127.0.0.1:3001 (try /blocks, POST /transactions)");
     tokio::spawn(rpc::run_api(rpc_state_for(blockstore, tx)));
 }
 
-/// A slot holding the *current* per-node mempool. On the hardware path the
-/// mempool is rebuilt every reconnect (each session has a fresh mux underneath),
-/// so the long-lived bridge task submits into the live mempool read from here.
-/// `None` while the link is down between sessions — submissions are dropped from
-/// the bridge, but a tx already admitted to a prior session's mempool that has
-/// not yet finalized will not survive the reconnect; the client can resubmit.
+/// Current per-session mempool; `None` while hardware is between links.
+/// The long-lived RPC bridge drops submissions until the next session appears.
 type MempoolSlot = Arc<tokio::sync::RwLock<Option<NodeMempool>>>;
 
-/// Drain client transactions from the RPC (`tx_rx`) and submit them into this
-/// node's mempool. The mempool owns dedup, per-sender nonce/fee ordering,
-/// gossip to the peer, and eviction on finalization — so the bridge only has to
-/// encode each `CoreTransaction` to its `bunkerglow::Transaction` wire form and
-/// hand it over.
+/// Encode RPC-submitted transactions and hand them to the current node mempool.
 fn spawn_tx_bridge(
     mut tx_rx: tokio::sync::mpsc::UnboundedReceiver<CoreTransaction>,
     mempool: MempoolSlot,
@@ -609,7 +488,6 @@ fn spawn_tx_bridge(
     });
 }
 
-/// Log the outcome of a mempool submission at debug level.
 fn trace_submit(core_tx: &CoreTransaction, admitted: bool) {
     if admitted {
         log::debug!("mempool admitted tx {}", hex::encode(core_tx.hash()));
@@ -621,9 +499,7 @@ fn trace_submit(core_tx: &CoreTransaction, admitted: bool) {
     }
 }
 
-/// Spawn a task that periodically returns long-in-flight mempool transactions to
-/// the pending set, so a tx packed into a slot that never finalized (e.g. a lost
-/// shred or a band drop) is re-packed rather than stuck. Runs until `cancel`.
+/// Requeue long-in-flight mempool transactions until `cancel` fires.
 fn spawn_mempool_maintenance(mempool: NodeMempool, cancel: tokio_util::sync::CancellationToken) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(30));
@@ -642,17 +518,8 @@ fn spawn_mempool_maintenance(mempool: NodeMempool, cancel: tokio_util::sync::Can
     });
 }
 
-/// Spawn a task that executes the transactions of newly finalized blocks into
-/// the shared execution state, recording per-tx results and pruning the mempool.
-///
-/// Polls the node's finalized frontier; for each newly finalized slot it reads
-/// the canonical block from `blockstore`, decodes its transactions (with the
-/// same raw / 8-byte-length-prefix fallback the UDP sim uses), applies them via
-/// `State::execute_block`, and records a [`rpc::TxResult`] per tx so `/tx/{hash}`
-/// and `/account/{pk}` reflect the outcome. Both nodes run this over identical
-/// genesis + identical finalized blocks, so their state stays in agreement.
-///
-/// Returns immediately; the task runs until `cancel` is cancelled.
+/// Execute newly finalized blocks and mirror results into RPC-visible state.
+/// Both nodes apply the same genesis and finalized blocks, so state stays aligned.
 fn spawn_block_executor(
     label: String,
     blockstore: SharedBlockstore,
@@ -671,9 +538,7 @@ fn spawn_block_executor(
 
             let finalized = pool.read().await.finalized_slot().inner();
 
-            // Advance `/nodes` to the finalized frontier EVERY tick, before
-            // and independent of execution, so the frontier tracks consensus
-            // even if execution stalls or the executor loop dies.
+            // Keep `/nodes` tracking consensus even if execution stalls.
             for node in tx.nodes.write().await.iter_mut() {
                 node.finalized_slot = finalized;
             }
@@ -683,8 +548,7 @@ fn spawn_block_executor(
             }
 
             let bs = blockstore.read().await;
-            // Bound per-tick work so catch-up after a restart stays responsive
-            // (a long-running chain can be hundreds of thousands of slots behind).
+            // Bound catch-up work per tick so restarts stay responsive.
             let batch_end = finalized.min(last_executed + 500);
             for slot in (last_executed + 1)..=batch_end {
                 let slot_id = Slot::new(slot);
@@ -697,10 +561,7 @@ fn spawn_block_executor(
                     continue;
                 };
                 let raw_txs = block.transactions();
-                // Evict this block's txs from the mempool now that they are
-                // finalized (whether they execute ok or fail — they will never be
-                // valid to re-pack). Uses the raw wire txs so the hashes match
-                // what the mempool admitted.
+                // Evict finalized wire txs so mempool hashes match admission hashes.
                 let evicted = mempool.evict_finalized(raw_txs).await;
                 if evicted > 0 {
                     log::debug!("[{label}] evicted {evicted} finalized tx(s) from mempool");
@@ -727,14 +588,9 @@ fn spawn_block_executor(
     });
 }
 
-/// Decode a finalized block's raw transactions into `CoreTransaction`s. A block
-/// transaction is the bincode encoding of a `CoreTransaction`, possibly wrapped
-/// with a wincode 8-byte length prefix; try the raw bytes first, then skip the
-/// prefix. Undecodable entries are dropped (they were never valid client txs).
+/// Decode raw block transactions, accepting the legacy 8-byte length prefix.
 fn decode_block_txs(raw: &[Transaction]) -> Vec<CoreTransaction> {
-    // Limit-guarded decode: without a limit bincode skips its container-length
-    // check, and these bytes include BUNKER_BLOAT_BYTES random padding — a
-    // random u64 read as a Vec length would abort the process on allocation.
+    // Limit decode so random padding cannot become an unbounded Vec allocation.
     let config = bincode::config::standard().with_limit::<4096>();
     raw.iter()
         .filter_map(|t| {
@@ -753,8 +609,7 @@ fn decode_block_txs(raw: &[Transaction]) -> Vec<CoreTransaction> {
         .collect()
 }
 
-/// Record execution results for one finalized slot: insert a [`rpc::TxResult`]
-/// per tx (so `/tx/{hash}` resolves) and prune those txs from the RPC mempool.
+/// Record one finalized slot's transaction results for RPC lookup.
 async fn record_tx_results(
     tx: &TxContext,
     slot: u64,
@@ -766,9 +621,7 @@ async fn record_tx_results(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    /// FIFO cap on retained tx results: uncapped, the map grew by one entry per
-    /// finalized tx for the life of the process. Old results age out of
-    /// `/tx/{hash}` once the cap is reached; the chain itself stays in RocksDB.
+    /// FIFO cap: old `/tx/{hash}` results age out before the RocksDB chain.
     const MAX_TX_RESULTS: usize = 10_000;
 
     let mut mempool = tx.mempool.write().await;
@@ -780,10 +633,8 @@ async fn record_tx_results(
             Ok(()) => (rpc::TxFinalStatus::Finalized, None),
             Err(e) => (rpc::TxFinalStatus::Failed, Some(e.to_string())),
         };
-        // First execution wins: the same tx can land in two blocks (each
-        // node's mempool packs it before finalization evicts it), and the
-        // duplicate then fails on nonce mismatch. Overwriting here would make
-        // a SUCCESSFUL transfer report "failed".
+        // First execution wins: duplicate inclusions fail on nonce and must not
+        // clobber an earlier successful result.
         if !results_map.contains_key(&hash) {
             results_map.insert(
                 hash.clone(),
@@ -807,31 +658,24 @@ async fn record_tx_results(
     }
 }
 
-/// Native balance credited to the genesis account at startup, so
-/// client-submitted transfers have funds to move. Large enough for many
-/// transfers-plus-fees over a long run.
+/// Native balance credited to the genesis account for client transfers.
 const GENESIS_BALANCE: u64 = 1_000_000_000_000;
 
-/// Deterministically generated keys + public validator info for the 2-node set.
+/// Deterministic keys and public validator info for the two-node set.
 struct Cluster {
     secret_keys: Vec<SecretKey>,
     voting_keys: Vec<aggsig::SecretKey>,
     validators: Vec<ValidatorInfo>,
-    /// Genesis ed25519 key that funds and signs client transactions. Derived
-    /// from the same `--seed` on both nodes, so both fund the identical account
-    /// and execute the same transactions to the same state.
+    /// Genesis key shared by both nodes via the deterministic seed.
     genesis_key: SigningKey,
 }
 
 impl Cluster {
-    /// Public key of the genesis (funded) account.
     fn genesis_pubkey(&self) -> [u8; 32] {
         self.genesis_key.verifying_key().to_bytes()
     }
 
-    /// Fresh execution state with the genesis account funded. Both nodes build
-    /// an identical genesis, then apply the same finalized transactions, so
-    /// their execution state stays in agreement without gossiping state.
+    /// Fresh genesis-funded state; finalized blocks keep both nodes aligned.
     fn genesis_state(&self) -> ExecutionState {
         let mut state = ExecutionState::new();
         state
@@ -841,10 +685,8 @@ impl Cluster {
     }
 }
 
-/// Build the fixed 2-validator set from `seed`. Both machines call this with the
-/// same seed and obtain identical keys/stake, so consensus agrees on membership.
-/// Per-channel `SocketAddr`s are ignored by the mux (single peer), so they are
-/// filled with a don't-care address.
+/// Build the fixed two-validator set from `seed`.
+/// Mux channels ignore per-channel addresses, so validators use a placeholder.
 fn build_cluster(seed: u64) -> Cluster {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut secret_keys = Vec::new();
@@ -867,9 +709,7 @@ fn build_cluster(seed: u64) -> Cluster {
         secret_keys.push(sk);
         voting_keys.push(vk);
     }
-    // Genesis key derived from the same RNG stream (after the validator keys),
-    // so a given --seed always yields the same funded/ signing account on both
-    // nodes. Build from 32 raw bytes to avoid a rand_core version dependency.
+    // Derive from raw seed bytes to avoid a rand_core version dependency.
     let mut genesis_seed = [0u8; 32];
     rng.fill_bytes(&mut genesis_seed);
     let genesis_key = SigningKey::from_bytes(&genesis_seed);
@@ -881,13 +721,8 @@ fn build_cluster(seed: u64) -> Cluster {
     }
 }
 
-/// Wire one Alpenglow node over a connected PACTOR transport, multiplexing its
-/// five logical networks across the single link. Returns the node and the mux
-/// handle (kept alive so the reader/writer tasks run; used for shutdown).
-///
-/// `turn`: `None` for a full-duplex transport (simulator — write freely);
-/// `Some(starts_with_turn)` for a real half-duplex PACTOR link, where exactly one
-/// side (the caller/master) must start with the transmit turn.
+/// Wire one Alpenglow node over a connected PACTOR transport.
+/// `turn` selects full-duplex (`None`) or half-duplex initial turn ownership.
 fn build_node(
     transport: Arc<dyn PactorTransport>,
     own_id: u64,
@@ -904,27 +739,17 @@ fn build_node(
         None => PactorMux::new(transport),
         Some(starts_with_turn) => PactorMux::new_half_duplex(transport, starts_with_turn),
     };
-    // Publish the mux's outbound-queue depth for the radio-stats panel.
     mux.set_queued_gauge(queued_gauge);
-    // All2All votes/certs are broadcast to all validators including self; over a
-    // single link there is no socket loopback, so self-deliver them or a node
-    // never counts its own vote toward the finalization quorum.
+    // All2All needs self-delivery because the single mux link has no socket loopback.
     let all2all_net: MuxAll2All = mux.channel_self_delivering(Channel::All2All);
     let shred_net: MuxShred = mux.channel(Channel::Disseminator);
     let repair_net: MuxRepair = mux.channel(Channel::Repair);
     let repair_req_net: MuxRepairReq = mux.channel(Channel::RepairRequest);
-    // Txs channel: NOT self-delivering. The per-node mempool provides the local
-    // path — a locally-submitted tx is admitted straight into this node's pool
-    // (and the producer packs from the pool), so it never needs to loop back
-    // through the channel. The channel carries only peer gossip, which the
-    // mempool's admit loop reads.
+    // Txs is peer-gossip only; local submissions enter through the node mempool.
     let txs_net: MuxTxs = mux.channel(Channel::Txs);
     let handle = mux.spawn();
 
-    // Per-node mempool wrapping the Txs channel. Over a single mux link there is
-    // one peer, addressed by a placeholder (the mux ignores the address); the
-    // mempool gossips each newly-admitted tx to it and its admit loop admits +
-    // re-gossips inbound peer txs, so both nodes' mempools converge.
+    // A placeholder peer address is enough because the mux ignores socket addrs.
     let mempool: NodeMempool = Mempool::new(txs_net, vec![dontcare_sockaddr()]);
     mempool.spawn_admit_loop();
 
@@ -943,18 +768,12 @@ fn build_node(
         mempool.clone(),
     );
 
-    // Genesis-funded execution state, shared with the RPC server (balances,
-    // accounts) and the finalized-block executor below. Both nodes start from an
-    // identical genesis and apply the same finalized transactions, so their
-    // execution state stays in lockstep without exchanging state.
+    // Identical genesis plus finalized blocks keeps node execution state aligned.
     let execution_state = Arc::new(tokio::sync::RwLock::new(cluster.genesis_state()));
     node.set_execution_state(execution_state.clone());
 
-    // On a real half-duplex link, feed Votor the mux's keepalive-driven liveness
-    // so its crashed-leader timeout PAUSES (re-arms) while the link is up but the
-    // reverse path is slow, instead of irreversibly skipping the window and
-    // jumping ahead. The full-duplex simulator keeps the default always-alive
-    // behavior (turn is None), so simulated runs are unchanged.
+    // Half-duplex links feed keepalive liveness into Votor so slow reverse paths
+    // re-arm crashed-leader timeouts instead of jumping ahead.
     if turn.is_some() {
         node.set_link_liveness(handle.liveness());
     }
@@ -962,18 +781,13 @@ fn build_node(
     (node, handle, mempool, execution_state)
 }
 
-/// Process-wide "stop now" flag, set by the Ctrl-C watcher (see
-/// [`spawn_shutdown_watcher`]). The hardware reconnect loop and `run_node`'s poll
-/// loop both honor it so a continuous (`--duration`-less) run ends promptly and
-/// cleanly on Ctrl-C — tearing down consensus and releasing the modem/DB.
+/// Process-wide Ctrl-C flag shared by the reconnect loop and node runner.
 static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn shutdown_requested() -> bool {
     SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Spawn a task that flips [`SHUTDOWN`] on the first Ctrl-C. Idempotent enough for
-/// our use: started once per run function before the work begins.
 fn spawn_shutdown_watcher() {
     tokio::spawn(async {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -985,20 +799,13 @@ fn spawn_shutdown_watcher() {
 
 /// Why [`run_node`] stopped.
 enum RunStop {
-    /// The `until` deadline elapsed.
     Deadline,
-    /// The PACTOR link dropped mid-session (caller may reconnect).
     LinkDown,
-    /// Ctrl-C requested a graceful shutdown.
     Shutdown,
 }
 
-/// Drive a node until `until`, polling its finalized slot for progress and (if
-/// `link` is given) watching for a mid-session link drop.
-///
-/// `Alpenglow::run` consumes the node, so we grab the pool handle (a cheap `Arc`
-/// clone) *before* moving the node into the run task, then poll it. Returns the
-/// highest finalized slot reached and why it stopped.
+/// Drive a node until deadline, shutdown, or link drop.
+/// The pool handle must be cloned before `Alpenglow::run` consumes the node.
 async fn run_node(
     label: &str,
     node: Node,
@@ -1033,17 +840,8 @@ async fn run_node(
         tokio::time::sleep(Duration::from_secs(2)).await;
     };
 
-    // Stop consensus, then tear the mux down so the transport (and its serial
-    // fd) can be released for a reconnect.
-    //
-    // Order matters: cancel consensus and let `run()` fully wind down BEFORE
-    // aborting the mux reader. `run()` aborts its internal loops and returns,
-    // dropping the `Arc<Alpenglow>` it owns — which is what releases the RocksDB
-    // blockstore/pool handles the NEXT session must re-open. We must therefore
-    // *await run() to completion*, not abandon it on a short timeout: a premature
-    // timeout leaves `run()`'s task (and its blockstore Arc) alive, so the next
-    // session's `DB::open` hits "lock held by current process" and panics.
-    // A generous cap still bounds a pathologically stuck teardown.
+    // Await `run()` before closing the mux so RocksDB handles drop before reconnect.
+    // The timeout only bounds a pathologically stuck teardown.
     cancel.cancel();
     match tokio::time::timeout(Duration::from_secs(15), run_task).await {
         Ok(_) => {}
@@ -1054,15 +852,8 @@ async fn run_node(
     (highest, stop)
 }
 
-/// Suppress only the expected teardown panic from orphaned consensus tasks.
-///
-/// On every reconnect, the discarded node's detached repair/consensus tasks
-/// (which loop on `receive().unwrap()` with no cancellation) terminate by
-/// panicking when the mux closes their queue — this is how they release their
-/// RocksDB handles for the next session, so it's deliberate and non-fatal. It is
-/// also noisy on a flaky link that reconnects often. Install a panic hook that
-/// drops *only* that specific message and delegates everything else to the
-/// default hook, so real panics still surface with full backtraces.
+/// Suppress only the expected mux-closed panic from orphaned teardown tasks.
+/// All other panics still delegate to the default hook.
 fn install_teardown_panic_filter() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1085,7 +876,6 @@ async fn main() -> anyhow::Result<()> {
     install_teardown_panic_filter();
     let args = Args::parse();
     let cluster = build_cluster(args.seed);
-    // `None` => run continuously until Ctrl-C; `Some` => stop after that long.
     let duration = args.duration.map(Duration::from_secs);
 
     if args.inspect {
@@ -1104,9 +894,6 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Resolves a run budget to an instant to stop at: the deadline if a finite
-/// `--duration` was given, or `Ctrl-C` if not. Returns a future that completes
-/// when the run should end, so callers can `select!` consensus work against it.
 async fn run_until(duration: Option<Duration>) {
     match duration {
         Some(d) => tokio::time::sleep(d).await,
@@ -1117,23 +904,16 @@ async fn run_until(duration: Option<Duration>) {
     }
 }
 
-/// A far-future instant used as the per-session deadline when running
-/// continuously (no `--duration`). The run actually stops on Ctrl-C via
-/// [`run_until`]; this just keeps per-session timing math (which expects an
-/// `Instant` deadline) well-defined without special-casing every call site.
+/// Per-session deadline; continuous runs use a far-future instant.
 fn deadline_for(duration: Option<Duration>) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     match duration {
         Some(d) => now + d,
-        // ~10 years; the Ctrl-C path ends the run long before this.
         None => now + Duration::from_secs(10 * 365 * 24 * 3600),
     }
 }
 
-/// Serve the RPC API over a node's persisted on-disk block store, without any
-/// modem or consensus. Lets you inspect the finalized chain (`/blocks`, etc.)
-/// after a run has ended — the chain lives in RocksDB under the current dir's
-/// `data/`, so run this from the same dir the node ran in (e.g. `/tmp/bc-node0`).
+/// Serve RPC over a node's persisted block store without modem or consensus.
 async fn run_inspect(
     args: &Args,
     cluster: Cluster,
@@ -1143,8 +923,7 @@ async fn run_inspect(
         .node
         .ok_or_else(|| anyhow::anyhow!("--inspect requires --node <id> to pick the block store"))?;
 
-    // A blockstore needs a votor channel, but in inspect mode nothing consumes it;
-    // a dropped receiver is fine (the store performs no sends during pure reads).
+    // Pure reads do not send on the required votor channel.
     let (votor_tx, _votor_rx) = tokio::sync::mpsc::channel(1);
     let epoch_info = Arc::new(EpochInfo::new(0, own_id, cluster.validators.clone()));
     let blockstore: SharedBlockstore = Arc::new(tokio::sync::RwLock::new(Box::new(
@@ -1155,25 +934,17 @@ async fn run_inspect(
         "=== inspect: serving node {own_id}'s on-disk chain (data/blockstore/{own_id}) ===\n\
          RPC API on http://127.0.0.1:3001 — try /blocks or /block/slot/1"
     );
-    // Inspect is offline: no consensus, so no injection or live execution. Build
-    // a context around a genesis-funded state (so `/account` shows the genesis
-    // balance) with the tx-bridge receiver dropped — `/submit` is a no-op here.
+    // Offline inspect has no tx bridge; `/submit` is a no-op.
     let exec = Arc::new(tokio::sync::RwLock::new(cluster.genesis_state()));
     let (tx_ctx, _tx_rx) = TxContext::new(&cluster, exec);
     spawn_rpc(blockstore, &tx_ctx);
 
-    // Stay up so the endpoint is reachable; honor --duration as an auto-exit, or
-    // run until Ctrl-C when no duration was given.
     run_until(duration).await;
     Ok(())
 }
 
-/// Build both nodes over a simulated PACTOR pair and run them against each other.
-///
-/// `half_duplex`: when true, enable the mux turn discipline (node 0 starts with
-/// the turn) even though the simulator is full-duplex underneath. This exercises
-/// the turn-grant/changeover handoff path that real PACTOR needs, catching
-/// integration bugs before going on-air.
+/// Build both nodes over a simulated PACTOR pair and run them together.
+/// `half_duplex` exercises real PACTOR turn handoff in-process.
 async fn run_simulated(
     cluster: Cluster,
     duration: Option<Duration>,
@@ -1181,9 +952,7 @@ async fn run_simulated(
     rpc: bool,
     packet_loss_percent: f32,
 ) -> anyhow::Result<()> {
-    // The simulated link retries lost frames (its ARQ model), so loss slows the
-    // link but never breaks delivery. Clamp away configs that would make
-    // retry-exhaustion likely.
+    // Simulated ARQ retries lost frames; clamp away retry-exhaustion configs.
     let packet_loss = (packet_loss_percent / 100.0).clamp(0.0, 0.9);
     spawn_shutdown_watcher();
     println!(
@@ -1194,23 +963,14 @@ async fn run_simulated(
             "full-duplex"
         }
     );
-    // The half-duplex sim faithfully models the slow reverse path, so exercise the
-    // same reverse-path optimization the hardware path uses: defer the slow-path
-    // finalization vote so a fast-finalized slot sends nothing extra back.
+    // Half-duplex mode uses the same slow-path vote deferral as hardware.
     if half_duplex {
         // SAFETY: set before any node / Votor is built below.
         unsafe {
             std::env::set_var("BUNKER_DEFER_FINAL_VOTE", "1");
         }
     }
-    // Two link models:
-    // - Full-duplex: a clean, symmetric, independent-direction link. Validates the
-    //   consensus-over-mux wiring without HF physics (the original sim behavior).
-    // - Half-duplex: ONE shared channel (only one side transmits at a time) with an
-    //   ARQ changeover cost and a ~10× slower reverse (slave→master) path — the
-    //   faithful model that reproduces the on-air "stall after a few slots".
-    // Both are lossless (real PACTOR does ARQ in hardware) with no read timeout (a
-    // long-lived node parks on idle reads).
+    // Half-duplex models one shared ARQ channel with asymmetric reverse latency.
     let config = if half_duplex {
         SimulatedPactorConfig {
             packet_loss,
@@ -1235,15 +995,13 @@ async fn run_simulated(
     };
     let (ta, tb) = SimulatedPactorPair::new(config);
 
-    // Establish the simulated link before wiring consensus: the simulated
-    // transport rejects writes until connected. Node 0 calls node 1.
+    // Connect before wiring consensus; simulated transports reject early writes.
     ta.set_mycall("NODE0").await?;
     tb.set_mycall("NODE1").await?;
     tb.accept_incoming(None).await.ok();
     ta.connect_peer("NODE1").await?;
 
-    // Count node 0's radio I/O (node 0 serves the RPC, so its stats feed the
-    // explorer's live radio panel).
+    // Node 0 serves RPC, so its counters feed radio stats.
     let link_counters = Arc::new(LinkCounters::default());
     let ta: Arc<dyn PactorTransport> = Arc::new(CountingTransport {
         inner: Arc::new(ta),
@@ -1253,12 +1011,10 @@ async fn run_simulated(
     });
     let tb: Arc<dyn PactorTransport> = Arc::new(tb);
 
-    // Full-duplex: no turn discipline (None). Half-duplex: node 0 starts with
-    // the turn, node 1 without.
+    // Half-duplex starts with node 0 holding the transmit turn.
     let turn_a = half_duplex.then_some(true);
     let turn_b = half_duplex.then_some(false);
-    // Node A's queue depth feeds the RPC radio stats (the demo panel serves
-    // node A); node B gets a throwaway gauge.
+    // Only node A's queue depth is served through RPC.
     let (node_a, handle_a, mempool_a, exec_a) = build_node(
         ta.clone(),
         0,
@@ -1269,7 +1025,6 @@ async fn run_simulated(
     let (node_b, handle_b, mempool_b, exec_b) = build_node(tb, 1, &cluster, turn_b, Arc::default());
     spawn_link_quality_poller(ta, node_a.get_cancel_token());
 
-    // Per-node transaction contexts (each over its own genesis-funded state).
     let (tx_a, tx_rx_a) = TxContext::new(&cluster, exec_a);
     let (tx_b, _tx_rx_b) = TxContext::new(&cluster, exec_b);
     spawn_radio_stats_sampler(link_counters, &tx_a);
@@ -1278,11 +1033,7 @@ async fn run_simulated(
         hex::encode(cluster.genesis_pubkey())
     );
 
-    // Node 0's RPC feeds its mempool; the mempool gossips each tx to node 1, so
-    // both nodes' mempools converge and whichever leads a slot packs from its own
-    // pool. Both nodes execute finalized blocks into their own state (identical
-    // genesis + blocks ⇒ identical state) and evict the finalized txs. The
-    // simulated link never drops, so node 0's mempool stays live for the run.
+    // RPC submits into node 0; mempool gossip converges both nodes before packing.
     let mempool_slot: MempoolSlot = Arc::new(tokio::sync::RwLock::new(Some(mempool_a.clone())));
     spawn_tx_bridge(tx_rx_a, mempool_slot);
     spawn_mempool_maintenance(mempool_a.clone(), node_a.get_cancel_token());
@@ -1304,30 +1055,24 @@ async fn run_simulated(
         node_b.get_cancel_token(),
     );
 
-    // Optional RPC over node 0's block store + transaction context.
     if rpc {
         spawn_rpc(node_a.get_blockstore(), &tx_a);
     }
 
     let until = deadline_for(duration);
-    // Simulated link never "drops" (full-duplex), so no link watch / reconnect.
     let a = tokio::spawn(async move { run_node("node0", node_a, handle_a, until, None).await });
     let b = tokio::spawn(async move { run_node("node1", node_b, handle_b, until, None).await });
 
     let (slot_a, slot_b) = (a.await?.0, b.await?.0);
     println!("=== done: node0 finalized {slot_a}, node1 finalized {slot_b} ===");
-    // Only treat zero progress as an error for a bounded run; a continuous run
-    // stopped by Ctrl-C may legitimately be ended before the first finalization.
+    // Zero progress is only an error for bounded runs.
     if slot_a == 0 && slot_b == 0 && duration.is_some() {
         anyhow::bail!("no slots finalized — consensus did not make progress");
     }
     Ok(())
 }
 
-/// Bring the modem up and establish the PACTOR link for one session.
-///
-/// Node 0 calls (`connect_peer`); node 1 listens (`LISTEN 1` + `accept_incoming`).
-/// Returns a connected transport ready for consensus.
+/// Bring up the modem and establish one caller/listener PACTOR session.
 async fn establish_link(
     init_cfg: &PactorInitConfig,
     is_caller: bool,
@@ -1335,8 +1080,7 @@ async fn establish_link(
     connect_attempts: u32,
     full_init: bool,
 ) -> anyhow::Result<UsbPactorTransport> {
-    // First session does the full bring-up; reconnects use the fast path (modem
-    // config persists across a STBY drop), reclaiming most of each band window.
+    // Reconnects use light init because modem config persists across STBY.
     let transport = if full_init {
         println!("bringing up modem (full init) ...");
         init_modem(init_cfg).await?
@@ -1354,25 +1098,15 @@ async fn establish_link(
             .await?;
     }
 
-    // Post-connect health check: on a marginal band the ARQ link often forms but
-    // collapses within seconds (the modem returns to the `cmd:` prompt / STBY).
-    // Confirm the link actually holds for a short window BEFORE declaring it up
-    // and starting consensus — otherwise we'd start a node on a dead link and the
-    // run would stall/exit. If it drops here, return an error so the caller's
-    // reconnect loop retries rather than proceeding.
-    //
-    // Crucially this is an ACTIVE check: it sends keepalive lines throughout. The
-    // ARQ link drops to STBY after ~43s of no traffic, and right after connect
-    // neither side has consensus data yet (mid inter-block window), so a passive
-    // wait would let the very link we're verifying time out. The keepalive byte
-    // (0xFE) is the same tag the peer's mux reader ignores.
+    // Actively keepalive during health check; a passive post-connect wait can
+    // let an idle ARQ link time out before consensus has traffic.
     println!("verifying link holds ...");
     let health_deadline = tokio::time::Instant::now() + LINK_HEALTH_WINDOW;
     while tokio::time::Instant::now() < health_deadline {
         if !transport.is_link_up() {
             anyhow::bail!("link collapsed during post-connect health check");
         }
-        // `#<msgid:00000001><tag:fe>\r` — a minimal keepalive line the peer drops.
+        // Minimal mux keepalive line; the peer drops tag 0xFE.
         let _ = transport.write_data(&[0x00, 0x00, 0x00, 0x01, 0xFE]).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -1380,17 +1114,11 @@ async fn establish_link(
     Ok(transport)
 }
 
-/// How long the link must stay up after connect before we trust it and start
-/// consensus. Longer than the few-seconds-to-`cmd:` collapse seen on marginal
-/// bands, short enough not to waste a good window.
+/// Post-connect hold time before starting consensus.
 const LINK_HEALTH_WINDOW: Duration = Duration::from_secs(10);
 
-/// Run one node over a real modem on this machine, **reconnecting across link
-/// drops** until the total `--duration` budget is spent.
-///
-/// Consensus state (finalized slot, blocks) persists in the on-disk RocksDB pool
-/// / blockstore, so a node rebuilt after a reconnect resumes from where it left
-/// off — a marginal-band drop becomes a recoverable pause, not a restart.
+/// Run one hardware node, reconnecting across link drops until the budget ends.
+/// Finalized consensus state persists in RocksDB across sessions.
 async fn run_hardware(
     args: &Args,
     cluster: Cluster,
@@ -1408,22 +1136,13 @@ async fn run_hardware(
     let is_caller = own_id == 0;
     let label = format!("node{own_id}");
 
-    // Stretch consensus timing to match the slow half-duplex link, BEFORE any
-    // node (and thus any timer) is built. Without this, blocks are produced
-    // faster than the link can disseminate+vote+certify them, so consensus times
-    // out past the first slot. Default 6x for radio (delta_first_slice = 180s,
-    // at/above the ~180s reverse-path read stall, so the crashed-leader timeout
-    // does not fire before a stalled first shred can arrive); the pause-on-alive
-    // logic rides out longer quiets. --delta-mult overrides.
+    // Set radio timing before any consensus timers exist; default 6x fits slow
+    // half-duplex dissemination/voting before timeouts.
     let delta_mult = args.delta_mult.unwrap_or(6.0);
     // SAFETY: set at startup before any consensus task / timer reads it.
     unsafe {
         std::env::set_var("BUNKER_DELTA_MULT", delta_mult.to_string());
-        // Over the slow half-duplex link, defer the slow-path finalization vote so
-        // a slot that fast-finalizes (both notar votes meet the 80% strong quorum)
-        // never sends the final vote / notar cert / final cert back over the
-        // expensive reverse path. Falls back to slow-final if fast-final does not
-        // fire in time. See `Votor::defer_final_vote`.
+        // Defer slow-path final votes so fast-finalized slots avoid reverse-path traffic.
         std::env::set_var("BUNKER_DEFER_FINAL_VOTE", "1");
     }
     println!(
@@ -1434,18 +1153,11 @@ async fn run_hardware(
     let mut init_cfg = PactorInitConfig::new(port, args.mycall.clone());
     init_cfg.baud = args.baud;
     init_cfg.frequency = args.frequency;
-    // Force-disconnect stale link state on every (re)connect attempt.
     init_cfg.reset = args.reset;
-    // The listener must enable LISTEN 1 to accept the incoming connect.
     init_cfg.listen = !is_caller;
 
-    // Persistent transaction plumbing, created once and shared across reconnects:
-    // per-tx results, genesis key, and the long-lived tx-bridge. The mempool
-    // itself is per-session (each reconnect builds a fresh mux underneath), so the
-    // bridge submits into the live mempool read from `mempool_slot`, which each
-    // session repopulates. A dummy execution state seeds the context; it is
-    // replaced per session with the node's real (genesis) state via
-    // `with_execution_state`.
+    // RPC transaction plumbing persists across reconnects; the live mempool is
+    // swapped per session through `mempool_slot`.
     let (base_tx, tx_rx) = TxContext::new(
         &cluster,
         Arc::new(tokio::sync::RwLock::new(cluster.genesis_state())),
@@ -1457,8 +1169,7 @@ async fn run_hardware(
     let mempool_slot: MempoolSlot = Arc::new(tokio::sync::RwLock::new(None));
     spawn_tx_bridge(tx_rx, mempool_slot.clone());
 
-    // Radio I/O counters, shared across reconnect sessions; the sampler feeds
-    // the explorer's live stats panel (WS `radio_stats`) and `/radio`.
+    // Radio counters span reconnects so `/radio` reports one process stream.
     let link_counters = Arc::new(LinkCounters::default());
     spawn_radio_stats_sampler(link_counters.clone(), &base_tx);
 
@@ -1470,14 +1181,10 @@ async fn run_hardware(
         session += 1;
         if session > 1 {
             println!("[{label}] reconnecting (session {session}) ...");
-            // Only tune the radio on the first bring-up. The TRX is already on
-            // frequency for later sessions, and re-tuning right after a STBY drop
-            // often returns no confirmation and (wrongly) aborts the reconnect.
+            // Tune only on first bring-up; later reconnects keep the TRX frequency.
             init_cfg.frequency = None;
         }
 
-        // Establish (or re-establish) the link for this session. Full init only
-        // on the first session; reconnects use the fast path.
         let transport = match establish_link(
             &init_cfg,
             is_caller,
@@ -1498,21 +1205,14 @@ async fn run_hardware(
             }
         };
 
-        // Count frames/bytes over the modem for the live radio-stats panel.
-        // NOTE: no active hostmode status polling here — a 10s status poll was
-        // tried and it destabilized the link: its transactions interleaved
-        // with the mux writer's data transactions on a busy (receive-heavy)
-        // link and desynced the hostmode exchange, wedging the modem twice
-        // within minutes on-air. The counters also gate is_link_up (see
-        // CountingTransport) so a wedged link tears the session down instead
-        // of stalling forever.
+        // Avoid active hostmode status polling; it can interleave with mux writes
+        // and desync the modem. Passive events plus watchdog counters are enough.
         let transport: Arc<dyn PactorTransport> = Arc::new(CountingTransport {
             inner: Arc::new(transport),
             counters: link_counters.clone(),
             consecutive_write_failures: AtomicU64::new(0),
             last_rx: std::sync::Mutex::new(Instant::now()),
         });
-        // Half-duplex link: the caller (node 0) starts holding the transmit turn.
         let (node, handle, mempool, exec) = build_node(
             transport.clone(),
             own_id,
@@ -1520,16 +1220,12 @@ async fn run_hardware(
             Some(is_caller),
             link_counters.outbound_queued.clone(),
         );
-        // Drive the modem's passive status events (LinkQuality etc.).
         spawn_link_quality_poller(transport.clone(), node.get_cancel_token());
 
-        // Publish this session's mempool so the bridge submits over the new mux.
+        // Publish the live mempool for the long-lived RPC bridge.
         *mempool_slot.write().await = Some(mempool.clone());
 
-        // This session's transaction context: same client-facing mempool/results
-        // as prior sessions, but this session's fresh (genesis) execution state.
-        // The executor rebuilds that state by replaying the persisted finalized
-        // chain from slot 1 (deterministic, so a reconnect resumes seamlessly).
+        // Rebuild execution by replaying persisted finalized blocks into fresh genesis.
         let session_tx = base_tx.with_execution_state(exec);
         spawn_mempool_maintenance(mempool.clone(), node.get_cancel_token());
         spawn_block_executor(
@@ -1541,12 +1237,7 @@ async fn run_hardware(
             node.get_cancel_token(),
         );
 
-        // Optional RPC over THIS session's block store + transaction context.
-        // Spawned per session and aborted before teardown below, so each
-        // reconnect's fresh RocksDB handle is the one being served and the DB
-        // lock is released for the next session. Block queries still see all
-        // finalized slots — the chain persists on disk and a rebuilt node resumes
-        // from it.
+        // Session-scoped RPC must drop its blockstore Arc before the next reconnect.
         let rpc_task = if args.rpc {
             Some(tokio::spawn(rpc::run_api(rpc_state_for(
                 node.get_blockstore(),
@@ -1571,26 +1262,16 @@ async fn run_hardware(
         .await;
         highest = highest.max(slot);
 
-        // Link is down for teardown: clear the mempool so the bridge drops
-        // submissions until the next session repopulates it.
+        // Drop submissions while no session owns a live mempool.
         *mempool_slot.write().await = None;
 
-        // Stop serving and WAIT for the server task to actually end before the
-        // next session re-opens the RocksDB. The RPC `SharedState` holds an `Arc`
-        // clone of this session's blockstore; that clone is only dropped once the
-        // axum server future is dropped, which happens when the aborted task is
-        // awaited. Skipping the await would leave the blockstore locked and the
-        // next session's `DB::open` would fail with "lock held by current process".
+        // Await aborted RPC so its blockstore Arc releases the RocksDB lock.
         if let Some(t) = rpc_task {
             t.abort();
             let _ = t.await;
         }
 
-        // Tell the modem to drop the link, then release the transport so its
-        // serial port is freed before the next session re-opens it. Dropping the
-        // last `Arc<UsbPactorTransport>` aborts its reader task and closes the fd;
-        // the brief sleep gives the OS time to release the device (otherwise the
-        // re-open hits "Device or resource busy").
+        // Drop transport and pause so the serial fd is released before reconnect.
         let _ = transport.disconnect().await;
         drop(transport);
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1602,8 +1283,7 @@ async fn run_hardware(
     }
 
     println!("=== done: node{own_id} finalized {highest} (after {session} session(s)) ===");
-    // A bounded run that finalized nothing is a failure; a continuous run ended by
-    // Ctrl-C before the first finalization is not.
+    // Zero progress is only an error for bounded runs.
     if highest == 0 && duration.is_some() && !shutdown_requested() {
         anyhow::bail!("no slots finalized — consensus did not make progress");
     }

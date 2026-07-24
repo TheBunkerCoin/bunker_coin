@@ -1,21 +1,10 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Core consensus logic and data structures.
+//! Core Alpenglow consensus orchestration.
 //!
-//! The central structure of the consensus protocol is [`Alpenglow`].
-//! It contains all state for a single consensus instance and also has access
-//! to the different necessary network protocols.
-//!
-//! Most important component data structures defined in this module are:
-//! - [`Blockstore`] holds individual shreds and reconstructed blocks for each slot.
-//! - [`Pool`] holds votes and certificates for each slot.
-//! - [`Votor`] handles the main voting logic.
-//!
-//! Some other data types for consensus are also defined here:
-//! - [`Cert`] represents a certificate of votes of a specific type.
-//! - [`Vote`] represents a vote of a specific type.
-//! - [`EpochInfo`] holds information about the epoch and all validators.
+//! Wires [`Blockstore`], [`Pool`], [`Votor`], block production, repair, epoch
+//! transitions, and snapshot checkpoints for one validator.
 
 mod block_producer;
 mod blockstore;
@@ -57,15 +46,7 @@ use crate::shredder::Shred;
 use crate::snapshot::{SnapshotCheckpoint, SnapshotStore};
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
 
-/// Multiplier applied to every consensus timing delta, read once from the
-/// `BUNKER_DELTA_MULT` environment variable (default `1.0`).
-///
-/// The default deltas assume an internet-speed network. Over a slow half-duplex
-/// PACTOR HF link a single block's disseminate → vote → certify round-trip takes
-/// far longer than the default ~120s block cadence, so consensus falls behind
-/// and times out. Setting `BUNKER_DELTA_MULT` (e.g. `8`) stretches all timers to
-/// match the link so each slot can finalize before the next block is produced.
-/// Sim/tests leave it unset (multiplier 1.0).
+/// Consensus timer multiplier from `BUNKER_DELTA_MULT`; slow links stretch all deltas.
 static DELTA_MULT: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
     std::env::var("BUNKER_DELTA_MULT")
         .ok()
@@ -91,15 +72,7 @@ fn delta_block() -> Duration {
 fn delta_timeout() -> Duration {
     scaled(240_000)
 }
-/// Timeout for standstill detection mechanism.
-///
-/// Deliberately NOT scaled by `BUNKER_DELTA_MULT`: standstill recovery is a
-/// small cert+vote rebroadcast that only fires when finalization has made no
-/// progress at all, so a short period is safe even on a slow link. Scaled,
-/// this would be 30 minutes on the hardware profile — and a link outage
-/// that loses in-flight votes (both nodes voted, votes were lost, the
-/// double-vote guard stops re-voting) deadlocks the chain until standstill
-/// recovery rebroadcasts them. Override with `BUNKER_STANDSTILL_SECS`.
+/// Standstill detection is not delta-scaled; recovery is a small cert/vote rebroadcast.
 fn delta_standstill() -> Duration {
     std::env::var("BUNKER_STANDSTILL_SECS")
         .ok()
@@ -111,40 +84,15 @@ fn delta_standstill() -> Duration {
 pub(crate) fn delta_first_slice() -> Duration {
     scaled(30_000)
 }
-/// Max time the leader waits for the *first* transaction before producing an
-/// EMPTY slice anyway, so an idle mempool does not stall block production for the
-/// whole (delta-scaled) slice window.
-///
-/// Without this, the producer sleeps the entire `delta_first_slice` /
-/// `delta_block` waiting for txs that never arrive (empty-block consensus), so at
-/// a high `BUNKER_DELTA_MULT` the leader can take minutes to emit slot 1 — longer
-/// than a marginal HF band stays up, so no block is ever disseminated. This bound
-/// is deliberately small and *also* delta-scaled (so it still relaxes a little on
-/// slow links) but tiny in absolute terms, letting the leader make progress
-/// promptly when there is nothing to pack.
+/// First-tx wait before producing an empty slice; prevents idle mempools stalling slots.
 pub(crate) fn delta_empty_slice() -> Duration {
     scaled(2_000)
 }
-/// Max time the leader waits for the *next* transaction after already packing at
-/// least one into the current slice, before closing the slice and disseminating.
-///
-/// Without this bound the producer holds a partially-full slice open for the
-/// whole (delta-scaled) `delta_block` window waiting to fill it — minutes on a
-/// slow link — so a single-transaction block takes a full block window to even
-/// begin dissemination, and finalization of that slot stalls far behind the
-/// empty-block frontier. Bounding the inter-tx wait lets a lightly-loaded leader
-/// close a slice promptly after the last tx, while a steady tx stream still
-/// fills slices (each packed tx re-arms this grace). Delta-scaled so it relaxes a
-/// little on slow links, but small in absolute terms.
+/// Inter-tx grace for closing a partially filled slice promptly under light load.
 pub(crate) fn delta_pack_grace() -> Duration {
     scaled(2_000)
 }
-/// Grace period for which a node defers its slow-path finalization vote, giving
-/// fast-final a chance to finalize the slot from notar votes alone (see
-/// `Votor::defer_final_vote`). Sized to roughly one network round-trip (so both
-/// notar votes can meet the 80% strong quorum) and delta-scaled so it stretches
-/// with a slow link. If fast-final does not fire within this window the node
-/// falls back to sending the finalization vote, so slow-final liveness is kept.
+/// Slow-path final-vote deferral window; falls back if fast-final does not land.
 pub(crate) fn delta_final_vote_grace() -> Duration {
     scaled(16_000)
 }
@@ -172,43 +120,29 @@ pub struct Alpenglow<A: All2All, D: Disseminator, T>
 where
     T: TransactionNetwork + 'static,
 {
-    /// Other validators' info.
     epoch_info: Arc<EpochInfo>,
 
-    /// Blockstore for storing raw block data.
     blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
-    /// Pool of votes and certificates.
     pool: Arc<RwLock<Box<dyn Pool + Send + Sync>>>,
 
-    /// Block production (i.e. leader side) component of the consensus protocol.
     block_producer: Arc<BlockProducer<D, T>>,
 
-    /// All-to-all broadcast network protocol for consensus messages.
     all2all: Arc<A>,
-    /// Block dissemination network protocol for shreds.
     disseminator: Arc<D>,
 
-    /// Indicates whether the node is shutting down.
     cancel_token: CancellationToken,
-    /// Votor task handle.
     votor_handle: tokio::task::JoinHandle<()>,
 
-    /// watch channel for broadcasting epoch info updates across tasks
     epoch_info_tx: watch::Sender<Arc<EpochInfo>>,
     epoch_info_rx: watch::Receiver<Arc<EpochInfo>>,
-    /// receiver for epoch boundary events from the pool
     epoch_boundary_rx: mpsc::Receiver<EpochBoundaryEvent>,
-    /// receiver for finalized slot events from the pool
     finalized_slot_rx: mpsc::Receiver<FinalizedSlotEvent>,
-    /// receiver for slashing reports from the pool
     slashing_rx: mpsc::Receiver<SlashingReport>,
-    /// optional execution state for epoch transitions
     execution_state: Option<Arc<RwLock<bunker_coin_core::execution::State>>>,
-    /// optional snapshot store for persisting state at epoch boundaries
     snapshot_store: Option<Arc<SnapshotStore>>,
-    /// epoch transition payloads waiting to be embedded in the first block of an epoch
+    /// Epoch transition payloads waiting for this node's first block of the epoch.
     pending_epoch_transitions: Arc<RwLock<std::collections::BTreeMap<u64, Vec<u8>>>>,
-    /// swappable link-liveness source consulted by Votor's crashed-leader timeout
+    /// Swappable link-liveness source consulted by Votor's crashed-leader timeout.
     link_liveness: Arc<SwappableLiveness>,
 }
 
@@ -219,9 +153,6 @@ where
     T: TransactionNetwork + 'static,
 {
     /// Creates a new Alpenglow consensus node.
-    ///
-    /// `repair_network` - [`RepairNetwork`] for sending requests and receiving responses.
-    /// `repair_request_network` - [`RepairRequestNetwork`] for answering incoming requests.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new<RN, RR>(
@@ -256,8 +187,7 @@ where
         pool.set_epoch_boundary_channel(epoch_boundary_tx);
         pool.set_finalized_slot_channel(finalized_slot_tx);
         pool.set_slashing_channel(slashing_tx);
-        // Frontier restored from the persisted certs by `PoolImpl::load_from_db`;
-        // Votor prunes/replays its own-vote log relative to this below.
+        // Votor replays its durable own-vote log relative to the restored frontier.
         let restored_finalized_slot = Pool::finalized_slot(&pool);
         let pool: Box<dyn Pool + Send + Sync> = Box::new(pool);
         let pool = Arc::new(RwLock::new(pool));
@@ -289,15 +219,10 @@ where
             votor_rx,
             all2all.clone(),
         );
-        // Shared, swappable link-liveness source. Defaults to always-alive (no
-        // behavior change for sim/UDP); the radio path swaps in a keepalive-driven
-        // source via `Alpenglow::set_link_liveness` after the transport is wired,
-        // so a crashed-leader timeout on a slow-but-alive link pauses, not skips.
+        // Radio swaps in keepalive liveness so slow-but-alive links pause timeouts.
         let link_liveness = Arc::new(SwappableLiveness::new());
         votor.set_link_liveness(link_liveness.clone());
-        // Durable own-vote log ("tower storage"): votes are persisted before
-        // broadcast and replayed here, so a crash-restart cannot cast a vote
-        // conflicting with one already sent (a slashable offence otherwise).
+        // Durable own-vote log prevents restart from casting conflicting votes.
         votor.set_vote_history(
             VoteHistory::open(epoch_info.own_id),
             restored_finalized_slot,
@@ -346,23 +271,17 @@ where
         }
     }
 
-    /// Swap in a link-liveness source for Votor's crashed-leader timeout.
-    ///
-    /// Defaults to always-alive; radio transports inject a keepalive-driven impl
-    /// so a slow-but-alive half-duplex link pauses (re-arms the timeout) instead
-    /// of irreversibly skipping the window. No-op effect for sim/UDP nodes.
+    /// Swaps Votor's crashed-leader timeout liveness source.
     pub fn set_link_liveness(&self, liveness: Arc<dyn LinkLiveness>) {
         self.link_liveness.set(liveness);
     }
 
-    /// Starts the different tasks of the Alpenglow node.
+    /// Starts the Alpenglow node tasks.
     ///
     /// # Errors
-    ///
-    /// Returns an error only if any of the tasks panics.
+    /// Returns an error only if a main task panics.
     #[fastrace::trace(short_name = true)]
     pub async fn run(mut self) -> Result<()> {
-        // clean load after startup
         {
             let pool_guard = self.pool.read().await;
             let highest_finalized = pool_guard.finalized_slot();
@@ -373,7 +292,6 @@ where
             drop(blockstore_guard);
         }
 
-        // take the epoch boundary receiver out so we can move it into the task
         let epoch_boundary_rx = std::mem::replace(&mut self.epoch_boundary_rx, mpsc::channel(1).1);
         let finalized_slot_rx = std::mem::replace(&mut self.finalized_slot_rx, mpsc::channel(1).1);
         let slashing_rx = std::mem::replace(&mut self.slashing_rx, mpsc::channel(1).1);
@@ -439,12 +357,8 @@ where
         epoch_loop.abort();
         finalized_checkpoint_loop.abort();
 
-        // Await ALL spawned tasks (not just msg/prod) so every `Arc<Alpenglow>`
-        // clone they hold is dropped before `run()` returns. Those Arcs keep the
-        // RocksDB blockstore/pool handles alive; if any task is still unwinding
-        // when `run()` returns and the node is rebuilt (reconnect), the new
-        // `DB::open` hits "lock held by current process". Aborted tasks resolve to
-        // `JoinError::Cancelled`, which we ignore here — teardown, not failure.
+        // Await all tasks so their `Arc<Alpenglow>` clones release RocksDB before reconnect.
+        // Cancelled joins are expected teardown, not failure.
         let (msg_res, prod_res, _, _, _) = tokio::join!(
             msg_loop,
             prod_loop,
@@ -452,12 +366,9 @@ where
             epoch_loop,
             finalized_checkpoint_loop,
         );
-        // Drop the local Arc; with all tasks finished this is the last reference,
-        // so the node (and its DB handles) is fully released here.
         drop(node);
 
-        // Surface a genuine panic (not a cancellation) from the main loops; a
-        // cancelled join is expected teardown and ignored.
+        // Surface genuine main-loop panics; cancellations are teardown.
         if let Ok(Err(e)) = msg_res {
             return Err(e);
         }
@@ -475,11 +386,7 @@ where
         Arc::clone(&self.pool)
     }
 
-    /// Shared handle to this node's block store (cheap `Arc` clone).
-    ///
-    /// Lets an out-of-band reader (e.g. an RPC server) query finalized blocks
-    /// while the node runs — the same handle the consensus loop writes to, so
-    /// reads see blocks as soon as they are persisted.
+    /// Shared blockstore handle for out-of-band readers.
     pub fn get_blockstore(&self) -> Arc<RwLock<Box<dyn Blockstore + Send + Sync>>> {
         Arc::clone(&self.blockstore)
     }
@@ -488,22 +395,12 @@ where
         self.cancel_token.clone()
     }
 
-    /// Handles incoming messages on all the different network interfaces.
-    ///
-    /// [`All2All`]: Handles incoming votes and certificates. Adds them to the [`Pool`].
-    /// [`Disseminator`]: Handles incoming shreds. Adds them to the [`Blockstore`].
+    /// Ingests incoming votes, certs, and shreds.
     async fn message_loop(self: &Arc<Self>) -> Result<()> {
-        // A receive/handle error must NOT kill this loop: it is the ONLY
-        // ingestion path for votes, certs, and disseminated shreds, it is
-        // spawned detached, and its JoinHandle is inspected only at teardown —
-        // an early return here silently and permanently stops all vote
-        // counting while the producer/repair/standstill loops keep running,
-        // leaving a node that looks alive but can never form another cert.
-        // Log loudly and keep receiving; back off briefly so a persistently-
-        // failing source (e.g. a closed channel) cannot hot-loop.
+        // Ingestion errors must not kill this only vote/cert/shred receive path.
+        // Log and back off so persistent failures cannot hot-loop.
         loop {
             tokio::select! {
-                // handle incoming votes and certificates
                 res = self.all2all.receive() => match res {
                     Ok(msg) => self.handle_all2all_message(msg).await,
                     Err(e) => {
@@ -511,7 +408,6 @@ where
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 },
-                // handle shreds received by block dissemination protocol
                 res = self.disseminator.receive() => match res {
                     Ok(shred) => {
                         if let Err(e) = self.handle_disseminator_shred(shred).await {
@@ -529,10 +425,7 @@ where
         }
     }
 
-    /// Handles standstill detection and triggers recovery.
-    ///
-    /// Keeps track of when consensus progresses, i.e., [`Pool`] finalizes new blocks.
-    /// Triggers standstill recovery if no progress was detected for a long time.
+    /// Triggers standstill recovery when finalization stops progressing.
     async fn standstill_loop(self: &Arc<Self>) -> Result<()> {
         let mut finalized_slot = Slot::new(0);
         let mut last_progress = Instant::now();
@@ -545,9 +438,7 @@ where
                 self.pool.read().await.recover_from_standstill().await;
                 last_progress = Instant::now();
             }
-            // Check at a fixed cadence: sleeping delta_block() (12 minutes at
-            // the hardware delta_mult) added up to a full block window of
-            // detection latency on top of the standstill period itself.
+            // Fixed cadence avoids adding a full scaled block window of detection latency.
             tokio::time::sleep(delta_block().min(Duration::from_secs(60))).await;
         }
     }
@@ -557,11 +448,7 @@ where
         trace!("received all2all msg: {msg:?}");
         match msg {
             ConsensusMessage::Vote(v) => {
-                // Log at info/warn (not trace): votes are low-rate and this
-                // is the only operational evidence of whether the peer's
-                // votes are arriving and being counted — at trace level a
-                // rejected vote is invisible and a finalization stall is
-                // undiagnosable from the logs.
+                // Vote logs stay info/warn because finalization stalls need visible evidence.
                 let (slot, signer) = (v.slot(), v.signer());
                 match self.pool.write().await.add_vote(v).await {
                     Ok(()) => info!("counted vote for slot {slot} from validator {signer}"),
@@ -585,16 +472,13 @@ where
 
     #[fastrace::trace(short_name = true)]
     async fn handle_disseminator_shred(&self, shred: Shred) -> std::io::Result<()> {
-        // potentially forward shred
         self.disseminator.forward(&shred).await?;
 
-        // if we are the leader, we already have the shred
         let slot = shred.payload().header.slot;
         if self.epoch_info.leader(slot).id == self.epoch_info.own_id {
             return Ok(());
         }
 
-        // otherwise, ingest into blockstore
         let res = self
             .blockstore
             .write()
@@ -643,11 +527,10 @@ async fn epoch_transition_loop(
             completed_epoch, event.finalized_slot
         );
 
-        // run state transition if execution state is available
         if let Some(ref state) = execution_state {
             let mut state_guard = state.write().await;
 
-            // drain slashing reports and convert to offence reports
+            // Convert pending slashing reports into epoch offences.
             while let Ok(report) = slashing_rx.try_recv() {
                 let validator_pk = *epoch_info.validator(report.validator_id).pubkey.as_bytes();
                 let offence_kind = match report.offence {
@@ -681,7 +564,6 @@ async fn epoch_transition_loop(
                 &result.state_hash[..8],
             );
 
-            // save snapshot
             if let Some(ref store) = snapshot_store {
                 store.save_snapshot(new_epoch, &state_guard);
                 if let Some(manifest) = store.load_manifest(new_epoch) {
@@ -722,12 +604,8 @@ async fn epoch_transition_loop(
                         ) {
                             Ok(encoded) => {
                                 let mut pending = pending_epoch_transitions.write().await;
-                                // A transition payload is consumed only when THIS
-                                // node produces the first block of its epoch; on
-                                // every epoch another validator leads, the entry
-                                // would sit here forever. Any epoch older than the
-                                // one starting now can no longer be embedded —
-                                // drop it.
+                                // Only this node's first block can consume a transition payload;
+                                // drop entries older than the epoch starting now.
                                 *pending = pending.split_off(&new_epoch);
                                 pending.insert(new_epoch, encoded);
                             }
@@ -756,7 +634,6 @@ async fn epoch_transition_loop(
             }
         }
 
-        // build new epoch info from current (for now, same validator set)
         let current = epoch_info_tx.borrow().clone();
         let new_epoch_info = Arc::new(EpochInfo::new(
             new_epoch,
@@ -764,7 +641,6 @@ async fn epoch_transition_loop(
             current.validators.clone(),
         ));
 
-        // unblock block production with the new epoch info
         let _ = epoch_info_tx.send(new_epoch_info);
         info!("epoch {} started", new_epoch);
     }
@@ -776,12 +652,8 @@ async fn finalized_checkpoint_loop(
     snapshot_store: Option<Arc<SnapshotStore>>,
 ) {
     while let Some(event) = finalized_slot_rx.recv().await {
-        // Drop in-memory blocks/shreds far below the new finalized frontier
-        // (they stay durable in RocksDB; reads fall back there). Done HERE —
-        // outside any pool lock — because taking `blockstore.write()` from
-        // inside the pool's cert handling adds a pool→blockstore lock edge
-        // that deadlocked against the shred-ingest path (which holds the
-        // blockstore write lock across an await on the bounded votor channel).
+        // Prune outside pool locks to avoid the pool-to-blockstore lock edge
+        // that can deadlock against shred ingestion.
         blockstore.write().await.prune_finalized(event.slot);
 
         let Some(ref snapshot_store) = snapshot_store else {

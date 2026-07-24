@@ -1,25 +1,10 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Different strategies for sampling validators.
+//! Sampling strategies for validator and relay selection.
 //!
-//! First, this module provides a trait for randomly sampling validators.
-//! To implement a new sampling strategy, you need to implement [`SamplingStrategy`],
-//! by implementing [`SamplingStrategy::sample`].
-//! The trait provides a default implementation for sampling `k` validators,
-//! via [`SamplingStrategy::sample_multiple`].
-//! However, samplers might override this for performance reasons.
-//!
-//! # Sampling strategies
-//!
-//! This module provides implementations for the following sampling strategies:
-//! - [`UniformSampler`] does uniform sampling with replacement.
-//! - [`StakeWeightedSampler`] samples validators proportional to their stake.
-//! - [`DecayingAcceptanceSampler`] samples validators less as they approach maximum.
-//! - [`TurbineSampler`] simulates the workload of Turbine.
-//! - [`PartitionSampler`] splits validators into bins and samples from each bin.
-//! - [`FaitAccompli1Sampler`] uses the FA1-F committee sampling strategy.
-//! - [`FaitAccompli2Sampler`] uses the FA2 committee sampling strategy.
+//! Includes uniform, stake-weighted, decaying-acceptance, Turbine, partitioned,
+//! Fait Accompli, and geography-aware samplers.
 
 use std::sync::Mutex;
 
@@ -30,52 +15,35 @@ use crate::disseminator::turbine::DEFAULT_FANOUT;
 use crate::sherpa::SherpaHandle;
 use crate::{Slot, Stake, ValidatorId, ValidatorInfo};
 
-/// Sampling strategies involving rejection sampling may panic after rejecting this many samples.
+/// Rejection samplers panic after this many failed attempts.
 const MAX_TRIES_PER_SAMPLE: usize = 100_000;
 
-/// An abstraction for randomly sampling validators based on some distribution.
+/// Random validator sampler.
 pub trait SamplingStrategy {
-    /// Samples a validator with this probability distribution.
-    ///
-    /// Depending on the implementor, this may or may not be stateless.
+    /// Samples a validator id.
     ///
     /// # Panics
-    ///
-    /// Implementations may panic if the sampler has reached an invalid state
-    /// or if the sampling process failed [`MAX_TRIES_PER_SAMPLE`] times.
+    /// Panics if the sampler state is invalid or rejection exceeds [`MAX_TRIES_PER_SAMPLE`].
     fn sample<R: RngCore>(&self, rng: &mut R) -> ValidatorId {
         self.sample_info(rng).id
     }
 
-    /// Samples a validator's `ValidatorInfo` with this probability distribution.
-    ///
-    /// Depending on the implementor, this may or may not be stateless.
+    /// Samples a validator's [`ValidatorInfo`].
     ///
     /// # Panics
-    ///
-    /// Implementations may panic if the sampler has reached an invalid state
-    /// or if the sampling process failed [`MAX_TRIES_PER_SAMPLE`] times.
+    /// Panics if the sampler state is invalid or rejection exceeds [`MAX_TRIES_PER_SAMPLE`].
     fn sample_info<R: RngCore>(&self, rng: &mut R) -> &ValidatorInfo;
 
-    /// Samples `k` validators with this probability distribution.
+    /// Samples `k` validator ids.
     ///
     /// # Panics
-    ///
-    /// Panics if any of the `k` calls to [`SamplingStrategy::sample`] panics.
+    /// Panics if any individual sample panics.
     fn sample_multiple<R: RngCore>(&self, k: usize, rng: &mut R) -> Vec<ValidatorId> {
         (0..k).map(|_| self.sample(rng)).collect()
     }
 
-    /// Deterministically samples the relay validator for a given shred.
-    ///
-    /// Every node independently computes the relay assignment to decide
-    /// whether it is the designated relay, so all nodes must arrive at the
-    /// same answer for the same `(slot, shred_index)`.
-    ///
-    /// The default implementation seeds an RNG from `(slot, shred_index)`
-    /// and draws a single sample. Samplers may override this to coordinate
-    /// relay assignments across the shreds of a slice (e.g. for geographic
-    /// path diversity).
+    /// Deterministically samples the relay for a shred.
+    /// All nodes must derive the same relay from the same `(slot, shred_index)`.
     fn sample_shred_relay(&self, slot: Slot, shred_index: usize) -> ValidatorId {
         let seed = [
             slot.inner().to_be_bytes(),
@@ -88,13 +56,13 @@ pub trait SamplingStrategy {
         self.sample(&mut rng)
     }
 
-    /// Returns a printable name of the sampling strategy.
+    /// Returns a printable strategy name.
     fn name() -> &'static str {
         std::any::type_name::<Self>()
     }
 }
 
-/// A trivial sampler that picks the same validator all the time.
+/// Sampler that always picks the same validator.
 #[derive(Clone)]
 pub struct AllSameSampler(pub ValidatorInfo);
 
@@ -112,10 +80,7 @@ impl SamplingStrategy for AllSameSampler {
     }
 }
 
-/// A basic sampler that picks all validators with equal probability.
-///
-/// This sampler is stateless and chooses validators with replacement.
-/// Multiple samples from this are thus independent and identically distributed.
+/// Stateless uniform sampler with replacement.
 #[derive(Clone)]
 pub struct UniformSampler {
     validators: Vec<ValidatorInfo>,
@@ -142,10 +107,7 @@ impl SamplingStrategy for UniformSampler {
     }
 }
 
-/// A sampler that picks validators directly proportional to their stake.
-///
-/// This sampler is stateless and chooses validators with replacement.
-/// Multiple samples from this are thus independent and identically distributed.
+/// Stateless stake-weighted sampler with replacement.
 #[derive(Clone)]
 pub struct StakeWeightedSampler {
     validators: Vec<ValidatorInfo>,
@@ -153,7 +115,7 @@ pub struct StakeWeightedSampler {
 }
 
 impl StakeWeightedSampler {
-    /// Creates a new `StakeWeightedSampler` instance.
+    /// Creates a stake-weighted sampler.
     pub fn new(validators: Vec<ValidatorInfo>) -> Self {
         let stakes: Vec<Stake> = validators.iter().map(|v| v.stake).collect();
         let stake_index = WeightedIndex::new(&stakes).unwrap();
@@ -179,15 +141,8 @@ impl SamplingStrategy for StakeWeightedSampler {
     }
 }
 
-/// A hybrid sampler between weighted sampling with and without replacement.
-///
-/// Any element is sample at most `ceil(max_samples)` times.
-/// Elements are rejected with probability proportional to `k / max_samples`,
-/// where `k` is how often the element has been sampled before.
-/// Sampling differs between, e.g., `max_samples = 2` and `max_samples = 2.5`.
-///
-/// - For `max_samples = 1` it is stake-weighted sampling WITHOUT replacement.
-/// - For `max_samples -> inf` it approaches the behavior WITH replacement.
+/// Stake-weighted sampler with rejection probability rising per prior sample.
+/// `max_samples = 1` approximates without replacement; infinity permits replacement.
 pub struct DecayingAcceptanceSampler {
     stake_weighted: StakeWeightedSampler,
     max_samples: f64,
@@ -195,7 +150,7 @@ pub struct DecayingAcceptanceSampler {
 }
 
 impl DecayingAcceptanceSampler {
-    /// Creates a new `DecayingAcceptanceSampler` instance.
+    /// Creates a decaying-acceptance sampler.
     pub fn new(validators: Vec<ValidatorInfo>, max_samples: f64) -> Self {
         let sample_count = vec![0; validators.len()];
         Self {
@@ -205,8 +160,7 @@ impl DecayingAcceptanceSampler {
         }
     }
 
-    /// Resets the internal state of this stateful sampler.
-    /// After resetting it is just as it was when it was first created.
+    /// Resets the stateful sample counters.
     pub fn reset(&self) {
         let mut sample_count = self.sample_count.lock().unwrap();
         *sample_count = vec![0; self.stake_weighted.validators.len()];
@@ -214,11 +168,10 @@ impl DecayingAcceptanceSampler {
 }
 
 impl SamplingStrategy for DecayingAcceptanceSampler {
-    /// Samples a validator with the given probability distribution.
+    /// Samples a validator id.
     ///
     /// # Panics
-    ///
-    /// Panics if after [`MAX_TRIES_PER_SAMPLE`] samples none was valid.
+    /// Panics if rejection exceeds [`MAX_TRIES_PER_SAMPLE`].
     fn sample<R: RngCore>(&self, rng: &mut R) -> ValidatorId {
         for _ in 0..MAX_TRIES_PER_SAMPLE {
             let sample = self.stake_weighted.sample(rng);
@@ -259,12 +212,8 @@ impl Clone for DecayingAcceptanceSampler {
     }
 }
 
-/// A sampler that simulates the probability distribution of Turbine for Rotor.
-///
-/// The goal is to distribute the required work for validators as in Turbine.
-/// Specifically, it should respect the same upper bound on the amount of work,
-/// that is, for `v` validators and given `fanout` any validator should
-/// be sampled no more than with probability `fanout / v`.
+/// Rotor sampler that approximates Turbine relay workload distribution.
+/// No validator should be sampled above `fanout / validators` probability.
 #[derive(Clone)]
 pub struct TurbineSampler {
     fanout: usize,
@@ -272,21 +221,18 @@ pub struct TurbineSampler {
 }
 
 impl TurbineSampler {
-    /// Creates a new `TurbineSampler` instance simulating the [`DEFAULT_FANOUT`]
-    /// from the actual [`Turbine`] implementation.
-    ///
-    /// [`Turbine`]: crate::disseminator::turbine::Turbine
+    /// Creates a sampler for the default [`Turbine`](crate::disseminator::turbine::Turbine) fanout.
     pub fn new(validators: Vec<ValidatorInfo>) -> Self {
         Self::new_with_fanout(validators, DEFAULT_FANOUT)
     }
 
-    /// Creates a new `TurbineSampler` instance simulating the given fanout.
-    // TODO: support more than 2 levels of Turbine?
+    /// Creates a sampler for a specific Turbine fanout.
+    // Models two Turbine levels.
     #[must_use]
     pub fn new_with_fanout(mut validators: Vec<ValidatorInfo>, turbine_fanout: usize) -> Self {
         let total_stake: Stake = validators.iter().map(|v| v.stake).sum();
 
-        // calculate expected work for each validator (only excess over leader work)
+        // Estimate each validator's relay work, excluding leader work.
         let mut expected_work = vec![0.0; validators.len()];
         let validators_left = validators.len() - 1;
         for leader in &validators {
@@ -320,7 +266,6 @@ impl TurbineSampler {
             }
         }
 
-        // turn expected work into stakes
         for (i, w) in expected_work.into_iter().enumerate() {
             validators[i].stake = (w * 1_000_000_000.0) as Stake;
         }
@@ -333,11 +278,10 @@ impl TurbineSampler {
 }
 
 impl SamplingStrategy for TurbineSampler {
-    /// Samples a validator with the given probability distribution.
+    /// Samples a validator id.
     ///
     /// # Panics
-    ///
-    /// Panics if after [`MAX_TRIES_PER_SAMPLE`] samples none was valid.
+    /// Panics if rejection exceeds [`MAX_TRIES_PER_SAMPLE`].
     fn sample<R: RngCore>(&self, rng: &mut R) -> ValidatorId {
         let n = self.stake_weighted.validators.len();
         let root = self.stake_weighted.sample(rng);
@@ -364,18 +308,8 @@ impl SamplingStrategy for TurbineSampler {
     }
 }
 
-/// A sampler that samples proportional to stake with reduced variance.
-///
-/// This sampler operates on `k` bins of validators of equal stake.
-/// Within each bin a validator is sampled with probability proportional to its stake.
-/// To sample `k` validators then, one validator is drawn from each of the `k` bins.
-///
-/// Given that each validator has less stake than to fill one bins entirely,
-/// as is the case if this is used as the fallback sampler in [`FaitAccompli1Sampler`],
-/// each validator appears in at most two bins and is thus sampled at most twice.
-///
-/// In expectation each validator is sampled proportionally to its stake.
-/// However, this is done with lower variance than [`StakeWeightedSampler`] would.
+/// Reduced-variance stake sampler that draws one validator from each stake bin.
+/// Validators below one bin of stake appear in at most two bins.
 #[derive(Clone)]
 pub struct PartitionSampler {
     validators: Vec<ValidatorInfo>,
@@ -385,10 +319,7 @@ pub struct PartitionSampler {
 }
 
 impl PartitionSampler {
-    /// Creates a new `ParitionSampler` instance.
-    ///
-    /// Partitions the given validators into `num_bins` bins of equal stake.
-    /// Paritioning is done randomly by splitting a randomly permuted list of nodes.
+    /// Creates a partition sampler by randomly splitting validators into equal-stake bins.
     pub fn new(validators: Vec<ValidatorInfo>, num_bins: usize) -> Self {
         if num_bins == 0 {
             return Self {
@@ -407,7 +338,6 @@ impl PartitionSampler {
         let mut validators_random = validators.clone();
         validators_random.shuffle(&mut rand::rng());
 
-        // partition into bins
         let mut current_bin = 0;
         let mut current_bin_stake = 0;
         for v in validators_random {
@@ -425,7 +355,6 @@ impl PartitionSampler {
             }
         }
 
-        // generate stake weighted indices for each bin
         let mut bins = Vec::with_capacity(num_bins);
         for stakes in &bin_stakes {
             let bin = WeightedIndex::new(stakes).unwrap();
@@ -465,17 +394,8 @@ impl SamplingStrategy for PartitionSampler {
     }
 }
 
-/// A sampler that uses the FA1-F committee sampling strategy.
-///
-/// This is a strict improvement over performing IID stake-weighted sampling.
-/// It achieves lower variance by deterministically sampling high-stake validators.
-///
-/// FA1-F is parameterized by a fallback sampler `F` and runs in two phases:
-/// 1. Any validator with more than `1/k` fractional stake, is deterministically
-///    selected `floor(fractional stake * k)` times.
-/// 2. For the remaining `k'` samples, sample each validator from `F`, instantiated
-///    with modified stake weights: `S'(v) = S(v) - floor(S(v) * k) / k`
-///
+/// FA1-F committee sampler: deterministic high-stake picks plus fallback.
+/// Remaining samples draw from `F` using residual stake weights.
 /// See also: <https://dl.acm.org/doi/pdf/10.1145/3576915.3623194>
 pub struct FaitAccompli1Sampler<F: SamplingStrategy> {
     validators: Vec<ValidatorInfo>,
@@ -484,9 +404,7 @@ pub struct FaitAccompli1Sampler<F: SamplingStrategy> {
 }
 
 impl FaitAccompli1Sampler<PartitionSampler> {
-    /// Creates a new FA1-F sampler with a variance-reducing partition fallback sampler.
-    ///
-    /// See [`PartitionSampler`] for more details.
+    /// Creates an FA1-F sampler with a partition fallback.
     #[must_use]
     pub fn new_with_partition_fallback(validators: Vec<ValidatorInfo>, k: u64) -> Self {
         let total_stake: Stake = validators.iter().map(|v| v.stake).sum();
@@ -514,9 +432,7 @@ impl FaitAccompli1Sampler<PartitionSampler> {
 }
 
 impl FaitAccompli1Sampler<StakeWeightedSampler> {
-    /// Creates a new FA1-F sampler with an IID stake-weighted fallback sampler.
-    ///
-    /// See [`StakeWeightedSampler`] for more details.
+    /// Creates an FA1-F sampler with IID stake-weighted fallback.
     #[must_use]
     pub fn new_with_stake_weighted_fallback(validators: Vec<ValidatorInfo>, k: u64) -> Self {
         let total_stake: Stake = validators.iter().map(|v| v.stake).sum();
@@ -584,8 +500,7 @@ impl<F: SamplingStrategy + Clone> Clone for FaitAccompli1Sampler<F> {
     }
 }
 
-/// A sampler that uses the FA2 committee sampling strategy.
-///
+/// FA2 committee sampler.
 /// See also: <https://dl.acm.org/doi/pdf/10.1145/3576915.3623194>
 pub struct FaitAccompli2Sampler {
     validators: Vec<ValidatorInfo>,
@@ -595,13 +510,9 @@ pub struct FaitAccompli2Sampler {
 }
 
 impl FaitAccompli2Sampler {
-    /// Creates a new FA2 sampler instance.
-    ///
-    /// This is instantiated for a fixed number of samples `k`.
-    /// To this end, the FA1 and FA2 pre-processing steps are applied,
-    /// and also a stake-weighted IID fallback sampler is generated.
+    /// Creates an FA2 sampler for a fixed sample count `k`.
     pub fn new(validators: Vec<ValidatorInfo>, k: u64) -> Self {
-        // FA1 step
+        // FA1 deterministic samples.
         let total_stake: Stake = validators.iter().map(|v| v.stake).sum();
         let mut required_samples = Vec::new();
         for v in &validators {
@@ -610,7 +521,7 @@ impl FaitAccompli2Sampler {
             required_samples.extend((0..samples).map(|_| v.id));
         }
 
-        // FA2 step
+        // FA2 medium-node probabilities.
         let f = Self::minimize_f(&validators, k);
         let mut medium_nodes = Vec::new();
         for (i, fi) in f.iter().enumerate() {
@@ -621,7 +532,7 @@ impl FaitAccompli2Sampler {
             }
         }
 
-        // generate stake-weighted IID fallback sampler
+        // Residual stake distribution for IID fallback.
         let r: f64 = validators
             .iter()
             .enumerate()
@@ -678,18 +589,18 @@ impl SamplingStrategy for FaitAccompli2Sampler {
     }
 
     fn sample_multiple<R: RngCore>(&self, k: usize, rng: &mut R) -> Vec<ValidatorId> {
-        // add required FA1 samples
+        // Required FA1 samples.
         let mut validators = Vec::with_capacity(k);
         validators.extend_from_slice(&self.required_samples);
 
-        // sample medium nodes (FA2 step)
+        // FA2 medium-node Bernoulli samples.
         for (validator, probability) in &self.medium_nodes {
             if rng.random_bool(*probability) {
                 validators.push(*validator);
             }
         }
 
-        // sample remaining validators IID stake-weighted
+        // Remaining slots use IID stake-weighted fallback.
         if validators.len() < k {
             let k_prime = k - validators.len();
             let additional_samples = self.fallback_sampler.sample_multiple(k_prime, rng);
@@ -715,36 +626,18 @@ impl Clone for FaitAccompli2Sampler {
     }
 }
 
-// ----- GeoAwareSampler -------------------------------------------------------
-
-/// A sampling strategy that selects relay validators using geographic diversity.
-///
-/// For each sample, [`GeoAwareSampler`] delegates to the Sherpa service to pick
-/// from the `top_k` geographically diverse candidates (excluding the leader),
-/// then samples uniformly among them weighted by stake. This ensures that
-/// Rotor relay selection maximises the use of distinct HF propagation paths
-/// as required by the Radiotor specification (§2.4).
-///
-/// Falls back to [`StakeWeightedSampler`] for validators without location data.
+/// Relay sampler that favors geographically diverse Sherpa candidates.
+/// Falls back to stake-weighted sampling when location data is insufficient.
 pub struct GeoAwareSampler {
     sherpa: SherpaHandle,
-    /// Number of diverse relay candidates to pre-select before stake-weighted sampling.
     top_k: usize,
-    /// Validator IDs to exclude from relay selection (typically the block leader).
     exclude: Vec<ValidatorId>,
-    /// Fallback for when not enough location data is available.
     fallback: StakeWeightedSampler,
-    /// Full validator list (kept for fallback construction).
     validators: Vec<ValidatorInfo>,
 }
 
 impl GeoAwareSampler {
-    /// Create a new `GeoAwareSampler`.
-    ///
-    /// - `sherpa`: shared Sherpa routing service.
-    /// - `validators`: the full validator set for the current epoch.
-    /// - `top_k`: how many geographically diverse candidates to consider per sample.
-    /// - `exclude`: validator IDs that must never be selected as relay (e.g. leader).
+    /// Creates a geography-aware sampler.
     pub fn new(
         sherpa: SherpaHandle,
         validators: Vec<ValidatorInfo>,
@@ -770,13 +663,13 @@ impl SamplingStrategy for GeoAwareSampler {
             return self.fallback.sample_info(rng);
         }
 
-        // Stake-weighted sample among the diverse candidates.
+        // Stake-weighted sample among diverse candidates.
         let stakes: Vec<Stake> = candidates.iter().map(|v| v.stake.max(1)).collect();
         match WeightedIndex::new(&stakes) {
             Ok(dist) => {
                 let idx = dist.sample(rng);
                 let chosen_id = candidates[idx].id;
-                // Return the reference from our own validators slice (lifetime safety).
+                // Return from `validators` so the reference has `self` lifetime.
                 self.validators
                     .iter()
                     .find(|v| v.id == chosen_id)
@@ -786,24 +679,13 @@ impl SamplingStrategy for GeoAwareSampler {
         }
     }
 
-    /// Assigns relays round-robin over the geographically diverse candidate list.
-    ///
-    /// `diverse_relays()` orders candidates by greedy farthest-point selection,
-    /// so walking the list assigns consecutive shreds to relays in distinct
-    /// geographic regions. This spreads the shreds of a slice across parallel
-    /// HF propagation paths and avoids routing them all through the same
-    /// geographic bottleneck (Radiotor spec §2.4).
-    ///
-    /// The assignment only depends on the validator set and `(slot, shred_index)`,
-    /// so all nodes compute the same relay. Distances are f64 Haversine values;
-    /// platform differences in libm could in principle reorder near-equidistant
-    /// candidates, which degrades to duplicate/missed relaying (repair recovers),
-    /// never to a safety violation.
+    /// Assigns relays round-robin over Sherpa's diverse candidate order.
+    /// Determinism is required for agreement; libm tie drift affects liveness only.
     fn sample_shred_relay(&self, slot: Slot, shred_index: usize) -> ValidatorId {
         let candidates = self.sherpa.diverse_relays(self.top_k, &self.exclude);
 
         if candidates.is_empty() {
-            // Degenerate case (everything excluded): seeded stake-weighted draw.
+            // Degenerate all-excluded case: seeded stake-weighted draw.
             let seed = [
                 slot.inner().to_be_bytes(),
                 shred_index.to_be_bytes(),
@@ -815,7 +697,7 @@ impl SamplingStrategy for GeoAwareSampler {
             return self.fallback.sample(&mut rng);
         }
 
-        // Offset by slot so relay duty rotates across slots as well.
+        // Offset by slot so relay duty rotates across slots.
         let idx = (slot.inner() as usize).wrapping_add(shred_index) % candidates.len();
         candidates[idx].id
     }
@@ -874,13 +756,11 @@ mod tests {
 
     #[test]
     fn uniform_sampler() {
-        // apply Hoeffding's bound to number of different samples
         let validators = create_validator_info(1000);
         let sampler = UniformSampler::new(validators);
         let sampled = sampler.sample_multiple(1000, &mut rand::rng());
         let sampled_set: HashSet<_> = sampled.iter().collect();
         assert!(sampled_set.len() > 500 && sampled_set.len() < 750);
-        // apply Chernoff's bound to maximum appearances of any sample
         let max_appearances = sampled_set
             .iter()
             .map(|i| sampled.iter().filter(|v| *v == *i).count())
@@ -889,7 +769,6 @@ mod tests {
         assert!(max_appearances > 1);
         assert!(max_appearances < 17);
 
-        // bounds should hold even with one high-stake validator
         let mut validators = create_validator_info(1000);
         validators[0].stake = 1_000_000_000;
         let sampler = UniformSampler::new(validators);
@@ -904,7 +783,6 @@ mod tests {
         assert!(max_appearances > 1);
         assert!(max_appearances < 17);
 
-        // bound should hold even with every second validator being high-stake
         let mut validators = create_validator_info(1000);
         for i in (0..validators.len()).step_by(2) {
             validators[i].stake = 1_000_000_000;
@@ -924,7 +802,6 @@ mod tests {
 
     #[test]
     fn stake_weighted_sampler() {
-        // with equal stake, bounds from uniform sampling hold
         let validators = create_validator_info(1000);
         let sampler = StakeWeightedSampler::new(validators);
         let sampled = sampler.sample_multiple(1000, &mut rand::rng());
@@ -938,7 +815,6 @@ mod tests {
         assert!(max_appearances > 1);
         assert!(max_appearances < 17);
 
-        // sampling is done by stake and with replacement
         let mut validators = create_validator_info(100);
         validators[0].stake = 1_000_000_000;
         let sampler = StakeWeightedSampler::new(validators);
@@ -950,14 +826,12 @@ mod tests {
 
     #[test]
     fn decaying_acceptance_sampler() {
-        // max_samples = 1 equivalent to sampling w/o replacement
         let validators = create_validator_info(100);
         let sampler = DecayingAcceptanceSampler::new(validators, 1.0);
         let sampled = sampler.sample_multiple(100, &mut rand::rng());
         let sampled_set: HashSet<_> = sampled.iter().copied().collect();
         assert_eq!(sampled_set.len(), 100);
 
-        // heavy node sampled at most max_samples times
         let mut validators = create_validator_info(100);
         validators[0].stake = 10_000;
         let sampler = DecayingAcceptanceSampler::new(validators, 5.0);
@@ -965,7 +839,6 @@ mod tests {
         let sampled0 = sampled.into_iter().filter(|v| *v == 0).count();
         assert!(sampled0 <= 5);
 
-        // max_samples = inf equivalent to sampling with replacement
         let mut validators = create_validator_info(100);
         validators[0].stake = 1_000_000_000;
         let sampler = DecayingAcceptanceSampler::new(validators, f64::INFINITY);
@@ -974,8 +847,6 @@ mod tests {
         let sampled0 = sampled.into_iter().filter(|v| *v == 0).count();
         assert_eq!(sampled0, 100);
 
-        // test `clone` and `reset`
-        // resetting after each iteration should behave the same as `max_samples = inf`
         let mut sampler = sampler.clone();
         sampler.max_samples = 5.0;
         for _ in 0..100 {
@@ -992,12 +863,10 @@ mod tests {
 
         let mut rng = rand::rng();
         let mut validators = create_validator_info(1000);
-        // two large nodes with roughly 5% of the stake each
         validators[0].stake = 55;
         validators[1].stake = 55;
         let total_stake = validators.len() as u64 - 2 + validators[0].stake + validators[1].stake;
 
-        // calculate work expected with `TurbineSampler`
         let sampler = TurbineSampler::new(validators.clone());
         let sampled = sampler.sample_multiple(TOTAL_SHREDS * SLICES, &mut rng);
         let appearances0 = sampled.iter().filter(|v| **v == 0).count();
@@ -1007,25 +876,21 @@ mod tests {
         let work1 = ((TOTAL_SHREDS * SLICES) as u64 * validators[1].stake / total_stake)
             + (appearances1 * (validators.len() - 2)) as u64;
 
-        // simulate and count work required with actual `Turbine`
         let mut turbine_work = [0, 0];
         let mut rng = SmallRng::from_rng(&mut rand::rng());
         for _ in 0..TOTAL_SHREDS * SLICES {
             let mut weighted_shuffle = WeightedShuffle::new(validators.iter().map(|v| v.stake));
             let mut validator_ids = weighted_shuffle.shuffle(&mut rng).map(|i| i as ValidatorId);
 
-            // leader work
             let leader = validator_ids.next().unwrap();
             if leader == 0 || leader == 1 {
                 turbine_work[leader as usize] += 1;
             }
-            // root work
             assert!(validators.len() > DEFAULT_FANOUT + 2);
             let root = validator_ids.next().unwrap();
             if root == 0 || root == 1 {
                 turbine_work[root as usize] += DEFAULT_FANOUT;
             }
-            // layer-1 work
             let mut validators_left = validators.len() - 2 - DEFAULT_FANOUT;
             for _ in 0..DEFAULT_FANOUT {
                 let parent = validator_ids.next().unwrap() as usize;
@@ -1040,7 +905,6 @@ mod tests {
             }
         }
 
-        // compare the two
         const TOLERANCE: f64 = 0.05;
         let rel_workload0 = turbine_work[0] as f64 / work0 as f64;
         println!("{rel_workload0}");
@@ -1057,7 +921,6 @@ mod tests {
     fn turbine_sampler_real_world() {
         const SLICES: usize = 100_000;
 
-        // use real mainnet validator stake distribution
         let stakes = VALIDATOR_DATA
             .iter()
             .filter_map(ValidatorData::active_stake)
@@ -1068,7 +931,6 @@ mod tests {
             validators[i].stake = stake;
         }
 
-        // calculate work expected with `TurbineSampler`
         let mut rng = SmallRng::from_rng(&mut rand::rng());
         let sampler = TurbineSampler::new(validators.clone());
         let mut expected_work = vec![0; validators.len()];
@@ -1084,20 +946,16 @@ mod tests {
             expected_work[v] = leader_work + relay_work;
         }
 
-        // simulate and count work required with actual `Turbine`
         let mut turbine_workload = vec![0; validators.len()];
         for _ in 0..TOTAL_SHREDS * SLICES {
             let mut weighted_shuffle = WeightedShuffle::new(validators.iter().map(|v| v.stake));
             let mut validator_ids = weighted_shuffle.shuffle(&mut rng).map(|i| i as ValidatorId);
 
-            // leader work
             let leader = validator_ids.next().unwrap();
             turbine_workload[leader as usize] += 1;
-            // root work
             assert!(validators.len() > DEFAULT_FANOUT + 2);
             let root = validator_ids.next().unwrap();
             turbine_workload[root as usize] += DEFAULT_FANOUT;
-            // level-1 work
             let mut validators_left = validators.len() - 2 - DEFAULT_FANOUT;
             for _ in 0..DEFAULT_FANOUT {
                 let parent = validator_ids.next().unwrap() as usize;
@@ -1109,10 +967,8 @@ mod tests {
             }
         }
 
-        // compare the two
         const TOLERANCE: f64 = 0.05;
         for (tw, sw) in turbine_workload.into_iter().zip(expected_work) {
-            // ignore very small validators
             if tw as f64 / (TOTAL_SHREDS * SLICES * (validators.len() - 1)) as f64 <= 0.001 {
                 continue;
             }
@@ -1124,7 +980,6 @@ mod tests {
 
     #[test]
     fn partition_sampler() {
-        // with k equal-weight nodes this deterministically selects all nodes
         let validators = create_validator_info(64);
         let sampler = PartitionSampler::new(validators, 64);
         let sampled = sampler.sample_multiple(64, &mut rand::rng());
@@ -1138,7 +993,6 @@ mod tests {
 
     #[test]
     fn fa1_sampler() {
-        // with k equal-weight nodes this deterministically selects all nodes
         let validators = create_validator_info(64);
         let sampler = FaitAccompli1Sampler::new_with_stake_weighted_fallback(validators, 64);
         let sampled = sampler.sample_multiple(64, &mut rand::rng());
@@ -1149,8 +1003,6 @@ mod tests {
             assert!(sampled.contains(&id));
         }
 
-        // with k equal-weight nodes this deterministically selects all nodes
-        // (also for partitioning fallback sampler)
         let validators = create_validator_info(64);
         let sampler = FaitAccompli1Sampler::new_with_partition_fallback(validators, 64);
         let sampled = sampler.sample_multiple(64, &mut rand::rng());
@@ -1161,7 +1013,6 @@ mod tests {
             assert!(sampled.contains(&id));
         }
 
-        // with many low-stake nodes this becomes the underlying fallback distribution
         let mut avg_max_appearances = 0.0;
         for _ in 0..20 {
             let validators = create_validator_info(1000);
@@ -1179,7 +1030,6 @@ mod tests {
         assert!(avg_max_appearances >= 1.0);
         assert!(avg_max_appearances < 3.0);
 
-        // with a mix, high stake nodes appear at least `floor(stake * k)` times
         let mut validators = create_validator_info(1000);
         validators[0].stake = 52;
         validators[1].stake = 52;
@@ -1194,7 +1044,6 @@ mod tests {
 
     #[test]
     fn fa2_sampler() {
-        // with k equal-weight nodes this deterministically selects all nodes
         let validators = create_validator_info(64);
         let sampler = FaitAccompli2Sampler::new(validators, 64);
         let sampled = sampler.sample_multiple(64, &mut rand::rng());
@@ -1239,8 +1088,6 @@ mod tests {
         }
     }
 
-    // --- GeoAwareSampler / sample_shred_relay tests --------------------------
-
     use std::sync::Arc;
 
     use crate::GeoLocation;
@@ -1254,7 +1101,6 @@ mod tests {
         validators
     }
 
-    /// Five validators spread around the globe.
     fn spread_locations() -> Vec<(f64, f64)> {
         vec![
             (51.5, -0.1),   // London
@@ -1282,13 +1128,11 @@ mod tests {
         let sherpa = Arc::new(Sherpa::new(0, validators.clone()));
         let sampler = GeoAwareSampler::new(sherpa, validators, 5, Vec::new());
 
-        // 5 candidates, 5 consecutive shreds: every shred gets a distinct relay
         let relays: HashSet<ValidatorId> = (0..5)
             .map(|i| sampler.sample_shred_relay(Slot::new(0), i))
             .collect();
         assert_eq!(relays.len(), 5);
 
-        // consecutive shreds never share a relay
         for i in 0..10 {
             let a = sampler.sample_shred_relay(Slot::new(0), i);
             let b = sampler.sample_shred_relay(Slot::new(0), i + 1);
@@ -1299,7 +1143,6 @@ mod tests {
     #[test]
     fn geo_aware_relay_deterministic_across_instances() {
         let validators = create_geo_validators(&spread_locations());
-        // two independent instances, as on two different nodes
         let sampler1 = GeoAwareSampler::new(
             Arc::new(Sherpa::new(0, validators.clone())),
             validators.clone(),
@@ -1344,16 +1187,13 @@ mod tests {
         let sherpa = Arc::new(Sherpa::new(0, validators.clone()));
         let sampler = GeoAwareSampler::new(sherpa, validators, 5, (0..n).collect());
 
-        // degenerate case: no candidates left, falls back to seeded sampling
         let relay = sampler.sample_shred_relay(Slot::new(0), 0);
         assert!(relay < n);
-        // still deterministic
         assert_eq!(relay, sampler.sample_shred_relay(Slot::new(0), 0));
     }
 
     #[test]
     fn geo_aware_relay_avoids_geographic_bottleneck() {
-        // three validators clustered around London, one in New York, one in Tokyo
         let validators = create_geo_validators(&[
             (51.5, -0.1),  // London
             (51.6, 0.0),   // London cluster
@@ -1364,8 +1204,6 @@ mod tests {
         let sherpa = Arc::new(Sherpa::new(0, validators.clone()));
         let sampler = GeoAwareSampler::new(sherpa, validators, 3, Vec::new());
 
-        // with top_k = 3 the diverse candidates span the three regions,
-        // so 3 consecutive shreds must include NY, Tokyo and at most one London node
         let relays: Vec<ValidatorId> = (0..3)
             .map(|i| sampler.sample_shred_relay(Slot::new(0), i))
             .collect();
