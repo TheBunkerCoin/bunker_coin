@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Data structure holding shreds, slices and blocks for a specific slot.
-//!
-//!
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
