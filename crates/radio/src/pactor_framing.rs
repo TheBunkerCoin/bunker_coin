@@ -92,10 +92,10 @@ pub(crate) fn fragment_message(message_id: u64, bytes: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// How long an incomplete reassembly may sit before it is evicted. A fragment
-/// lost on-air (bad line, mid-message changeover, session drop) previously left
-/// its `ReassemblyState` in the map FOREVER — unbounded growth on a flaky link,
-/// and a permanently wedged `message_id` that could mis-merge with a later
+/// How long an incomplete reassembly may sit before it is evicted. Without a
+/// TTL a fragment lost on-air (bad line, mid-message changeover, session drop)
+/// leaves its `ReassemblyState` in the map forever — unbounded growth on a
+/// flaky link, plus a wedged `message_id` that could mis-merge with a later
 /// message reusing the id (the per-mux counter restarts at 0 each session).
 /// Generous for PACTOR speeds: a large multi-fragment message takes minutes.
 const REASSEMBLY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
