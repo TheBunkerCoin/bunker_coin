@@ -304,10 +304,9 @@ impl<S: SamplingStrategy + Send + Sync> QuorumRobustnessTest<S> {
                     if corrupted[*id as usize] {
                         continue;
                     }
-                    if corrupted_stake + (*stake as f64)
-                        < stake_per_bin * byzantine_bins
-                        // && val_stake < stake_per_bin
-                        && total_corrupted_stake + val_stake < self.total_stake as f64 * adversary_strength.byzantine
+                    if corrupted_stake + (*stake as f64) < stake_per_bin * byzantine_bins
+                        && total_corrupted_stake + val_stake
+                            < self.total_stake as f64 * adversary_strength.byzantine
                     {
                         corrupted[*id as usize] = true;
                         corrupted_stake += *stake as f64;

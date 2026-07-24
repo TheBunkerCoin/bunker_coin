@@ -134,7 +134,7 @@ impl ReedSolomonCoder {
     /// Removes the padding before returning the data.
     /// See [`ReedSolomonCoder::shred`] for details on the padding scheme.
     ///
-    /// Errors
+    /// # Errors
     ///
     /// If fewer than [`DATA_SHREDS`] elements in `shreds` are `Some()` then returns [`ReedSolomonDeshredError::NotEnoughShreds`].
     /// If the restored payload is larger than [`MAX_DATA_PER_SLICE_AFTER_PADDING`] then returns [`ReedSolomonDeshredError::TooMuchData`].
