@@ -79,20 +79,11 @@ pub struct SimulatedPactorConfig {
     pub forced_initial_losses: u32,
     pub fade_windows: Vec<FadeWindow>,
     pub read_timeout: Option<Duration>,
-    /// When `true`, the two endpoints share ONE physical channel: only one side
-    /// may transmit at a time (a `write_data` blocks while the peer is mid-write)
-    /// and reversing the transmit direction costs `changeover_delay`. This is what
-    /// makes the simulator faithful to a real PACTOR ARQ link; with it `false`
-    /// (the default) both directions are independent and full-duplex, preserving
-    /// the original behavior for existing tests.
+    /// Models one shared half-duplex channel; disabled means independent directions.
     pub half_duplex: bool,
-    /// Cost of reversing the transmit direction on the shared half-duplex medium
-    /// (the ARQ changeover). Ignored unless `half_duplex` is `true`.
+    /// ARQ changeover delay for reversing the shared half-duplex medium.
     pub changeover_delay: Duration,
-    /// Throughput penalty applied to the *reverse* (slave→master) direction,
-    /// i.e. transmissions from the endpoint that did NOT initiate the connection.
-    /// On-air the reverse ARQ path is roughly 10× slower; `10.0` models that.
-    /// `1.0` means symmetric. Ignored unless `half_duplex` is `true`.
+    /// Throughput penalty for slave-to-master transmissions; `1.0` is symmetric.
     pub reverse_slowdown: f64,
 }
 
@@ -156,17 +147,13 @@ impl SimulatedPactorConfig {
         }
     }
 
-    /// A faithful **half-duplex** HF link: one shared physical channel (only one
-    /// side transmits at a time), expensive ARQ changeover, and a ~10× slower
-    /// reverse (slave→master) path. This is the profile that reproduces the
-    /// on-air "stall after a few slots" — the reverse notar-vote round-trip
-    /// competes for the single channel and crawls back over the slow reverse leg.
+    /// Half-duplex HF profile: shared channel, ARQ changeover, and slow reverse path.
     pub fn half_duplex_hf() -> Self {
         Self {
             half_duplex: true,
             changeover_delay: Duration::from_secs(2),
             reverse_slowdown: 10.0,
-            // Forward path is the healthy master→slave direction.
+            // Master-to-slave is the fast direction.
             speed: PactorSpeed::P4,
             packet_loss: 0.05,
             latency: Duration::from_millis(250),
@@ -245,13 +232,8 @@ impl SharedStats {
     }
 }
 
-/// The single shared physical channel for a half-duplex link.
-///
-/// Holding `lock` for a transmission serializes the two directions (only one
-/// side on the air at a time). `last_sender` records who transmitted last so a
-/// direction reversal can be charged the ARQ `changeover_delay`. The "master"
-/// (`true`) is endpoint A — the connection initiator — and the "slave" (`false`)
-/// is endpoint B; the reverse (B→master) path is the slow one.
+/// Shared channel state for serializing half-duplex transmissions.
+/// The lock stores the last sender so direction reversals can pay changeover.
 #[derive(Debug)]
 struct HalfDuplexMedium {
     lock: Mutex<Option<bool>>,
@@ -272,18 +254,16 @@ pub struct SimulatedPactorTransport {
     config: SimulatedPactorConfig,
     stats: Arc<SharedStats>,
     started_at: tokio::time::Instant,
-    /// Shared single channel; only consulted when `config.half_duplex` is set.
+    /// Shared channel used when `config.half_duplex` is set.
     medium: Arc<HalfDuplexMedium>,
-    /// `true` for the master (connection initiator, endpoint A), `false` for the
-    /// slave (endpoint B). The slave's transmit direction is the slow reverse path.
+    /// `true` for the initiator; the other endpoint uses the slow reverse path.
     is_master: bool,
 }
 
 pub struct SimulatedPactorPair;
 
 impl SimulatedPactorPair {
-    // A factory for a connected pair of endpoints; returning a tuple rather
-    // than Self is the point.
+    // Factory returns a connected endpoint pair, not `Self`.
     #[allow(clippy::new_ret_no_self)]
     pub fn new(
         config: SimulatedPactorConfig,
@@ -453,15 +433,11 @@ impl PactorTransport for SimulatedPactorTransport {
             return Err(ScsPactorError::Disconnected);
         }
 
-        // On a half-duplex link there is ONE physical channel: hold it for the
-        // whole transmission so the peer cannot transmit concurrently, and charge
-        // the ARQ changeover whenever the transmit direction reverses. The guard
-        // is held across the retry loop below, so a retransmitting sender keeps
-        // the channel for the duration of its (possibly slow) burst.
+        // Hold the half-duplex channel across retries so retransmit bursts stay serialized.
         let _medium_guard = if self.config.half_duplex {
             let mut last_sender = self.medium.lock.lock().await;
             if *last_sender != Some(self.is_master) {
-                // Direction reversal (or first transmit): pay the changeover.
+                // Direction reversal pays the ARQ changeover.
                 if last_sender.is_some() {
                     sleep(self.config.changeover_delay).await;
                 }
@@ -472,7 +448,7 @@ impl PactorTransport for SimulatedPactorTransport {
             None
         };
 
-        // The reverse (slave→master) direction is the slow ARQ leg.
+        // Slave-to-master is the slow ARQ leg.
         let direction_slowdown = if self.config.half_duplex && !self.is_master {
             self.config.reverse_slowdown.max(1.0)
         } else {
@@ -508,12 +484,7 @@ impl PactorTransport for SimulatedPactorTransport {
                 self.stats
                     .bytes_delivered
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
-                // Best-effort telemetry: use try_send, NEVER a blocking send.
-                // The event channel is bounded (1024) and only drained when a
-                // link-quality poller is attached; in the simulated two-node
-                // run only node 0 has one, so a blocking send here wedged
-                // node 1's write_data forever after 1024 writes (~100 slots) —
-                // silently stalling consensus.
+                // Telemetry must not block writers when no poller drains events.
                 let _ = self.local.event_tx.try_send(PactorLinkEvent::LinkQuality {
                     speed_level: speed.level(),
                     retries,

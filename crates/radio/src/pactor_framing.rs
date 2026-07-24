@@ -1,25 +1,14 @@
-//! Fragmentation/reassembly shared by [`PactorNetwork`](crate::pactor_network)
-//! and [`PactorMux`](crate::pactor_mux).
-//!
-//! The transport's [`write_data`](scs_pactor::PactorTransport::write_data)
-//! carries one message as a single hex line that must fit the 300-byte radio
-//! MTU. Larger payloads are split across several lines with a small
-//! [`FragmentHeader`] and reassembled by [`Reassembler`]. A payload that fits
-//! one line is a single `total_fragments == 1` fragment, so the common case
-//! (a vote) is unchanged on the wire shape.
+//! PACTOR MTU fragmentation and reassembly shared by `PactorNetwork` and `PactorMux`.
+//! Each fragment is one `write_data` line with a `FragmentHeader` before payload bytes.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Radio MTU (bytes per `write_data` line, hex-encoded `#...\r`). One line is
-/// `1 (#) + 2*payload + 1 (\r)`, so the byte budget carried per line (header +
-/// fragment chunk) is `(MTU - 2) / 2`.
+/// Radio line MTU; hex framing leaves `(RADIO_MTU - 2) / 2` bytes for header plus chunk.
 pub(crate) const RADIO_MTU: usize = 300;
 
-/// Per-fragment header prepended to each `write_data` line. `message_id` is
-/// shared by all fragments of one message; `fragment_index` is 0-based;
-/// `total_fragments` is the count.
+/// Per-fragment header; `message_id` groups fragments and `fragment_index` is 0-based.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FragmentHeader {
     pub message_id: u64,
@@ -27,7 +16,7 @@ pub(crate) struct FragmentHeader {
     pub total_fragments: u16,
 }
 
-/// Encoded size of a [`FragmentHeader`] — used to size the effective payload.
+/// Encoded [`FragmentHeader`] size used to compute the fragment payload budget.
 pub(crate) fn fragment_header_len() -> usize {
     bincode::serde::encode_to_vec(
         &FragmentHeader {
@@ -41,8 +30,7 @@ pub(crate) fn fragment_header_len() -> usize {
     .len()
 }
 
-/// Bytes of message payload carried per fragment line, after reserving room for
-/// the header and accounting for hex doubling within the MTU. At least 1.
+/// Payload bytes per fragment after reserving header space and hex-encoded MTU overhead.
 pub(crate) fn effective_chunk_len() -> usize {
     let line_byte_budget = (RADIO_MTU - 2) / 2;
     line_byte_budget
@@ -50,7 +38,7 @@ pub(crate) fn effective_chunk_len() -> usize {
         .max(1)
 }
 
-/// Build one fragment line: bincode header followed by the raw chunk bytes.
+/// Encode a header followed by raw chunk bytes.
 pub(crate) fn frame_fragment(header: &FragmentHeader, chunk: &[u8]) -> Vec<u8> {
     let mut packet = bincode::serde::encode_to_vec(header, bincode::config::standard())
         .expect("header encoding cannot fail");
@@ -58,7 +46,7 @@ pub(crate) fn frame_fragment(header: &FragmentHeader, chunk: &[u8]) -> Vec<u8> {
     packet
 }
 
-/// Split a framed fragment line back into its header and chunk bytes.
+/// Decode a fragment line into its header and chunk bytes.
 pub(crate) fn parse_fragment(bytes: &[u8]) -> Option<(FragmentHeader, Vec<u8>)> {
     let (header, consumed): (FragmentHeader, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard()).ok()?;
@@ -68,8 +56,7 @@ pub(crate) fn parse_fragment(bytes: &[u8]) -> Option<(FragmentHeader, Vec<u8>)> 
     Some((header, bytes[consumed..].to_vec()))
 }
 
-/// Split a serialized message into MTU-sized fragment lines, ready for
-/// `write_data`. A message that fits one line yields a single fragment.
+/// Split serialized bytes into MTU-sized fragment lines.
 pub(crate) fn fragment_message(message_id: u64, bytes: &[u8]) -> Vec<Vec<u8>> {
     let chunk_len = effective_chunk_len();
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
@@ -92,40 +79,22 @@ pub(crate) fn fragment_message(message_id: u64, bytes: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// How long an incomplete reassembly may sit before it is evicted. Without a
-/// TTL a fragment lost on-air (bad line, mid-message changeover, session drop)
-/// leaves its `ReassemblyState` in the map forever — unbounded growth on a
-/// flaky link, plus a wedged `message_id` that could mis-merge with a later
-/// message reusing the id (the per-mux counter restarts at 0 each session).
-/// Generous for PACTOR speeds: a large multi-fragment message takes minutes.
+/// TTL for incomplete reassemblies; lost fragments must not pin memory or message ids.
 const REASSEMBLY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Maximum number of concurrently in-flight reassemblies. On a point-to-point
-/// half-duplex link even 2 is unusual; garbled lines that bincode-decode into
-/// bogus headers can mint arbitrary `message_id`s, so cap the map and evict the
-/// oldest when full.
+/// Cap in-flight reassemblies; bogus headers can mint arbitrary message ids.
 const MAX_PARTIAL_MESSAGES: usize = 32;
 
-/// Maximum plausible fragment count per message. `total_fragments` is
-/// wire-controlled up to u16::MAX (~9 MB at the effective chunk size); real
-/// consensus messages are a handful of fragments. Anything above this is a
-/// corrupt or hostile header.
+/// Cap wire-controlled fragment counts before allocating state.
 const MAX_FRAGMENTS_PER_MESSAGE: u16 = 1024;
 
-/// In-progress reassembly of a fragmented message.
 struct ReassemblyState {
     fragments: HashMap<u16, Vec<u8>>,
     total_fragments: u16,
-    /// When the first fragment arrived, for TTL eviction.
     created: std::time::Instant,
 }
 
-/// Accumulates inbound fragment lines and yields complete messages.
-///
-/// Tolerates out-of-order fragments; reassembly is over a single point-to-point
-/// link, so the peer's id is implicit (`message_id` alone keys an in-flight
-/// message). Incomplete reassemblies are evicted after [`REASSEMBLY_TTL`], and
-/// at most [`MAX_PARTIAL_MESSAGES`] are held at once.
+/// Bounded, TTL-evicted reassembler for one point-to-point peer.
 #[derive(Default)]
 pub(crate) struct Reassembler {
     partial: HashMap<u64, ReassemblyState>,
@@ -136,26 +105,20 @@ impl Reassembler {
         Self::default()
     }
 
-    /// Feed one inbound fragment line. Returns `Some(message)` once the line
-    /// completes a message, `None` if more fragments are still needed or the
-    /// line was unparseable (logged by the caller).
+    /// Feed one fragment line and return a complete message when reassembly finishes.
     pub fn push_line(&mut self, line: &[u8]) -> Option<Vec<u8>> {
         self.push_line_at(line, std::time::Instant::now())
     }
 
-    /// [`Self::push_line`] with an explicit clock, so tests can drive TTL
-    /// eviction without waiting.
+    /// Test hook for driving TTL eviction with an explicit clock.
     fn push_line_at(&mut self, line: &[u8], now: std::time::Instant) -> Option<Vec<u8>> {
-        // Evict expired partials first: a message that lost a fragment will
-        // never complete; holding its state forever both leaks memory and
-        // wedges its message_id against reuse.
+        // Lost fragments cannot pin message ids or memory past the TTL.
         self.partial
             .retain(|_, state| now.duration_since(state.created) < REASSEMBLY_TTL);
 
         let (header, chunk) = parse_fragment(line)?;
 
-        // Corrupt/hostile headers can claim absurd fragment counts or oversized
-        // chunks; both bound the memory a single message_id may pin.
+        // Bound memory pinned by corrupt or hostile wire headers.
         if header.total_fragments > MAX_FRAGMENTS_PER_MESSAGE || chunk.len() > effective_chunk_len()
         {
             return None;
@@ -187,10 +150,7 @@ impl Reassembler {
                 total_fragments: header.total_fragments,
                 created: now,
             });
-        // A fragment disagreeing with the recorded total is corrupt (or a
-        // colliding message id). Accepting it could push `fragments.len()`
-        // past `total_fragments`, after which the exact-equality completion
-        // check below could never fire — wedging the entry forever.
+        // Reject conflicting totals so a corrupt id collision cannot wedge completion.
         if header.total_fragments != state.total_fragments
             || header.fragment_index >= state.total_fragments
         {
@@ -208,8 +168,7 @@ impl Reassembler {
             match state.fragments.get(&i) {
                 Some(fragment) => message.extend_from_slice(fragment),
                 None => {
-                    // Should be unreachable (count matched), but never panic on
-                    // wire data — drop and wait for a retransmit.
+                    // Count matched, but never panic on wire data.
                     self.partial.remove(&header.message_id);
                     return None;
                 }
@@ -270,8 +229,7 @@ mod tests {
         assert_eq!(out.unwrap(), payload);
     }
 
-    /// Incomplete reassemblies must be evicted after [`REASSEMBLY_TTL`]: a lost
-    /// fragment previously wedged its `message_id` (and its memory) forever.
+    /// Incomplete reassemblies expire so lost fragments cannot pin ids or memory.
     #[test]
     fn stale_partial_is_evicted_and_id_reusable() {
         let payload: Vec<u8> = (0..300u32).map(|i| (i % 7) as u8).collect();
@@ -280,14 +238,10 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         let mut r = Reassembler::new();
-        // First fragment arrives; the rest are lost on-air.
         assert!(r.push_line_at(&lines[0], t0).is_none());
         assert_eq!(r.partial.len(), 1);
 
-        // Past the TTL, the stale partial is evicted...
         let later = t0 + REASSEMBLY_TTL + std::time::Duration::from_secs(1);
-        // ...and a fresh message reusing the same id reassembles cleanly
-        // instead of mis-merging with the stale fragments.
         let mut out = None;
         for line in &lines {
             if let Some(m) = r.push_line_at(line, later) {
@@ -298,8 +252,7 @@ mod tests {
         assert!(r.partial.is_empty());
     }
 
-    /// The in-flight map is capped: garbled lines minting arbitrary message ids
-    /// must not grow it without bound.
+    /// Bogus message ids cannot grow the in-flight map without bound.
     #[test]
     fn partial_map_is_capped() {
         let now = std::time::Instant::now();
@@ -316,9 +269,7 @@ mod tests {
         assert!(r.partial.len() <= MAX_PARTIAL_MESSAGES);
     }
 
-    /// A fragment whose header disagrees with the recorded total (corruption or
-    /// id collision) must be rejected — previously it could overshoot the
-    /// exact-equality completion check and wedge the entry forever.
+    /// Conflicting totals are rejected so corrupt fragments cannot wedge completion.
     #[test]
     fn mismatched_total_is_rejected_without_wedging() {
         let payload: Vec<u8> = (0..300u32).map(|i| (i % 11) as u8).collect();
@@ -329,7 +280,6 @@ mod tests {
         let mut r = Reassembler::new();
         assert!(r.push_line_at(&lines[0], now).is_none());
 
-        // Corrupt line: same id, bogus total. Must be dropped.
         let bogus = frame_fragment(
             &FragmentHeader {
                 message_id: 7,
@@ -340,7 +290,6 @@ mod tests {
         );
         assert!(r.push_line_at(&bogus, now).is_none());
 
-        // The genuine remaining fragments still complete the message.
         let mut out = None;
         for line in &lines[1..] {
             if let Some(m) = r.push_line_at(line, now) {
@@ -350,8 +299,7 @@ mod tests {
         assert_eq!(out.unwrap(), payload);
     }
 
-    /// Absurd fragment counts and oversized chunks are wire-controlled memory
-    /// amplification; both must be dropped outright.
+    /// Wire-controlled memory amplification is dropped before state allocation.
     #[test]
     fn hostile_headers_are_dropped() {
         let now = std::time::Instant::now();
@@ -389,7 +337,6 @@ mod tests {
 
         let mut r = Reassembler::new();
         let (mut got_a, mut got_b) = (None, None);
-        // Interleave the two messages' fragments.
         for i in 0..la.len().max(lb.len()) {
             if let Some(line) = la.get(i) {
                 if let Some(m) = r.push_line(line) {

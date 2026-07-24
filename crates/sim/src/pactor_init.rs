@@ -1,13 +1,5 @@
-//! Shared SCS DR-7400 modem bring-up for the hardware PACTOR binaries.
-//!
-//! This factors the proven terminal-mode init / JHOST4 hostmode / connect-listen
-//! sequence (originally inline in `pactor_hw_test`) into one place so other
-//! binaries (e.g. `pactor_consensus`) can obtain a connected
-//! [`UsbPactorTransport`] without duplicating the modem-specific dance.
-//!
-//! The DR-7400 reverts from JHOST hostmode to terminal mode on connect, so the
-//! flow drives it in terminal/converse mode; see the BunkerCoin hardware
-//! bring-up notes for the firmware quirks this works around.
+//! Shared DR-7400 modem bring-up for hardware PACTOR binaries.
+//! Uses terminal/converse mode because this firmware exits JHOST hostmode on connect.
 
 use std::time::{Duration, Instant};
 
@@ -132,20 +124,15 @@ async fn verify_hostmode(transport: &UsbPactorTransport) -> bool {
     )
 }
 
-/// Bring a modem up into JHOST4 CRC hostmode and return a ready transport.
-///
-/// Mirrors the proven `pactor_hw_test` sequence: drain → exit any hostmode/
-/// converse → optional stale-link clear → terminal-mode config (MYcall, PTCH,
-/// CHO 26, tones, etc.) → optional LISTEN → optional TRX tune → JHOST4 → verify.
+/// Bring a modem to verified JHOST4 CRC hostmode.
+/// Terminal/converse setup is required because this firmware exits JHOST on connect.
 pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTransport> {
     let port = cfg.port.as_str();
     let mut serial = open_serial(port, cfg.baud)?;
 
     drain_serial(&mut serial).await;
 
-    // Step 1: exit any existing hostmode/converse. ESC first in case a prior data
-    // session left the modem in CONVerse mode (terminal commands are ignored
-    // until ESC returns it to command mode).
+    // ESC returns a stale converse session to terminal command mode.
     serial.write_all(&[0x1b]).await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -155,8 +142,7 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
     tokio::time::sleep(Duration::from_millis(1000)).await;
     drain_serial(&mut serial).await;
 
-    // Step 1b: optional force-disconnect of stale link state (preserves config;
-    // deliberately NOT RESTART, which would wipe LISTEN/MYcall on this firmware).
+    // DD clears stale link state without wiping LISTEN/MYcall on this firmware.
     if cfg.reset {
         serial.write_all(&[0x1b]).await?;
         serial.flush().await?;
@@ -167,7 +153,7 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
         drain_serial(&mut serial).await;
     }
 
-    // Step 2: terminal-mode ASCII config (matching ptc-go).
+    // Terminal-mode config mirrors ptc-go's DR-7400 bring-up.
     send_ascii(&mut serial, "").await?;
     send_ascii(&mut serial, "Quit").await?;
     let commands = [
@@ -176,8 +162,7 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
         "MAXE 35".to_owned(),
         "REM 0".to_owned(),
         "CHOB 0".to_owned(),
-        // CHANGEOVER char = Ctrl-Z (26): lets the ISS hand the transmit turn to
-        // the peer in converse mode (required for the answerer to transmit back).
+        // Ctrl-Z lets the ISS hand the transmit turn to the peer in converse mode.
         "CHO 26".to_owned(),
         "TONES 4".to_owned(),
         "MARK 1600".to_owned(),
@@ -190,12 +175,10 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
         send_ascii(&mut serial, command).await?;
     }
 
-    // The answerer must be in listen mode to accept an incoming connect.
     if cfg.listen {
         send_ascii(&mut serial, "LISTEN 1").await?;
     }
 
-    // Step 2b: optional TRX CI-V frequency control.
     if let Some(frequency) = cfg.frequency {
         send_ascii(&mut serial, "TRX TYpe").await?;
         match (cfg.trx_baud, cfg.trx_addr.as_deref()) {
@@ -219,16 +202,13 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
         }
     }
 
-    // Step 3: enter JHOST4 CRC hostmode and consume the startup banner.
     send_ascii(&mut serial, "JHOST4").await?;
     tokio::time::sleep(Duration::from_millis(1000)).await;
     let _ = try_decode_hostmode(&read_all(&mut serial, 2000).await);
 
-    // Step 4: wrap in the transport and verify hostmode.
     let mut config = UsbPactorConfig::new(port);
     config.command_timeout = cfg.command_timeout;
-    // ARQ over a marginal HF link can take minutes, especially the reverse
-    // (slave -> master) direction after a changeover; give reads a wide window.
+    // Marginal HF ARQ can take minutes after changeover.
     config.read_timeout = Some(Duration::from_secs(180));
     let transport = UsbPactorTransport::from_stream(serial, config);
 
@@ -244,22 +224,13 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
     ))
 }
 
-/// Fast re-init for a reconnect: re-open the modem WITHOUT the full bring-up.
-///
-/// The modem's stored configuration (MYcall, PTCH, CHO, tones, LISTEN, TRX
-/// frequency, …) survives a STBY drop, so after the first [`init_modem`] a
-/// reconnect only needs to return the modem to a clean terminal command prompt
-/// and re-open the transport — skipping the ~30-60s of drain/config/JHOST4/verify
-/// that dominate full init. On a flaky band that drops every minute this reclaims
-/// most of each good-band window for actual consensus.
-///
-/// `listen` re-asserts `LISTEN 1` (cheap insurance) on the answering modem.
+/// Re-open a modem after STBY without the full drain/config/JHOST4 sequence.
+/// Assumes stored MYcall/PTCH/CHO/tones/TRX config from a prior [`init_modem`].
 pub async fn light_init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTransport> {
     let port = cfg.port.as_str();
     let mut serial = open_serial(port, cfg.baud)?;
 
-    // Return to a clean command prompt: ESC out of any lingering converse mode,
-    // drain, force-disconnect any stale link (preserves config), drain again.
+    // Return to terminal command mode without wiping persisted modem config.
     serial.write_all(&[0x1b]).await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -268,7 +239,6 @@ pub async fn light_init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPacto
     tokio::time::sleep(Duration::from_millis(300)).await;
     drain_serial(&mut serial).await;
 
-    // Re-assert LISTEN on the answerer (config persists, but cheap to be safe).
     if cfg.listen {
         send_ascii(&mut serial, "LISTEN 1").await?;
     }
@@ -279,10 +249,7 @@ pub async fn light_init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPacto
     Ok(UsbPactorTransport::from_stream(serial, config))
 }
 
-/// Establish the PACTOR link from the caller side, retrying a few times.
-///
-/// On a marginal HF link a single connect can abort to STBY; retrying after a
-/// short settle often succeeds. Returns once connected.
+/// Establish the PACTOR link from the caller side, retrying after brief settle delays.
 pub async fn connect_with_retries(
     transport: &UsbPactorTransport,
     remote_call: &str,

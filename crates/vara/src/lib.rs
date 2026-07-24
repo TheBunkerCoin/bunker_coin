@@ -163,14 +163,7 @@ impl VaraClient {
         self.send_command("DISCONNECT").await
     }
 
-    /// Enter VARA HF unproto (broadcast/FEC) mode.
-    ///
-    /// Sends `UNPROTO <destination>` to the VARA modem, switching it from
-    /// point-to-point ARQ to broadcast FEC mode. In this mode, data written
-    /// via [`write_unproto_data`](Self::write_unproto_data) is broadcast to
-    /// all stations monitoring the frequency.
-    ///
-    /// Typical destinations: `"CQ"` (general broadcast), or a specific group call.
+    /// Enter VARA HF unproto broadcast/FEC mode for a destination call.
     pub async fn enter_unproto_mode(&self, destination: &str) -> Result<(), VaraError> {
         self.send_command(&format!("UNPROTO {destination}")).await
     }
@@ -180,10 +173,7 @@ impl VaraClient {
         self.send_command("DISCONNECT").await
     }
 
-    /// Write data in unproto (broadcast/FEC) mode.
-    ///
-    /// This delegates to [`write_data`](Self::write_data) — VARA handles
-    /// FEC encoding internally when in unproto mode.
+    /// Write data in unproto mode; VARA handles FEC internally.
     pub async fn write_unproto_data(&self, data: &[u8]) -> Result<(), VaraError> {
         self.write_data(data).await
     }
@@ -202,9 +192,6 @@ mod tests {
 
     #[test]
     fn test_vara_unproto_command_format() {
-        // Verify that enter_unproto_mode formats the correct VARA command.
-        // We can't call the async method without a connected client, but we
-        // can verify the command string format directly.
         let destination = "CQ";
         let expected_cmd = format!("UNPROTO {destination}");
         assert_eq!(expected_cmd, "UNPROTO CQ");

@@ -150,14 +150,12 @@ impl FinalityTracker {
             }
             FinalizationStatus::Finalized(hash) | FinalizationStatus::ImplicitlyFinalized(hash) => {
                 assert_eq!(*hash, block_hash, "consensus safety violation");
-                // RESTORE the finalized status: the insert above downgraded it
-                // to Notarized. Leaving the downgrade in place (the old
-                // behavior) let a later descendant's finalization walk descend
-                // through this supposedly-final slot and re-report already
-                // finalized ancestors — harmless before state pruning existed,
-                // but a re-report of a pruned ancestor now duplicates
-                // parent-ready bookkeeping. A notar cert arriving after
-                // finalization is routine (cert ordering races).
+                // Restore the finalized status: the insert above downgraded it
+                // to Notarized. A downgrade here lets a later descendant's
+                // finalization walk descend through this supposedly-final slot
+                // and re-report already-finalized (possibly pruned) ancestors,
+                // duplicating parent-ready bookkeeping. A notar cert arriving
+                // after finalization is routine (cert ordering races).
                 self.status.insert(slot, status);
                 FinalizationEvent::default()
             }
@@ -190,9 +188,8 @@ impl FinalityTracker {
             FinalizationStatus::FinalPendingNotar => FinalizationEvent::default(),
             status @ (FinalizationStatus::Finalized(_)
             | FinalizationStatus::ImplicitlyFinalized(_)) => {
-                // RESTORE: the insert above downgraded a finalized slot to
-                // FinalPendingNotar (same downgrade bug as in
-                // `mark_notarized` — see the comment there).
+                // Restore: the insert above would downgrade a finalized slot to
+                // FinalPendingNotar; put the finalized status back.
                 self.status.insert(slot, status);
                 FinalizationEvent::default()
             }
@@ -399,8 +396,8 @@ mod tests {
         assert_eq!(tracker.mark_finalized(s4), FinalizationEvent::default());
 
         // ...so finalizing slot 5 must NOT re-report already-finalized
-        // ancestors (pre-fix: the walk descended through the downgraded slot 4
-        // into the pruned region and re-reported slot 3).
+        // ancestors by descending through a downgraded slot 4 into the
+        // pruned region.
         let ev = tracker.mark_fast_finalized(s5, h5.clone());
         assert_eq!(ev.finalized, Some((s5, h5)));
         assert_eq!(

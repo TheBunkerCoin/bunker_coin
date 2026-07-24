@@ -1,11 +1,4 @@
-//! Minimal serial probe for SCS PACTOR modems.
-//!
-//! The SCS Dragon DR-7400 uses a non-standard baud rate of 829440.
-//! This probe tests that baud rate using Linux's custom_divisor support.
-//!
-//! ```text
-//! cargo run --bin modem_probe -- --port /dev/ttyUSB0
-//! ```
+//! Minimal serial probe for SCS PACTOR modems using the DR-7400 custom baud rate.
 
 use std::time::Duration;
 
@@ -110,7 +103,6 @@ async fn main() -> anyhow::Result<()> {
 
     set_ftdi_latency(&args.port);
 
-    // Try opening at the specified baud rate
     println!("=== Opening serial port at {} baud ===", args.baud);
     let mut serial = match tokio_serial::new(&args.port, args.baud)
         .data_bits(DataBits::Eight)
@@ -125,12 +117,7 @@ async fn main() -> anyhow::Result<()> {
             println!("  The FTDI FT232R may not support this custom baud rate.");
             println!("  Trying to set it via Linux ioctl...");
 
-            // Fall back: open at a standard baud, then try to change
-            // via the Linux serial_struct custom_divisor interface.
-            // FTDI base clock = 3000000 Hz
-            // divisor = 3000000 / 829440 ≈ 3.616... → try closest
-            // Actually, FT232R can do 3000000 / 829440, but the driver
-            // may need ASYNC_SPD_CUST flag.
+            // Some FTDI drivers require custom baud configuration outside this probe.
             return Err(anyhow::anyhow!(
                 "Cannot open at {} baud. Try: stty -F {} {} raw",
                 args.baud,
@@ -143,7 +130,6 @@ async fn main() -> anyhow::Result<()> {
     let _ = serial.write_request_to_send(true);
     println!("  Port opened successfully!");
 
-    // Capture initial burst
     println!("\n=== Phase 1: Initial burst (3 sec) ===");
     let burst = read_all(&mut serial, 3000).await;
     print_bytes("initial", &burst);
@@ -162,7 +148,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Send CRC-framed JHOST0 to exit any existing hostmode
     println!("\n=== Phase 2: CRC-framed JHOST0 (exit hostmode) ===");
     let quit_frame = encode_frame(&HostmodeFrame::command(0, b"JHOST0".to_vec()))?;
     println!("  >> {:02x?}", quit_frame);
@@ -201,14 +186,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Extra drain
     tokio::time::sleep(Duration::from_millis(500)).await;
     let extra = read_all(&mut serial, 2000).await;
     if !extra.is_empty() {
         print_bytes("extra", &extra);
     }
 
-    // Terminal mode test
     println!("\n=== Phase 3: Terminal mode commands ===");
     for cmd in ["", "MYcall", "VER", "SERBaud"] {
         let label = if cmd.is_empty() { "CR" } else { cmd };
@@ -221,7 +204,6 @@ async fn main() -> anyhow::Result<()> {
         print_bytes(label, &resp);
     }
 
-    // JHOST4 entry
     println!("\n=== Phase 4: Enter JHOST4 ===");
     println!("  >> JHOST4");
     serial.write_all(b"JHOST4\r").await?;
@@ -230,7 +212,6 @@ async fn main() -> anyhow::Result<()> {
     let resp = read_all(&mut serial, 3000).await;
     print_bytes("JHOST4", &resp);
 
-    // Verify hostmode
     println!("\n=== Phase 5: Hostmode verification ===");
     let l_frame = encode_frame(&HostmodeFrame::with_code(31, 0x41, b"L".to_vec()))?;
     println!("  >> hostmode L ch31 (reset): {:02x?}", l_frame);

@@ -371,8 +371,7 @@ pub struct SharedState {
     pub snapshot_store: Option<Arc<SnapshotStore>>,
 }
 
-/// Decodes fixed-size bytes from native hex or wallet-style base58.
-/// Exact-length hex wins before falling back to base58.
+/// Decode fixed-size bytes from exact-length hex or wallet-style base58.
 fn decode_bytes_any<const N: usize>(s: &str) -> Result<[u8; N], String> {
     if s.len() == 2 * N && s.chars().all(|c| c.is_ascii_hexdigit()) {
         let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {e}"))?;
@@ -483,8 +482,7 @@ fn body_type_name(body: &TransactionBody) -> &'static str {
 }
 
 fn decode_raw_transaction(raw: &bunkerglow::Transaction) -> Option<CoreTransaction> {
-    // Accept raw bincode or legacy 8-byte length-prefixed bincode.
-    // Limit decode so random padding cannot become an unbounded Vec allocation.
+    // Accept raw or legacy length-prefixed bincode, with bounded allocation.
     let config = bincode::config::standard().with_limit::<4096>();
     let data = &raw.0;
     bincode::serde::decode_from_slice(data, config)
@@ -666,7 +664,7 @@ async fn submit_transaction(
         signature,
     };
 
-    // Zero-signature genesis txs are nonce-filled and signed server-side.
+    // Zero-signature genesis txs are signed server-side after filling the current nonce.
     if tx.signature == [0u8; 64] {
         if let Some(sk) = &state.genesis_signing_key {
             let genesis_pk = sk.verifying_key().to_bytes();
@@ -791,16 +789,14 @@ async fn blocks(
         let bs = bs_arc.read().await;
 
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
-        // Persistent-node paths may have no in-memory blocks; finalized frontier
-        // tracks chain height, with headroom for produced-but-unfinalized slots.
+        // Persistent nodes may have no in-memory blocks; use finalized height with headroom.
         let highest_finalized_slot = {
             let nodes = state.nodes.read().await;
             nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
         };
         let top = highest_mem_slot.max(highest_finalized_slot) + 200;
 
-        // Scan only the newest window needed for this page; genesis-to-tip scans
-        // are too expensive on long chains. Extra headroom covers skip slots.
+        // Bound blockstore scans to the page window plus skip-slot headroom.
         let want = offset + limit;
         let window = (want * 3).max(400) as u64;
         let low = top.saturating_sub(window);
@@ -1052,8 +1048,7 @@ async fn get_transaction(
     axum::http::StatusCode::NOT_FOUND.into_response()
 }
 
-/// Lists finalized-chain transactions newest-first, paginated like `/blocks`.
-/// Real transactions are decoded from blockstore and annotated from `tx_results`.
+/// List finalized-chain transactions newest-first, annotated from `tx_results`.
 async fn list_transactions(
     Query(p): Query<Pagination>,
     state: axum::extract::State<SharedState>,
@@ -1072,8 +1067,7 @@ async fn list_transactions(
             nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
         };
 
-        // Scan newest-first and emit duplicate inclusions only at the executed slot.
-        // Bound scans by page need and `max_scan`; `total` is known-so-far.
+        // Scan newest-first, bounded by page need and a fixed recent window.
         let need = offset + limit;
         let max_scan: u64 = 20_000;
         let scan_floor = highest_finalized_slot.saturating_sub(max_scan);
@@ -1169,13 +1163,13 @@ async fn find_tx_in_blockstore(
     let blocks = state.blocks.read().await;
     let highest_mem_slot = blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
     drop(blocks);
-    // Use the finalized frontier when in-memory blocks are absent.
+    // Fall back to finalized height when in-memory blocks are absent.
     let highest_finalized_slot = {
         let nodes = state.nodes.read().await;
         nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
     };
 
-    // Wallet tx lookups are recent; scan tip-down within a fixed window.
+    // Wallet lookups scan tip-down within a fixed recent window.
     let top = highest_mem_slot.max(highest_finalized_slot) + 200;
     let max_scan: u64 = 20_000;
     let floor = top.saturating_sub(max_scan);
@@ -1374,7 +1368,6 @@ async fn get_token_holders(
         })
         .collect();
 
-    // Sort by balance for deterministic output.
     holders.sort_by(|a, b| {
         b["balance"]
             .as_u64()

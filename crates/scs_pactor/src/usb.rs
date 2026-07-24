@@ -188,8 +188,7 @@ impl UsbPactorTransport {
 
                 trace!("[reader:{label}] got {} bytes: {:02x?}", n, &buf[..n]);
 
-                // Connected firmware reports status as terminal ASCII; route those
-                // lines while ignoring non-printable hostmode framing bytes.
+                // Connected firmware reports status as terminal ASCII amid hostmode bytes.
                 for &b in &buf[..n] {
                     if b == b'\r' || b == b'\n' {
                         if !term_line.is_empty() {
@@ -222,7 +221,7 @@ impl UsbPactorTransport {
                     } else if (b.is_ascii_graphic() || b == b' ') && term_line.len() < 4096 {
                         term_line.push(b);
                     } else {
-                        // Non-printable hostmode bytes invalidate the partial text line.
+                        // Hostmode bytes invalidate partial terminal text.
                         term_line.clear();
                     }
                 }
@@ -299,8 +298,7 @@ impl UsbPactorTransport {
         self.send_hostmode_frame(frame).await
     }
 
-    /// Sends a command and advances the hostmode counter only after ACK.
-    /// No ACK means the modem did not consume the frame, so the toggle must hold.
+    /// Send a command and advance the hostmode counter only after ACK.
     pub async fn send_command_best_effort_ack(
         &self,
         frame: HostmodeFrame,
@@ -381,7 +379,6 @@ impl UsbPactorTransport {
             self.write_encoded_frame(&encoded).await?;
             match self.recv_hostmode_packet(self.command_timeout).await? {
                 HostmodePacket::Frame(response) => {
-                    // ACK advances the packet counter.
                     self.packet_counter.lock().await.advance();
                     trace!(
                         "[tx] hostmode_transaction response: ch={} code=0x{:02x} payload={:02x?}",
@@ -399,7 +396,6 @@ impl UsbPactorTransport {
                             "hostmode repeat request limit exceeded".to_owned(),
                         ));
                     }
-                    // Repeat requests resend without advancing the counter.
                 }
             }
         }
@@ -550,7 +546,6 @@ async fn route_frame(
 ) -> Result<(), ScsPactorError> {
     match frame.channel {
         PACTOR_CHANNEL => {
-            // PACTOR type bit separates command responses from data.
             if frame.code & 0x01 != 0 {
                 let line = String::from_utf8(frame.payload)
                     .map_err(|e| ScsPactorError::Protocol(e.to_string()))?;
@@ -580,7 +575,6 @@ async fn route_frame(
         }
         EXTENDED_POLL_CHANNEL => {}
         _ => {
-            // Non-PACTOR channels still honor the command/data type bit.
             if frame.code & 0x01 != 0 {
                 let line = String::from_utf8(frame.payload)
                     .map_err(|e| ScsPactorError::Protocol(e.to_string()))?;
@@ -596,8 +590,7 @@ async fn route_frame(
     Ok(())
 }
 
-/// Routes terminal-mode status banners into command text and link events.
-/// Returns `true` when the line indicates a link drop.
+/// Route terminal-mode status banners into command text and link events.
 async fn route_terminal_line(
     line: &str,
     command_tx: &mpsc::Sender<String>,
@@ -628,7 +621,7 @@ async fn route_terminal_line(
         || body.starts_with("NO CONNECT")
         || body.starts_with("STBY")
     {
-        // STBY can mean setup failure after call progress; normal disconnects also emit it.
+        // STBY is treated as link failure only by terminal-line routing.
         let _ = event_tx
             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
             .await;
@@ -637,11 +630,9 @@ async fn route_terminal_line(
         // Terminal mode must not poll status; parse only volunteered quality banners.
         let _ = event_tx.send(event).await;
     } else if !is_prompt_echo(body) {
-        // Log unknown banners so parser additions come from actual modem text.
         info!("[status-line?] unrecognized modem banner: {body:?}");
     }
 
-    // Forward raw text for callers polling `read_status_line`.
     let _ = command_tx.send(body.to_owned()).await;
     link_down
 }
@@ -672,7 +663,6 @@ fn parse_quality_banner(body: &str) -> Option<PactorLinkEvent> {
         });
     }
 
-    // Bare speed banners have no retry figure.
     for prefix in ["SPEED-LEVEL", "SPEEDLEVEL", "SPEED LEVEL"] {
         if let Some(rest) = upper.strip_prefix(prefix) {
             if let Ok(level) = rest.trim().parse::<u8>() {
@@ -706,8 +696,7 @@ impl PactorTransport for UsbPactorTransport {
 
     async fn connect_peer(&self, remote_call: &str) -> Result<(), ScsPactorError> {
         let _ = self.link_down_tx.send(false);
-        // Connect must be terminal-mode text; framed hostmode `C` is typed on-air
-        // and CRC bytes can corrupt the callsign. Leave JHOST before dialing.
+        // Dialing must use terminal text; framed hostmode bytes corrupt the callsign.
         let _ = self.write_raw(b"JHOST0\r").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -719,7 +708,7 @@ impl PactorTransport for UsbPactorTransport {
         let mut saw_link_setup = false;
         let mut rx = self.event_rx.lock().await;
 
-        // CR nudges prompt fresh terminal status while waiting for link resolution.
+        // CR nudges fresh terminal status while waiting for link resolution.
         let nudge_interval = Duration::from_secs(2);
 
         loop {
@@ -732,7 +721,7 @@ impl PactorTransport for UsbPactorTransport {
                 Ok(Some(event)) => match event {
                     PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
                         debug!("[connect] link established (CONNECTED TO {remote_call})");
-                        // Enter CONVerse so subsequent `write_data` bytes transmit.
+                        // CONVerse mode makes subsequent `write_data` bytes transmit.
                         let _ = self.write_raw(b"CONV\r").await;
                         debug!("[connect] entered converse mode (CONV)");
                         return Ok(());
@@ -770,10 +759,8 @@ impl PactorTransport for UsbPactorTransport {
         &self,
         timeout_after: Option<Duration>,
     ) -> Result<String, ScsPactorError> {
-        // The listener must stay in terminal command mode until CONNECTED, then
-        // enter CONVerse; entering converse early prevents the RF auto-answer.
+        // Auto-answer requires terminal mode until CONNECTED, then CONVerse.
         let _ = self.link_down_tx.send(false);
-        // Leave JHOST so terminal-mode auto-answer and ASCII banners work.
         let _ = self.write_raw(b"JHOST0\r").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         debug!("[accept] listening; waiting for incoming CONNECTED ...");
@@ -814,7 +801,7 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
-        // Send payload as printable `#<hex>\r` lines over the terminal link.
+        // Payloads travel as printable `#<hex>\r` terminal lines.
         let line = format!("{DATA_LINE_MARKER}{}\r", encode_hex(data));
         trace!("[data] write_data: {} bytes -> {:?}", data.len(), &line);
         let r = self.write_raw(line.as_bytes()).await;
@@ -831,8 +818,7 @@ impl PactorTransport for UsbPactorTransport {
         );
         let mut rx = self.data_rx.lock().await;
 
-        // Only a fresh link-down watch update fails this read; stale latched drops
-        // from earlier in the session must not poison the next receive.
+        // Ignore stale link-down latches; only fresh drops fail this read.
         let mut link_down = self.link_down.clone();
         link_down.mark_unchanged();
         let recv_with_down = async {
@@ -873,7 +859,7 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     async fn disconnect(&self) -> Result<(), ScsPactorError> {
-        // Leave CONVerse with ESC before terminal `D`; hostmode disconnect is wrong here.
+        // Leave CONVerse before terminal `D`; hostmode disconnect is wrong here.
         self.write_raw(&[0x1b]).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         self.write_raw(b"D\r").await?;
@@ -881,7 +867,6 @@ impl PactorTransport for UsbPactorTransport {
     }
 
     fn is_link_up(&self) -> bool {
-        // Reader latches down states; connect/accept clear them.
         !*self.link_down.borrow()
     }
 

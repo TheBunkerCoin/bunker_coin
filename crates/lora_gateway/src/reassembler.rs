@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use bunker_coin_core::capsule::{CapsuleHeader, DecodedCapsule};
 use bunker_coin_core::types::{PublicKey, Signature};
 
-/// Key for pending reassembly: (sender, msg_id).
 type ReassemblyKey = (PublicKey, u32);
 
 struct PendingMessage {
@@ -31,8 +30,7 @@ impl FragmentReassembler {
         }
     }
 
-    /// Feed a decoded capsule. Returns `Some((header, full_body, sig))` when all fragments
-    /// for a message have arrived.
+    /// Feed a capsule and return a complete signed body when all fragments arrive.
     pub fn feed(&mut self, capsule: DecodedCapsule) -> Option<(CapsuleHeader, Vec<u8>, Signature)> {
         match capsule {
             DecodedCapsule::Single { header, body, sig } => Some((header, body, sig)),
@@ -60,7 +58,7 @@ impl FragmentReassembler {
                 body_chunk,
                 ..
             } => {
-                // Find the pending entry by msg_id (we need the sender key)
+                // Continuations lack sender, so find the first-fragment entry by message id.
                 let key = self.pending.keys().find(|(_, id)| *id == msg_id).cloned();
                 if let Some(key) = key {
                     if let Some(entry) = self.pending.get_mut(&key) {
@@ -68,7 +66,6 @@ impl FragmentReassembler {
                     }
                     self.try_complete(&key)
                 } else {
-                    // No first fragment seen yet — drop
                     None
                 }
             }
@@ -134,8 +131,7 @@ mod tests {
         for (i, frag) in frags.into_iter().enumerate() {
             let result = r.feed(frag);
             if i < 1 {
-                // First fragment shouldn't complete yet (need continuation)
-                // Actually, first might complete if only 2 frags — check
+                // Completion is checked below.
             }
             if let Some((_, reassembled, _)) = result {
                 assert_eq!(reassembled, body);
@@ -150,11 +146,9 @@ mod tests {
         let mut r = FragmentReassembler::new(Duration::from_secs(60));
         let body = vec![0x42; 400];
         let mut frags = make_fragments(&body, 2);
-        // Reverse order: send continuations first, then first fragment
         frags.reverse();
 
-        // A continuation without its first fragment is dropped, so reassembly
-        // is not guaranteed to complete here; when it does, it must match.
+        // Continuations before their first fragment are dropped.
         for frag in frags {
             if let Some((_, reassembled, _)) = r.feed(frag) {
                 assert_eq!(reassembled, body);
@@ -168,7 +162,6 @@ mod tests {
         let body = vec![0x42; 400];
         let frags = make_fragments(&body, 3);
 
-        // Only feed the first fragment
         let result = r.feed(frags[0].clone());
         assert!(result.is_none());
         assert_eq!(r.pending_count(), 1);
@@ -183,7 +176,6 @@ mod tests {
         r.feed(frags[0].clone());
         assert_eq!(r.pending_count(), 1);
 
-        // With max_age=0, everything is expired immediately
         r.evict_expired();
         assert_eq!(r.pending_count(), 0);
     }

@@ -190,7 +190,6 @@ impl State {
             });
         }
 
-        // deduct fee and bump nonce
         account.native_balance -= tx.fee;
         account.nonce += 1;
         self.tx_fee_pool += tx.fee;
@@ -312,7 +311,7 @@ impl State {
                     });
                 }
                 acc.native_balance -= amount;
-                // epoch 0 as placeholder; real epoch comes from consensus context
+                // Consensus context supplies the real activation epoch.
                 self.staking.queue_bond(sender, *validator, *amount, 0);
                 Ok(())
             }
@@ -502,31 +501,25 @@ impl State {
         let current_epoch = completed_epoch + 1;
         self.current_epoch = current_epoch;
 
-        // 1. process slashes
         let slashes_applied = self.staking.process_slashes(current_epoch);
 
-        // 2. activate pending bonds
         let bonds_activated = self.staking.activate_pending_bonds(current_epoch);
 
-        // 3. complete retirements
         let retires_completed = self.staking.complete_pending_retires(current_epoch);
 
-        // 4. apply pending commission changes
         self.staking.apply_commission_changes();
 
-        // 4b. process location claims
         let location_claims_validated = self.staking.process_location_claims(current_epoch);
 
-        // 5. drain relay participants before distribution
+        // Relay participation is epoch-local and must be drained before rewards.
         let relay_participants = self.staking.drain_relay_participants();
 
-        // 5a. capture and reset epoch counters
         let messages_anchored = self.epoch_messages_anchored;
         let deliveries_completed = self.epoch_deliveries_completed;
         self.epoch_messages_anchored = 0;
         self.epoch_deliveries_completed = 0;
 
-        // 5b. distribute fee pools with commission
+        // Fee distribution applies commission and dust filtering.
         let total_stake = self.staking.total_active_stake();
         let mut pool_distributed = [0u64; 3];
 
@@ -534,7 +527,6 @@ impl State {
             let active_validators: Vec<(PublicKey, Amount)> =
                 self.staking.validator_set().into_iter().collect();
 
-            // Helper closure to distribute a pool to a set of eligible validators
             let distribute_pool = |state_accounts: &mut HashMap<PublicKey, Account>,
                                    staking: &StakingLedger,
                                    pool_amount: Amount,
@@ -612,7 +604,6 @@ impl State {
                 distributed
             };
 
-            // tx_fee_pool: all active validators
             pool_distributed[0] = distribute_pool(
                 &mut self.accounts,
                 &self.staking,
@@ -633,7 +624,7 @@ impl State {
                 &msg_eligible,
             );
 
-            // bridge_fee_pool: all active validators (bridge eligibility deferred to BCert impl)
+            // Bridge eligibility is deferred; active validators receive this pool for now.
             pool_distributed[2] = distribute_pool(
                 &mut self.accounts,
                 &self.staking,
@@ -647,13 +638,10 @@ impl State {
         self.msg_fee_pool -= pool_distributed[1];
         self.bridge_fee_pool -= pool_distributed[2];
 
-        // 6. collect deactivated validators (below MIN_SELF_STAKE)
         let deactivated = self.staking.validators_below_min_self_stake();
 
-        // 7. derive new validator set
         let new_validators = self.staking.validator_set();
 
-        // 8. compute state hash
         let state_hash = self.compute_state_hash();
 
         EpochTransitionResult {
@@ -673,7 +661,7 @@ impl State {
     pub fn compute_state_hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
 
-        // accounts — sort by key for determinism
+        // Sort map-backed fields for deterministic hashing.
         let mut accounts: Vec<_> = self.accounts.iter().collect();
         accounts.sort_by_key(|(k, _)| *k);
         for (pk, acc) in &accounts {
@@ -687,7 +675,6 @@ impl State {
             }
         }
 
-        // tokens — sort by key
         let mut tokens: Vec<_> = self.tokens.iter().collect();
         tokens.sort_by_key(|(k, _)| *k);
         for (tid, meta) in &tokens {
@@ -713,7 +700,6 @@ impl State {
             hasher.update(amount.to_le_bytes());
         }
 
-        // jailed — sort by key
         let mut jailed: Vec<_> = self.staking.jailed.iter().collect();
         jailed.sort_by_key(|(k, _)| *k);
         for (pk, record) in &jailed {
@@ -722,7 +708,6 @@ impl State {
             hasher.update(record.amount_slashed.to_le_bytes());
         }
 
-        // self_bonds — sort by key
         let mut self_bonds: Vec<_> = self.staking.self_bonds.iter().collect();
         self_bonds.sort_by_key(|(k, _)| *k);
         for (pk, amount) in &self_bonds {
@@ -730,7 +715,6 @@ impl State {
             hasher.update(amount.to_le_bytes());
         }
 
-        // commission_rates — sort by key
         let mut commissions: Vec<_> = self.staking.commission_rates.iter().collect();
         commissions.sort_by_key(|(k, _)| *k);
         for (pk, rate) in &commissions {
@@ -738,7 +722,6 @@ impl State {
             hasher.update(rate.to_le_bytes());
         }
 
-        // delegator_stakes — sort by key for determinism
         let mut del_stakes: Vec<_> = self.staking.delegator_stakes.iter().collect();
         del_stakes.sort_by_key(|(k, _)| *k);
         for ((delegator, validator), amount) in &del_stakes {
@@ -747,7 +730,6 @@ impl State {
             hasher.update(amount.to_le_bytes());
         }
 
-        // validated_locations — sort by key
         let mut locations: Vec<_> = self.staking.validated_locations.iter().collect();
         locations.sort_by_key(|(k, _)| *k);
         for (pk, loc) in &locations {
@@ -758,7 +740,6 @@ impl State {
             hasher.update(loc.attestation_count.to_le_bytes());
         }
 
-        // pending_location_claims
         for (claim, attestations) in &self.staking.pending_location_claims {
             hasher.update(claim.validator);
             hasher.update(claim.lat.to_le_bytes());
@@ -771,7 +752,7 @@ impl State {
             }
         }
 
-        // msg_relay_participants — sort for determinism
+        // Sort set-backed relay participants for deterministic hashing.
         let mut relay_parts: Vec<_> = self
             .staking
             .msg_relay_participants
@@ -783,17 +764,14 @@ impl State {
             hasher.update(pk);
         }
 
-        // epoch messaging counters
         hasher.update(self.epoch_messages_anchored.to_le_bytes());
         hasher.update(self.epoch_deliveries_completed.to_le_bytes());
 
-        // pending commission changes
         for (pk, rate) in &self.staking.pending_commission_changes {
             hasher.update(pk);
             hasher.update(rate.to_le_bytes());
         }
 
-        // pending bonds
         for bond in &self.staking.pending_bonds {
             hasher.update(bond.delegator);
             hasher.update(bond.validator);
@@ -801,7 +779,6 @@ impl State {
             hasher.update(bond.epoch_queued.to_le_bytes());
         }
 
-        // pending retires
         for retire in &self.staking.pending_retires {
             hasher.update(retire.delegator);
             hasher.update(retire.validator);
@@ -809,7 +786,6 @@ impl State {
             hasher.update(retire.epoch_queued.to_le_bytes());
         }
 
-        // completed retires
         for retire in &self.staking.completed_retires {
             hasher.update(retire.delegator);
             hasher.update(retire.validator);
@@ -1019,7 +995,6 @@ mod tests {
         let (_, pk_b) = make_keypair();
         let mut state = funded_state(&pk_a, 1_000);
 
-        // mint first
         let mut mint_tx = Transaction {
             sender: pk_a,
             nonce: 0,
@@ -1177,11 +1152,9 @@ mod tests {
         let delegator: PublicKey = [1u8; 32];
         let validator: PublicKey = [2u8; 32];
 
-        // queue a bond at epoch 0
         state.staking.queue_bond(delegator, validator, 500, 0);
         assert!(state.staking.delegations.is_empty());
 
-        // epoch 0 -> 1 transition: bond should activate (ACTIVATION_DELAY = 1)
         let result = state.process_epoch_transition(0);
         assert_eq!(result.bonds_activated.len(), 1);
         assert_eq!(*state.staking.delegations.get(&validator).unwrap(), 500);
@@ -1214,7 +1187,6 @@ mod tests {
 
         let result = state.process_epoch_transition(0);
         assert_eq!(result.slashes_applied.len(), 1);
-        // 100% slash: all 1000 burned
         assert_eq!(result.slashes_applied[0].amount_slashed, 1000);
         assert!(!state.staking.delegations.contains_key(&validator));
         assert!(state.staking.jailed.contains_key(&validator));
@@ -1230,7 +1202,6 @@ mod tests {
         state.staking.delegations.insert(pk, 2 * MIN_SELF_STAKE);
         state.staking.self_bonds.insert(pk, 2 * MIN_SELF_STAKE);
 
-        // Use Downtime: 0% slash, 1-epoch jail
         state.staking.report_offence(SlashingEvent {
             validator: pk,
             offence: SlashOffenceKind::Downtime,
@@ -1239,7 +1210,6 @@ mod tests {
         state.staking.process_slashes(0);
         assert!(state.staking.jailed.contains_key(&pk));
 
-        // unjail too early — jailed at epoch 0, need epoch >= 1
         state.current_epoch = 0;
         let mut tx = Transaction {
             sender: pk,
@@ -1252,7 +1222,6 @@ mod tests {
         let err = state.execute_tx(&tx).unwrap_err();
         assert!(matches!(err, ExecutionError::JailPeriodNotElapsed));
 
-        // unjail succeeds at epoch 1
         state.current_epoch = 1;
         let mut tx = Transaction {
             sender: pk,
@@ -1390,7 +1359,6 @@ mod tests {
         state.staking.delegations.insert(v1, 500);
         state.staking.delegations.insert(v2, 500);
         state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
-        // v2 has no self_bonds
 
         let set = state.staking.validator_set();
         assert_eq!(set.len(), 1);
@@ -1436,7 +1404,6 @@ mod tests {
 
         let records = ledger.process_slashes(0);
         assert_eq!(records.len(), 1);
-        // 100% slash: all 2000 delegation and all 1000 self-bond burned
         assert_eq!(records[0].amount_slashed, 2000);
         assert!(!ledger.self_bonds.contains_key(&validator));
         assert!(!ledger.delegations.contains_key(&validator));
@@ -1489,7 +1456,6 @@ mod tests {
         let v1: PublicKey = [1u8; 32];
         let v2: PublicKey = [2u8; 32];
 
-        // v1 has 999x the delegation of v2
         state.staking.delegations.insert(v1, 999);
         state.staking.delegations.insert(v2, 1);
         state.staking.self_bonds.insert(v1, MIN_SELF_STAKE);
@@ -1498,8 +1464,6 @@ mod tests {
 
         let result = state.process_epoch_transition(0);
 
-        // v1 share = 999 * 999 / 1000 = 998 (>= DUST_THRESHOLD)
-        // v2 share = 999 * 1 / 1000 = 0 (< DUST_THRESHOLD, skipped)
         assert_eq!(result.fees_distributed, 998);
         assert_eq!(state.get_account(&v1).unwrap().native_balance, 998);
         assert_eq!(
@@ -1530,7 +1494,6 @@ mod tests {
 
         let result = state.process_epoch_transition(0);
 
-        // all pools distributed
         assert_eq!(result.fees_distributed, 100);
         assert_eq!(state.tx_fee_pool, 0);
         assert_eq!(state.msg_fee_pool, 0);
@@ -1775,7 +1738,6 @@ mod tests {
         let (_, pk_b) = make_keypair();
         let mut state = funded_state(&pk, 10_000);
 
-        // mint 100 tokens
         let mut mint_tx = Transaction {
             sender: pk,
             nonce: 0,
@@ -1887,7 +1849,6 @@ mod tests {
     fn set_commission_not_validator() {
         let (sk, pk) = make_keypair();
         let mut state = funded_state(&pk, 10_000);
-        // pk has no delegation
 
         let mut tx = Transaction {
             sender: pk,
@@ -2047,11 +2008,9 @@ mod tests {
         state.staking.self_bonds.insert(validator, MIN_SELF_STAKE);
         state.staking.queue_retire(delegator, validator, 500, 0);
 
-        // epoch 0->1: too early (UNBONDING_PERIOD = 2)
         let r1 = state.process_epoch_transition(0);
         assert!(r1.retires_completed.is_empty());
 
-        // epoch 1->2: should complete
         let r2 = state.process_epoch_transition(1);
         assert_eq!(r2.retires_completed.len(), 1);
         assert_eq!(
@@ -2075,8 +2034,6 @@ mod tests {
         assert!(result.deactivated.contains(&v2));
         assert!(!result.deactivated.contains(&v1));
     }
-
-    // -- Burn tests --
 
     fn mint_token(
         sk: &SigningKey,

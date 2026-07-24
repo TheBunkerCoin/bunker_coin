@@ -1,27 +1,6 @@
-//! `bunkerglow::network::Network` implementation backed by a PACTOR modem link.
-//!
-//! This lets the existing Alpenglow consensus simulation — which is generic over
-//! the [`Network`](bunkerglow::network::Network) trait — run over two real SCS
-//! PACTOR modems instead of the in-process [`SimulatedNetwork`]. It mirrors
-//! [`UdpNetwork`](bunkerglow::network::udp) but serializes each typed message and
-//! ships it over the connected ARQ link via [`PactorTransport`].
-//!
-//! PACTOR is a connected point-to-point link, so the [`SocketAddr`] routing
-//! arguments are ignored: every send goes to the single connected peer. This is
-//! the first increment toward running the full simulation over the modems; it
-//! exercises one typed channel end to end.
-//!
-//! ## Fragmentation
-//!
-//! The transport's [`write_data`](PactorTransport::write_data) carries one
-//! message as a single hex line that must fit the 300-byte radio MTU. Real
-//! consensus payloads (Certs with aggregated BLS sigs, Shreds, blocks) exceed
-//! that. `PactorNetwork` therefore fragments a serialized message across several
-//! `write_data` lines using a small [`FragmentHeader`] (mirroring the simulated
-//! [`RadioNetworkCore`](crate::network_core) fragmentation) and reassembles them
-//! on [`receive`](Network::receive) by looping [`read_data`](PactorTransport::read_data).
-//! A message that fits one line is sent as a single `total_fragments == 1`
-//! fragment, so the common case (a vote) is unchanged on the wire shape.
+//! `Network` implementation backed by one connected PACTOR modem peer.
+//! `SocketAddr` routing is ignored: every send targets the single ARQ peer.
+//! Serialized messages are fragmented into MTU-sized `write_data` lines and reassembled on receive.
 
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -40,16 +19,12 @@ use crate::pactor_framing::{fragment_message, Reassembler};
 /// Maximum number of bytes read for a single inbound message.
 const DEFAULT_MAX_READ_LEN: usize = 8192;
 
-/// Network abstraction over a connected PACTOR modem link.
-///
-/// `S` is the message type sent, `R` the type received. The transport must
-/// already be connected (link established) before sending or receiving.
+/// Network wrapper for an already-connected PACTOR transport.
 pub struct PactorNetwork<S, R> {
     transport: Arc<dyn PactorTransport>,
     max_read_len: usize,
     message_counter: AtomicU64,
-    /// Partially-received messages. Reassembly is over a single point-to-point
-    /// link, so the peer's id is implicit.
+    /// Reassembly state keyed by message id; peer identity is implicit.
     reassembly: Mutex<Reassembler>,
     _msg_types: PhantomData<(S, R)>,
 }
@@ -60,9 +35,7 @@ impl<S, R> PactorNetwork<S, R> {
         Self {
             transport,
             max_read_len: DEFAULT_MAX_READ_LEN,
-            // Session-unique id namespace (see PactorMux::build): random high
-            // 32 bits, counting low 32 bits — stale-partial merges across
-            // session restarts become improbable.
+            // Random high bits make stale-partial merges across session restarts unlikely.
             message_counter: AtomicU64::new(u64::from(rand::random::<u32>()) << 32),
             reassembly: Mutex::new(Reassembler::new()),
             _msg_types: PhantomData,
@@ -75,9 +48,7 @@ impl<S, R> PactorNetwork<S, R> {
         self
     }
 
-    /// Fragment a serialized message across one or more `write_data` lines so
-    /// each line stays within the radio MTU. A message that fits one line is
-    /// sent as a single `total_fragments == 1` fragment.
+    /// Fragment serialized bytes into radio-MTU `write_data` lines.
     async fn send_serialized(&self, bytes: &[u8]) -> std::io::Result<()> {
         let message_id = self.message_counter.fetch_add(1, Ordering::Relaxed);
         for line in fragment_message(message_id, bytes) {
@@ -89,8 +60,7 @@ impl<S, R> PactorNetwork<S, R> {
         Ok(())
     }
 
-    /// Read fragment lines until a complete message is reassembled, then return
-    /// its raw (still-serialized) bytes.
+    /// Read fragment lines until one serialized message is complete.
     async fn receive_serialized(&self) -> std::io::Result<Vec<u8>> {
         loop {
             let line = self
@@ -103,8 +73,6 @@ impl<S, R> PactorNetwork<S, R> {
             match reassembly.push_line(&line) {
                 Some(message) => return Ok(message),
                 None => {
-                    // Either a mid-message fragment, or an unparseable line.
-                    // Keep reading; reassembly tolerates both.
                     continue;
                 }
             }
@@ -116,12 +84,8 @@ impl<S, R> PactorNetwork<S, R>
 where
     S: SchemaWrite<Src = S> + Send + Sync,
 {
-    /// Send several messages within a single transmit turn (no changeover
-    /// between them). Each message is fragmented across as many framed lines as
-    /// the MTU requires, but the link stays in the sending direction throughout
-    /// — amortizing the expensive half-duplex ARQ changeover across the batch.
-    ///
-    /// The caller is responsible for the changeover before/after the batch.
+    /// Send a batch within one transmit turn to amortize half-duplex ARQ changeover.
+    /// The caller owns the changeover before and after the batch.
     pub async fn send_batch(&self, messages: &[S]) -> std::io::Result<()> {
         for msg in messages {
             let bytes = wincode::serialize(msg)
@@ -148,8 +112,7 @@ where
     ) -> std::io::Result<()> {
         let bytes = wincode::serialize(message)
             .map_err(|e| std::io::Error::other(format!("serialize failed: {e:?}")))?;
-        // One physical peer on the link: send once regardless of how many
-        // logical addresses were requested, but only if at least one was.
+        // One physical peer: send once if at least one logical address was requested.
         if addrs.into_iter().next().is_some() {
             self.send_serialized(&bytes).await?;
         }
@@ -185,8 +148,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
-    /// A fake transport that records written lines and replays queued lines back
-    /// for `read_data`, so fragmentation/reassembly can be tested without radio.
+    /// Fake transport for fragmentation/reassembly tests without radio.
     struct FakeTransport {
         written: Mutex<Vec<Vec<u8>>>,
         inbound: Mutex<VecDeque<Vec<u8>>>,
@@ -262,14 +224,12 @@ mod tests {
         let transport = Arc::new(FakeTransport::new());
         let net: PactorNetwork<Vec<u8>, Vec<u8>> = PactorNetwork::new(transport.clone());
 
-        // Several times the per-line chunk budget so it must span many lines.
         let payload: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         net.send_serialized(&payload).await.unwrap();
 
         let lines = transport.take_written().await;
         assert!(lines.len() > 1, "large message should fragment");
 
-        // Feed the same fragments back and confirm exact reassembly.
         transport.queue_inbound(lines).await;
         let received = net.receive_serialized().await.unwrap();
         assert_eq!(received, payload);
@@ -296,7 +256,6 @@ mod tests {
         let transport = Arc::new(FakeTransport::new());
         let net: PactorNetwork<Vec<u8>, Vec<u8>> = PactorNetwork::new(transport.clone());
 
-        // One junk line, then a valid single-fragment message.
         net.send_serialized(b"world").await.unwrap();
         let good = transport.take_written().await;
         transport.queue_inbound(vec![vec![0xff, 0xff]]).await;
