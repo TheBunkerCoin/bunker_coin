@@ -530,6 +530,10 @@ fn spawn_block_executor(
 ) {
     tokio::spawn(async move {
         let mut last_executed: u64 = 0;
+        // Pre-restart boundary events never re-fire; the catch-up walk applies
+        // those transitions itself, while live crossings stay with the epoch loop.
+        let startup_floor = pool.read().await.finalized_slot().inner();
+        let mut epoch_cursor: u64 = 0;
         loop {
             if cancel.is_cancelled() {
                 break;
@@ -552,6 +556,24 @@ fn spawn_block_executor(
             let batch_end = finalized.min(last_executed + 500);
             for slot in (last_executed + 1)..=batch_end {
                 let slot_id = Slot::new(slot);
+                // Dense walk: a crossing makes `slot - 1` the completed boundary.
+                let slot_epoch = slot_id.epoch();
+                if slot_epoch > epoch_cursor {
+                    if slot - 1 <= startup_floor {
+                        let result = tx
+                            .execution_state
+                            .write()
+                            .await
+                            .process_epoch_transition(epoch_cursor);
+                        println!(
+                            "[{label}] applied epoch {epoch_cursor} transition during catch-up \
+                             (boundary slot {}, {} fees distributed)",
+                            slot - 1,
+                            result.fees_distributed
+                        );
+                    }
+                    epoch_cursor = slot_epoch;
+                }
                 let Some(hash) = bs.canonical_block_hash(slot_id) else {
                     continue; // skip-certified slot: no block to execute
                 };
