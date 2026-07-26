@@ -575,13 +575,20 @@ pub struct MuxLiveness {
     last_activity_ms: Arc<AtomicU64>,
 }
 
-/// Inbound-activity window for link liveness.
-const LIVENESS_WINDOW: Duration = Duration::from_secs(30);
+/// Inbound-activity window for link liveness; must exceed the longest normal
+/// inbound gap (slow changeovers), else Votor reads the link as dead and skips.
+fn liveness_window() -> Duration {
+    std::env::var("BUNKER_LIVENESS_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(90))
+}
 
 impl LinkLiveness for MuxLiveness {
     fn is_link_alive(&self) -> bool {
         let last = self.last_activity_ms.load(Ordering::Relaxed);
-        now_ms().saturating_sub(last) < LIVENESS_WINDOW.as_millis() as u64
+        now_ms().saturating_sub(last) < liveness_window().as_millis() as u64
     }
 }
 
