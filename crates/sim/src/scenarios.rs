@@ -1159,26 +1159,27 @@ pub async fn multi_node_consensus_simulation_with_api(
                                             .iter()
                                             .filter_map(|raw| {
                                                 // Transaction.0 may wrap bincode bytes in an 8-byte wincode Vec prefix.
-                                                // Try raw bytes first, then the prefixed form.
+                                                // Try raw bytes first, then the prefixed form. Limit-guarded:
+                                                // bloat padding read as a length without a limit triggers a
+                                                // `capacity overflow` panic.
+                                                let config = bincode::config::standard()
+                                                    .with_limit::<4096>();
                                                 let data = &raw.0;
-                                                bincode::serde::decode_from_slice(
-                                                    data,
-                                                    bincode::config::standard(),
-                                                )
-                                                .or_else(|_| {
-                                                    if data.len() > 8 {
-                                                        bincode::serde::decode_from_slice(
-                                                            &data[8..],
-                                                            bincode::config::standard(),
-                                                        )
-                                                    } else {
-                                                        Err(bincode::error::DecodeError::Other(
-                                                            "too short",
-                                                        ))
-                                                    }
-                                                })
-                                                .ok()
-                                                .map(|(tx, _)| tx)
+                                                bincode::serde::decode_from_slice(data, config)
+                                                    .or_else(|_| {
+                                                        if data.len() > 8 {
+                                                            bincode::serde::decode_from_slice(
+                                                                &data[8..],
+                                                                config,
+                                                            )
+                                                        } else {
+                                                            Err(bincode::error::DecodeError::Other(
+                                                                "too short",
+                                                            ))
+                                                        }
+                                                    })
+                                                    .ok()
+                                                    .map(|(tx, _)| tx)
                                             })
                                             .collect();
 
