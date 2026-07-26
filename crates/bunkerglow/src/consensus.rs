@@ -189,6 +189,18 @@ where
         pool.set_slashing_channel(slashing_tx);
         // Votor replays its durable own-vote log relative to the restored frontier.
         let restored_finalized_slot = Pool::finalized_slot(&pool);
+        // Fast-forward the epoch watch to the restored frontier's epoch: the
+        // boundary finalization that would publish it happened before the
+        // restart and never re-fires, leaving the producer parked at the
+        // boundary window forever.
+        let restored_epoch = restored_finalized_slot.epoch();
+        if restored_epoch > epoch_info.epoch() {
+            let _ = epoch_info_tx.send(Arc::new(EpochInfo::new(
+                restored_epoch,
+                epoch_info.own_id,
+                epoch_info.validators.clone(),
+            )));
+        }
         let pool: Box<dyn Pool + Send + Sync> = Box::new(pool);
         let pool = Arc::new(RwLock::new(pool));
 
