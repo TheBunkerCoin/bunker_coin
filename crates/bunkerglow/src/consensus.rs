@@ -441,14 +441,18 @@ where
     async fn standstill_loop(self: &Arc<Self>) -> Result<()> {
         let mut finalized_slot = Slot::new(0);
         let mut last_progress = Instant::now();
+        // Dry recoveries double the interval so rebroadcasts don't starve shreds of airtime.
+        let mut dry_recoveries: u32 = 0;
         loop {
             let slot = self.pool.read().await.finalized_slot();
             if slot > finalized_slot {
                 finalized_slot = slot;
                 last_progress = Instant::now();
-            } else if last_progress.elapsed() > delta_standstill() {
+                dry_recoveries = 0;
+            } else if last_progress.elapsed() > delta_standstill() * 2u32.pow(dry_recoveries) {
                 self.pool.read().await.recover_from_standstill().await;
                 last_progress = Instant::now();
+                dry_recoveries = (dry_recoveries + 1).min(2);
             }
             // Fixed cadence avoids adding a full scaled block window of detection latency.
             tokio::time::sleep(delta_block().min(Duration::from_secs(60))).await;
