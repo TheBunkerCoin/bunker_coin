@@ -790,10 +790,7 @@ async fn blocks(
 
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
         // Persistent nodes may have no in-memory blocks; use finalized height with headroom.
-        let highest_finalized_slot = {
-            let nodes = state.nodes.read().await;
-            nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
-        };
+        let highest_finalized_slot = current_slot(&state).await;
         let top = highest_mem_slot.max(highest_finalized_slot) + 200;
 
         // Bound blockstore scans to the page window plus skip-slot headroom.
@@ -1062,10 +1059,7 @@ async fn list_transactions(
         let bs = bs_arc.read().await;
         let results = state.tx_results.read().await;
 
-        let highest_finalized_slot = {
-            let nodes = state.nodes.read().await;
-            nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
-        };
+        let highest_finalized_slot = current_slot(&state).await;
 
         // Scan newest-first, bounded by page need and a fixed recent window.
         let need = offset + limit;
@@ -1164,10 +1158,7 @@ async fn find_tx_in_blockstore(
     let highest_mem_slot = blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
     drop(blocks);
     // Fall back to finalized height when in-memory blocks are absent.
-    let highest_finalized_slot = {
-        let nodes = state.nodes.read().await;
-        nodes.iter().map(|n| n.finalized_slot).max().unwrap_or(0)
-    };
+    let highest_finalized_slot = current_slot(state).await;
 
     // Wallet lookups scan tip-down within a fixed recent window.
     let top = highest_mem_slot.max(highest_finalized_slot) + 200;
@@ -2421,6 +2412,33 @@ fn tx_id_to_hex(s: &str) -> Result<String, String> {
     decode_bytes_any::<32>(s).map(hex::encode)
 }
 
+/// Decodes a `sendTransaction`/`simulateTransaction` first param: a base64
+/// native transaction string, or a JSON transaction object passed straight
+/// through. Returns `None` if neither shape is present.
+fn decode_tx_param(p: &[serde_json::Value]) -> Option<serde_json::Value> {
+    match p.first() {
+        Some(serde_json::Value::String(b64)) => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        }
+        Some(tx) if tx.is_object() => Some(tx.clone()),
+        _ => None,
+    }
+}
+
+/// Converts a hex `hash` field (as the REST API returns) to a bare base58
+/// string, as wallets expect. Returns `None` if the field is missing or not a
+/// 32-byte hex hash.
+fn hash_field_to_b58(v: &serde_json::Value) -> Option<String> {
+    v.get("hash")
+        .and_then(|h| h.as_str())
+        .and_then(|h| decode_bytes_any::<32>(h).ok())
+        .map(|bytes| b58(&bytes))
+}
+
 /// Recommended fee surfaced through `getFeeForMessage`; chain checks affordability.
 const RECOMMENDED_TX_FEE: u64 = 100;
 
@@ -2686,9 +2704,7 @@ async fn handle_rpc_call(
                             .iter()
                             .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("block"))
                     })
-                    .and_then(|b| b.get("hash").and_then(|h| h.as_str()))
-                    .and_then(|h| decode_bytes_any::<32>(h).ok())
-                    .map(|bytes| b58(&bytes))
+                    .and_then(hash_field_to_b58)
                     .unwrap_or_else(|| b58(&[0u8; 32])),
                 Err(_) => b58(&[0u8; 32]),
             };
@@ -2774,28 +2790,13 @@ async fn handle_rpc_call(
         },
         // Base64 native transaction in, base58 transaction id out.
         "sendTransaction" => {
-            let tx_json: Option<serde_json::Value> = match p.first() {
-                Some(serde_json::Value::String(b64)) => {
-                    use base64::Engine;
-                    base64::engine::general_purpose::STANDARD
-                        .decode(b64)
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                }
-                Some(tx) if tx.is_object() => Some(tx.clone()),
-                _ => None,
-            };
-            match tx_json {
+            match decode_tx_param(p) {
                 Some(tx) => Ok(
                     match rest_dispatch(rest, M::POST, "/transactions", Some(&tx)).await {
                         Ok(resp) => {
                             // REST returns hex; wallets expect bare base58 id.
-                            match resp
-                                .get("hash")
-                                .and_then(|h| h.as_str())
-                                .and_then(|h| decode_bytes_any::<32>(h).ok())
-                            {
-                                Some(bytes) => Ok(serde_json::json!(b58(&bytes))),
+                            match hash_field_to_b58(&resp) {
+                                Some(id) => Ok(serde_json::json!(id)),
                                 None => Ok(resp),
                             }
                         }
@@ -2806,47 +2807,30 @@ async fn handle_rpc_call(
             }
         }
         // Preflight shape follows Solana `RpcResponse<{err, logs}>`.
-        "simulateTransaction" => {
-            let tx_json: Option<serde_json::Value> = match p.first() {
-                Some(serde_json::Value::String(b64)) => {
-                    use base64::Engine;
-                    base64::engine::general_purpose::STANDARD
-                        .decode(b64)
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                }
-                Some(tx) if tx.is_object() => Some(tx.clone()),
-                _ => None,
-            };
-            match tx_json {
-                Some(tx) => {
-                    let slot = current_slot(state).await;
-                    let err = simulate_tx(state, &tx).await;
-                    Ok(Ok(ctx_value(
-                        slot,
-                        serde_json::json!({
-                            "err": err.map(|e| serde_json::json!({ "message": e }))
-                                      .unwrap_or(serde_json::Value::Null),
-                            "logs": [],
-                            "unitsConsumed": 0,
-                        }),
-                    )))
-                }
-                None => Err(()),
+        "simulateTransaction" => match decode_tx_param(p) {
+            Some(tx) => {
+                let slot = current_slot(state).await;
+                let err = simulate_tx(state, &tx).await;
+                Ok(Ok(ctx_value(
+                    slot,
+                    serde_json::json!({
+                        "err": err.map(|e| serde_json::json!({ "message": e }))
+                                  .unwrap_or(serde_json::Value::Null),
+                        "logs": [],
+                        "unitsConsumed": 0,
+                    }),
+                )))
             }
-        }
+            None => Err(()),
+        },
         // Devnet faucet mirrors Solana requestAirdrop and returns a base58 tx id.
         "requestAirdrop" => match (param_str(p, 0).map(decode_pubkey), param_u64(p, 1, 0)) {
             (Ok(Ok(recipient)), Ok(amount)) if amount > 0 => {
                 match build_airdrop_tx(state, recipient, amount).await {
                     Ok(tx) => Ok(
                         match rest_dispatch(rest, M::POST, "/transactions", Some(&tx)).await {
-                            Ok(resp) => match resp
-                                .get("hash")
-                                .and_then(|h| h.as_str())
-                                .and_then(|h| decode_bytes_any::<32>(h).ok())
-                            {
-                                Some(bytes) => Ok(serde_json::json!(b58(&bytes))),
+                            Ok(resp) => match hash_field_to_b58(&resp) {
+                                Some(id) => Ok(serde_json::json!(id)),
                                 None => Ok(resp),
                             },
                             Err(e) => Err(e),

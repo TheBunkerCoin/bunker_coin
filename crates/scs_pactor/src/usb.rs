@@ -20,30 +20,12 @@ const MAX_HOSTMODE_RETRIES: u8 = 3;
 /// Prefix for printable terminal-mode data lines (`#<hex>\r`).
 const DATA_LINE_MARKER: &str = "#";
 
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-    }
-    s
-}
-
 fn decode_hex_line(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.trim();
-    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+    if hex.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16)?;
-        let lo = (bytes[i + 1] as char).to_digit(16)?;
-        out.push(((hi << 4) | lo) as u8);
-        i += 2;
-    }
-    Some(out)
+    hex::decode(hex).ok()
 }
 
 #[derive(Clone, Debug)]
@@ -802,7 +784,7 @@ impl PactorTransport for UsbPactorTransport {
 
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
         // Payloads travel as printable `#<hex>\r` terminal lines.
-        let line = format!("{DATA_LINE_MARKER}{}\r", encode_hex(data));
+        let line = format!("{DATA_LINE_MARKER}{}\r", hex::encode(data));
         trace!("[data] write_data: {} bytes -> {:?}", data.len(), &line);
         let r = self.write_raw(line.as_bytes()).await;
         if let Err(e) = &r {

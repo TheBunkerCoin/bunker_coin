@@ -2,6 +2,7 @@
 //! Each fragment is one `write_data` line with a `FragmentHeader` before payload bytes.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,25 +18,32 @@ pub(crate) struct FragmentHeader {
 }
 
 /// Encoded [`FragmentHeader`] size used to compute the fragment payload budget.
+/// Fixed for a given `FragmentHeader` layout, so compute it once.
 pub(crate) fn fragment_header_len() -> usize {
-    bincode::serde::encode_to_vec(
-        &FragmentHeader {
-            message_id: u64::MAX,
-            fragment_index: u16::MAX,
-            total_fragments: u16::MAX,
-        },
-        bincode::config::standard(),
-    )
-    .expect("encoding a fixed header cannot fail")
-    .len()
+    static LEN: LazyLock<usize> = LazyLock::new(|| {
+        bincode::serde::encode_to_vec(
+            &FragmentHeader {
+                message_id: u64::MAX,
+                fragment_index: u16::MAX,
+                total_fragments: u16::MAX,
+            },
+            bincode::config::standard(),
+        )
+        .expect("encoding a fixed header cannot fail")
+        .len()
+    });
+    *LEN
 }
 
 /// Payload bytes per fragment after reserving header space and hex-encoded MTU overhead.
 pub(crate) fn effective_chunk_len() -> usize {
-    let line_byte_budget = (RADIO_MTU - 2) / 2;
-    line_byte_budget
-        .saturating_sub(fragment_header_len())
-        .max(1)
+    static LEN: LazyLock<usize> = LazyLock::new(|| {
+        let line_byte_budget = (RADIO_MTU - 2) / 2;
+        line_byte_budget
+            .saturating_sub(fragment_header_len())
+            .max(1)
+    });
+    *LEN
 }
 
 /// Encode a header followed by raw chunk bytes.
