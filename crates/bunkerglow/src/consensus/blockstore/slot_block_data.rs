@@ -245,8 +245,6 @@ impl BlockData {
     }
 
     /// Reconstructs the slice if the blockstore contains enough shreds.
-    ///
-    /// See [`ReconstructSliceResult`] for more info on what the function returns.
     fn try_reconstruct_slice(
         &mut self,
         index: SliceIndex,
@@ -262,7 +260,7 @@ impl BlockData {
             Entry::Vacant(entry) => entry,
         };
 
-        // assuming caller has inserted at least one valid shred so unwrap() should be safe
+        // Caller inserted at least one shred for this index; the entry exists.
         let slice_shreds = self.shreds.get_mut(&index).unwrap();
         let (reconstructed_slice, reconstructed_shreds) = match shredder.deshred(slice_shreds) {
             Ok(output) => output,
@@ -289,8 +287,6 @@ impl BlockData {
     }
 
     /// Reconstructs the block if the blockstore contains all slices.
-    ///
-    /// See [`ReconstructBlockResult`] for more info on what the function returns.
     fn try_reconstruct_block(&mut self) -> ReconstructBlockResult {
         if self.completed.is_some() {
             trace!("already have block for slot {}", self.slot);
@@ -313,7 +309,7 @@ impl BlockData {
         self.double_merkle_tree = Some(tree);
 
         let first_slice = self.slices.get(&SliceIndex::first()).unwrap();
-        // based on the logic in `try_reconstruct_slice`, first_slice should be valid i.e. it must contain a parent.
+        // try_reconstruct_slice validated that the first slice contains a parent.
         let mut parent = first_slice.parent.clone().unwrap();
         let mut parent_switched = false;
 
@@ -373,12 +369,8 @@ impl BlockData {
             transactions.extend(payload.transactions);
         }
 
-        // The parent slot comes from the (leader-controlled) block payload. A
-        // valid block's parent must be a strictly earlier slot; anything else
-        // (parent == self, parent in the future) is a malformed/hostile block.
-        // Reject it here rather than let it reach `Pool::add_block`, whose
-        // `assert!(block_id.0 > parent_id.0)` would otherwise panic the whole
-        // consensus task on a single bad block from a peer.
+        // The leader controls the claimed parent slot; a non-earlier parent would
+        // trip `Pool::add_block`'s ordering assert and kill the consensus task.
         if parent.0 >= self.slot {
             warn!(
                 "block in slot {} claims parent in slot {} (not strictly earlier) — rejecting",
@@ -547,7 +539,6 @@ mod tests {
         }
     }
 
-    // If a subsequent slice switches parent to the original, the block is not reconstructed.
     #[test]
     fn reconstruct_block_optimistic_handover_duplicate_parent() {
         let sk = SecretKey::new(&mut rand::rng());
@@ -573,7 +564,6 @@ mod tests {
         }
     }
 
-    // Two switches of parents do not reconstruct block.
     #[test]
     fn reconstruct_block_optimistic_handover_two_switches() {
         let sk = SecretKey::new(&mut rand::rng());
@@ -605,7 +595,6 @@ mod tests {
         }
     }
 
-    // Optimistic handover works.
     #[test]
     fn reconstruct_block_optimistic_handover_works() {
         let sk = SecretKey::new(&mut rand::rng());

@@ -25,20 +25,11 @@ use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder};
 use crate::types::{Slice, SliceHeader, SliceIndex, SlicePayload, Slot};
 use crate::{BlockId, BlockPayload, Disseminator, MAX_TRANSACTION_SIZE, Transaction};
 
-/// Target number of "bloat" payload bytes to pad each produced slice up to,
-/// read from `BUNKER_BLOAT_BYTES` (default `0` = disabled).
-///
-/// When set, after packing real transactions the leader tops the slice up with
-/// dummy [`Transaction`]s of random bytes until the slice holds at least this
-/// many payload bytes (capped at the slice capacity). This makes every block —
-/// including otherwise-empty ones — occupy the HF link longer, so there is a
-/// steady stream of data to disseminate and consume. Each bloat tx is a normal
-/// `Transaction(Vec<u8>)` on the wire, so this is not a wire-format change; both
-/// nodes still parse blocks identically whether or not bloat is enabled.
-///
-/// Values above [`MAX_DATA_PER_SLICE`] just fill a single slice; multi-slice
-/// bloat blocks are not produced (one padded slice is a simpler, band-friendlier
-/// increase than several).
+/// Pad each produced slice up to this many payload bytes with dummy
+/// transactions so blocks keep the HF link busy (`BUNKER_BLOAT_BYTES`,
+/// default `0` = disabled). Bloat txs are normal `Transaction`s on the wire,
+/// so this is not a wire-format change; values above the slice capacity just
+/// fill a single slice.
 fn bloat_target_bytes() -> usize {
     std::env::var("BUNKER_BLOAT_BYTES")
         .ok()
@@ -46,12 +37,8 @@ fn bloat_target_bytes() -> usize {
         .unwrap_or(0)
 }
 
-/// Produces blocks from transactions and dissminates them.
-///
-/// This is the leader's side of the consensus protocol.
-/// Produces blocks in accordance with the consensus protocol's timeouts.
-/// Receives transactions from clients via a [`Network`] instance and packs them into blocks.
-/// Finished blocks are shredded and disseminated via a [`Disseminator`] instance.
+/// Leader side of the consensus protocol: packs client transactions into
+/// blocks on the protocol's timeouts, then shreds and disseminates them.
 pub(super) struct BlockProducer<D: Disseminator, T: Network> {
     /// Own validator's secret key (used e.g. for block production).
     /// This is not the same as the voting secret key, which is held by [`super::Votor`].
@@ -154,14 +141,9 @@ where
 
             let last_slot_in_window = first_slot_in_window.last_slot_in_window();
 
-            // Skip windows already behind the finalized frontier. After a
-            // restart the pool restores the frontier, but this loop starts at
-            // genesis — and `wait_for_first_slot` reports old windows Ready
-            // (their parents are in the blockstore), so without this check the
-            // leader re-produces and re-disseminates every historical window
-            // at full block cadence before producing anything new. Harmless to
-            // state (re-production is deterministic) but it stalls fresh
-            // blocks entirely.
+            // After a restart this loop starts at genesis while the pool floor
+            // is ahead; without this skip the leader re-produces every
+            // historical window before emitting anything new.
             let finalized = self.pool.read().await.finalized_slot();
             if last_slot_in_window <= finalized {
                 debug!(
@@ -171,7 +153,6 @@ where
                 continue;
             }
 
-            // don't do anything if we are not the leader
             let leader = self.epoch_info.leader(first_slot_in_window);
             if leader.id != self.epoch_info.own_id {
                 debug!(
@@ -181,7 +162,6 @@ where
                 continue;
             }
 
-            // wait for ParentReady or block in previous slot
             let slot_ready = wait_for_first_slot(
                 self.pool.clone(),
                 self.blockstore.clone(),
@@ -189,7 +169,6 @@ where
             )
             .await;
 
-            // produce first block
             let start = Instant::now();
             let mut block_id = match slot_ready {
                 SlotReady::Skip => {
@@ -218,7 +197,6 @@ where
                 start.elapsed().as_millis()
             );
 
-            // produce remaining blocks
             for slot in first_slot_in_window.slots_in_window().skip(1) {
                 let slot_epoch = slot.epoch();
                 if slot_epoch > current_epoch {
@@ -251,9 +229,9 @@ where
         Ok(())
     }
 
-    /// Produces a block in the situation where we have not yet seen the `ParentReady` event.
-    ///
-    /// The `parent_block_id` refers to the block of the previous slot which may end up not being the actualy parent of the block.
+    /// Produces a block before the `ParentReady` event is seen;
+    /// `parent_block_id` is the previous slot's block and may end up not being
+    /// the actual parent.
     pub(super) async fn produce_block_parent_not_ready(
         &self,
         slot: Slot,
@@ -288,14 +266,13 @@ where
                 // 2. first slice finishes at most delta_first_slice after ParentReady is seen
                 duration_left.min(self.delta_first_slice)
             } else {
-                // cap timeout for each slice to `DELTA_BLOCK`
-                // makes sure optimistic block production yields before timeout would expire
+                // Cap per-slice time so optimistic production yields before the timeout.
                 duration_left.min(self.delta_block)
             };
             let produce_slice_future =
                 produce_slice_payload(slot, &self.txs_receiver, parent, time_for_slice, None);
 
-            // If we have not yet received the ParentReady event, wait for it concurrently while producing the next slice.
+            // Await ParentReady concurrently while producing the next slice.
             let (mut payload, new_duration_left, terminal_empty) = if parent_ready_receiver
                 .is_terminated()
             {
@@ -309,8 +286,7 @@ where
                         (payload, Duration::MAX, terminal_empty)
                     }
                     res = &mut parent_ready_receiver => {
-                        // Got ParentReady event while producing slice.
-                        // It's a NOP if we have been using the same parent as before.
+                        // ParentReady arrived mid-slice; a no-op if the parent is unchanged.
 
                         let start = Instant::now();
                         let (new_slot, new_hash) = res.unwrap();
@@ -328,8 +304,7 @@ where
                             );
                             payload.parent = Some((new_slot, new_hash));
                         }
-                        // ParentReady was seen, start the DELTA_BLOCK timer
-                        // account for the time it took to finish producing the slice
+                        // Start the DELTA_BLOCK timer, net of time already spent on the slice.
                         debug!("starting blocktime timer");
                         let duration = self.delta_block.saturating_sub(start.elapsed());
                         (payload, duration, terminal_empty)
@@ -486,16 +461,11 @@ where
     }
 }
 
-// TODO: extend docstring
-/// Returns
 /// Produces one slice's payload, returning `(payload, duration_left, terminal)`.
 ///
-/// `terminal` is `true` when the slice was produced EMPTY via the short
-/// empty-slice grace (idle mempool) — signalling the caller that there is nothing
-/// more to pack, so this slice should be the block's last (an empty block is a
-/// single slice). Without this, returning a zero `duration_left` from the first
-/// slice would (via the caller's elapsed math) spawn a phantom second empty
-/// slice, doubling the shreds on the wire.
+/// `terminal` is `true` when the slice came out EMPTY via the idle-mempool
+/// grace, making it the block's last; without it the caller's elapsed math
+/// would spawn a phantom second empty slice, doubling the shreds on the wire.
 async fn produce_slice_payload<T>(
     slot: Slot,
     txs_receiver: &T,
@@ -528,30 +498,22 @@ where
 
     // `(duration_left, terminal_empty)` — see the function docs for `terminal`.
     let (ret, terminal_empty) = loop {
-        // While the mempool is empty, wait only a short grace for the first tx;
-        // if none arrives, produce an EMPTY slice rather than sleeping the entire
-        // (delta-scaled) slice window. This keeps an idle, empty-block leader
-        // making progress promptly — otherwise at a high BUNKER_DELTA_MULT the
-        // leader can take minutes to emit slot 1, longer than a marginal HF band
-        // stays up, and never disseminates a block. Once we have packed at least
-        // one tx, fall back to the full window so a busy slice fills up normally.
+        // With an empty mempool wait only a short grace before emitting an
+        // EMPTY slice; sleeping the whole delta-scaled window would stall an
+        // idle leader for minutes at high BUNKER_DELTA_MULT.
         let empty_so_far = txs.is_empty();
         let max_wait = if empty_so_far {
             duration_left.min(super::delta_empty_slice())
         } else {
-            // Already packed ≥1 tx: wait only a short grace for the NEXT tx
-            // (measured from the last one packed) rather than holding the slice
-            // open for the whole block window. A steady tx stream re-arms this
-            // each iteration and keeps filling the slice; a lull closes it
-            // promptly so the block disseminates and its slot can finalize.
+            // With ≥1 tx packed, a short per-tx grace closes the slice on a
+            // lull instead of holding it open for the whole block window.
             duration_left.min(start_time.elapsed() + super::delta_pack_grace())
         };
         let sleep_duration = max_wait.saturating_sub(start_time.elapsed());
         let res = tokio::select! {
             () = tokio::time::sleep(sleep_duration) => {
-                // Timed out. If still empty, this is a terminal empty slice (the
-                // whole, single-slice empty block). If we already have txs, it is
-                // a normal full-window flush (not terminal — the slot may continue).
+                // Still empty on timeout = terminal single-slice empty block;
+                // otherwise a normal flush.
                 break (Duration::ZERO, empty_so_far);
             }
             res = txs_receiver.receive() => {
@@ -572,21 +534,15 @@ where
         }
     };
 
-    // Top the slice up with dummy bloat transactions when configured
-    // (`BUNKER_BLOAT_BYTES`), so the block occupies the radio link longer even
-    // with an idle mempool. Random bytes, so modem-level compression (PACTOR
-    // PMC) cannot shrink the padding back down. The padded slice keeps its
-    // `terminal_empty` flag: an idle-mempool block stays a single (now padded)
-    // slice rather than growing into a multi-slice block.
+    // Bloat padding (`BUNKER_BLOAT_BYTES`): random bytes so the modem's PMC
+    // compression cannot shrink it; the padded slice keeps its
+    // `terminal_empty` flag so an idle block stays single-slice.
     let bloat_target = bloat_target_bytes().min(initial_capacity);
     let mut packed_bytes = initial_capacity - slice_capacity_left;
     if bloat_target > packed_bytes {
         use rand::{RngCore, SeedableRng};
-        // DETERMINISTIC padding, seeded by the slot: a leader that crashes and
-        // re-produces the same slot must emit byte-identical padding, or the
-        // re-production hashes differently and forks the slot. Slot-seeded
-        // pseudo-random bytes are reproducible while still incompressible to
-        // the modem's PMC.
+        // Slot-seeded padding: a crashed leader re-producing the slot must
+        // emit byte-identical bytes or the re-production forks the slot.
         let mut rng = rand::rngs::StdRng::seed_from_u64(slot.inner());
         while packed_bytes < bloat_target && slice_capacity_left > 8 {
             let chunk = (bloat_target - packed_bytes)
@@ -617,7 +573,7 @@ where
     (payload, ret, terminal_empty)
 }
 
-/// Enum to capture the different scenarios that can be returned from [`wait_for_first_slot`].
+/// Outcome of [`wait_for_first_slot`].
 #[derive(Debug)]
 enum SlotReady {
     /// Window was already skipped.
@@ -628,13 +584,8 @@ enum SlotReady {
     ParentReadyNotSeen(BlockId, oneshot::Receiver<BlockId>),
 }
 
-/// Waits for first slot in the given window to become ready for block production.
-///
-/// Ready here can mean:
-/// - Pool emitted the `ParentReady` event for it, OR
-/// - the blockstore has stored a block for the previous slot.
-///
-/// See [`SlotReady`] for what is returned.
+/// Waits for the window's first slot to become ready for production: either
+/// the pool emitted `ParentReady`, or the previous slot's block was stored.
 async fn wait_for_first_slot(
     pool: Arc<RwLock<Box<dyn Pool + Send + Sync>>>,
     blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,

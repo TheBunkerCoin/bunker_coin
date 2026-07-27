@@ -1,10 +1,7 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Implements the [`ParentReadyState`] data structure.
-//!
-//! It holds the necessary state for a given slot to track the parent-ready condition.
-//! This is used by the [`super::ParentReadyTracker`].
+//! Per-slot state for the parent-ready condition, used by [`super::ParentReadyTracker`].
 
 use either::Either;
 use log::warn;
@@ -16,14 +13,9 @@ use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH};
 
 /// Status of whether an individual slot has a parent ready.
 enum IsReady {
-    /// Do not have a parent ready for this slot yet.
-    ///
-    /// Might have someone waiting to hear when the slot does become ready.
+    /// No parent ready yet; may hold a waiter to notify when one lands.
     NotReady(Option<oneshot::Sender<BlockId>>),
-    /// Have at least one parent ready for this slot.
-    ///
-    /// We can potentially have multiple parents ready per slot, but we
-    /// optimize for the common case where there will only be one.
+    /// Ready parents; sized for the common single-parent case.
     Ready(SmallVec<[BlockId; 1]>),
 }
 
@@ -38,10 +30,7 @@ impl Default for IsReady {
 pub(super) struct ParentReadyState {
     /// Whether this slot is skip-certified.
     skip: bool,
-    /// Blocks that are notarized-fallback for this slot, if any.
-    ///
-    /// We can potentially have multiple notar fallbacks per slot,
-    /// but we optimize for the common case where there will only be one.
+    /// Notarized-fallback blocks; sized for the common single-fallback case.
     notar_fallbacks: SmallVec<[BlockHash; 1]>,
     /// Current status of the parent-ready condition for this slot.
     // NOTE: Do not make this field more visible.
@@ -113,10 +102,8 @@ impl ParentReadyState {
                 self.is_ready = IsReady::Ready(smallvec![id]);
             }
             IsReady::Ready(ready_ids) => {
-                // A parent can be legitimately re-derived (e.g. a finalization
-                // walk crossing the prune floor re-reports an ancestor whose
-                // dedup flag was pruned), so re-adding a ready parent must be a
-                // no-op rather than an assertion.
+                // Finalization walks past the prune floor legitimately re-derive
+                // parents, so re-adding must stay a no-op rather than an assert.
                 if !ready_ids.contains(&id) {
                     ready_ids.push(id);
                 }

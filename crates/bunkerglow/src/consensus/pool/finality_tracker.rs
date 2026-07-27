@@ -1,21 +1,8 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tracks finality of blocks.
-//!
-//! This is used internally as part of [`PoolImpl`].
-//!
-//! Keeps track of:
-//! - Direct finalization of blocks,
-//! - resulting indirect finalizations of blocks, AND
-//! - resulting implicit skipping of slots
-//!
-//! It does this based on:
-//! - Notarization of blocks,
-//! - finalization of slots, AND
-//! - availability of blocks and knowledge of their parents.
-//!
-//! [`PoolImpl`]: crate::consensus::pool::PoolImpl
+//! Tracks direct finalizations and the indirect finalizations and implicit
+//! skips they cause, for [`PoolImpl`](crate::consensus::pool::PoolImpl).
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -65,11 +52,8 @@ pub struct FinalizationEvent {
 }
 
 impl FinalityTracker {
-    /// Adds the given `parent` for the given `block`.
-    ///
-    /// Handles possibly resulting implicit finalizations.
-    ///
-    /// Returns a [`FinalizationEvent`] that contains information about newly finalized slots.
+    /// Adds the given `parent` for the given `block`, handling any resulting
+    /// implicit finalizations.
     pub fn add_parent(&mut self, block: BlockId, parent: BlockId) -> FinalizationEvent {
         assert!(block.0 > parent.0);
         match self.parents.entry(block.clone()) {
@@ -100,11 +84,8 @@ impl FinalityTracker {
         }
     }
 
-    /// Marks the given block as fast finalized.
-    ///
-    /// If the block was newly finalized, handles resulting implicit finalizations.
-    ///
-    /// Returns a [`FinalizationEvent`] that contains information about newly finalized slots.
+    /// Marks the given block as fast finalized, handling any resulting
+    /// implicit finalizations.
     pub fn mark_fast_finalized(&mut self, slot: Slot, block_hash: BlockHash) -> FinalizationEvent {
         let old = self
             .status
@@ -129,12 +110,8 @@ impl FinalityTracker {
         event
     }
 
-    /// Marks the given block as notarized.
-    ///
-    /// Handles possibly resulting direct finalization of the block.
-    /// Further, also handles any possibly resulting implicit finalizations.
-    ///
-    /// Returns a [`FinalizationEvent`] that contains information about newly finalized slots.
+    /// Marks the given block as notarized, handling any resulting direct and
+    /// implicit finalizations.
     pub fn mark_notarized(&mut self, slot: Slot, block_hash: BlockHash) -> FinalizationEvent {
         let old = self
             .status
@@ -150,12 +127,8 @@ impl FinalityTracker {
             }
             FinalizationStatus::Finalized(hash) | FinalizationStatus::ImplicitlyFinalized(hash) => {
                 assert_eq!(*hash, block_hash, "consensus safety violation");
-                // Restore the finalized status: the insert above downgraded it
-                // to Notarized. A downgrade here lets a later descendant's
-                // finalization walk descend through this supposedly-final slot
-                // and re-report already-finalized (possibly pruned) ancestors,
-                // duplicating parent-ready bookkeeping. A notar cert arriving
-                // after finalization is routine (cert ordering races).
+                // Restore: a downgrade would let a descendant's finalization walk
+                // re-report pruned ancestors. Late notar certs are routine.
                 self.status.insert(slot, status);
                 FinalizationEvent::default()
             }
@@ -170,12 +143,8 @@ impl FinalityTracker {
         }
     }
 
-    /// Marks the given slot as finalized.
-    ///
-    /// Handles possibly resulting direct finalization of a block in this slot.
-    /// Further, also handles any possibly resulting implicit finalizations.
-    ///
-    /// Returns a [`FinalizationEvent`] that contains information about newly finalized slots.
+    /// Marks the given slot as finalized, handling any resulting direct and
+    /// implicit finalizations.
     pub fn mark_finalized(&mut self, slot: Slot) -> FinalizationEvent {
         let old = self
             .status
@@ -188,8 +157,7 @@ impl FinalityTracker {
             FinalizationStatus::FinalPendingNotar => FinalizationEvent::default(),
             status @ (FinalizationStatus::Finalized(_)
             | FinalizationStatus::ImplicitlyFinalized(_)) => {
-                // Restore: the insert above would downgrade a finalized slot to
-                // FinalPendingNotar; put the finalized status back.
+                // Restore: the insert would downgrade a finalized slot.
                 self.status.insert(slot, status);
                 FinalizationEvent::default()
             }
@@ -205,25 +173,15 @@ impl FinalityTracker {
     }
 
     /// Returns the highest finalized slot.
-    ///
-    /// This means that slot has a fast finalization OR finalization + notarization.
-    /// Also, all prior slots are finalized (directly or implicitly) OR implicitly skipped.
     pub fn highest_finalized_slot(&self) -> Slot {
         self.highest_finalized_slot
     }
 
-    /// Drops per-slot state for slots strictly below `below`.
+    /// Drops per-slot state below `below`; without pruning both maps grow
+    /// forever.
     ///
-    /// Called as finalization advances (with `below` = the first slot of the
-    /// finalized slot's window), since without pruning `status` grows by one
-    /// entry per slot and `parents` by one entry per block, forever.
-    ///
-    /// Safe because nothing consults entries that far back: certs/votes below
-    /// the finalized frontier are rejected by the pool before reaching the
-    /// tracker, and the implicit-finalization recursion stops at the first
-    /// already-finalized ancestor — the frontier slot's own entry, which is at
-    /// or above `below` and therefore kept. `highest_finalized_slot` is a
-    /// stored field, unaffected.
+    /// Safe: the pool rejects certs/votes below the frontier, and the
+    /// finalization walk stops at the frontier's own entry, which is kept.
     pub fn prune(&mut self, below: Slot) {
         self.status = self.status.split_off(&below);
         self.parents
@@ -242,14 +200,8 @@ impl FinalityTracker {
         self.parents.len()
     }
 
-    /// Handles the direct finalization of the given block.
-    ///
-    /// Recurses through ancestors, potentially implicitly finalizing them.
-    ///
-    /// Updates the `event` all along the way with:
-    /// - The finalized block,
-    /// - any potentially implicitly finalized blocks, AND
-    /// - any implicitly skipped slots.
+    /// Records the direct finalization into `event`, then recurses through
+    /// ancestors implicitly finalizing them.
     fn handle_finalized_block(&mut self, finalized: BlockId, event: &mut FinalizationEvent) {
         let (slot, _) = finalized;
         event.finalized = Some(finalized.clone());
@@ -260,13 +212,8 @@ impl FinalityTracker {
         }
     }
 
-    /// Handles the indirect finalization of the given block.
-    ///
-    /// Recurses through ancestors, potentially implicitly finalizing them as well.
-    ///
-    /// Updates the `event` all along the way with:
-    /// - Any potentially implicitly finalized blocks, AND
-    /// - any implicitly skipped slots.
+    /// Records an implicit finalization and its skips into `event`, recursing
+    /// through ancestors.
     fn handle_implicitly_finalized(
         &mut self,
         source_slot: Slot,
@@ -274,13 +221,9 @@ impl FinalityTracker {
         event: &mut FinalizationEvent,
     ) {
         assert!(source_slot > implicitly_finalized.0);
-        // NOTE on pruning: this walk may cross the prune floor when parent
-        // links arrive out of order (a block learned only after finalization).
-        // That is a genuine FIRST report and must proceed — downstream
-        // parent-ready derivation depends on it. Re-reports of already-
-        // finalized ancestors cannot get here: the walk stops at the first
-        // kept Finalized/ImplicitlyFinalized status, and `mark_notarized`/
-        // `mark_finalized` restore (never downgrade) those statuses.
+        // Crossing the prune floor on a late parent link is a genuine first
+        // report and must proceed; re-reports cannot get here because the walk
+        // stops at the first kept (never downgraded) finalized status.
 
         for slot in implicitly_finalized.0.future_slots() {
             if slot == source_slot {
