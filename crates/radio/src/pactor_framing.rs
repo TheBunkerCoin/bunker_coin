@@ -247,17 +247,24 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut r = Reassembler::new();
         assert!(r.push_line_at(&lines[0], t0).is_none());
-        assert_eq!(r.partial.len(), 1);
+        assert!(r.partial.contains_key(&42));
 
+        // A fragment of a DIFFERENT message past the TTL must sweep the stale
+        // entry; completion must not be what removes it.
+        let other = fragment_message(43, &payload);
         let later = t0 + REASSEMBLY_TTL + std::time::Duration::from_secs(1);
+        assert!(r.push_line_at(&other[0], later).is_none());
+        assert!(!r.partial.contains_key(&42));
+        assert!(r.partial.contains_key(&43));
+
+        // The swept id is reusable: the full message reassembles afterwards.
         let mut out = None;
         for line in &lines {
             if let Some(m) = r.push_line_at(line, later) {
                 out = Some(m);
             }
         }
-        assert_eq!(out.unwrap(), payload);
-        assert!(r.partial.is_empty());
+        assert_eq!(out.expect("reassembly never completed"), payload);
     }
 
     /// Bogus message ids cannot grow the in-flight map without bound.

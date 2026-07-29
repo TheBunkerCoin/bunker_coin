@@ -190,14 +190,29 @@ mod tests {
         assert_eq!(c.data_port, 8301);
     }
 
-    #[test]
-    fn test_vara_unproto_command_format() {
-        let destination = "CQ";
-        let expected_cmd = format!("UNPROTO {destination}");
-        assert_eq!(expected_cmd, "UNPROTO CQ");
+    #[tokio::test]
+    async fn enter_unproto_mode_sends_unproto_command() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
 
-        let destination = "BUNKERNET";
-        let expected_cmd = format!("UNPROTO {destination}");
-        assert_eq!(expected_cmd, "UNPROTO BUNKERNET");
+        let cmd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = VaraConfig::new("127.0.0.1");
+        config.cmd_port = cmd_listener.local_addr().unwrap().port();
+        config.data_port = data_listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut cmd_sock, _) = cmd_listener.accept().await.unwrap();
+            let _data_sock = data_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = cmd_sock.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            buf
+        });
+
+        let client = VaraClient::connect(config).await.unwrap();
+        client.enter_unproto_mode("CQ").await.unwrap();
+
+        assert_eq!(server.await.unwrap(), b"UNPROTO CQ\n");
     }
 }

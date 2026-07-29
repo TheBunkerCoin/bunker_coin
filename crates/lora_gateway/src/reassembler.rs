@@ -142,18 +142,37 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_reassembly() {
+    fn out_of_order_continuations_reassemble() {
         let mut r = FragmentReassembler::new(Duration::from_secs(60));
-        let body = vec![0x42; 400];
+        let body = vec![0x42; 600];
         let mut frags = make_fragments(&body, 2);
+        assert!(frags.len() >= 3);
+        let first = frags.remove(0);
         frags.reverse();
 
-        // Continuations before their first fragment are dropped.
+        assert!(r.feed(first).is_none());
+        let mut done = false;
         for frag in frags {
             if let Some((_, reassembled, _)) = r.feed(frag) {
                 assert_eq!(reassembled, body);
+                done = true;
             }
         }
+        assert!(done, "reassembly never completed");
+    }
+
+    #[test]
+    fn continuations_before_first_fragment_are_dropped() {
+        let mut r = FragmentReassembler::new(Duration::from_secs(60));
+        let body = vec![0x42; 600];
+        let mut frags = make_fragments(&body, 2);
+        frags.reverse();
+
+        for frag in frags {
+            assert!(r.feed(frag).is_none());
+        }
+        // Only the first fragment created state; early continuations were dropped.
+        assert_eq!(r.pending_count(), 1);
     }
 
     #[test]
