@@ -11,6 +11,7 @@ STATE=/var/lib/logrotate/bunkercoin.status
 
 cat > "$CONF" << EOF
 ${HOME_DIR}/bc-node0/run.log ${HOME_DIR}/bc-node1/run.log ${HOME_DIR}/stream.log {
+    su  
     size 200M
     rotate 2
     copytruncate
