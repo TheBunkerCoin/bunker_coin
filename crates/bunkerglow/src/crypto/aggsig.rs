@@ -45,15 +45,22 @@ use crate::ValidatorId;
 const DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// Size of an uncompressed BLS signature (in the `min_sig` scheme).
-///
-/// We deal with uncompressed signatures everywhere.
-/// This way signatures are twice as big as if we used compressed signatures.
-/// However, we save the time of uncompressing the signature before verifying.
 const UNCOMPRESSED_SIG_SIZE: usize = 96;
 const_assert_eq!(
     UNCOMPRESSED_SIG_SIZE,
     std::mem::size_of::<blst::blst_p1_affine>()
 );
+
+/// Size of a **compressed** BLS signature (G1 point, `min_sig` scheme).
+///
+/// Signatures are serialized compressed on the wire: half the bytes of the
+/// uncompressed form, at the cost of an uncompress step before verifying. Over an
+/// internet link the uncompressed form trades those bytes for CPU; over a
+/// byte-starved half-duplex PACTOR HF link the bytes dominate (a vote on the slow
+/// reverse path can take tens of seconds), so the compressed form is the right
+/// tradeoff — it can be the difference between a vote fitting in one 300-byte MTU
+/// line versus fragmenting across two.
+const COMPRESSED_SIG_SIZE: usize = 48;
 
 /// Maximum number of signers that can be aggregated into an aggregate signature.
 const MAX_SIGNERS: usize = 2048;
@@ -109,8 +116,8 @@ impl<'de> SchemaRead<'de> for IndividualSignature {
         reader: &mut impl wincode::io::Reader<'de>,
         dst: &mut MaybeUninit<Self::Dst>,
     ) -> wincode::ReadResult<()> {
-        let sig_bytes = reader.borrow_exact(UNCOMPRESSED_SIG_SIZE)?;
-        let sig = BlstSignature::deserialize(sig_bytes).map_err(|e| {
+        let sig_bytes = reader.borrow_exact(COMPRESSED_SIG_SIZE)?;
+        let sig = BlstSignature::uncompress(sig_bytes).map_err(|e| {
             warn!("encountered invalid BLS sig: {e:?}");
             wincode::ReadError::Custom("invalid BLS encoding")
         })?;
@@ -123,11 +130,11 @@ impl SchemaWrite for IndividualSignature {
     type Src = IndividualSignature;
 
     fn size_of(_src: &Self::Src) -> wincode::WriteResult<usize> {
-        Ok(UNCOMPRESSED_SIG_SIZE)
+        Ok(COMPRESSED_SIG_SIZE)
     }
 
     fn write(writer: &mut impl wincode::io::Writer, src: &Self::Src) -> wincode::WriteResult<()> {
-        Ok(writer.write(&src.0.serialize())?)
+        Ok(writer.write(&src.0.compress())?)
     }
 }
 
@@ -148,12 +155,12 @@ impl<'de> SchemaRead<'de> for AggregateSignature {
         dst: &mut MaybeUninit<Self::Dst>,
     ) -> wincode::ReadResult<()> {
         // read raw data
-        let sig_bytes = reader.borrow_exact(UNCOMPRESSED_SIG_SIZE)?;
+        let sig_bytes = reader.borrow_exact(COMPRESSED_SIG_SIZE)?;
         let num_bits = <usize>::get(reader)?;
         let bitmask_raw_vec = <Vec<usize>>::get(reader)?;
 
-        // map BLS signature
-        let sig = BlstSignature::from_bytes(sig_bytes).map_err(|e| {
+        // map BLS signature (compressed on the wire)
+        let sig = BlstSignature::uncompress(sig_bytes).map_err(|e| {
             warn!("encountered invalid BLS sig: {e:?}");
             wincode::ReadError::Custom("invalid BLS encoding")
         })?;
@@ -194,11 +201,11 @@ impl SchemaWrite for AggregateSignature {
     fn size_of(src: &Self::Src) -> wincode::WriteResult<usize> {
         let bitslice_num_elements = src.bitmask.as_bitslice().len();
         // sig + num_bits + num_usizes + usize_len * num_usizes
-        Ok(UNCOMPRESSED_SIG_SIZE + 8 + 8 + 8 * bitslice_num_elements)
+        Ok(COMPRESSED_SIG_SIZE + 8 + 8 + 8 * bitslice_num_elements)
     }
 
     fn write(writer: &mut impl wincode::io::Writer, src: &Self::Src) -> wincode::WriteResult<()> {
-        writer.write(&src.sig.serialize())?;
+        writer.write(&src.sig.compress())?;
         <usize as SchemaWrite>::write(writer, &src.bitmask.as_bitslice().len())?;
         let data = src.bitmask.as_bitslice().domain();
         <usize as SchemaWrite>::write(writer, &data.len())?;

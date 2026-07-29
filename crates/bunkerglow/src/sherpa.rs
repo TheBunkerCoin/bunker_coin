@@ -28,7 +28,7 @@
 //! use bunkerglow::all2all::SherpaAll2All;
 //!
 //! let sherpa = Arc::new(Sherpa::new(epoch_info.clone()));
-//! let all2all = SherpaAll2All::new(validators.clone(), network, sherpa.clone());
+//! let all2all = SherpaAll2All::new(own_id, network, sherpa.clone());
 //! ```
 
 use std::collections::HashMap;
@@ -45,21 +45,12 @@ const FAILURE_THRESHOLD: u32 = 3;
 pub type RoutePath = Vec<ValidatorId>;
 
 /// Link state for a single (src → dst) pair.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct LinkState {
     /// Number of consecutive send failures on this link.
     failures: u32,
     /// Whether the link is currently considered failed/unreachable.
     failed: bool,
-}
-
-impl Default for LinkState {
-    fn default() -> Self {
-        Self {
-            failures: 0,
-            failed: false,
-        }
-    }
 }
 
 /// Sherpa — location-aware routing service.
@@ -132,7 +123,7 @@ impl Sherpa {
         // If no location data is available, return by descending stake (best effort).
         if candidates.iter().all(|v| v.location.is_none()) {
             let mut by_stake = candidates;
-            by_stake.sort_by(|a, b| b.stake.cmp(&a.stake));
+            by_stake.sort_by_key(|v| std::cmp::Reverse(v.stake));
             return by_stake.into_iter().take(k).collect();
         }
 

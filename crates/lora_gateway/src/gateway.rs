@@ -61,18 +61,16 @@ impl LoRaGateway {
 
     /// Process a raw frame received from the transport.
     pub async fn process_frame(&self, raw: &[u8]) -> GatewayResult {
-        // 1. Decode
         let capsule = match decode(raw) {
             Ok(c) => c,
             Err(e) => return GatewayResult::DecodeFailed(e.to_string()),
         };
 
-        // Extract sender + msg_id for dedup/rate-limit
         let (sender, msg_id) = match &capsule {
             DecodedCapsule::Single { header, .. } => (header.sender, header.msg_id),
             DecodedCapsule::FragFirst { header, .. } => (header.sender, header.msg_id),
             DecodedCapsule::FragCont { .. } => {
-                // Continuations skip dedup/rate-limit (first fragment already checked)
+                // Continuations rely on sender checks from the first fragment.
                 let mut reassembler = self.reassembler.lock().await;
                 return match reassembler.feed(capsule) {
                     Some((header, body, sig)) => self.finalize(&header, &body, &sig).await,
@@ -81,7 +79,6 @@ impl LoRaGateway {
             }
         };
 
-        // 2. Dedup
         {
             let mut dedup = self.dedup.lock().await;
             if dedup.is_duplicate(&sender, msg_id) {
@@ -89,7 +86,6 @@ impl LoRaGateway {
             }
         }
 
-        // 3. Rate limit
         {
             let mut rl = self.rate_limiter.lock().await;
             if !rl.check(&sender, Instant::now()) {
@@ -97,7 +93,6 @@ impl LoRaGateway {
             }
         }
 
-        // 4. Reassemble or pass through
         let mut reassembler = self.reassembler.lock().await;
         match reassembler.feed(capsule) {
             Some((header, body, sig)) => {
@@ -108,21 +103,18 @@ impl LoRaGateway {
         }
     }
 
-    /// Verify signature, deserialize body, construct Transaction, relay.
+    /// Verify, deserialize, and relay a completed capsule.
     async fn finalize(&self, header: &CapsuleHeader, body: &[u8], sig: &[u8; 64]) -> GatewayResult {
-        // 5. Verify signature
         if verify_capsule_signature(&header.sender, header.nonce, header.fee, body, sig).is_err() {
             return GatewayResult::SignatureInvalid;
         }
 
-        // 6. Deserialize body
         let tx_body: TransactionBody =
             match bincode::serde::decode_from_slice(body, bincode::config::standard()) {
                 Ok((b, _)) => b,
                 Err(_) => return GatewayResult::BodyDeserializeFailed,
             };
 
-        // 7. Construct transaction and relay
         let tx = Transaction {
             sender: header.sender,
             nonce: header.nonce,
@@ -138,7 +130,6 @@ impl LoRaGateway {
     /// Run the gateway receive loop. Blocks until the transport disconnects.
     pub async fn run(&self) {
         loop {
-            // Periodic eviction
             {
                 let mut reassembler = self.reassembler.lock().await;
                 reassembler.evict_expired();
@@ -149,7 +140,7 @@ impl LoRaGateway {
                     let result = self.process_frame(&frame.payload).await;
                     log::debug!("gateway frame result: {:?}", result);
 
-                    // Best-effort ACK on successful relay
+                    // ACK is best-effort after relay succeeds.
                     if result == GatewayResult::Relayed {
                         let _ = self.transport.send_ack(&[0x01]).await;
                     }
@@ -255,11 +246,9 @@ mod tests {
         config.rate_burst = 1.0; // only 1 allowed
         let gateway = LoRaGateway::new(Arc::new(gw), config, tx_relay);
 
-        // First succeeds (msg_id=1)
         let frame1 = make_signed_single(&sk, 1, &body_bytes);
         assert_eq!(gateway.process_frame(&frame1).await, GatewayResult::Relayed);
 
-        // Second with different msg_id should be rate limited
         let frame2 = make_signed_single(&sk, 2, &body_bytes);
         assert_eq!(
             gateway.process_frame(&frame2).await,
@@ -270,7 +259,6 @@ mod tests {
     #[tokio::test]
     async fn invalid_signature_rejected() {
         let body_bytes = transfer_body_bytes();
-        // Construct a capsule with a bogus signature
         let sender = [0xAA; 32];
         let header = CapsuleHeader {
             sender,
@@ -285,7 +273,7 @@ mod tests {
         let (_user, gw) = crate::simulated::SimulatedLoRaTransport::pair(Default::default());
         let gateway = LoRaGateway::new(Arc::new(gw), make_config(), tx_relay);
 
-        // [0xAA; 32] is not a valid ed25519 key, so verification will fail
+        // The gateway collapses sender-key and signature failures to SignatureInvalid.
         let result = gateway.process_frame(&frame).await;
         assert!(
             result == GatewayResult::SignatureInvalid,
@@ -300,17 +288,7 @@ mod tests {
         let sk = SigningKey::generate(&mut rng);
         let sender = sk.verifying_key().to_bytes();
 
-        // Create a body that requires fragmentation (> 183 bytes)
-        // Use a Transfer body repeated in a larger serialized form — instead,
-        // just create a raw body of 300 bytes and use it directly.
-        // For the gateway to accept it, it needs to be a valid bincode TransactionBody.
-        // Use a Mint with a long-ish ticker to stay within budget but exceed single capsule.
-        // Actually, let's just use a large body and accept BodyDeserializeFailed
-        // since we want to test reassembly works, not body parsing.
-        // Better: test the reassembly + signature flow by using a real body.
-
-        // A MessageAnchor body is large (32 + 288 + 8 = 328 bytes in raw fields)
-        // but bincode adds enum tag + field lengths. Let's just encode it:
+        // MessageAnchor yields a fragmented body that still deserializes.
         use bunker_coin_core::transaction::TransactionBody;
         let body = TransactionBody::MessageAnchor {
             destination: [0x02; 32],
@@ -336,7 +314,6 @@ mod tests {
         let (_user, gw) = crate::simulated::SimulatedLoRaTransport::pair(Default::default());
         let gateway = LoRaGateway::new(Arc::new(gw), make_config(), tx_relay);
 
-        // Feed all frames
         for (i, frame) in frames.iter().enumerate() {
             let result = gateway.process_frame(frame).await;
             if i < frames.len() - 1 {

@@ -336,12 +336,4 @@ mod tests {
         assert_eq!(timings.get(event).unwrap()[0], SimTime::new(10));
         assert_eq!(timings.get(event).unwrap()[1], SimTime::NEVER);
     }
-
-    // #[test]
-    // fn stats() {
-    //     let mut stats = TimingStats::default();
-    //     let mut stats = EventTimingStats::default();
-    //     stats.record_latencies(&[], &SimulationEnvironment::new());
-    //     assert_eq!(stats.get_avg_percentile_latency(1), 0.0);
-    // }
 }

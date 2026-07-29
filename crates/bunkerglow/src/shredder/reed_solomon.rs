@@ -134,7 +134,7 @@ impl ReedSolomonCoder {
     /// Removes the padding before returning the data.
     /// See [`ReedSolomonCoder::shred`] for details on the padding scheme.
     ///
-    /// Errors
+    /// # Errors
     ///
     /// If fewer than [`DATA_SHREDS`] elements in `shreds` are `Some()` then returns [`ReedSolomonDeshredError::NotEnoughShreds`].
     /// If the restored payload is larger than [`MAX_DATA_PER_SLICE_AFTER_PADDING`] then returns [`ReedSolomonDeshredError::TooMuchData`].
@@ -306,7 +306,9 @@ mod tests {
     ) -> [Option<ValidatedShred>; TOTAL_SHREDS] {
         let sk = SecretKey::new(&mut rand::rng());
         let mut shreds = data_and_coding_to_output_shreds(header, shreds, &sk).map(Some);
-        for shred in shreds.iter_mut().skip(TOTAL_SHREDS - DATA_SHREDS) {
+        // Keep exactly DATA_SHREDS shreds (the minimum reconstruction needs),
+        // drop the rest — fewer than DATA_SHREDS would fail with NotEnoughShreds.
+        for shred in shreds.iter_mut().skip(DATA_SHREDS) {
             *shred = None;
         }
         shreds

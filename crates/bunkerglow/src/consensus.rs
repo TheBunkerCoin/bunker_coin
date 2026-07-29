@@ -1,28 +1,19 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Core consensus logic and data structures.
+//! Core Alpenglow consensus orchestration.
 //!
-//! The central structure of the consensus protocol is [`Alpenglow`].
-//! It contains all state for a single consensus instance and also has access
-//! to the different necessary network protocols.
-//!
-//! Most important component data structures defined in this module are:
-//! - [`Blockstore`] holds individual shreds and reconstructed blocks for each slot.
-//! - [`Pool`] holds votes and certificates for each slot.
-//! - [`Votor`] handles the main voting logic.
-//!
-//! Some other data types for consensus are also defined here:
-//! - [`Cert`] represents a certificate of votes of a specific type.
-//! - [`Vote`] represents a vote of a specific type.
-//! - [`EpochInfo`] holds information about the epoch and all validators.
+//! Wires [`Blockstore`], [`Pool`], [`Votor`], block production, repair, epoch
+//! transitions, and snapshot checkpoints for one validator.
 
 mod block_producer;
 mod blockstore;
 mod cert;
 mod epoch_info;
+mod link_liveness;
 mod pool;
 mod vote;
+mod vote_history;
 pub(crate) mod votor;
 
 use std::marker::{Send, Sync};
@@ -36,13 +27,15 @@ use color_eyre::Result;
 pub use epoch_info::EpochInfo;
 use fastrace::Span;
 use fastrace::future::FutureExt;
-use log::{info, trace, warn};
+pub use link_liveness::{LinkLiveness, NoLiveness, SwappableLiveness};
+use log::{error, info, trace, warn};
 pub use pool::{
     AddVoteError, EpochBoundaryEvent, FinalizedSlotEvent, Pool, PoolError, PoolImpl, SlashingReport,
 };
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 pub use vote::Vote;
+use vote_history::VoteHistory;
 use votor::Votor;
 use wincode::{SchemaRead, SchemaWrite};
 
@@ -53,22 +46,56 @@ use crate::shredder::Shred;
 use crate::snapshot::{SnapshotCheckpoint, SnapshotStore};
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
 
+/// Consensus timer multiplier from `BUNKER_DELTA_MULT`; slow links stretch all deltas.
+static DELTA_MULT: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+    std::env::var("BUNKER_DELTA_MULT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|m| *m > 0.0)
+        .unwrap_or(1.0)
+});
+
+/// Scale a base duration by [`DELTA_MULT`].
+fn scaled(base_ms: u64) -> Duration {
+    Duration::from_millis((base_ms as f64 * *DELTA_MULT) as u64)
+}
+
 /// Time bound assumed on network transmission delays during periods of synchrony.
-pub(crate) const DELTA: Duration = Duration::from_millis(8_000);
-/// Target time for block production (slot length)
-const TARGET_BLOCK_TIME: Duration = Duration::from_millis(60_000);
+pub(crate) fn delta() -> Duration {
+    scaled(8_000)
+}
 /// Time the leader has for producing and sending the block.
-const DELTA_BLOCK: Duration = Duration::from_millis(120_000);
-/// Timeout to use when we haven't seen any shred from the leader's block.
-const DELTA_EARLY_TIMEOUT: Duration = Duration::from_millis(180_000);
-// const DELTA_EARLY_TIMEOUT: Duration = DELTA.checked_mul(2).unwrap();
+fn delta_block() -> Duration {
+    scaled(120_000)
+}
 /// Timeout to use when we have seen at least one shred from the leader's block.
-const DELTA_TIMEOUT: Duration = Duration::from_millis(240_000);
-// const DELTA_TIMEOUT: Duration = DELTA_EARLY_TIMEOUT.checked_add(DELTA_BLOCK).unwrap();
-/// Timeout for standstill detection mechanism.
-const DELTA_STANDSTILL: Duration = Duration::from_millis(300_000);
+fn delta_timeout() -> Duration {
+    scaled(240_000)
+}
+/// Standstill detection is not delta-scaled; recovery is a small cert/vote rebroadcast.
+fn delta_standstill() -> Duration {
+    std::env::var("BUNKER_STANDSTILL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(300))
+}
 /// Max time to produce and send the first slice of a block.
-pub(crate) const DELTA_FIRST_SLICE: Duration = Duration::from_millis(30_000);
+pub(crate) fn delta_first_slice() -> Duration {
+    scaled(30_000)
+}
+/// First-tx wait before producing an empty slice; prevents idle mempools stalling slots.
+pub(crate) fn delta_empty_slice() -> Duration {
+    scaled(2_000)
+}
+/// Inter-tx grace for closing a partially filled slice promptly under light load.
+pub(crate) fn delta_pack_grace() -> Duration {
+    scaled(2_000)
+}
+/// Slow-path final-vote deferral window; falls back if fast-final does not land.
+pub(crate) fn delta_final_vote_grace() -> Duration {
+    scaled(16_000)
+}
 
 #[derive(Clone, Debug, SchemaRead, SchemaWrite)]
 pub enum ConsensusMessage {
@@ -93,42 +120,30 @@ pub struct Alpenglow<A: All2All, D: Disseminator, T>
 where
     T: TransactionNetwork + 'static,
 {
-    /// Other validators' info.
     epoch_info: Arc<EpochInfo>,
 
-    /// Blockstore for storing raw block data.
     blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
-    /// Pool of votes and certificates.
     pool: Arc<RwLock<Box<dyn Pool + Send + Sync>>>,
 
-    /// Block production (i.e. leader side) component of the consensus protocol.
     block_producer: Arc<BlockProducer<D, T>>,
 
-    /// All-to-all broadcast network protocol for consensus messages.
     all2all: Arc<A>,
-    /// Block dissemination network protocol for shreds.
     disseminator: Arc<D>,
 
-    /// Indicates whether the node is shutting down.
     cancel_token: CancellationToken,
-    /// Votor task handle.
     votor_handle: tokio::task::JoinHandle<()>,
 
-    /// watch channel for broadcasting epoch info updates across tasks
     epoch_info_tx: watch::Sender<Arc<EpochInfo>>,
     epoch_info_rx: watch::Receiver<Arc<EpochInfo>>,
-    /// receiver for epoch boundary events from the pool
     epoch_boundary_rx: mpsc::Receiver<EpochBoundaryEvent>,
-    /// receiver for finalized slot events from the pool
     finalized_slot_rx: mpsc::Receiver<FinalizedSlotEvent>,
-    /// receiver for slashing reports from the pool
     slashing_rx: mpsc::Receiver<SlashingReport>,
-    /// optional execution state for epoch transitions
     execution_state: Option<Arc<RwLock<bunker_coin_core::execution::State>>>,
-    /// optional snapshot store for persisting state at epoch boundaries
     snapshot_store: Option<Arc<SnapshotStore>>,
-    /// epoch transition payloads waiting to be embedded in the first block of an epoch
+    /// Epoch transition payloads waiting for this node's first block of the epoch.
     pending_epoch_transitions: Arc<RwLock<std::collections::BTreeMap<u64, Vec<u8>>>>,
+    /// Swappable link-liveness source consulted by Votor's crashed-leader timeout.
+    link_liveness: Arc<SwappableLiveness>,
 }
 
 impl<A, D, T> Alpenglow<A, D, T>
@@ -138,9 +153,6 @@ where
     T: TransactionNetwork + 'static,
 {
     /// Creates a new Alpenglow consensus node.
-    ///
-    /// `repair_network` - [`RepairNetwork`] for sending requests and receiving responses.
-    /// `repair_request_network` - [`RepairRequestNetwork`] for answering incoming requests.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new<RN, RR>(
@@ -175,6 +187,20 @@ where
         pool.set_epoch_boundary_channel(epoch_boundary_tx);
         pool.set_finalized_slot_channel(finalized_slot_tx);
         pool.set_slashing_channel(slashing_tx);
+        // Votor replays its durable own-vote log relative to the restored frontier.
+        let restored_finalized_slot = Pool::finalized_slot(&pool);
+        // Fast-forward the epoch watch to the restored frontier's epoch: the
+        // boundary finalization that would publish it happened before the
+        // restart and never re-fires, leaving the producer parked at the
+        // boundary window forever.
+        let restored_epoch = restored_finalized_slot.epoch();
+        if restored_epoch > epoch_info.epoch() {
+            let _ = epoch_info_tx.send(Arc::new(EpochInfo::new(
+                restored_epoch,
+                epoch_info.own_id,
+                epoch_info.validators.clone(),
+            )));
+        }
         let pool: Box<dyn Pool + Send + Sync> = Box::new(pool);
         let pool = Arc::new(RwLock::new(pool));
 
@@ -205,6 +231,14 @@ where
             votor_rx,
             all2all.clone(),
         );
+        // Radio swaps in keepalive liveness so slow-but-alive links pause timeouts.
+        let link_liveness = Arc::new(SwappableLiveness::new());
+        votor.set_link_liveness(link_liveness.clone());
+        // Durable own-vote log prevents restart from casting conflicting votes.
+        votor.set_vote_history(
+            VoteHistory::open(epoch_info.own_id),
+            restored_finalized_slot,
+        );
         let votor_handle = tokio::spawn(
             async move { votor.voting_loop().await.unwrap() }
                 .in_span(Span::enter_with_local_parent("voting loop")),
@@ -220,8 +254,8 @@ where
             blockstore.clone(),
             pool.clone(),
             cancel_token.clone(),
-            DELTA_BLOCK,
-            DELTA_FIRST_SLICE,
+            delta_block(),
+            delta_first_slice(),
             epoch_info_rx.clone(),
             pending_epoch_transitions.clone(),
         ));
@@ -245,17 +279,21 @@ where
             execution_state: None,
             snapshot_store: Some(snapshot_store),
             pending_epoch_transitions,
+            link_liveness,
         }
     }
 
-    /// Starts the different tasks of the Alpenglow node.
+    /// Swaps Votor's crashed-leader timeout liveness source.
+    pub fn set_link_liveness(&self, liveness: Arc<dyn LinkLiveness>) {
+        self.link_liveness.set(liveness);
+    }
+
+    /// Starts the Alpenglow node tasks.
     ///
     /// # Errors
-    ///
-    /// Returns an error only if any of the tasks panics.
+    /// Returns an error only if a main task panics.
     #[fastrace::trace(short_name = true)]
     pub async fn run(mut self) -> Result<()> {
-        // clean load after startup
         {
             let pool_guard = self.pool.read().await;
             let highest_finalized = pool_guard.finalized_slot();
@@ -266,7 +304,6 @@ where
             drop(blockstore_guard);
         }
 
-        // take the epoch boundary receiver out so we can move it into the task
         let epoch_boundary_rx = std::mem::replace(&mut self.epoch_boundary_rx, mpsc::channel(1).1);
         let finalized_slot_rx = std::mem::replace(&mut self.finalized_slot_rx, mpsc::channel(1).1);
         let slashing_rx = std::mem::replace(&mut self.slashing_rx, mpsc::channel(1).1);
@@ -332,9 +369,24 @@ where
         epoch_loop.abort();
         finalized_checkpoint_loop.abort();
 
-        let (msg_res, prod_res) = tokio::join!(msg_loop, prod_loop);
-        msg_res??;
-        prod_res??;
+        // Await all tasks so their `Arc<Alpenglow>` clones release RocksDB before reconnect.
+        // Cancelled joins are expected teardown, not failure.
+        let (msg_res, prod_res, _, _, _) = tokio::join!(
+            msg_loop,
+            prod_loop,
+            standstill_loop,
+            epoch_loop,
+            finalized_checkpoint_loop,
+        );
+        drop(node);
+
+        // Surface genuine main-loop panics; cancellations are teardown.
+        if let Ok(Err(e)) = msg_res {
+            return Err(e);
+        }
+        if let Ok(Err(e)) = prod_res {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -346,44 +398,64 @@ where
         Arc::clone(&self.pool)
     }
 
+    /// Shared blockstore handle for out-of-band readers.
+    pub fn get_blockstore(&self) -> Arc<RwLock<Box<dyn Blockstore + Send + Sync>>> {
+        Arc::clone(&self.blockstore)
+    }
+
     pub fn get_cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
     }
 
-    /// Handles incoming messages on all the different network interfaces.
-    ///
-    /// [`All2All`]: Handles incoming votes and certificates. Adds them to the [`Pool`].
-    /// [`Disseminator`]: Handles incoming shreds. Adds them to the [`Blockstore`].
+    /// Ingests incoming votes, certs, and shreds.
     async fn message_loop(self: &Arc<Self>) -> Result<()> {
+        // Ingestion errors must not kill this only vote/cert/shred receive path.
+        // Log and back off so persistent failures cannot hot-loop.
         loop {
             tokio::select! {
-                // handle incoming votes and certificates
-                res = self.all2all.receive() => self.handle_all2all_message(res?).await,
-                // handle shreds received by block dissemination protocol
-                res = self.disseminator.receive() => self.handle_disseminator_shred(res?).await?,
+                res = self.all2all.receive() => match res {
+                    Ok(msg) => self.handle_all2all_message(msg).await,
+                    Err(e) => {
+                        error!("all2all receive failed (vote/cert ingestion degraded): {e}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                },
+                res = self.disseminator.receive() => match res {
+                    Ok(shred) => {
+                        if let Err(e) = self.handle_disseminator_shred(shred).await {
+                            error!("disseminator shred handling failed: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        error!("disseminator receive failed (shred ingestion degraded): {e}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                },
 
                 () = self.cancel_token.cancelled() => return Ok(()),
             };
         }
     }
 
-    /// Handles standstill detection and triggers recovery.
-    ///
-    /// Keeps track of when consensus progresses, i.e., [`Pool`] finalizes new blocks.
-    /// Triggers standstill recovery if no progress was detected for a long time.
+    /// Triggers standstill recovery when finalization stops progressing.
     async fn standstill_loop(self: &Arc<Self>) -> Result<()> {
         let mut finalized_slot = Slot::new(0);
         let mut last_progress = Instant::now();
+        // Dry recoveries double the interval so rebroadcasts don't starve shreds of airtime.
+        let mut dry_recoveries: u32 = 0;
         loop {
             let slot = self.pool.read().await.finalized_slot();
             if slot > finalized_slot {
                 finalized_slot = slot;
                 last_progress = Instant::now();
-            } else if last_progress.elapsed() > DELTA_STANDSTILL {
+                dry_recoveries = 0;
+            } else if last_progress.elapsed() > delta_standstill() * 2u32.pow(dry_recoveries) {
                 self.pool.read().await.recover_from_standstill().await;
                 last_progress = Instant::now();
+                dry_recoveries = (dry_recoveries + 1).min(2);
             }
-            tokio::time::sleep(DELTA_BLOCK).await;
+            // Fixed cadence avoids adding a full scaled block window of detection latency.
+            tokio::time::sleep(delta_block().min(Duration::from_secs(60))).await;
         }
     }
 
@@ -391,32 +463,38 @@ where
     async fn handle_all2all_message(&self, msg: ConsensusMessage) {
         trace!("received all2all msg: {msg:?}");
         match msg {
-            ConsensusMessage::Vote(v) => match self.pool.write().await.add_vote(v).await {
-                Ok(()) => {}
-                Err(AddVoteError::Slashable(offence)) => {
-                    warn!("slashable offence detected: {offence}");
+            ConsensusMessage::Vote(v) => {
+                // Vote logs stay info/warn because finalization stalls need visible evidence.
+                let (slot, signer) = (v.slot(), v.signer());
+                match self.pool.write().await.add_vote(v).await {
+                    Ok(()) => info!("counted vote for slot {slot} from validator {signer}"),
+                    Err(AddVoteError::Slashable(offence)) => {
+                        warn!("slashable offence detected: {offence}");
+                    }
+                    Err(err) => {
+                        warn!("ignoring vote for slot {slot} from validator {signer}: {err}");
+                    }
                 }
-                Err(err) => trace!("ignoring invalid vote: {err}"),
-            },
-            ConsensusMessage::Cert(c) => match self.pool.write().await.add_cert(c).await {
-                Ok(()) => {}
-                Err(err) => trace!("ignoring invalid cert: {err}"),
-            },
+            }
+            ConsensusMessage::Cert(c) => {
+                let (slot, kind) = (c.slot(), c.kind_str());
+                match self.pool.write().await.add_cert(c).await {
+                    Ok(()) => info!("ingested {kind} cert for slot {slot}"),
+                    Err(err) => warn!("ignoring {kind} cert for slot {slot}: {err}"),
+                }
+            }
         }
     }
 
     #[fastrace::trace(short_name = true)]
     async fn handle_disseminator_shred(&self, shred: Shred) -> std::io::Result<()> {
-        // potentially forward shred
         self.disseminator.forward(&shred).await?;
 
-        // if we are the leader, we already have the shred
         let slot = shred.payload().header.slot;
         if self.epoch_info.leader(slot).id == self.epoch_info.own_id {
             return Ok(());
         }
 
-        // otherwise, ingest into blockstore
         let res = self
             .blockstore
             .write()
@@ -465,11 +543,10 @@ async fn epoch_transition_loop(
             completed_epoch, event.finalized_slot
         );
 
-        // run state transition if execution state is available
         if let Some(ref state) = execution_state {
             let mut state_guard = state.write().await;
 
-            // drain slashing reports and convert to offence reports
+            // Convert pending slashing reports into epoch offences.
             while let Ok(report) = slashing_rx.try_recv() {
                 let validator_pk = *epoch_info.validator(report.validator_id).pubkey.as_bytes();
                 let offence_kind = match report.offence {
@@ -503,7 +580,6 @@ async fn epoch_transition_loop(
                 &result.state_hash[..8],
             );
 
-            // save snapshot
             if let Some(ref store) = snapshot_store {
                 store.save_snapshot(new_epoch, &state_guard);
                 if let Some(manifest) = store.load_manifest(new_epoch) {
@@ -543,10 +619,11 @@ async fn epoch_transition_loop(
                             bincode::config::standard(),
                         ) {
                             Ok(encoded) => {
-                                pending_epoch_transitions
-                                    .write()
-                                    .await
-                                    .insert(new_epoch, encoded);
+                                let mut pending = pending_epoch_transitions.write().await;
+                                // Only this node's first block can consume a transition payload;
+                                // drop entries older than the epoch starting now.
+                                *pending = pending.split_off(&new_epoch);
+                                pending.insert(new_epoch, encoded);
                             }
                             Err(e) => warn!(
                                 "failed to encode epoch transition block for epoch {}: {}",
@@ -573,7 +650,6 @@ async fn epoch_transition_loop(
             }
         }
 
-        // build new epoch info from current (for now, same validator set)
         let current = epoch_info_tx.borrow().clone();
         let new_epoch_info = Arc::new(EpochInfo::new(
             new_epoch,
@@ -581,7 +657,6 @@ async fn epoch_transition_loop(
             current.validators.clone(),
         ));
 
-        // unblock block production with the new epoch info
         let _ = epoch_info_tx.send(new_epoch_info);
         info!("epoch {} started", new_epoch);
     }
@@ -592,11 +667,14 @@ async fn finalized_checkpoint_loop(
     blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
     snapshot_store: Option<Arc<SnapshotStore>>,
 ) {
-    let Some(snapshot_store) = snapshot_store else {
-        return;
-    };
-
     while let Some(event) = finalized_slot_rx.recv().await {
+        // Prune outside pool locks to avoid the pool-to-blockstore lock edge
+        // that can deadlock against shred ingestion.
+        blockstore.write().await.prune_finalized(event.slot);
+
+        let Some(ref snapshot_store) = snapshot_store else {
+            continue;
+        };
         let block_hash = event
             .finalization_certs
             .iter()

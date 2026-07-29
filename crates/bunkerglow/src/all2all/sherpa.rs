@@ -16,15 +16,13 @@
 //! system to route data efficiently across the globe" and enables the BLS
 //! in-flight aggregation path described in §2.1 (Votor).
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
 use super::All2All;
+use crate::ValidatorId;
 use crate::consensus::ConsensusMessage;
 use crate::network::{ConsensusNetwork, Network};
-use crate::sherpa::{Sherpa, SherpaHandle};
-use crate::{ValidatorId, ValidatorInfo};
+use crate::sherpa::SherpaHandle;
 
 /// Location-aware all-to-all broadcast using the Sherpa routing service.
 ///
@@ -32,7 +30,6 @@ use crate::{ValidatorId, ValidatorInfo};
 /// geographic proximity, skipping links currently marked as failed.
 /// Failed links are retried lazily once Sherpa clears them.
 pub struct SherpaAll2All<N: Network> {
-    validators: Vec<ValidatorInfo>,
     network: N,
     sherpa: SherpaHandle,
     own_id: ValidatorId,
@@ -41,17 +38,11 @@ pub struct SherpaAll2All<N: Network> {
 impl<N: Network> SherpaAll2All<N> {
     /// Creates a new `SherpaAll2All` instance.
     ///
-    /// - `validators`: the full validator set for this epoch.
     /// - `network`: the underlying consensus network for sending/receiving.
-    /// - `sherpa`: shared Sherpa service (may be shared with Rotor).
-    pub fn new(
-        own_id: ValidatorId,
-        validators: Vec<ValidatorInfo>,
-        network: N,
-        sherpa: SherpaHandle,
-    ) -> Self {
+    /// - `sherpa`: shared Sherpa service (may be shared with Rotor). Peer set
+    ///   and ordering come from Sherpa, so no separate validator list is kept.
+    pub fn new(own_id: ValidatorId, network: N, sherpa: SherpaHandle) -> Self {
         Self {
-            validators,
             network,
             sherpa,
             own_id,
@@ -108,7 +99,6 @@ mod tests {
     use tokio::task::JoinSet;
 
     use super::*;
-    use crate::GeoLocation;
     use crate::consensus::Vote;
     use crate::crypto::aggsig;
     use crate::crypto::signature::SecretKey;
@@ -116,6 +106,7 @@ mod tests {
     use crate::network::{SimulatedNetwork, dontcare_sockaddr, localhost_ip_sockaddr};
     use crate::sherpa::Sherpa;
     use crate::types::Slot;
+    use crate::{GeoLocation, ValidatorInfo};
 
     fn make_validator_with_location(id: u64, lat: f64, lon: f64, stake: u64) -> ValidatorInfo {
         let sk = SecretKey::new(&mut rand::rng());
@@ -161,7 +152,7 @@ mod tests {
         // Sender network (node 0)
         let net_sender: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
             core.join_unlimited(0).await;
-        let all2all_sender = SherpaAll2All::new(0, validators.clone(), net_sender, sherpa.clone());
+        let all2all_sender = SherpaAll2All::new(0, net_sender, sherpa.clone());
 
         // Receiver networks (nodes 1–4)
         let mut receiver_tasks = JoinSet::new();
@@ -169,7 +160,7 @@ mod tests {
             let net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
                 core.join_unlimited(i).await;
             let sherpa_recv = Arc::new(Sherpa::new(i, validators.clone()));
-            let all2all_recv = SherpaAll2All::new(i, validators.clone(), net, sherpa_recv);
+            let all2all_recv = SherpaAll2All::new(i, net, sherpa_recv);
             receiver_tasks.spawn(async move {
                 let msg = all2all_recv.receive().await.unwrap();
                 assert!(matches!(msg, ConsensusMessage::Vote(_)));

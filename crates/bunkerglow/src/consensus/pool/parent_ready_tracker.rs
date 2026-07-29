@@ -42,7 +42,6 @@ impl ParentReadyTracker {
             return SmallVec::new();
         }
 
-        // add this block as valid parent to any skip-connected future windows
         let mut newly_certified = SmallVec::new();
         for slot in slot.future_slots() {
             let state = self.slot_state(slot);
@@ -66,38 +65,32 @@ impl ParentReadyTracker {
             return SmallVec::new();
         }
 
-        // find possible parents for future windows
         let mut potential_parents = SmallVec::<[BlockId; 1]>::new();
         let window_slots = marked_slot.slots_in_window();
-        // going back from `marked_slot` find any skip-connected parents
+        // Walk backward from `marked_slot` collecting skip-connected parents,
+        // stopping at the first non-skipped slot.
         for slot in window_slots.filter(|s| *s <= marked_slot).rev() {
             let state = self.slot_state(slot);
-            // add any notarized-fallback blocks from this slot
             if slot != marked_slot {
                 for nf in state.notar_fallback_blocks() {
                     potential_parents.push((slot, nf));
                 }
             }
-            // stop as soon as we see any non-skipped slot
             if !state.is_skip_certified() {
                 break;
             }
-            // if the slot is skipped, add its parents as well
             potential_parents.extend(state.ready_block_ids().iter().cloned());
         }
 
-        // add these as valid parents to any skip-connected future windows
         let mut newly_certified = SmallVec::new();
         for slot in marked_slot.future_slots() {
             let state = self.slot_state(slot);
-            // add parents to this window
             if slot.is_start_of_window() {
                 for parent in &potential_parents {
                     state.add_to_ready(parent.clone());
                     newly_certified.push((slot, parent.clone()));
                 }
             }
-            // stop as soon as we see any non-skipped slot
             if !state.is_skip_certified() {
                 break;
             }
@@ -126,7 +119,6 @@ impl ParentReadyTracker {
             parents_ready.extend(self.mark_skipped(slot));
         }
 
-        // keep only highest slot ParentReady
         let maybe_parent = parents_ready.iter().max_by_key(|(slot, _)| slot);
         maybe_parent.into_iter().cloned().collect()
     }
@@ -156,6 +148,27 @@ impl ParentReadyTracker {
     /// Initializes the state with [`Default`] if necessary.
     fn slot_state(&mut self, slot: Slot) -> &mut ParentReadyState {
         self.0.entry(slot).or_default()
+    }
+
+    /// Drops per-slot state for slots strictly below `below`.
+    ///
+    /// Called as finalization advances (with `below` = the first slot of the
+    /// finalized slot's window) — without pruning this map grows by at least
+    /// one entry per slot, forever.
+    ///
+    /// Safe at that boundary: certs below the finalized frontier are rejected
+    /// before reaching the tracker, `mark_skipped`'s backward walk stays
+    /// within the marked slot's own window (kept in full), the forward walks
+    /// only touch future slots, and parent-ready waiters are registered for
+    /// upcoming window starts above the frontier.
+    pub fn prune(&mut self, below: Slot) {
+        self.0.retain(|slot, _| *slot >= below);
+    }
+
+    /// Number of tracked per-slot entries (test-only, for prune assertions).
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -311,7 +324,6 @@ mod tests {
         let window3 = windows.next().unwrap();
         let mut tracker = ParentReadyTracker::default();
 
-        // skip slots in first window
         for slot in window1.slots_in_window() {
             if slot.is_genesis() {
                 continue;
@@ -319,14 +331,12 @@ mod tests {
             tracker.mark_skipped(slot);
         }
 
-        // genesis should be valid parent for 2nd window
         let res = tracker.wait_for_parent_ready(window2);
         let Either::Left((slot, hash)) = res else {
             panic!("unexpected result {res:?}");
         };
         assert_eq!((slot, hash), genesis);
 
-        // parent should not yet be ready
         let res = tracker.wait_for_parent_ready(window3);
         let Either::Right(mut rx) = res else {
             panic!("unexpected result {res:?}");
@@ -335,12 +345,10 @@ mod tests {
             panic!("parent should not yet be ready");
         };
 
-        // skip slots in first window
         for slot in window2.slots_in_window() {
             tracker.mark_skipped(slot);
         }
 
-        // now we should be notified of genesis as valid parent
         assert_eq!(rx.try_recv(), Ok(genesis));
     }
 

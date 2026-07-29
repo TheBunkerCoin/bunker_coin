@@ -79,6 +79,12 @@ pub struct SimulatedPactorConfig {
     pub forced_initial_losses: u32,
     pub fade_windows: Vec<FadeWindow>,
     pub read_timeout: Option<Duration>,
+    /// Models one shared half-duplex channel; disabled means independent directions.
+    pub half_duplex: bool,
+    /// ARQ changeover delay for reversing the shared half-duplex medium.
+    pub changeover_delay: Duration,
+    /// Throughput penalty for slave-to-master transmissions; `1.0` is symmetric.
+    pub reverse_slowdown: f64,
 }
 
 impl Default for SimulatedPactorConfig {
@@ -94,6 +100,9 @@ impl Default for SimulatedPactorConfig {
             forced_initial_losses: 0,
             fade_windows: Vec::new(),
             read_timeout: Some(Duration::from_secs(10)),
+            half_duplex: false,
+            changeover_delay: Duration::from_secs(2),
+            reverse_slowdown: 10.0,
         }
     }
 }
@@ -111,6 +120,7 @@ impl SimulatedPactorConfig {
             forced_initial_losses: 0,
             fade_windows: Vec::new(),
             read_timeout: Some(Duration::from_secs(10)),
+            ..Self::default()
         }
     }
 
@@ -126,6 +136,7 @@ impl SimulatedPactorConfig {
             forced_initial_losses: 0,
             fade_windows: Vec::new(),
             read_timeout: Some(Duration::from_secs(20)),
+            ..Self::default()
         }
     }
 
@@ -133,6 +144,26 @@ impl SimulatedPactorConfig {
         Self {
             fade_windows,
             ..Self::marginal_link()
+        }
+    }
+
+    /// Half-duplex HF profile: shared channel, ARQ changeover, and slow reverse path.
+    pub fn half_duplex_hf() -> Self {
+        Self {
+            half_duplex: true,
+            changeover_delay: Duration::from_secs(2),
+            reverse_slowdown: 10.0,
+            // Master-to-slave is the fast direction.
+            speed: PactorSpeed::P4,
+            packet_loss: 0.05,
+            latency: Duration::from_millis(250),
+            latency_jitter: Duration::from_millis(50),
+            setup_delay: Duration::from_secs(2),
+            max_retries: 8,
+            downshift_after_retries: 2,
+            forced_initial_losses: 0,
+            fade_windows: Vec::new(),
+            read_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -201,6 +232,21 @@ impl SharedStats {
     }
 }
 
+/// Shared channel state for serializing half-duplex transmissions.
+/// The lock stores the last sender so direction reversals can pay changeover.
+#[derive(Debug)]
+struct HalfDuplexMedium {
+    lock: Mutex<Option<bool>>,
+}
+
+impl HalfDuplexMedium {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lock: Mutex::new(None),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct SimulatedPactorTransport {
     local: Arc<Endpoint>,
@@ -208,11 +254,17 @@ pub struct SimulatedPactorTransport {
     config: SimulatedPactorConfig,
     stats: Arc<SharedStats>,
     started_at: tokio::time::Instant,
+    /// Shared channel used when `config.half_duplex` is set.
+    medium: Arc<HalfDuplexMedium>,
+    /// `true` for the initiator; the other endpoint uses the slow reverse path.
+    is_master: bool,
 }
 
 pub struct SimulatedPactorPair;
 
 impl SimulatedPactorPair {
+    // Factory returns a connected endpoint pair, not `Self`.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         config: SimulatedPactorConfig,
     ) -> (SimulatedPactorTransport, SimulatedPactorTransport) {
@@ -220,6 +272,7 @@ impl SimulatedPactorPair {
         let b = Endpoint::new();
         let stats = Arc::new(SharedStats::default());
         let started_at = tokio::time::Instant::now();
+        let medium = HalfDuplexMedium::new();
         (
             SimulatedPactorTransport {
                 local: a.clone(),
@@ -227,6 +280,8 @@ impl SimulatedPactorPair {
                 config: config.clone(),
                 stats: stats.clone(),
                 started_at,
+                medium: medium.clone(),
+                is_master: true,
             },
             SimulatedPactorTransport {
                 local: b,
@@ -234,6 +289,8 @@ impl SimulatedPactorPair {
                 config,
                 stats,
                 started_at,
+                medium,
+                is_master: false,
             },
         )
     }
@@ -287,35 +344,23 @@ impl SimulatedPactorTransport {
     }
 
     pub async fn read_status_line(&self) -> Result<String, ScsPactorError> {
-        loop {
-            match self.next_event(self.config.read_timeout).await? {
-                PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
-                    return Ok(format!("CONNECTED {remote_call}"));
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::Connecting { remote_call }) => {
-                    return Ok(format!("CONNECTING {remote_call}"));
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::Disconnected) => {
-                    return Ok("DISCONNECTED".to_owned());
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::LinkFailure) => {
-                    return Ok("LINK FAILURE".to_owned());
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::Busy) => return Ok("BUSY".to_owned()),
-                PactorLinkEvent::Status(PactorLinkStatus::Queued) => {
-                    return Ok("QUEUED".to_owned());
-                }
-                PactorLinkEvent::Status(PactorLinkStatus::Idle) => return Ok("IDLE".to_owned()),
-                PactorLinkEvent::LinkQuality {
-                    speed_level,
-                    retries,
-                } => {
-                    return Ok(format!(
-                        "LINK QUALITY SPEED={speed_level} RETRIES={retries}"
-                    ))
-                }
+        Ok(match self.next_event(self.config.read_timeout).await? {
+            PactorLinkEvent::Status(PactorLinkStatus::Connected { remote_call }) => {
+                format!("CONNECTED {remote_call}")
             }
-        }
+            PactorLinkEvent::Status(PactorLinkStatus::Connecting { remote_call }) => {
+                format!("CONNECTING {remote_call}")
+            }
+            PactorLinkEvent::Status(PactorLinkStatus::Disconnected) => "DISCONNECTED".to_owned(),
+            PactorLinkEvent::Status(PactorLinkStatus::LinkFailure) => "LINK FAILURE".to_owned(),
+            PactorLinkEvent::Status(PactorLinkStatus::Busy) => "BUSY".to_owned(),
+            PactorLinkEvent::Status(PactorLinkStatus::Queued) => "QUEUED".to_owned(),
+            PactorLinkEvent::Status(PactorLinkStatus::Idle) => "IDLE".to_owned(),
+            PactorLinkEvent::LinkQuality {
+                speed_level,
+                retries,
+            } => format!("LINK QUALITY SPEED={speed_level} RETRIES={retries}"),
+        })
     }
 
     async fn emit_status_line(&self, line: &str) {
@@ -388,12 +433,35 @@ impl PactorTransport for SimulatedPactorTransport {
             return Err(ScsPactorError::Disconnected);
         }
 
+        // Hold the half-duplex channel across retries so retransmit bursts stay serialized.
+        let _medium_guard = if self.config.half_duplex {
+            let mut last_sender = self.medium.lock.lock().await;
+            if *last_sender != Some(self.is_master) {
+                // Direction reversal pays the ARQ changeover.
+                if last_sender.is_some() {
+                    sleep(self.config.changeover_delay).await;
+                }
+                *last_sender = Some(self.is_master);
+            }
+            Some(last_sender)
+        } else {
+            None
+        };
+
+        // Slave-to-master is the slow ARQ leg.
+        let direction_slowdown = if self.config.half_duplex && !self.is_master {
+            self.config.reverse_slowdown.max(1.0)
+        } else {
+            1.0
+        };
+
         let mut retries = 0;
         let mut speed = self.config.speed;
         loop {
             self.stats.frames_attempted.fetch_add(1, Ordering::Relaxed);
-            let transmit_time =
-                Duration::from_secs_f64((data.len() * 8) as f64 / speed.raw_bps() as f64);
+            let transmit_time = Duration::from_secs_f64(
+                (data.len() * 8) as f64 / speed.raw_bps() as f64 * direction_slowdown,
+            );
             let jitter = if self.config.latency_jitter.is_zero() {
                 Duration::ZERO
             } else {
@@ -416,14 +484,11 @@ impl PactorTransport for SimulatedPactorTransport {
                 self.stats
                     .bytes_delivered
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
-                let _ = self
-                    .local
-                    .event_tx
-                    .send(PactorLinkEvent::LinkQuality {
-                        speed_level: speed.level(),
-                        retries,
-                    })
-                    .await;
+                // Telemetry must not block writers when no poller drains events.
+                let _ = self.local.event_tx.try_send(PactorLinkEvent::LinkQuality {
+                    speed_level: speed.level(),
+                    retries,
+                });
                 return Ok(());
             }
 
@@ -692,6 +757,89 @@ mod tests {
         assert_eq!(stats.frames_lost, 0);
         assert_eq!(stats.retransmissions, 0);
         assert_eq!(stats.bytes_delivered, 128);
+    }
+
+    #[tokio::test]
+    async fn half_duplex_reverse_path_is_slower_than_forward() {
+        // Same payload, same link — but the slave→master (reverse) transmit must
+        // take `reverse_slowdown`× longer than the master→slave (forward) one.
+        let config = SimulatedPactorConfig {
+            half_duplex: true,
+            reverse_slowdown: 10.0,
+            changeover_delay: Duration::ZERO,
+            speed: PactorSpeed::P4,
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            ..Default::default()
+        };
+        let (master, slave) = SimulatedPactorPair::new(config);
+        master.set_mycall("MASTER").await.unwrap();
+        slave.set_mycall("SLAVE").await.unwrap();
+        master.connect_peer("SLAVE").await.unwrap();
+
+        let payload = [0xAB; 64];
+
+        let t0 = tokio::time::Instant::now();
+        master.write_data(&payload).await.unwrap();
+        let forward = t0.elapsed();
+        let _ = slave.read_data(1024).await.unwrap();
+
+        let t1 = tokio::time::Instant::now();
+        slave.write_data(&payload).await.unwrap();
+        let reverse = t1.elapsed();
+        let _ = master.read_data(1024).await.unwrap();
+
+        // Reverse should be ~10× forward (allow slack for the changeover-free path).
+        assert!(
+            reverse >= forward * 8,
+            "reverse {reverse:?} should be ~10x forward {forward:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn half_duplex_serializes_concurrent_transmissions() {
+        // Both sides try to transmit at once over ONE channel. They must not
+        // overlap: total wall time ≈ sum of both transmit times (+ a changeover),
+        // not the max (which is what a full-duplex link would give).
+        let config = SimulatedPactorConfig {
+            half_duplex: true,
+            reverse_slowdown: 1.0,
+            changeover_delay: Duration::from_secs(2),
+            speed: PactorSpeed::P4,
+            packet_loss: 0.0,
+            latency: Duration::ZERO,
+            latency_jitter: Duration::ZERO,
+            setup_delay: Duration::ZERO,
+            ..Default::default()
+        };
+        let (master, slave) = SimulatedPactorPair::new(config);
+        master.set_mycall("MASTER").await.unwrap();
+        slave.set_mycall("SLAVE").await.unwrap();
+        master.connect_peer("SLAVE").await.unwrap();
+
+        let payload = vec![0xCD; 130]; // ~0.2s each at P4 (5200 bps)
+        let one_tx =
+            Duration::from_secs_f64((payload.len() * 8) as f64 / PactorSpeed::P4.raw_bps() as f64);
+
+        let m = master.clone();
+        let s = slave.clone();
+        let p1 = payload.clone();
+        let p2 = payload.clone();
+        let t0 = tokio::time::Instant::now();
+        let wm = tokio::spawn(async move { m.write_data(&p1).await });
+        let ws = tokio::spawn(async move { s.write_data(&p2).await });
+        wm.await.unwrap().unwrap();
+        ws.await.unwrap().unwrap();
+        let total = t0.elapsed();
+
+        // Serialized: both transmits run back-to-back (≥ 2× one_tx). A full-duplex
+        // link would finish in ~one_tx.
+        assert!(
+            total >= one_tx * 2,
+            "half-duplex transmits must serialize: total {total:?} < 2x one_tx {one_tx:?}"
+        );
     }
 
     #[tokio::test]

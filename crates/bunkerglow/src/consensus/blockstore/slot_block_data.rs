@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Data structure holding shreds, slices and blocks for a specific slot.
-//!
-//!
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -247,8 +245,6 @@ impl BlockData {
     }
 
     /// Reconstructs the slice if the blockstore contains enough shreds.
-    ///
-    /// See [`ReconstructSliceResult`] for more info on what the function returns.
     fn try_reconstruct_slice(
         &mut self,
         index: SliceIndex,
@@ -264,7 +260,7 @@ impl BlockData {
             Entry::Vacant(entry) => entry,
         };
 
-        // assuming caller has inserted at least one valid shred so unwrap() should be safe
+        // Caller inserted at least one shred for this index; the entry exists.
         let slice_shreds = self.shreds.get_mut(&index).unwrap();
         let (reconstructed_slice, reconstructed_shreds) = match shredder.deshred(slice_shreds) {
             Ok(output) => output,
@@ -282,7 +278,6 @@ impl BlockData {
             return ReconstructSliceResult::Error;
         }
 
-        // insert reconstructed slice and shreds
         entry.insert(reconstructed_slice);
         let mut reconstructed_shreds = reconstructed_shreds.map(Some);
         std::mem::swap(slice_shreds, &mut reconstructed_shreds);
@@ -292,8 +287,6 @@ impl BlockData {
     }
 
     /// Reconstructs the block if the blockstore contains all slices.
-    ///
-    /// See [`ReconstructBlockResult`] for more info on what the function returns.
     fn try_reconstruct_block(&mut self) -> ReconstructBlockResult {
         if self.completed.is_some() {
             trace!("already have block for slot {}", self.slot);
@@ -307,7 +300,6 @@ impl BlockData {
             return ReconstructBlockResult::NoAction;
         }
 
-        // calculate double-Merkle tree & block hash
         let merkle_roots = self
             .slices
             .values()
@@ -316,16 +308,23 @@ impl BlockData {
         let block_hash = tree.get_root();
         self.double_merkle_tree = Some(tree);
 
-        // reconstruct block header
         let first_slice = self.slices.get(&SliceIndex::first()).unwrap();
-        // based on the logic in `try_reconstruct_slice`, first_slice should be valid i.e. it must contain a parent.
+        // try_reconstruct_slice validated that the first slice contains a parent.
         let mut parent = first_slice.parent.clone().unwrap();
         let mut parent_switched = false;
 
         let mut epoch_transition = None;
         let mut transactions = vec![];
         for (ind, slice) in &self.slices {
-            // handle optimistic handover
+            // A slot mismatch means slices from different slots were combined;
+            // reject rather than produce a block with ambiguous identity.
+            if slice.slot != self.slot {
+                warn!(
+                    "slice {ind} claims slot {} but reconstructing slot {}",
+                    slice.slot, self.slot
+                );
+                return ReconstructBlockResult::Error;
+            }
             if !ind.is_first()
                 && let Some(new_parent) = slice.parent.clone()
             {
@@ -370,6 +369,16 @@ impl BlockData {
             transactions.extend(payload.transactions);
         }
 
+        // The leader controls the claimed parent slot; a non-earlier parent would
+        // trip `Pool::add_block`'s ordering assert and kill the consensus task.
+        if parent.0 >= self.slot {
+            warn!(
+                "block in slot {} claims parent in slot {} (not strictly earlier) — rejecting",
+                self.slot, parent.0
+            );
+            return ReconstructBlockResult::Error;
+        }
+
         let block = Block {
             slot: self.slot,
             hash: block_hash.clone(),
@@ -381,7 +390,6 @@ impl BlockData {
         let block_info = BlockInfo::from(&block);
         self.completed = Some((block_hash, block));
 
-        // clean up raw slices
         self.slices.clear();
 
         ReconstructBlockResult::Complete(block_info)
@@ -432,7 +440,6 @@ mod tests {
         let pk = sk.to_pk();
         let slot = Slot::new(123);
 
-        // manage to construct block from just enough shreds
         let slices = create_random_block(slot, 1);
         let mut block_data = BlockData::new(slot);
         let mut shredder = RegularShredder::default();
@@ -448,7 +455,6 @@ mod tests {
         }
         assert!(block_data.completed.is_some());
 
-        // all shreds should have been reconstructed
         let slice_shreds = block_data.shreds.get(&SliceIndex::first()).unwrap();
         assert_eq!(slice_shreds.len(), TOTAL_SHREDS);
         for shred_index in ShredIndex::all() {
@@ -461,7 +467,6 @@ mod tests {
         let sk = SecretKey::new(&mut rand::rng());
         let slot = Slot::new(123);
 
-        // manage to construct a valid block
         let slices = create_random_block(slot, 1);
         let (events, res) =
             handle_slice(&mut BlockData::new(slices[0].slot), slices[0].clone(), &sk);
@@ -479,7 +484,6 @@ mod tests {
         };
         assert_votor_events_match(events[1].clone(), block_event);
 
-        // do not construct a valid block when slice is invalid
         let mut slices = create_random_block(slot, 1);
         slices[0].parent = None;
         let (events, res) =
@@ -490,7 +494,51 @@ mod tests {
         assert_votor_events_match(events[0].clone(), first_shred_event);
     }
 
-    // If a subsequent slice switches parent to the original, the block is not reconstructed.
+    /// A parent slot not strictly earlier than its own slot must reject as
+    /// `InvalidShred` rather than emit a `Block`. Builds the slice directly to
+    /// avoid depending on `create_random_block`'s payload sizing.
+    #[test]
+    fn reconstruct_block_rejects_non_earlier_parent() {
+        use crate::BlockPayload;
+        use crate::types::{Slice, SliceHeader, SlicePayload};
+
+        fn malformed_single_slice(slot: Slot, parent_slot: Slot) -> Slice {
+            let parent_hash: BlockHash = crate::crypto::Hash::random_for_test().into();
+            let data = wincode::serialize(&BlockPayload {
+                epoch_transition: None,
+                transactions: vec![],
+            })
+            .unwrap();
+            let payload = SlicePayload::new(slot, Some((parent_slot, parent_hash)), data);
+            let header = SliceHeader {
+                slot,
+                slice_index: SliceIndex::first(),
+                is_last: true,
+            };
+            Slice::from_parts(header, payload, None)
+        }
+
+        let sk = SecretKey::new(&mut rand::rng());
+        let slot = Slot::new(123);
+
+        for parent_slot in [slot, slot.next()] {
+            let slice = malformed_single_slice(slot, parent_slot);
+            let (events, res) = handle_slice(&mut BlockData::new(slot), slice, &sk);
+            assert_eq!(
+                res.unwrap_err(),
+                AddShredError::InvalidShred,
+                "parent slot {parent_slot} (>= own slot {slot}) must be rejected"
+            );
+            // The FirstShred event may fire, but never a Block event.
+            assert!(
+                events
+                    .iter()
+                    .all(|e| !matches!(e, VotorEvent::Block { .. })),
+                "malformed block must not emit a Block event"
+            );
+        }
+    }
+
     #[test]
     fn reconstruct_block_optimistic_handover_duplicate_parent() {
         let sk = SecretKey::new(&mut rand::rng());
@@ -516,7 +564,6 @@ mod tests {
         }
     }
 
-    // Two switches of parents do not reconstruct block.
     #[test]
     fn reconstruct_block_optimistic_handover_two_switches() {
         let sk = SecretKey::new(&mut rand::rng());
@@ -548,7 +595,6 @@ mod tests {
         }
     }
 
-    // Optimistic handover works.
     #[test]
     fn reconstruct_block_optimistic_handover_works() {
         let sk = SecretKey::new(&mut rand::rng());

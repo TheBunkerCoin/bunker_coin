@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use bunker_coin_core::capsule::{CapsuleHeader, DecodedCapsule};
 use bunker_coin_core::types::{PublicKey, Signature};
 
-/// Key for pending reassembly: (sender, msg_id).
 type ReassemblyKey = (PublicKey, u32);
 
 struct PendingMessage {
@@ -31,8 +30,7 @@ impl FragmentReassembler {
         }
     }
 
-    /// Feed a decoded capsule. Returns `Some((header, full_body, sig))` when all fragments
-    /// for a message have arrived.
+    /// Feed a capsule and return a complete signed body when all fragments arrive.
     pub fn feed(&mut self, capsule: DecodedCapsule) -> Option<(CapsuleHeader, Vec<u8>, Signature)> {
         match capsule {
             DecodedCapsule::Single { header, body, sig } => Some((header, body, sig)),
@@ -60,7 +58,7 @@ impl FragmentReassembler {
                 body_chunk,
                 ..
             } => {
-                // Find the pending entry by msg_id (we need the sender key)
+                // Continuations lack sender, so find the first-fragment entry by message id.
                 let key = self.pending.keys().find(|(_, id)| *id == msg_id).cloned();
                 if let Some(key) = key {
                     if let Some(entry) = self.pending.get_mut(&key) {
@@ -68,7 +66,6 @@ impl FragmentReassembler {
                     }
                     self.try_complete(&key)
                 } else {
-                    // No first fragment seen yet — drop
                     None
                 }
             }
@@ -134,8 +131,7 @@ mod tests {
         for (i, frag) in frags.into_iter().enumerate() {
             let result = r.feed(frag);
             if i < 1 {
-                // First fragment shouldn't complete yet (need continuation)
-                // Actually, first might complete if only 2 frags — check
+                // Completion is checked below.
             }
             if let Some((_, reassembled, _)) = result {
                 assert_eq!(reassembled, body);
@@ -146,26 +142,37 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_reassembly() {
+    fn out_of_order_continuations_reassemble() {
         let mut r = FragmentReassembler::new(Duration::from_secs(60));
-        let body = vec![0x42; 400];
+        let body = vec![0x42; 600];
         let mut frags = make_fragments(&body, 2);
-        // Reverse order: send continuations first, then first fragment
+        assert!(frags.len() >= 3);
+        let first = frags.remove(0);
         frags.reverse();
 
-        let mut completed = false;
+        assert!(r.feed(first).is_none());
+        let mut done = false;
         for frag in frags {
             if let Some((_, reassembled, _)) = r.feed(frag) {
                 assert_eq!(reassembled, body);
-                completed = true;
+                done = true;
             }
         }
-        // Out-of-order: continuation without first fragment is dropped,
-        // so it may not complete. That's expected behavior.
-        if !completed {
-            // This is fine — continuations without first fragment are dropped
-            assert!(true);
+        assert!(done, "reassembly never completed");
+    }
+
+    #[test]
+    fn continuations_before_first_fragment_are_dropped() {
+        let mut r = FragmentReassembler::new(Duration::from_secs(60));
+        let body = vec![0x42; 600];
+        let mut frags = make_fragments(&body, 2);
+        frags.reverse();
+
+        for frag in frags {
+            assert!(r.feed(frag).is_none());
         }
+        // Only the first fragment created state; early continuations were dropped.
+        assert_eq!(r.pending_count(), 1);
     }
 
     #[test]
@@ -174,7 +181,6 @@ mod tests {
         let body = vec![0x42; 400];
         let frags = make_fragments(&body, 3);
 
-        // Only feed the first fragment
         let result = r.feed(frags[0].clone());
         assert!(result.is_none());
         assert_eq!(r.pending_count(), 1);
@@ -189,7 +195,6 @@ mod tests {
         r.feed(frags[0].clone());
         assert_eq!(r.pending_count(), 1);
 
-        // With max_age=0, everything is expired immediately
         r.evict_expired();
         assert_eq!(r.pending_count(), 0);
     }

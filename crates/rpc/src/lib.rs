@@ -5,7 +5,7 @@ use axum::{
         Path, Query, WebSocketUpgrade,
     },
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use bunker_coin_core::execution::State as ExecutionState;
@@ -18,7 +18,6 @@ use bunkerglow::snapshot::{SnapshotManifest, SnapshotStore};
 use bunkerglow::Slot;
 use ed25519_dalek::SigningKey;
 use futures::{sink::SinkExt, stream::StreamExt};
-use hex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,8 +26,6 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 const MAX_MEMPOOL_SIZE: usize = 10_000;
-
-// -- block types --
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -147,8 +144,6 @@ pub enum BlockUpdate {
     },
 }
 
-// -- websocket types --
-
 #[derive(Serialize, Clone)]
 #[serde(tag = "type")]
 pub enum WebSocketUpdate {
@@ -163,6 +158,10 @@ pub enum WebSocketUpdate {
         effective_throughput_bps_2s: f64,
         packet_loss_rate_2s: f64,
         packets_queued: u64,
+        /// Modem-reported PACTOR speed level; 0 means not yet reported.
+        link_speed_level: u64,
+        /// Bytes received over the window, separate from local transmit counts.
+        bytes_received_2s: u64,
     },
     #[serde(rename = "transaction_received")]
     TransactionReceived {
@@ -181,8 +180,6 @@ pub enum WebSocketUpdate {
     },
 }
 
-// -- node / radio types --
-
 #[derive(Serialize, Clone)]
 pub struct NodeStatus {
     pub node_id: u64,
@@ -197,10 +194,14 @@ pub struct RadioStats {
     pub jitter_ms: u32,
     pub packets_sent: u64,
     pub packets_dropped: u64,
+    /// Messages currently enqueued in the mux awaiting transmission.
+    #[serde(default)]
+    pub packets_queued: u64,
     pub current_throughput_bps: f64,
+    /// Modem-reported PACTOR speed level (0 = not yet reported).
+    #[serde(default)]
+    pub link_speed_level: u64,
 }
-
-// -- transaction / mempool types --
 
 #[derive(Serialize, Clone)]
 pub struct MempoolEntry {
@@ -212,8 +213,6 @@ pub struct MempoolEntry {
     pub body: TransactionBodyResponse,
     pub received_at: u64,
 }
-
-// -- transaction result types --
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -231,8 +230,6 @@ pub struct TxResult {
     pub error: Option<String>,
     pub executed_at: u64,
 }
-
-// -- transaction response types --
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type")]
@@ -295,8 +292,6 @@ pub struct TransactionSummary {
     pub fee: u64,
     pub body: TransactionBodyResponse,
 }
-
-// -- block detail response --
 
 #[derive(Serialize, Clone)]
 pub struct BlockDetailResponse {
@@ -361,8 +356,6 @@ enum TransactionBodyRequest {
     },
 }
 
-// -- shared state --
-
 #[derive(Clone)]
 pub struct SharedState {
     pub blocks: Arc<RwLock<Vec<Block>>>,
@@ -378,18 +371,26 @@ pub struct SharedState {
     pub snapshot_store: Option<Arc<SnapshotStore>>,
 }
 
-// -- hex decode helpers --
-
-fn decode_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
-    <[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| format!("expected 32 bytes, got {}", bytes.len()))
+/// Decode fixed-size bytes from exact-length hex or wallet-style base58.
+fn decode_bytes_any<const N: usize>(s: &str) -> Result<[u8; N], String> {
+    if s.len() == 2 * N && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {e}"))?;
+        return <[u8; N]>::try_from(bytes.as_slice())
+            .map_err(|_| format!("expected {N} bytes, got {}", bytes.len()));
+    }
+    let bytes = bs58::decode(s)
+        .into_vec()
+        .map_err(|e| format!("neither {}-char hex nor base58: {e}", 2 * N))?;
+    <[u8; N]>::try_from(bytes.as_slice())
+        .map_err(|_| format!("expected {N} bytes, got {}", bytes.len()))
 }
 
-fn decode_signature(hex_str: &str) -> Result<[u8; 64], String> {
-    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
-    <[u8; 64]>::try_from(bytes.as_slice())
-        .map_err(|_| format!("expected 64 bytes, got {}", bytes.len()))
+fn decode_pubkey(s: &str) -> Result<[u8; 32], String> {
+    decode_bytes_any::<32>(s)
+}
+
+fn decode_signature(s: &str) -> Result<[u8; 64], String> {
+    decode_bytes_any::<64>(s)
 }
 
 fn decode_token_id(hex_str: &str) -> Result<[u8; 4], String> {
@@ -480,16 +481,14 @@ fn body_type_name(body: &TransactionBody) -> &'static str {
     }
 }
 
-// -- decode / conversion helpers --
-
 fn decode_raw_transaction(raw: &bunkerglow::Transaction) -> Option<CoreTransaction> {
-    // Transaction.0 may have a wincode Vec<u8> length prefix (8-byte LE u64)
-    // wrapping the bincode payload. Try raw first, then skip the prefix.
+    // Accept raw or legacy length-prefixed bincode, with bounded allocation.
+    let config = bincode::config::standard().with_limit::<4096>();
     let data = &raw.0;
-    bincode::serde::decode_from_slice(data, bincode::config::standard())
+    bincode::serde::decode_from_slice(data, config)
         .or_else(|_| {
             if data.len() > 8 {
-                bincode::serde::decode_from_slice(&data[8..], bincode::config::standard())
+                bincode::serde::decode_from_slice(&data[8..], config)
             } else {
                 Err(bincode::error::DecodeError::Other("too short"))
             }
@@ -614,15 +613,11 @@ fn build_api_block(
     }
 }
 
-// -- query params --
-
 #[derive(Deserialize)]
 struct Pagination {
     limit: Option<usize>,
     offset: Option<usize>,
 }
-
-// -- transaction handlers --
 
 async fn submit_transaction(
     state: axum::extract::State<SharedState>,
@@ -669,13 +664,11 @@ async fn submit_transaction(
         signature,
     };
 
-    // server-side signing: if signature is all zeros and sender matches genesis pubkey,
-    // auto-fill the nonce from current execution state and sign it
+    // Zero-signature genesis txs are signed server-side after filling the current nonce.
     if tx.signature == [0u8; 64] {
         if let Some(sk) = &state.genesis_signing_key {
             let genesis_pk = sk.verifying_key().to_bytes();
             if tx.sender == genesis_pk {
-                // auto-fill nonce from current account state
                 let exec = state.execution_state.read().await;
                 let current_nonce = exec.get_account(&genesis_pk).map(|a| a.nonce).unwrap_or(0);
                 drop(exec);
@@ -691,7 +684,6 @@ async fn submit_transaction(
     let hash = hex::encode(tx.hash());
     let body_type = body_type_name(&tx.body);
 
-    // duplicate check + size limit
     {
         let mempool = state.mempool.read().await;
         if mempool.iter().any(|e| e.hash == hash) {
@@ -781,9 +773,6 @@ async fn mempool_transaction(
     axum::http::StatusCode::NOT_FOUND.into_response()
 }
 
-// -- block handlers --
-
-// this probably qualifies for a rewrite soon:tm:
 async fn blocks(
     Query(p): Query<Pagination>,
     state: axum::extract::State<SharedState>,
@@ -800,8 +789,16 @@ async fn blocks(
         let bs = bs_arc.read().await;
 
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
+        // Persistent nodes may have no in-memory blocks; use finalized height with headroom.
+        let highest_finalized_slot = current_slot(&state).await;
+        let top = highest_mem_slot.max(highest_finalized_slot) + 200;
 
-        for slot_u64 in 0..=highest_mem_slot + 200 {
+        // Bound blockstore scans to the page window plus skip-slot headroom.
+        let want = offset + limit;
+        let window = (want * 3).max(400) as u64;
+        let low = top.saturating_sub(window);
+
+        for slot_u64 in low..=top {
             if all_blocks.iter().any(|b| b.slot() == slot_u64) {
                 continue;
             }
@@ -819,7 +816,52 @@ async fn blocks(
         }
     }
 
-    all_blocks.sort_by(|a, b| b.slot().cmp(&a.slot()));
+    // Finalized blocks finalize ancestors; walk parent links instead of using a
+    // slot frontier so skip-certified dead blocks are not falsely finalized.
+    {
+        let mut index_by_hash: HashMap<String, usize> = HashMap::new();
+        for (i, b) in all_blocks.iter().enumerate() {
+            if let Block::Block { hash, .. } = b {
+                index_by_hash.insert(hash.clone(), i);
+            }
+        }
+        let mut cursor = all_blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b,
+                    Block::Block {
+                        status: SlotStatus::Finalized,
+                        ..
+                    }
+                )
+            })
+            .max_by_key(|b| b.slot())
+            .and_then(|b| match b {
+                Block::Block { hash, .. } => Some(hash.clone()),
+                _ => None,
+            });
+        while let Some(h) = cursor {
+            let Some(&i) = index_by_hash.get(&h) else {
+                break;
+            };
+            // Removing each hash guards against corrupt parent cycles.
+            index_by_hash.remove(&h);
+            cursor = match &mut all_blocks[i] {
+                Block::Block {
+                    status,
+                    parent_hash,
+                    ..
+                } => {
+                    *status = SlotStatus::Finalized;
+                    Some(parent_hash.clone())
+                }
+                _ => None,
+            };
+        }
+    }
+
+    all_blocks.sort_by_key(|b| std::cmp::Reverse(b.slot()));
 
     let total = all_blocks.len();
     if offset >= total {
@@ -896,7 +938,6 @@ async fn block_by_slot(
 ) -> impl IntoResponse {
     let include_txs = params.include_transactions.unwrap_or(false);
 
-    // check in-memory blocks first
     {
         let blocks = state.blocks.read().await;
         if let Some(block) = blocks.iter().find(|b| b.slot() == slot_num) {
@@ -908,7 +949,6 @@ async fn block_by_slot(
         }
     }
 
-    // fall back to blockstore
     if let Some(bs_arc) = &state.blockstore {
         let bs = bs_arc.read().await;
         let slot = Slot::new(slot_num);
@@ -938,11 +978,9 @@ async fn get_transaction(
     Path(hash): Path<String>,
     state: axum::extract::State<SharedState>,
 ) -> impl IntoResponse {
-    // check tx_results first (finalized transactions)
     {
         let results = state.tx_results.read().await;
         if let Some(result) = results.get(&hash) {
-            // find the original tx details from blockstore
             let (sender, nonce, fee, body) = find_tx_details_in_blockstore(&state, &hash)
                 .await
                 .unwrap_or_else(|| ("unknown".to_string(), 0, 0, None));
@@ -969,7 +1007,6 @@ async fn get_transaction(
         }
     }
 
-    // check mempool (in-memory)
     {
         let pool = state.mempool.read().await;
         if let Some(entry) = pool.iter().find(|e| e.hash == hash) {
@@ -985,7 +1022,6 @@ async fn get_transaction(
         }
     }
 
-    // scan blockstore (confirmed but not yet finalized/executed)
     if let Some((sender, nonce, fee, body, slot_u64, blk_hash)) =
         find_tx_in_blockstore(&state, &hash).await
     {
@@ -1007,6 +1043,93 @@ async fn get_transaction(
     }
 
     axum::http::StatusCode::NOT_FOUND.into_response()
+}
+
+/// List finalized-chain transactions newest-first, annotated from `tx_results`.
+async fn list_transactions(
+    Query(p): Query<Pagination>,
+    state: axum::extract::State<SharedState>,
+) -> Json<serde_json::Value> {
+    let limit = p.limit.unwrap_or(50).min(200);
+    let offset = p.offset.unwrap_or(0);
+
+    let mut txs: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(bs_arc) = &state.blockstore {
+        let bs = bs_arc.read().await;
+        let results = state.tx_results.read().await;
+
+        let highest_finalized_slot = current_slot(&state).await;
+
+        // Scan newest-first, bounded by page need and a fixed recent window.
+        let need = offset + limit;
+        let max_scan: u64 = 20_000;
+        let scan_floor = highest_finalized_slot.saturating_sub(max_scan);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for slot_u64 in (scan_floor..=highest_finalized_slot).rev() {
+            if txs.len() >= need {
+                break;
+            }
+            let slot = Slot::new(slot_u64);
+            let Some(hash) = bs.canonical_block_hash(slot) else {
+                continue;
+            };
+            let block_hash: DoubleMerkleRoot = hash.clone().into();
+            let Some(blk) = bs.get_block(&(slot, block_hash)) else {
+                continue;
+            };
+            let blk_hash_hex = hex::encode(&hash);
+            for raw_tx in blk.transactions() {
+                let Some(core_tx) = decode_raw_transaction(raw_tx) else {
+                    continue; // bloat padding / undecodable — not a real tx
+                };
+                let tx_hash = hex::encode(core_tx.hash());
+                if let Some(r) = results.get(&tx_hash) {
+                    // Emit duplicate inclusions only where they executed.
+                    if r.slot != slot_u64 {
+                        continue;
+                    }
+                }
+                if !seen.insert(tx_hash.clone()) {
+                    continue;
+                }
+                let status = match results.get(&tx_hash) {
+                    Some(r) => serde_json::json!({
+                        "location": "finalized",
+                        "slot": r.slot,
+                        "block_hash": r.block_hash,
+                        "success": matches!(r.status, TxFinalStatus::Finalized),
+                        "error": r.error,
+                    }),
+                    None => serde_json::json!({
+                        "location": "confirmed",
+                        "slot": slot_u64,
+                        "block_hash": blk_hash_hex,
+                    }),
+                };
+                txs.push(serde_json::json!({
+                    "hash": tx_hash,
+                    "sender": hex::encode(core_tx.sender),
+                    "nonce": core_tx.nonce,
+                    "fee": core_tx.fee,
+                    "slot": slot_u64,
+                    "block_hash": blk_hash_hex,
+                    "body": core_tx_to_body_response(&core_tx.body),
+                    "status": status,
+                }));
+            }
+        }
+    }
+
+    let total = txs.len();
+    let page: Vec<serde_json::Value> = txs.into_iter().skip(offset).take(limit).collect();
+
+    Json(serde_json::json!({
+        "transactions": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }))
 }
 
 async fn find_tx_details_in_blockstore(
@@ -1034,8 +1157,14 @@ async fn find_tx_in_blockstore(
     let blocks = state.blocks.read().await;
     let highest_mem_slot = blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
     drop(blocks);
+    // Fall back to finalized height when in-memory blocks are absent.
+    let highest_finalized_slot = current_slot(state).await;
 
-    for slot_u64 in 0..=highest_mem_slot + 200 {
+    // Wallet lookups scan tip-down within a fixed recent window.
+    let top = highest_mem_slot.max(highest_finalized_slot) + 200;
+    let max_scan: u64 = 20_000;
+    let floor = top.saturating_sub(max_scan);
+    for slot_u64 in (floor..=top).rev() {
         let slot = Slot::new(slot_u64);
         if let Some(blk_hash) = bs.canonical_block_hash(slot) {
             let block_hash: DoubleMerkleRoot = blk_hash.clone().into();
@@ -1061,8 +1190,6 @@ async fn find_tx_in_blockstore(
     }
     None
 }
-
-// -- websocket --
 
 async fn websocket_handler(
     ws: WebSocketUpgrade,
@@ -1098,8 +1225,6 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
         _ = &mut recv_task => send_task.abort(),
     }
 }
-
-// -- account / token handlers --
 
 async fn get_account(
     Path(pubkey_hex): Path<String>,
@@ -1161,8 +1286,6 @@ async fn get_tokens(state: axum::extract::State<SharedState>) -> Json<serde_json
     Json(serde_json::json!({ "tokens": tokens }))
 }
 
-// -- single token handler --
-
 async fn get_token(
     Path(id_hex): Path<String>,
     state: axum::extract::State<SharedState>,
@@ -1197,8 +1320,6 @@ async fn get_token(
             .into_response()
     }
 }
-
-// -- token holders handler --
 
 async fn get_token_holders(
     Path(id_hex): Path<String>,
@@ -1238,7 +1359,6 @@ async fn get_token_holders(
         })
         .collect();
 
-    // sort by balance descending for deterministic output
     holders.sort_by(|a, b| {
         b["balance"]
             .as_u64()
@@ -1260,8 +1380,6 @@ async fn get_token_holders(
     }))
     .into_response()
 }
-
-// -- account tokens handler --
 
 async fn get_account_tokens(
     Path(pubkey_hex): Path<String>,
@@ -1312,8 +1430,6 @@ async fn get_account_tokens(
     .into_response()
 }
 
-// -- staking overview handler --
-
 async fn get_staking(state: axum::extract::State<SharedState>) -> Json<serde_json::Value> {
     let exec = state.execution_state.read().await;
     let validator_set: Vec<serde_json::Value> = exec
@@ -1341,8 +1457,6 @@ async fn get_staking(state: axum::extract::State<SharedState>) -> Json<serde_jso
         "current_epoch": current_epoch,
     }))
 }
-
-// -- snapshot bootstrap handlers --
 
 fn manifest_json(manifest: &SnapshotManifest) -> serde_json::Value {
     serde_json::json!({
@@ -1523,8 +1637,6 @@ async fn get_snapshot_chunk(
     }
 }
 
-// -- genesis handler --
-
 async fn get_genesis(state: axum::extract::State<SharedState>) -> impl IntoResponse {
     let Some(sk) = &state.genesis_signing_key else {
         return (
@@ -1548,11 +1660,43 @@ async fn get_genesis(state: axum::extract::State<SharedState>) -> impl IntoRespo
     .into_response()
 }
 
-// -- server --
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_pubkey_accepts_base58() {
+        let key: [u8; 32] = [7u8; 32];
+        let b58_str = bs58::encode(key).into_string();
+        assert_eq!(decode_pubkey(&b58_str).unwrap(), key);
+        assert_eq!(decode_pubkey(&hex::encode(key)).unwrap(), key);
+        let hexy = "aa".repeat(32);
+        assert_eq!(decode_pubkey(&hexy).unwrap(), [0xaa; 32]);
+    }
+
+    #[test]
+    fn decode_signature_accepts_base58() {
+        let sig: [u8; 64] = [9u8; 64];
+        let b58_str = bs58::encode(sig).into_string();
+        assert_eq!(decode_signature(&b58_str).unwrap(), sig);
+        assert_eq!(decode_signature(&hex::encode(sig)).unwrap(), sig);
+        assert!(decode_signature("not-a-signature").is_err());
+    }
+
+    #[test]
+    fn tx_id_roundtrips_base58_and_hex() {
+        let id: [u8; 32] = [3u8; 32];
+        let b58_str = bs58::encode(id).into_string();
+        assert_eq!(tx_id_to_hex(&b58_str).unwrap(), hex::encode(id));
+        assert_eq!(tx_id_to_hex(&hex::encode(id)).unwrap(), hex::encode(id));
+    }
+
+    #[test]
+    fn ctx_value_matches_solana_rpcresponse_shape() {
+        let v = ctx_value(42, serde_json::json!(1000));
+        assert_eq!(v["context"]["slot"], 42);
+        assert_eq!(v["value"], 1000);
+    }
 
     #[test]
     fn decode_pubkey_valid() {
@@ -1576,7 +1720,9 @@ mod tests {
     fn decode_pubkey_invalid_hex() {
         let result = decode_pubkey("not_valid_hex");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid hex"));
+        assert!(result
+            .unwrap_err()
+            .contains("neither 64-char hex nor base58"));
     }
 
     #[test]
@@ -1584,7 +1730,6 @@ mod tests {
         let hex_str = "00".repeat(16);
         let result = decode_pubkey(&hex_str);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expected 32 bytes"));
     }
 
     #[test]
@@ -1606,7 +1751,6 @@ mod tests {
         let hex_str = "00".repeat(32);
         let result = decode_signature(&hex_str);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expected 64 bytes"));
     }
 
     #[test]
@@ -1733,7 +1877,6 @@ mod tests {
     #[test]
     fn convert_body_mint_ticker_at_bounds() {
         let hash = "00".repeat(32);
-        // exactly 3 chars (min)
         let body = TransactionBodyRequest::Mint {
             ticker: "ABC".to_string(),
             max_supply: 100,
@@ -1741,7 +1884,6 @@ mod tests {
         };
         assert!(convert_body(body).is_ok());
 
-        // exactly MAX_TICKER_LEN chars (max)
         let body = TransactionBodyRequest::Mint {
             ticker: "A".repeat(MAX_TICKER_LEN),
             max_supply: 100,
@@ -1994,8 +2136,6 @@ mod tests {
         assert!(json.contains("\"type\":\"skip\""));
     }
 
-    // -- decode_raw_transaction tests --
-
     fn make_core_tx(body: TransactionBody) -> CoreTransaction {
         CoreTransaction {
             sender: [0xAA; 32],
@@ -2033,8 +2173,6 @@ mod tests {
         let raw = bunkerglow::Transaction(vec![]);
         assert!(decode_raw_transaction(&raw).is_none());
     }
-
-    // -- core_tx_to_body_response tests --
 
     #[test]
     fn core_tx_to_body_response_transfer() {
@@ -2158,8 +2296,6 @@ mod tests {
         }
     }
 
-    // -- BlockDetailResponse serialization tests --
-
     #[test]
     fn block_detail_response_without_transactions() {
         let block = Block::Block {
@@ -2177,9 +2313,7 @@ mod tests {
             transactions: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
-        // without transactions, should look the same as a plain Block
         let plain_json = serde_json::to_string(&block).unwrap();
-        // both should parse to same value (no extra "transactions" key)
         let resp_val: serde_json::Value = serde_json::from_str(&json).unwrap();
         let plain_val: serde_json::Value = serde_json::from_str(&plain_json).unwrap();
         assert_eq!(resp_val, plain_val);
@@ -2219,8 +2353,6 @@ mod tests {
         assert_eq!(val["slot"], 5);
     }
 
-    // -- TransactionBodyResponse serialization --
-
     #[test]
     fn transaction_body_response_json_has_type_tag() {
         let resp = TransactionBodyResponse::Transfer {
@@ -2234,6 +2366,559 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"type\":\"UnJail\""));
     }
+}
+
+// Solana-style JSON-RPC adapter; methods dispatch through REST handlers.
+#[derive(serde::Deserialize)]
+struct JsonRpcRequest {
+    jsonrpc: Option<String>,
+    id: Option<serde_json::Value>,
+    method: Option<String>,
+    #[serde(default)]
+    params: Vec<serde_json::Value>,
+}
+
+fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+fn rpc_ok(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+/// Solana `RpcResponse<T>` envelope; wallets read results from `.value`.
+fn ctx_value(slot: u64, value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "context": { "slot": slot, "apiVersion": "bunkercoin-1.0" }, "value": value })
+}
+
+fn b58(bytes: &[u8]) -> String {
+    bs58::encode(bytes).into_string()
+}
+
+/// Highest finalized slot exposed as wallet-visible context.
+async fn current_slot(state: &SharedState) -> u64 {
+    state
+        .nodes
+        .read()
+        .await
+        .iter()
+        .map(|n| n.finalized_slot)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Parses a wallet transaction id into the node's lowercase hex key.
+fn tx_id_to_hex(s: &str) -> Result<String, String> {
+    decode_bytes_any::<32>(s).map(hex::encode)
+}
+
+/// Decodes a `sendTransaction`/`simulateTransaction` first param: a base64
+/// native transaction string, or a JSON transaction object passed straight
+/// through. Returns `None` if neither shape is present.
+fn decode_tx_param(p: &[serde_json::Value]) -> Option<serde_json::Value> {
+    match p.first() {
+        Some(serde_json::Value::String(b64)) => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        }
+        Some(tx) if tx.is_object() => Some(tx.clone()),
+        _ => None,
+    }
+}
+
+/// Converts a hex `hash` field (as the REST API returns) to a bare base58
+/// string, as wallets expect. Returns `None` if the field is missing or not a
+/// 32-byte hex hash.
+fn hash_field_to_b58(v: &serde_json::Value) -> Option<String> {
+    v.get("hash")
+        .and_then(|h| h.as_str())
+        .and_then(|h| decode_bytes_any::<32>(h).ok())
+        .map(|bytes| b58(&bytes))
+}
+
+/// Recommended fee surfaced through `getFeeForMessage`; chain checks affordability.
+const RECOMMENDED_TX_FEE: u64 = 100;
+
+/// Preflights wallet transactions against signature, nonce, and balance state.
+async fn simulate_tx(state: &SharedState, tx_json: &serde_json::Value) -> Option<String> {
+    let req: SubmitTransactionRequest = match serde_json::from_value(tx_json.clone()) {
+        Ok(r) => r,
+        Err(e) => return Some(format!("malformed transaction: {e}")),
+    };
+    let sender = match decode_pubkey(&req.sender) {
+        Ok(k) => k,
+        Err(e) => return Some(format!("invalid sender: {e}")),
+    };
+    let signature = match decode_signature(&req.signature) {
+        Ok(s) => s,
+        Err(e) => return Some(format!("invalid signature: {e}")),
+    };
+    let body = match convert_body(req.body) {
+        Ok(b) => b,
+        Err(e) => return Some(format!("invalid body: {e}")),
+    };
+    let tx = CoreTransaction {
+        sender,
+        nonce: req.nonce,
+        fee: req.fee,
+        body,
+        signature,
+    };
+
+    // Genesis zero-signature txs are server-signed; all others verify normally.
+    let genesis_pk = state
+        .genesis_signing_key
+        .as_ref()
+        .map(|sk| sk.verifying_key().to_bytes());
+    let server_signed = tx.signature == [0u8; 64] && Some(tx.sender) == genesis_pk;
+    if !server_signed {
+        use ed25519_dalek::Verifier;
+        let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&tx.sender) else {
+            return Some("sender is not a valid ed25519 public key".into());
+        };
+        let sig = ed25519_dalek::Signature::from_bytes(&tx.signature);
+        if vk.verify(&tx.signing_hash(), &sig).is_err() {
+            return Some("signature verification failed".into());
+        }
+    }
+
+    let exec = state.execution_state.read().await;
+    let account = exec.get_account(&tx.sender);
+    let (balance, expected_nonce) = account
+        .map(|a| (a.native_balance, a.nonce))
+        .unwrap_or((0, 0));
+    if !server_signed && tx.nonce != expected_nonce {
+        return Some(format!(
+            "nonce mismatch: transaction has {}, account is at {expected_nonce}",
+            tx.nonce
+        ));
+    }
+    let needed = match &tx.body {
+        TransactionBody::Transfer { amount, .. } => tx.fee.saturating_add(*amount),
+        _ => tx.fee,
+    };
+    if balance < needed {
+        return Some(format!(
+            "insufficient balance: have {balance}, need {needed}"
+        ));
+    }
+    None
+}
+
+/// Builds faucet transfer JSON that reuses the zero-signature server-sign path.
+async fn build_airdrop_tx(
+    state: &SharedState,
+    recipient: [u8; 32],
+    amount: u64,
+) -> Result<serde_json::Value, String> {
+    let Some(sk) = &state.genesis_signing_key else {
+        return Err("airdrop unavailable: node has no genesis keypair".into());
+    };
+    let genesis_pk = sk.verifying_key().to_bytes();
+    Ok(serde_json::json!({
+        "sender": hex::encode(genesis_pk),
+        "nonce": 0,
+        "fee": RECOMMENDED_TX_FEE,
+        "signature": hex::encode([0u8; 64]),
+        "body": { "Transfer": { "to": hex::encode(recipient), "amount": amount } },
+    }))
+}
+
+fn param_str(params: &[serde_json::Value], i: usize) -> Result<&str, ()> {
+    params
+        .get(i)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or(())
+}
+
+fn param_u64(params: &[serde_json::Value], i: usize, fallback: u64) -> Result<u64, ()> {
+    match params.get(i) {
+        None => Ok(fallback),
+        Some(v) => v.as_u64().ok_or(()),
+    }
+}
+
+/// Dispatches through the REST router and parses the JSON body.
+async fn rest_dispatch(
+    rest: &Router,
+    method: axum::http::Method,
+    path_and_query: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, (i64, String)> {
+    use tower::util::ServiceExt;
+
+    let builder = axum::http::Request::builder()
+        .method(method)
+        .uri(path_and_query);
+    let request = match body {
+        Some(b) => builder
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(b).unwrap_or_default(),
+            )),
+        None => builder.body(axum::body::Body::empty()),
+    }
+    .map_err(|e| (-32603i64, format!("internal request build failed: {e}")))?;
+
+    let response = rest
+        .clone()
+        .oneshot(request)
+        .await
+        .map_err(|_| (-32603i64, "internal dispatch failed".to_owned()))?;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .map_err(|e| (-32603i64, format!("body read failed: {e}")))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+
+    if status.is_success() {
+        Ok(value)
+    } else {
+        let message = value
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("upstream status {status}"));
+        Err((-32000, message))
+    }
+}
+
+async fn handle_rpc_call(
+    rest: &Router,
+    state: &SharedState,
+    call: JsonRpcRequest,
+) -> serde_json::Value {
+    let id = call.id.unwrap_or(serde_json::Value::Null);
+    if call.jsonrpc.as_deref() != Some("2.0") || call.method.is_none() {
+        return rpc_error(id, -32600, "Invalid request");
+    }
+    let method = call.method.unwrap();
+    let p = &call.params;
+    use axum::http::Method as M;
+
+    // Map each wallet method to REST dispatch or a local compatibility response.
+    let dispatched: Result<Result<serde_json::Value, (i64, String)>, ()> = match method.as_str() {
+        "getHealth" => Ok(Ok(serde_json::json!("ok"))),
+        "getSlot" => Ok(match rest_dispatch(rest, M::GET, "/nodes", None).await {
+            Ok(nodes) => Ok(serde_json::json!(nodes
+                .as_array()
+                .map(|ns| ns
+                    .iter()
+                    .filter_map(|n| n.get("finalized_slot").and_then(|s| s.as_u64()))
+                    .max()
+                    .unwrap_or(0))
+                .unwrap_or(0))),
+            Err(e) => Err(e),
+        }),
+        "getNodes" => Ok(rest_dispatch(rest, M::GET, "/nodes", None).await),
+        "getGenesis" => Ok(rest_dispatch(rest, M::GET, "/genesis", None).await),
+        "getStaking" => Ok(rest_dispatch(rest, M::GET, "/staking", None).await),
+        "getTokens" => Ok(rest_dispatch(rest, M::GET, "/tokens", None).await),
+        "getBlock" => match param_u64(p, 0, u64::MAX) {
+            Ok(slot) if slot != u64::MAX => {
+                Ok(rest_dispatch(rest, M::GET, &format!("/block/slot/{slot}"), None).await)
+            }
+            _ => Err(()),
+        },
+        "getBlocks" => match (param_u64(p, 0, 20), param_u64(p, 1, 0)) {
+            (Ok(limit), Ok(offset)) => Ok(rest_dispatch(
+                rest,
+                M::GET,
+                &format!("/blocks?limit={limit}&offset={offset}"),
+                None,
+            )
+            .await),
+            _ => Err(()),
+        },
+        // Missing accounts return balance 0 inside Solana's RpcResponse shape.
+        "getBalance" => match param_str(p, 0).map(decode_pubkey) {
+            Ok(Ok(pk)) => {
+                let slot = current_slot(state).await;
+                let balance = state
+                    .execution_state
+                    .read()
+                    .await
+                    .get_account(&pk)
+                    .map(|a| a.native_balance)
+                    .unwrap_or(0);
+                Ok(Ok(ctx_value(slot, serde_json::json!(balance))))
+            }
+            _ => Err(()),
+        },
+        // Nonexistent accounts return `value: null`; chain extras live under `data`.
+        "getAccountInfo" => match param_str(p, 0).map(decode_pubkey) {
+            Ok(Ok(pk)) => {
+                let slot = current_slot(state).await;
+                let value = match state.execution_state.read().await.get_account(&pk) {
+                    None => serde_json::Value::Null,
+                    Some(account) => {
+                        let tokens: serde_json::Map<String, serde_json::Value> = account
+                            .token_balances
+                            .iter()
+                            .map(|(tid, bal)| (hex::encode(tid), serde_json::json!(*bal)))
+                            .collect();
+                        serde_json::json!({
+                            "lamports": account.native_balance,
+                            "owner": b58(&[0u8; 32]),
+                            "executable": false,
+                            "rentEpoch": 0,
+                            "space": 0,
+                            "data": {
+                                "nonce": account.nonce,
+                                "tokenBalances": tokens,
+                            },
+                        })
+                    }
+                };
+                Ok(Ok(ctx_value(slot, value)))
+            }
+            _ => Err(()),
+        },
+        "getTokenAccountsByOwner" => match param_str(p, 0) {
+            Ok(pk) => {
+                let slot = current_slot(state).await;
+                Ok(
+                    match rest_dispatch(rest, M::GET, &format!("/accounts/{pk}/tokens"), None).await
+                    {
+                        Ok(v) => Ok(ctx_value(slot, v)),
+                        Err(e) => Err(e),
+                    },
+                )
+            }
+            Err(()) => Err(()),
+        },
+        // Wallets expect this Solana shape even though transactions are nonce-based.
+        "getLatestBlockhash" => {
+            let slot = current_slot(state).await;
+            // Use REST's merged block view and ignore skip entries with placeholder hashes.
+            let blockhash = match rest_dispatch(rest, M::GET, "/blocks?limit=8", None).await {
+                Ok(list) => list
+                    .as_array()
+                    .and_then(|blocks| {
+                        blocks
+                            .iter()
+                            .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("block"))
+                    })
+                    .and_then(hash_field_to_b58)
+                    .unwrap_or_else(|| b58(&[0u8; 32])),
+                Err(_) => b58(&[0u8; 32]),
+            };
+            Ok(Ok(ctx_value(
+                slot,
+                serde_json::json!({ "blockhash": blockhash, "lastValidBlockHeight": slot + 300 }),
+            )))
+        }
+        "getBlockHeight" => Ok(Ok(serde_json::json!(current_slot(state).await))),
+        "getVersion" => Ok(Ok(
+            serde_json::json!({ "solana-core": "2.0.0-bunkercoin", "feature-set": 1 }),
+        )),
+        "getGenesisHash" => {
+            // Stable wallet-visible cluster id: genesis pubkey, or zero key fallback.
+            let gh = state
+                .genesis_signing_key
+                .as_ref()
+                .map(|sk| b58(&sk.verifying_key().to_bytes()))
+                .unwrap_or_else(|| b58(&[0u8; 32]));
+            Ok(Ok(serde_json::json!(gh)))
+        }
+        "getMinimumBalanceForRentExemption" => Ok(Ok(serde_json::json!(0))),
+        "getFeeForMessage" => {
+            let slot = current_slot(state).await;
+            Ok(Ok(ctx_value(slot, serde_json::json!(RECOMMENDED_TX_FEE))))
+        }
+        // Mempool maps to processed; executed finalized blocks map to finalized.
+        "getSignatureStatuses" => match p.first().and_then(|v| v.as_array()) {
+            Some(ids) => {
+                let slot = current_slot(state).await;
+                let results = state.tx_results.read().await;
+                let mempool = state.mempool.read().await;
+                let statuses: Vec<serde_json::Value> = ids
+                    .iter()
+                    .map(|idv| {
+                        let Some(hex_id) = idv.as_str().and_then(|s| tx_id_to_hex(s).ok()) else {
+                            return serde_json::Value::Null;
+                        };
+                        if let Some(res) = results.get(&hex_id) {
+                            let err = match res.status {
+                                TxFinalStatus::Finalized => serde_json::Value::Null,
+                                TxFinalStatus::Failed => serde_json::json!({
+                                    "message": res.error.clone().unwrap_or_default()
+                                }),
+                            };
+                            return serde_json::json!({
+                                "slot": res.slot,
+                                "confirmations": serde_json::Value::Null,
+                                "confirmationStatus": "finalized",
+                                "err": err,
+                                "status": if err.is_null() {
+                                    serde_json::json!({ "Ok": null })
+                                } else {
+                                    serde_json::json!({ "Err": err })
+                                },
+                            });
+                        }
+                        if mempool.iter().any(|e| e.hash == hex_id) {
+                            return serde_json::json!({
+                                "slot": slot,
+                                "confirmations": 0,
+                                "confirmationStatus": "processed",
+                                "err": serde_json::Value::Null,
+                                "status": { "Ok": null },
+                            });
+                        }
+                        serde_json::Value::Null
+                    })
+                    .collect();
+                Ok(Ok(ctx_value(slot, serde_json::json!(statuses))))
+            }
+            None => Err(()),
+        },
+        "getToken" => match param_str(p, 0) {
+            Ok(tid) => Ok(rest_dispatch(rest, M::GET, &format!("/tokens/{tid}"), None).await),
+            Err(()) => Err(()),
+        },
+        "getTokenHolders" => match param_str(p, 0) {
+            Ok(tid) => {
+                Ok(rest_dispatch(rest, M::GET, &format!("/tokens/{tid}/holders"), None).await)
+            }
+            Err(()) => Err(()),
+        },
+        // Base64 native transaction in, base58 transaction id out.
+        "sendTransaction" => {
+            match decode_tx_param(p) {
+                Some(tx) => Ok(
+                    match rest_dispatch(rest, M::POST, "/transactions", Some(&tx)).await {
+                        Ok(resp) => {
+                            // REST returns hex; wallets expect bare base58 id.
+                            match hash_field_to_b58(&resp) {
+                                Some(id) => Ok(serde_json::json!(id)),
+                                None => Ok(resp),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    },
+                ),
+                None => Err(()),
+            }
+        }
+        // Preflight shape follows Solana `RpcResponse<{err, logs}>`.
+        "simulateTransaction" => match decode_tx_param(p) {
+            Some(tx) => {
+                let slot = current_slot(state).await;
+                let err = simulate_tx(state, &tx).await;
+                Ok(Ok(ctx_value(
+                    slot,
+                    serde_json::json!({
+                        "err": err.map(|e| serde_json::json!({ "message": e }))
+                                  .unwrap_or(serde_json::Value::Null),
+                        "logs": [],
+                        "unitsConsumed": 0,
+                    }),
+                )))
+            }
+            None => Err(()),
+        },
+        // Devnet faucet mirrors Solana requestAirdrop and returns a base58 tx id.
+        "requestAirdrop" => match (param_str(p, 0).map(decode_pubkey), param_u64(p, 1, 0)) {
+            (Ok(Ok(recipient)), Ok(amount)) if amount > 0 => {
+                match build_airdrop_tx(state, recipient, amount).await {
+                    Ok(tx) => Ok(
+                        match rest_dispatch(rest, M::POST, "/transactions", Some(&tx)).await {
+                            Ok(resp) => match hash_field_to_b58(&resp) {
+                                Some(id) => Ok(serde_json::json!(id)),
+                                None => Ok(resp),
+                            },
+                            Err(e) => Err(e),
+                        },
+                    ),
+                    Err(msg) => Ok(Err((-32601, msg))),
+                }
+            }
+            _ => Err(()),
+        },
+        "getTransaction" => match param_str(p, 0) {
+            Ok(hash) => {
+                Ok(rest_dispatch(rest, M::GET, &format!("/transactions/{hash}"), None).await)
+            }
+            Err(()) => Err(()),
+        },
+        "getTransactions" => match (param_u64(p, 0, 50), param_u64(p, 1, 0)) {
+            (Ok(limit), Ok(offset)) => Ok(rest_dispatch(
+                rest,
+                M::GET,
+                &format!("/transactions?limit={limit}&offset={offset}"),
+                None,
+            )
+            .await),
+            _ => Err(()),
+        },
+        "getMempool" => match (param_u64(p, 0, 100), param_u64(p, 1, 0)) {
+            (Ok(limit), Ok(offset)) => Ok(rest_dispatch(
+                rest,
+                M::GET,
+                &format!("/mempool?limit={limit}&offset={offset}"),
+                None,
+            )
+            .await),
+            _ => Err(()),
+        },
+        _ => return rpc_error(id, -32601, "Method not found"),
+    };
+
+    match dispatched {
+        Err(()) => rpc_error(id, -32602, "Invalid params"),
+        Ok(Ok(result)) => rpc_ok(id, result),
+        Ok(Err((code, message))) => rpc_error(id, code, &message),
+    }
+}
+
+async fn jsonrpc_handler(
+    axum::extract::Extension(rest): axum::extract::Extension<Router>,
+    axum::extract::Extension(state): axum::extract::Extension<SharedState>,
+    body: String,
+) -> Json<serde_json::Value> {
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(rpc_error(serde_json::Value::Null, -32700, "Parse error")),
+    };
+
+    if let serde_json::Value::Array(calls) = payload {
+        if calls.is_empty() {
+            return Json(rpc_error(
+                serde_json::Value::Null,
+                -32600,
+                "Invalid request",
+            ));
+        }
+        let mut out = Vec::with_capacity(calls.len());
+        for call in calls {
+            let parsed: JsonRpcRequest = serde_json::from_value(call).unwrap_or(JsonRpcRequest {
+                jsonrpc: None,
+                id: None,
+                method: None,
+                params: Vec::new(),
+            });
+            out.push(handle_rpc_call(&rest, &state, parsed).await);
+        }
+        return Json(serde_json::Value::Array(out));
+    }
+
+    let parsed: JsonRpcRequest = match serde_json::from_value(payload) {
+        Ok(r) => r,
+        Err(_) => {
+            return Json(rpc_error(
+                serde_json::Value::Null,
+                -32600,
+                "Invalid request",
+            ))
+        }
+    };
+    Json(handle_rpc_call(&rest, &state, parsed).await)
 }
 
 pub async fn run_api(state: SharedState) {
@@ -2254,7 +2939,10 @@ pub async fn run_api(state: SharedState) {
         .route("/block/{hash}", get(block))
         .route("/block/slot/{slot_num}", get(block_by_slot))
         .route("/transactions/{hash}", get(get_transaction))
-        .route("/transactions", post(submit_transaction))
+        .route(
+            "/transactions",
+            get(list_transactions).post(submit_transaction),
+        )
         .route("/mempool", get(mempool))
         .route("/mempool/{hash}", get(mempool_transaction))
         .route("/accounts/{pubkey}", get(get_account))
@@ -2268,12 +2956,23 @@ pub async fn run_api(state: SharedState) {
         .route("/snapshots/{epoch}/chunks/{index}", get(get_snapshot_chunk))
         .route("/genesis", get(get_genesis))
         .route("/ws", get(websocket_handler))
+        .layer(cors.clone())
+        .with_state(state.clone());
+    let jsonrpc_state = state;
+    // JSON-RPC at POST / reuses the REST router for native behavior.
+    let app = Router::new()
+        .route("/", axum::routing::post(jsonrpc_handler))
+        .layer(axum::extract::Extension(app.clone()))
+        .layer(axum::extract::Extension(jsonrpc_state))
         .layer(cors)
-        .with_state(state);
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:3001").await {
+        .merge(app);
+    // `BUNKER_RPC_ADDR` overrides the default loopback bind for remote access.
+    let bind_addr =
+        std::env::var("BUNKER_RPC_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".to_owned());
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("failed to bind API server on 127.0.0.1:3001: {err}");
+            eprintln!("failed to bind API server on {bind_addr}: {err}");
             return;
         }
     };

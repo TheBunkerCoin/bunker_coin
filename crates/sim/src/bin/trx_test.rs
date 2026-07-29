@@ -1,12 +1,4 @@
-//! Test TRX CI-V frequency control on an SCS PACTOR modem.
-//!
-//! ```text
-//! cargo run -p bunker_coin_sim --bin trx_test -- \
-//!   --port /dev/ttyUSB0 --frequency 14079.0
-//! ```
-//!
-//! This initializes the modem into terminal mode, queries the TRX CI-V
-//! configuration, and attempts to tune the radio to the given frequency.
+//! TRX CI-V frequency-control smoke test for an SCS PACTOR modem.
 
 use std::time::Duration;
 
@@ -77,7 +69,6 @@ async fn main() -> anyhow::Result<()> {
     println!("Frequency: {} kHz", args.frequency);
     println!();
 
-    // Open serial port
     let mut serial = tokio_serial::new(&args.port, args.baud)
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
@@ -89,37 +80,30 @@ async fn main() -> anyhow::Result<()> {
     let _ = serial.write_request_to_send(true);
     println!("Serial port opened.\n");
 
-    // Drain any buffered data
     println!("--- Draining buffer ---");
     read_response(&mut serial, 500).await;
 
-    // Exit any existing hostmode
     println!("--- Exiting any hostmode ---");
     serial.write_all(b"JHOST0\r").await?;
     serial.flush().await?;
     tokio::time::sleep(Duration::from_millis(1000)).await;
     read_response(&mut serial, 500).await;
 
-    // Sync terminal
     println!("\n--- Terminal sync ---");
     send_cmd(&mut serial, "").await?;
 
-    // Check modem responds
     println!("\n--- Modem identity ---");
     send_cmd(&mut serial, "MYcall").await?;
 
-    // Query TRX CI-V config
     println!("\n--- TRX CI-V configuration ---");
     let trx_config = send_cmd(&mut serial, "TRX TYpe").await?;
     if trx_config.trim().is_empty() || trx_config.contains("no response") {
         println!("\n  WARNING: No TRX config returned. CI-V may not be set up.");
     }
 
-    // Attempt frequency change
     println!("\n--- Frequency change: {} kHz ---", args.frequency);
     let freq_resp = send_cmd(&mut serial, &format!("TRX Frequency {}", args.frequency)).await?;
 
-    // Give the radio a bit more time to respond
     tokio::time::sleep(Duration::from_millis(2000)).await;
     let extra = read_response(&mut serial, 1000).await;
     let extra_text = String::from_utf8_lossy(&extra);

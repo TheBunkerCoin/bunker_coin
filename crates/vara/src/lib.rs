@@ -163,14 +163,7 @@ impl VaraClient {
         self.send_command("DISCONNECT").await
     }
 
-    /// Enter VARA HF unproto (broadcast/FEC) mode.
-    ///
-    /// Sends `UNPROTO <destination>` to the VARA modem, switching it from
-    /// point-to-point ARQ to broadcast FEC mode. In this mode, data written
-    /// via [`write_unproto_data`](Self::write_unproto_data) is broadcast to
-    /// all stations monitoring the frequency.
-    ///
-    /// Typical destinations: `"CQ"` (general broadcast), or a specific group call.
+    /// Enter VARA HF unproto broadcast/FEC mode for a destination call.
     pub async fn enter_unproto_mode(&self, destination: &str) -> Result<(), VaraError> {
         self.send_command(&format!("UNPROTO {destination}")).await
     }
@@ -180,10 +173,7 @@ impl VaraClient {
         self.send_command("DISCONNECT").await
     }
 
-    /// Write data in unproto (broadcast/FEC) mode.
-    ///
-    /// This delegates to [`write_data`](Self::write_data) — VARA handles
-    /// FEC encoding internally when in unproto mode.
+    /// Write data in unproto mode; VARA handles FEC internally.
     pub async fn write_unproto_data(&self, data: &[u8]) -> Result<(), VaraError> {
         self.write_data(data).await
     }
@@ -200,17 +190,29 @@ mod tests {
         assert_eq!(c.data_port, 8301);
     }
 
-    #[test]
-    fn test_vara_unproto_command_format() {
-        // Verify that enter_unproto_mode formats the correct VARA command.
-        // We can't call the async method without a connected client, but we
-        // can verify the command string format directly.
-        let destination = "CQ";
-        let expected_cmd = format!("UNPROTO {destination}");
-        assert_eq!(expected_cmd, "UNPROTO CQ");
+    #[tokio::test]
+    async fn enter_unproto_mode_sends_unproto_command() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
 
-        let destination = "BUNKERNET";
-        let expected_cmd = format!("UNPROTO {destination}");
-        assert_eq!(expected_cmd, "UNPROTO BUNKERNET");
+        let cmd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = VaraConfig::new("127.0.0.1");
+        config.cmd_port = cmd_listener.local_addr().unwrap().port();
+        config.data_port = data_listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut cmd_sock, _) = cmd_listener.accept().await.unwrap();
+            let _data_sock = data_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = cmd_sock.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            buf
+        });
+
+        let client = VaraClient::connect(config).await.unwrap();
+        client.enter_unproto_mode("CQ").await.unwrap();
+
+        assert_eq!(server.await.unwrap(), b"UNPROTO CQ\n");
     }
 }

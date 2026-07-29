@@ -11,6 +11,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
+hex = "0.4"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }

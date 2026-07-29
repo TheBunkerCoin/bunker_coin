@@ -1,10 +1,5 @@
-//! Capsule: compact binary transaction envelope for LoRa last-mile access.
-//!
-//! Wire formats (all little-endian where applicable):
-//!
-//! **Single (kind=0x00):** `[kind:1][msg_id:4][sender:32][nonce:8][fee:8][body...][sig:64]`
-//! **Fragment-first (kind=0x01):** `[kind:1][msg_id:4][frag_idx:1][total_frags:1][sender:32][nonce:8][fee:8][body_chunk...][sig:64]`
-//! **Fragment-continuation (kind=0x02):** `[kind:1][msg_id:4][frag_idx:1][total_frags:1][body_chunk...]`
+//! Compact transaction capsules for LoRa last-mile access.
+//! Single and first fragments carry sender/nonce/fee/signature; continuations carry fragment metadata and body bytes.
 
 use crate::types::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
@@ -14,11 +9,11 @@ pub const CAPSULE_SINGLE_KIND: u8 = 0x00;
 pub const CAPSULE_FRAG_FIRST_KIND: u8 = 0x01;
 pub const CAPSULE_FRAG_CONT_KIND: u8 = 0x02;
 
-/// Single: kind(1) + msg_id(4) + sender(32) + nonce(8) + fee(8) + sig(64) = 117
+/// Fixed overhead for a single capsule.
 pub const CAPSULE_SINGLE_OVERHEAD: usize = 1 + 4 + 32 + 8 + 8 + 64;
-/// Fragment-first: kind(1) + msg_id(4) + frag_idx(1) + total_frags(1) + sender(32) + nonce(8) + fee(8) + sig(64) = 119
+/// Fixed overhead for the first fragment.
 pub const CAPSULE_FRAG_FIRST_OVERHEAD: usize = 1 + 4 + 1 + 1 + 32 + 8 + 8 + 64;
-/// Fragment-continuation: kind(1) + msg_id(4) + frag_idx(1) + total_frags(1) = 7
+/// Fixed overhead for continuation fragments.
 pub const CAPSULE_FRAG_CONT_OVERHEAD: usize = 1 + 4 + 1 + 1;
 
 /// Maximum body bytes in a single capsule.
@@ -104,20 +99,16 @@ pub fn encode_single(
     Ok(buf)
 }
 
-/// Encode a body that may exceed the single-capsule budget into fragments.
-///
-/// Returns a vec of frame bytes. The first frame is a FragFirst, the rest are FragCont.
+/// Encode a body as one capsule or a FragFirst followed by FragCont frames.
 pub fn encode_fragmented(
     header: &CapsuleHeader,
     body: &[u8],
     sig: &Signature,
 ) -> Result<Vec<Vec<u8>>, CapsuleError> {
-    // If it fits in a single capsule, just use that
     if body.len() <= CAPSULE_SINGLE_BODY_BUDGET {
         return Ok(vec![encode_single(header, body, sig)?]);
     }
 
-    // Calculate how many continuation frames we need after the first
     let first_chunk_len = CAPSULE_FRAG_FIRST_BODY_BUDGET.min(body.len());
     let remaining = body.len() - first_chunk_len;
     let cont_count = remaining.div_ceil(CAPSULE_FRAG_CONT_BODY_BUDGET);
@@ -125,7 +116,6 @@ pub fn encode_fragmented(
 
     let mut frames = Vec::with_capacity(total_frags as usize);
 
-    // First fragment
     {
         let chunk = &body[..first_chunk_len];
         let total = CAPSULE_FRAG_FIRST_OVERHEAD + chunk.len();
@@ -145,7 +135,6 @@ pub fn encode_fragmented(
         frames.push(buf);
     }
 
-    // Continuation fragments
     let mut offset = first_chunk_len;
     for i in 1..total_frags {
         let end = (offset + CAPSULE_FRAG_CONT_BODY_BUDGET).min(body.len());
@@ -245,10 +234,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedCapsule, CapsuleError> {
     }
 }
 
-/// Compute the signing hash for a capsule, identical to `Transaction::signing_hash()`.
-///
-/// `hash = SHA256(sender || nonce_le || fee_le || body_bytes)`
-/// where `body_bytes` is the bincode-serialized `TransactionBody`.
+/// Compute the capsule signing hash over sender, nonce, fee, and serialized body.
 pub fn capsule_signing_hash(sender: &PublicKey, nonce: u64, fee: u64, body: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(sender);
@@ -258,9 +244,7 @@ pub fn capsule_signing_hash(sender: &PublicKey, nonce: u64, fee: u64, body: &[u8
     hasher.finalize().into()
 }
 
-/// Verify the ed25519 signature on a capsule.
-///
-/// The message signed is `SHA256(sender || nonce_le || fee_le || body_bytes)`.
+/// Verify the ed25519 signature over the capsule signing hash.
 pub fn verify_capsule_signature(
     sender: &PublicKey,
     nonce: u64,
@@ -317,7 +301,6 @@ mod tests {
     #[test]
     fn encode_decode_fragmented_roundtrip() {
         let header = test_header(2);
-        // 400 bytes — requires fragmentation
         let body = vec![0x42; 400];
         let sig = [0xCC; 64];
 
@@ -328,7 +311,6 @@ mod tests {
             assert!(frame.len() <= CAPSULE_MTU);
         }
 
-        // Decode first fragment
         let first = decode(&frames[0]).unwrap();
         let mut reassembled = Vec::new();
         match first {
@@ -348,7 +330,6 @@ mod tests {
             _ => panic!("expected FragFirst"),
         }
 
-        // Decode continuation fragments
         for frame in &frames[1..] {
             let decoded = decode(frame).unwrap();
             match decoded {
@@ -367,9 +348,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated() {
-        // Too short for any kind
         assert_eq!(decode(&[]).unwrap_err(), CapsuleError::TooShort);
-        // Single kind but truncated
         assert_eq!(
             decode(&[CAPSULE_SINGLE_KIND, 0, 0]).unwrap_err(),
             CapsuleError::TooShort
@@ -425,24 +404,16 @@ mod tests {
 
     #[test]
     fn single_budget_fits_simple_bodies() {
-        // Verify the body budget constant is correct
         assert_eq!(CAPSULE_SINGLE_BODY_BUDGET, 183);
         assert_eq!(CAPSULE_FRAG_FIRST_BODY_BUDGET, 181);
         assert_eq!(CAPSULE_FRAG_CONT_BODY_BUDGET, 293);
 
-        // A Transfer body: tag(1) + to(32) + amount(8) = 41 bytes (well within 183)
-        // A Bond body: tag(1) + validator(32) + amount(8) = 41 bytes
-        // A Mint body: tag(1) + ticker_len(4) + ticker(~8) + max_supply(8) + hash(32) = ~53 bytes
-        // All simple TransactionBody variants fit within 183 bytes.
-        // The largest simple body is UpdateMetadata: tag(1) + token_id(4) + hash(32) = 37 bytes.
-        // So 183 bytes is more than enough for all simple tx types.
         let body_183 = vec![0u8; CAPSULE_SINGLE_BODY_BUDGET];
         let header = test_header(99);
         let sig = [0; 64];
         let encoded = encode_single(&header, &body_183, &sig).unwrap();
         assert_eq!(encoded.len(), CAPSULE_MTU);
 
-        // One more byte should fail
         let body_184 = vec![0u8; CAPSULE_SINGLE_BODY_BUDGET + 1];
         assert!(encode_single(&header, &body_184, &sig).is_err());
     }

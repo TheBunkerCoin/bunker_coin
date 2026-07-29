@@ -100,15 +100,6 @@ impl<S: SamplingStrategy + Send + Sync> QuorumRobustnessTest<S> {
     ) -> Result<()> {
         let mut attack_probs = vec![0.0; self.attacks.len()];
 
-        // try three different adversary strategies
-        // let partition_attack_probs = self.run_bin_packing(adversary_strength, attack_probs);
-        // debug!("bin-packing failure rates:");
-        // for (attack, prob) in self.attacks.iter().zip(partition_attack_probs.iter()) {
-        //     debug!("  - {}: {:.2}", attack.name, prob.log10());
-        // }
-        // self.reset();
-        // vec_max(&mut attack_probs, &partition_attack_probs);
-
         let random_attack_probs = self.run_random(adversary_strength, &attack_probs);
         debug!("random failure rates:");
         for (attack, prob) in self.attacks.iter().zip(random_attack_probs.iter()) {
@@ -140,8 +131,6 @@ impl<S: SamplingStrategy + Send + Sync> QuorumRobustnessTest<S> {
             sampling_strategy.to_string(),
             adversary_strength.byzantine.to_string(),
             adversary_strength.crashed.to_string(),
-            // self.params().num_data_shreds.to_string(),
-            // self.params().num_shreds.to_string(),
         ];
         for attack_prob in &attack_probs {
             row.push(attack_prob.log2().to_string());
@@ -315,10 +304,9 @@ impl<S: SamplingStrategy + Send + Sync> QuorumRobustnessTest<S> {
                     if corrupted[*id as usize] {
                         continue;
                     }
-                    if corrupted_stake + (*stake as f64)
-                        < stake_per_bin * byzantine_bins
-                        // && val_stake < stake_per_bin
-                        && total_corrupted_stake + val_stake < self.total_stake as f64 * adversary_strength.byzantine
+                    if corrupted_stake + (*stake as f64) < stake_per_bin * byzantine_bins
+                        && total_corrupted_stake + val_stake
+                            < self.total_stake as f64 * adversary_strength.byzantine
                     {
                         corrupted[*id as usize] = true;
                         corrupted_stake += *stake as f64;

@@ -25,7 +25,37 @@ use crate::shredder::{RegularShredder, Shred, ShredIndex, ShredderPool, Validate
 use crate::types::SliceIndex;
 use crate::{Block, BlockId, Slot};
 
-/// additional metadata (might need refactor @e)
+/// Process-global RocksDB handles; reconnects must reuse per-path locks.
+static DB_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Arc<DB>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Opens RocksDB once per path, retrying only the first out-of-process open.
+pub(crate) fn open_db_with_retry(opts: &Options, path: &str) -> Result<Arc<DB>, rocksdb::Error> {
+    let mut cache = DB_CACHE.lock().unwrap();
+    if let Some(db) = cache.get(path) {
+        return Ok(db.clone());
+    }
+    const ATTEMPTS: u32 = 30;
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match DB::open(opts, path) {
+            Ok(db) => {
+                let db = Arc::new(db);
+                cache.insert(path.to_owned(), db.clone());
+                return Ok(db);
+            }
+            Err(e) => {
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt"))
+}
+
+/// Metadata persisted alongside a block.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockMetadata {
     pub slot: Slot,
@@ -51,41 +81,31 @@ impl From<&Block> for BlockInfo {
     }
 }
 
-/// blocks kept in memory at start-up
-const HOT_BLOCK_LIMIT: usize = 200;
+/// Recent finalized slots kept hot for repair; older blocks fall back to RocksDB.
+const HOT_BLOCK_LIMIT: u64 = 200;
 
 /// Blockstore is the fundamental data structure holding block data per slot.
 pub struct BlockstoreImpl {
-    /// Data structure holding the actual block data per slot.
     block_data: BTreeMap<Slot, SlotBlockData>,
-    /// Shredders used for reconstructing blocks.
     shredders: ShredderPool<RegularShredder>,
 
-    /// Event channel for sending notifications to Votor.
     votor_channel: Sender<VotorEvent>,
-    /// Information about all active validators.
     epoch_info: Arc<EpochInfo>,
 
-    /// Persistent RocksDB handle for durable block storage.
-    db: DB,
+    /// Cached shared RocksDB handle for durable block storage.
+    db: Arc<DB>,
 }
 
 impl BlockstoreImpl {
-    /// Initializes a new empty blockstore.
-    ///
-    /// Blockstore will send the following [`VotorEvent`]s to the provided `votor_channel`:
-    /// - [`VotorEvent::FirstShred`] when receiving the first shred for a slot
-    ///   from the block dissemination protocol
-    /// - [`VotorEvent::Block`] for any reconstructed block
+    /// Initializes an empty blockstore and Votor event channel.
     pub fn new(epoch_info: Arc<EpochInfo>, votor_channel: Sender<VotorEvent>) -> Self {
-        // ensure the data directory exists and open/create RocksDB database
         std::fs::create_dir_all("data").ok();
         let db_path = format!("data/blockstore/{}", epoch_info.own_id);
         std::fs::create_dir_all(&db_path).ok();
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = DB::open(&opts, db_path).expect("open RocksDB");
+        let db = open_db_with_retry(&opts, &db_path).expect("open RocksDB");
 
         Self {
             block_data: BTreeMap::new(),
@@ -96,7 +116,7 @@ impl BlockstoreImpl {
         }
     }
 
-    /// Deletes everything before the given `slot` from the blockstore.
+    /// Deletes in-memory block data before `slot`; RocksDB remains durable.
     pub fn prune(&mut self, slot: Slot) {
         self.block_data = self.block_data.split_off(&slot);
     }
@@ -116,6 +136,13 @@ impl BlockstoreImpl {
                     &hex::encode(block_info.parent.1.as_hash())[..8],
                     block_info.parent.0,
                 );
+                // Persist block bytes and metadata so restarts, inspect, and RPC can serve them.
+                let hash = block_info.hash.as_hash().clone();
+                let block_id = (*slot, block_info.hash.clone());
+                if let Some(block) = self.get_block(&block_id) {
+                    self.persist_block(*slot, &hash, &block);
+                }
+
                 self.votor_channel.send(event).await.unwrap();
 
                 Some(block_info)
@@ -124,11 +151,34 @@ impl BlockstoreImpl {
         }
     }
 
-    /// Gives reference to stored block data for the given `block_id`.
-    ///
-    /// Considers both, the disseminated block and any repaired blocks.
-    ///
-    /// Returns [`None`] if blockstore does not know about this block yet.
+    /// Persists a completed block and base metadata; finalization fills timestamp later.
+    fn persist_block(&self, slot: Slot, hash: &Hash, block: &Block) {
+        let key = format!("{:016X}{}", slot, hex::encode(hash));
+        if let Ok(value) = bincode::serde::encode_to_vec(block, bincode::config::standard()) {
+            let _ = self.db.put(key.as_bytes(), value);
+        }
+        // Do not clobber a finalized timestamp with base metadata.
+        if self.load_block_metadata(slot, hash.clone()).is_none() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let metadata = BlockMetadata {
+                slot,
+                hash: hash.clone(),
+                producer: self.epoch_info.leader(slot).id,
+                proposed_timestamp: now,
+                finalized_timestamp: None,
+            };
+            let meta_key = format!("meta|{:016X}{}", slot, hex::encode(hash));
+            if let Ok(value) = bincode::serde::encode_to_vec(&metadata, bincode::config::standard())
+            {
+                let _ = self.db.put(meta_key.as_bytes(), value);
+            }
+        }
+    }
+
+    /// Finds disseminated or repaired block data for `block_id`.
     fn get_block_data(&self, block_id: &BlockId) -> Option<&BlockData> {
         let (slot, hash) = block_id;
         let slot_data = self.slot_data(*slot)?;
@@ -140,23 +190,16 @@ impl BlockstoreImpl {
         slot_data.repaired.get(hash)
     }
 
-    /// Reads slot data for the given `slot`.
     fn slot_data(&self, slot: Slot) -> Option<&SlotBlockData> {
         self.block_data.get(&slot)
     }
 
-    /// Writes slot data for the given `slot`, initializing it if necessary.
     fn slot_data_mut(&mut self, slot: Slot) -> &mut SlotBlockData {
         self.block_data
             .entry(slot)
             .or_insert_with(|| SlotBlockData::new(slot))
     }
 
-    /// Gives the shred for the given `slot`, `slice` and `shred` index.
-    ///
-    /// Considers only the disseminated block.
-    ///
-    /// Only used for testing.
     #[cfg(test)]
     fn get_disseminated_shred(
         &self,
@@ -172,9 +215,6 @@ impl BlockstoreImpl {
         })
     }
 
-    /// Gives the number of stored shreds for a given `slot` (across all slices).
-    ///
-    /// Only used for testing.
     #[cfg(test)]
     fn stored_shreds_for_slot(&self, slot: Slot) -> usize {
         self.slot_data(slot).map_or(0, |s| {
@@ -186,9 +226,6 @@ impl BlockstoreImpl {
         })
     }
 
-    /// Gives the number of stored slices for a given `slot`.
-    ///
-    /// Only used for testing.
     #[cfg(test)]
     pub(crate) fn stored_slices_for_slot(&self, slot: Slot) -> usize {
         self.slot_data(slot)
@@ -242,21 +279,14 @@ pub trait Blockstore {
     fn update_finalized_timestamp(&self, slot: Slot, hash: Hash, timestamp: u64);
 
     fn clean_beyond_finalized(&mut self, highest_finalized_slot: Slot);
+
+    /// Drops cold in-memory finalized slots while keeping RocksDB as the fallback.
+    fn prune_finalized(&mut self, finalized_slot: Slot);
 }
 
 #[async_trait]
 impl Blockstore for BlockstoreImpl {
-    /// Stores a new shred in the blockstore.
-    ///
-    /// This shred is stored in the default spot without a known block hash.
-    /// For shreds obtained through repair, `add_shred_from_repair` should be used instead.
-    /// Compared to that function, this one checks for leader equivocation.
-    ///
-    /// Reconstructs the corresponding slice and block if possible and necessary.
-    /// If the added shred belongs to the last slice, all later shreds are deleted.
-    ///
-    /// Returns `Some(slot, block_info)` if a block was reconstructed, `None` otherwise.
-    /// In the `Some`-case, `block_info` is the [`BlockInfo`] of the reconstructed block.
+    /// Stores a disseminated shred, checking leader equivocation and reconstructing if possible.
     #[fastrace::trace(short_name = true)]
     async fn add_shred_from_disseminator(
         &mut self,
@@ -278,18 +308,7 @@ impl Blockstore for BlockstoreImpl {
         }
     }
 
-    /// Stores a new shred from repair in the blockstore.
-    ///
-    /// This shred is stored in a spot associated with the given block`hash`.
-    /// For shreds obtained through block dissemination, `add_shred_from_disseminator`
-    /// should be used instead.
-    /// Compared to that function, this one does not check for leader equivocation.
-    ///
-    /// Reconstructs the corresponding slice and block if possible and necessary.
-    /// If the added shred belongs to last slice, deletes later slices and their shreds.
-    ///
-    /// Returns `Some(slot, block_info)` if a block was reconstructed, `None` otherwise.
-    /// In the `Some`-case, `block_info` is the [`BlockInfo`] of the reconstructed block.
+    /// Stores a repair shred under a known block hash and reconstructs if possible.
     #[fastrace::trace(short_name = true)]
     async fn add_shred_from_repair(
         &mut self,
@@ -313,11 +332,7 @@ impl Blockstore for BlockstoreImpl {
         }
     }
 
-    /// Gives the disseminated block hash for a given `slot`, if any.
-    ///
-    /// This refers to the block we received from block dissemination.
-    ///
-    /// Returns `None` if we have no block or only blocks from repair.
+    /// Returns the disseminated block hash for `slot`, excluding repair-only blocks.
     fn disseminated_block_hash(&self, slot: Slot) -> Option<BlockHash> {
         self.slot_data(slot)?
             .disseminated
@@ -327,26 +342,24 @@ impl Blockstore for BlockstoreImpl {
     }
 
     fn get_block(&self, block_id: &BlockId) -> Option<Block> {
-        let block_data = self.get_block_data(block_id)?;
-        if let Some((hash, block)) = block_data.completed.as_ref() {
+        if let Some(block_data) = self.get_block_data(block_id)
+            && let Some((hash, block)) = block_data.completed.as_ref()
+        {
             debug_assert_eq!(*hash, block_id.1);
-            Some(block.clone())
-        } else {
-            None
+            return Some(block.clone());
         }
+        // In-memory data may be empty after restart or inspect; fall back to RocksDB.
+        let (slot, hash) = block_id;
+        self.load_block_from_db(*slot, hash.as_hash().clone())
     }
 
-    /// Gives the last slice index for the given `block_id`.
-    ///
-    /// Returns `None` if blockstore does not know the last slice yet.
+    /// Returns the last slice index once known.
     fn get_last_slice_index(&self, block_id: &BlockId) -> Option<SliceIndex> {
         let block_data = self.get_block_data(block_id)?;
         block_data.last_slice
     }
 
-    /// Gives reference to stored shred for given `block_id`, `slice_index` and `shred_index`.
-    ///
-    /// Returns `None` if blockstore does not hold that shred.
+    /// Returns a stored shred by block, slice, and shred index.
     fn get_shred(
         &self,
         block_id: &BlockId,
@@ -358,9 +371,7 @@ impl Blockstore for BlockstoreImpl {
         slice_shreds[*shred_index].clone()
     }
 
-    /// Generates a Merkle proof for the given `slice_index` of the given `block_id`.
-    ///
-    /// Returns `None` if blockstore does not hold that block yet.
+    /// Builds a double-Merkle proof for a stored block slice.
     fn create_double_merkle_proof(
         &self,
         block_id: &BlockId,
@@ -378,37 +389,52 @@ impl Blockstore for BlockstoreImpl {
 
     fn load_block_from_db(&self, slot: Slot, hash: Hash) -> Option<Block> {
         let key = format!("{:016X}{}", slot, hex::encode(hash));
-        if let Ok(Some(val)) = self.db.get(key.as_bytes()) {
-            if let Ok((block, _)) =
+        if let Ok(Some(val)) = self.db.get(key.as_bytes())
+            && let Ok((block, _)) =
                 bincode::serde::decode_from_slice::<Block, _>(&val, bincode::config::standard())
-            {
-                return Some(block);
-            }
+        {
+            return Some(block);
         }
         None
     }
 
     fn canonical_block_hash(&self, slot: Slot) -> Option<Hash> {
-        self.disseminated_block_hash(slot)
-            .map(|bh| bh.as_hash().clone())
+        if let Some(bh) = self.disseminated_block_hash(slot) {
+            return Some(bh.as_hash().clone());
+        }
+        // In-memory may be empty; persisted metadata encodes the slot's canonical hash.
+        let prefix = format!("meta|{:016X}", slot);
+        let prefix_bytes = prefix.as_bytes();
+        for item in self.db.prefix_iterator(prefix_bytes).flatten() {
+            let (k, _) = item;
+            if !k.starts_with(prefix_bytes) {
+                break;
+            }
+            // `meta|{slot}{hash}` stores the canonical hash suffix.
+            let hex_hash = &k[prefix_bytes.len()..];
+            if let Ok(bytes) = hex::decode(hex_hash)
+                && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
+            {
+                return Some(Hash::from(arr));
+            }
+        }
+        None
     }
 
     fn load_block_by_hash(&self, hash: Hash) -> Option<(Slot, Block)> {
         let suffix = hex::encode(hash);
         let suffix_bytes = suffix.as_bytes();
         for item in self.db.iterator(IteratorMode::Start) {
-            if let Ok((k, v)) = item {
-                if k.len() >= 16 + suffix_bytes.len()
-                    && &k[k.len() - suffix_bytes.len()..] == suffix_bytes
+            if let Ok((k, v)) = item
+                && k.len() >= 16 + suffix_bytes.len()
+                && &k[k.len() - suffix_bytes.len()..] == suffix_bytes
+            {
+                let slot_str = std::str::from_utf8(&k[0..16]).ok()?;
+                let slot = Slot::new(u64::from_str_radix(slot_str, 16).ok()?);
+                if let Ok((block, _)) =
+                    bincode::serde::decode_from_slice::<Block, _>(&v, bincode::config::standard())
                 {
-                    let slot_str = std::str::from_utf8(&k[0..16]).ok()?;
-                    let slot = Slot::new(u64::from_str_radix(slot_str, 16).ok()?);
-                    if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(
-                        &v,
-                        bincode::config::standard(),
-                    ) {
-                        return Some((slot, block));
-                    }
+                    return Some((slot, block));
                 }
             }
         }
@@ -417,13 +443,13 @@ impl Blockstore for BlockstoreImpl {
 
     fn load_block_metadata(&self, slot: Slot, hash: Hash) -> Option<BlockMetadata> {
         let key = format!("meta|{:016X}{}", slot, hex::encode(hash));
-        if let Ok(Some(val)) = self.db.get(key.as_bytes()) {
-            if let Ok((metadata, _)) = bincode::serde::decode_from_slice::<BlockMetadata, _>(
+        if let Ok(Some(val)) = self.db.get(key.as_bytes())
+            && let Ok((metadata, _)) = bincode::serde::decode_from_slice::<BlockMetadata, _>(
                 &val,
                 bincode::config::standard(),
-            ) {
-                return Some(metadata);
-            }
+            )
+        {
+            return Some(metadata);
         }
         None
     }
@@ -439,6 +465,11 @@ impl Blockstore for BlockstoreImpl {
         }
     }
 
+    fn prune_finalized(&mut self, finalized_slot: Slot) {
+        let cutoff = Slot::new(finalized_slot.inner().saturating_sub(HOT_BLOCK_LIMIT));
+        self.prune(cutoff);
+    }
+
     fn clean_beyond_finalized(&mut self, highest_finalized_slot: Slot) {
         println!(
             "[Blockstore::clean_beyond_finalized] pruning blocks beyond slot {}",
@@ -448,35 +479,28 @@ impl Blockstore for BlockstoreImpl {
         let mut batch = WriteBatch::default();
         let mut deleted_count = 0;
         let mut deleted_meta_count = 0;
-        for item in self.db.iterator(IteratorMode::Start) {
-            if let Ok((k, _v)) = item {
-                let finalized = highest_finalized_slot.inner();
-                if k.starts_with(b"meta|") {
-                    if k.len() >= 21 {
-                        if let Ok(slot_hex) = std::str::from_utf8(&k[5..21]) {
-                            if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
-                                if slot_val > finalized {
-                                    batch.delete(&k);
-                                    deleted_meta_count += 1;
-                                }
-                            }
-                        }
-                    }
-                } else if k.len() >= 16 {
-                    if let Ok(slot_hex) = std::str::from_utf8(&k[0..16]) {
-                        if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
-                            if slot_val > finalized {
-                                batch.delete(&k);
-                                deleted_count += 1;
-                            }
-                        }
-                    }
+        for (k, _v) in self.db.iterator(IteratorMode::Start).flatten() {
+            let finalized = highest_finalized_slot.inner();
+            if k.starts_with(b"meta|") {
+                if k.len() >= 21
+                    && let Ok(slot_hex) = std::str::from_utf8(&k[5..21])
+                    && let Ok(slot_val) = u64::from_str_radix(slot_hex, 16)
+                    && slot_val > finalized
+                {
+                    batch.delete(&k);
+                    deleted_meta_count += 1;
                 }
+            } else if k.len() >= 16
+                && let Ok(slot_hex) = std::str::from_utf8(&k[0..16])
+                && let Ok(slot_val) = u64::from_str_radix(slot_hex, 16)
+                && slot_val > finalized
+            {
+                batch.delete(&k);
+                deleted_count += 1;
             }
         }
         let _ = self.db.write(batch);
 
-        // clean up in-memory block data beyond finalized slot
         let beyond = self.block_data.split_off(&highest_finalized_slot.next());
         let pruned = beyond.len();
         drop(beyond);
@@ -494,6 +518,24 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    /// Same-process DB reopens must hit the shared handle cache.
+    #[test]
+    fn open_db_with_retry_reuses_handle_for_same_path() {
+        let dir = std::env::temp_dir().join(format!("bunker_db_cache_test_{}", std::process::id()));
+        let path = dir.to_str().unwrap();
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+
+        let a = open_db_with_retry(&opts, path).expect("first open");
+        let b = open_db_with_retry(&opts, path).expect("second open of same path");
+        assert!(Arc::ptr_eq(&a, &b));
+
+        a.put(b"k", b"v").unwrap();
+        assert_eq!(b.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use crate::ValidatorInfo;
     use crate::crypto::merkle::DoubleMerkleTree;
     use crate::crypto::signature::SecretKey;
@@ -540,16 +582,13 @@ mod tests {
         let (sk, mut blockstore) = test_setup(tx);
         assert!(blockstore.slot_data(slot).is_none());
 
-        // generate single-slice block
         let (block_hash, _, shreds) = create_random_shredded_block(slot, 1, &sk);
         let block_id = (slot, block_hash);
 
         let slice_hash = &shreds[0][0].merkle_root;
         for shred in &shreds[0] {
-            // store shred
             add_shred_ignore_duplicate(&mut blockstore, shred.clone().into_shred()).await?;
 
-            // check shred is stored
             let Some(stored_shred) = blockstore.get_disseminated_shred(
                 slot,
                 SliceIndex::first(),
@@ -560,7 +599,6 @@ mod tests {
             assert_eq!(stored_shred.payload().data, shred.payload().data);
         }
 
-        // create and check double-Merkle proof
         let proof = blockstore
             .create_double_merkle_proof(&block_id, SliceIndex::first())
             .unwrap();
@@ -579,16 +617,13 @@ mod tests {
         let (sk, mut blockstore) = test_setup(tx);
         assert!(blockstore.slot_data(slot).is_none());
 
-        // generate two-slice block
         let (_hash, _tree, slices) = create_random_shredded_block(slot, 2, &sk);
 
-        // first slice is not enough
         for shred in slices[0].clone() {
             add_shred_ignore_duplicate(&mut blockstore, shred.into_shred()).await?;
         }
         assert!(blockstore.disseminated_block_hash(slot).is_none());
 
-        // after second slice we should have the block
         for shred in slices[1].clone() {
             add_shred_ignore_duplicate(&mut blockstore, shred.into_shred()).await?;
         }
@@ -604,10 +639,8 @@ mod tests {
         let (sk, mut blockstore) = test_setup(tx);
         assert!(blockstore.slot_data(slot).is_none());
 
-        // generate and shred two slices
         let (block_hash, _tree, slices) = create_random_shredded_block(slot, 2, &sk);
 
-        // first slice is not enough
         for shred in slices[0].clone().into_iter().take(DATA_SHREDS) {
             blockstore
                 .add_shred_from_repair(block_hash.clone(), shred.into_shred())
@@ -615,7 +648,6 @@ mod tests {
         }
         assert!(blockstore.get_block(&(slot, block_hash.clone())).is_none());
 
-        // after second slice we should have the block
         for shred in slices[1].clone().into_iter().take(DATA_SHREDS) {
             blockstore
                 .add_shred_from_repair(block_hash.clone(), shred.into_shred())
@@ -633,10 +665,8 @@ mod tests {
         let (sk, mut blockstore) = test_setup(tx);
         assert!(blockstore.disseminated_block_hash(slot).is_none());
 
-        // generate a single slice for slot 0
         let (_hash, _tree, slices) = create_random_shredded_block(slot, 1, &sk);
 
-        // insert shreds in reverse order
         for shred in slices[0].clone().into_iter().rev() {
             add_shred_ignore_duplicate(&mut blockstore, shred.into_shred()).await?;
         }
@@ -652,11 +682,9 @@ mod tests {
         let (sk, mut blockstore) = test_setup(tx);
         assert!(blockstore.disseminated_block_hash(slot).is_none());
 
-        // generate a larger block for slot 0
         let (_hash, _tree, slices) = create_random_shredded_block(slot, 4, &sk);
         assert_eq!(blockstore.stored_slices_for_slot(slot), 0);
 
-        // insert just enough shreds to reconstruct slice 0 (from beginning)
         for shred in slices[0].clone().into_iter().take(DATA_SHREDS) {
             blockstore
                 .add_shred_from_disseminator(shred.into_shred())
@@ -664,7 +692,6 @@ mod tests {
         }
         assert_eq!(blockstore.stored_slices_for_slot(slot), 1);
 
-        // insert just enough shreds to reconstruct slice 1 (from end)
         for shred in slices[1]
             .clone()
             .into_iter()
@@ -676,7 +703,6 @@ mod tests {
         }
         assert_eq!(blockstore.stored_slices_for_slot(slot), 2);
 
-        // insert just enough shreds to reconstruct slice 2 (from middle)
         for shred in slices[2]
             .clone()
             .into_iter()
@@ -689,7 +715,6 @@ mod tests {
         }
         assert_eq!(blockstore.stored_slices_for_slot(slot), 3);
 
-        // insert just enough shreds to reconstruct slice 3 (split)
         for (_, shred) in slices[3]
             .clone()
             .into_iter()
@@ -702,7 +727,6 @@ mod tests {
         }
         assert!(blockstore.disseminated_block_hash(slot).is_some());
 
-        // slices are deleted after reconstruction
         assert_eq!(blockstore.stored_slices_for_slot(slot), 0);
 
         Ok(())
@@ -715,25 +739,20 @@ mod tests {
         let (sk, mut blockstore) = test_setup(tx);
         assert!(blockstore.disseminated_block_hash(slot).is_none());
 
-        // generate two slices for slot 0
         let (_hash, _tree, slices) = create_random_shredded_block(slot, 2, &sk);
 
-        // second slice alone is not enough
         for shred in slices[0].clone() {
             add_shred_ignore_duplicate(&mut blockstore, shred.into_shred()).await?;
         }
         assert!(blockstore.disseminated_block_hash(slot).is_none());
 
-        // stored all shreds for slot 0
         assert_eq!(blockstore.stored_shreds_for_slot(slot), TOTAL_SHREDS);
 
-        // after also also inserting first slice we should have the block
         for shred in slices[1].clone() {
             add_shred_ignore_duplicate(&mut blockstore, shred.into_shred()).await?;
         }
         assert!(blockstore.disseminated_block_hash(slot).is_some());
 
-        // stored all shreds
         assert_eq!(blockstore.stored_shreds_for_slot(slot), 2 * TOTAL_SHREDS);
 
         Ok(())
@@ -746,19 +765,16 @@ mod tests {
         let (sk, mut blockstore) = test_setup(tx);
         let (_hash, _tree, slices) = create_random_shredded_block(slot, 1, &sk);
 
-        // inserting single shred should not throw errors
         let res = blockstore
             .add_shred_from_disseminator(slices[0][0].clone().into_shred())
             .await;
         assert!(res.is_ok());
 
-        // inserting same shred again should give duplicate error
         let res = blockstore
             .add_shred_from_disseminator(slices[0][0].clone().into_shred())
             .await;
         assert_eq!(res, Err(AddShredError::Duplicate));
 
-        // should only store one copy
         assert_eq!(blockstore.stored_shreds_for_slot(slot), 1);
 
         Ok(())
@@ -771,7 +787,6 @@ mod tests {
         let (sk, mut blockstore) = test_setup(tx);
         let (_hash, _tree, slices) = create_random_shredded_block(slot, 1, &sk);
 
-        // insert shreds with wrong Merkle root
         for shred in slices[0].clone() {
             let mut shred = shred.into_shred();
             shred.merkle_root = Hash::random_for_test().into();
@@ -780,6 +795,39 @@ mod tests {
             assert_eq!(res.err(), Some(AddShredError::InvalidSignature));
         }
 
+        Ok(())
+    }
+
+    /// Cold finalized slots are pruned from memory but remain readable from RocksDB.
+    #[tokio::test]
+    async fn prune_finalized_keeps_hot_window_and_db_fallback() -> Result<()> {
+        let old_slot = Slot::new(250);
+        let new_slot = Slot::new(451);
+        let (tx, _rx) = mpsc::channel(1000);
+        let (sk, mut blockstore) = test_setup(tx);
+        let old_block = create_random_shredded_block(old_slot, 1, &sk);
+        let new_block = create_random_shredded_block(new_slot, 1, &sk);
+        let mut shreds = vec![];
+        shreds.extend(old_block.2.into_iter().flatten());
+        shreds.extend(new_block.2.into_iter().flatten());
+        for shred in shreds {
+            add_shred_ignore_duplicate(&mut blockstore, shred.into_shred()).await?;
+        }
+        let old_hash = blockstore.disseminated_block_hash(old_slot).unwrap();
+        assert!(blockstore.stored_shreds_for_slot(old_slot) > 0);
+        assert!(blockstore.stored_shreds_for_slot(new_slot) > 0);
+
+        blockstore.prune_finalized(new_slot);
+
+        assert_eq!(blockstore.stored_shreds_for_slot(old_slot), 0);
+        assert!(blockstore.stored_shreds_for_slot(new_slot) > 0);
+        assert!(
+            blockstore.get_block(&(old_slot, old_hash)).is_some(),
+            "pruned block must remain readable via the DB fallback"
+        );
+
+        blockstore.prune_finalized(Slot::new(100));
+        assert!(blockstore.stored_shreds_for_slot(new_slot) > 0);
         Ok(())
     }
 
@@ -796,7 +844,6 @@ mod tests {
         let block1 = create_random_shredded_block(block1_slot, 1, &sk);
         let block2 = create_random_shredded_block(block2_slot, 1, &sk);
 
-        // insert shreds
         let mut shreds = vec![];
         shreds.extend(block0.2.into_iter().flatten());
         shreds.extend(block1.2.into_iter().flatten());
@@ -808,18 +855,15 @@ mod tests {
         assert!(blockstore.disseminated_block_hash(block1_slot).is_some());
         assert!(blockstore.disseminated_block_hash(block2_slot).is_some());
 
-        // stored all shreds
         assert_eq!(blockstore.stored_shreds_for_slot(block0_slot), TOTAL_SHREDS);
         assert_eq!(blockstore.stored_shreds_for_slot(block1_slot), TOTAL_SHREDS);
         assert_eq!(blockstore.stored_shreds_for_slot(block2_slot), TOTAL_SHREDS);
 
-        // some (and only some) shreds deleted after partial pruning
         blockstore.prune(block1_slot);
         assert_eq!(blockstore.stored_shreds_for_slot(block0_slot), 0);
         assert_eq!(blockstore.stored_shreds_for_slot(block1_slot), TOTAL_SHREDS);
         assert_eq!(blockstore.stored_shreds_for_slot(block2_slot), TOTAL_SHREDS);
 
-        // no shreds left after full pruning
         blockstore.prune(future_slot);
         assert_eq!(blockstore.stored_shreds_for_slot(block0_slot), 0);
         assert_eq!(blockstore.stored_shreds_for_slot(block1_slot), 0);

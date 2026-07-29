@@ -252,14 +252,12 @@ impl SnapshotStore {
     pub fn prune_old_snapshots(&self, keep_latest_n: usize) {
         let iter = self.db.iterator(IteratorMode::End);
         let mut epochs: Vec<u64> = Vec::new();
-        for item in iter {
-            if let Ok((key, _)) = item {
-                let key_str = std::str::from_utf8(&key).unwrap_or("");
-                if let Some(hex_str) = key_str.strip_prefix("snapshot|") {
-                    if let Ok(epoch) = u64::from_str_radix(hex_str, 16) {
-                        epochs.push(epoch);
-                    }
-                }
+        for (key, _) in iter.flatten() {
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            if let Some(hex_str) = key_str.strip_prefix("snapshot|")
+                && let Ok(epoch) = u64::from_str_radix(hex_str, 16)
+            {
+                epochs.push(epoch);
             }
         }
         epochs.sort_unstable_by(|a, b| b.cmp(a));
@@ -268,15 +266,13 @@ impl SnapshotStore {
             let old_epochs = &epochs[keep_latest_n..];
             let mut keys_to_delete = Vec::new();
             let iter = self.db.iterator(IteratorMode::Start);
-            for item in iter {
-                if let Ok((key, _)) = item {
-                    let key_str = std::str::from_utf8(&key).unwrap_or("");
-                    if old_epochs
-                        .iter()
-                        .any(|epoch| snapshot_key_matches_epoch(key_str, *epoch))
-                    {
-                        keys_to_delete.push(key.to_vec());
-                    }
+            for (key, _) in iter.flatten() {
+                let key_str = std::str::from_utf8(&key).unwrap_or("");
+                if old_epochs
+                    .iter()
+                    .any(|epoch| snapshot_key_matches_epoch(key_str, *epoch))
+                {
+                    keys_to_delete.push(key.to_vec());
                 }
             }
 

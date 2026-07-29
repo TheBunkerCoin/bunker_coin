@@ -7,12 +7,17 @@ use thiserror::Error;
 pub mod framing;
 pub mod network_core;
 pub mod pactor;
+pub mod pactor_framing;
+pub mod pactor_mux;
+pub mod pactor_network;
 pub mod scheduler;
 pub mod simulated;
 
 pub use framing::{RadioFrame, RadioFramer};
 pub use network_core::RadioNetworkCore;
 pub use pactor::PactorRadioNode;
+pub use pactor_mux::{Channel, MuxChannel, MuxInjector, MuxLiveness, PactorMux, PactorMuxHandle};
+pub use pactor_network::PactorNetwork;
 pub use scheduler::RadioScheduler;
 pub use simulated::SimulatedRadioNetwork;
 
@@ -39,6 +44,11 @@ pub enum NetworkError {
     Unknown,
 }
 
+/// Upper bound on a decoded [`NetworkMessage`]'s allocation size. Real messages
+/// (shreds incl. headers/Merkle path, votes, certs) are a few KB; 1 MiB is
+/// generous headroom while still rejecting corrupted length fields instantly.
+const MAX_NETWORK_MESSAGE_BYTES: usize = 1 << 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
     Ping,
@@ -52,9 +62,20 @@ impl NetworkMessage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NetworkError> {
-        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map(|(msg, _)| msg)
-            .map_err(|_| NetworkError::Unknown)
+        // Decode with an allocation limit. Without one, bincode's container
+        // length guard is a no-op (`claim_container_read` only checks when a
+        // limit is configured), so a corrupted length field in bytes coming off
+        // the radio (e.g. a fragment desync) makes `Vec::with_capacity` attempt
+        // an absurd allocation and ABORTS the process. With the
+        // limit, corruption is a decode `Err` and the message is dropped
+        // (repair/ARQ recovers). The limit is decode-side only: the wire format
+        // is unchanged and encode still uses the standard config.
+        bincode::serde::decode_from_slice(
+            bytes,
+            bincode::config::standard().with_limit::<MAX_NETWORK_MESSAGE_BYTES>(),
+        )
+        .map(|(msg, _)| msg)
+        .map_err(|_| NetworkError::Unknown)
     }
 }
 

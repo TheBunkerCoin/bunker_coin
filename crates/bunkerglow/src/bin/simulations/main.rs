@@ -160,9 +160,6 @@ fn main() -> Result<()> {
 
     // run tests for different stake distributions
     run_tests_for_stake_distribution("solana", &VALIDATOR_DATA)?;
-    // run_tests_for_stake_distribution("sui", &SUI_VALIDATOR_DATA);
-    // run_tests_for_stake_distribution("5hubs", &FIVE_HUBS_VALIDATOR_DATA);
-    // run_tests_for_stake_distribution("stock_exchanges", &STOCK_EXCHANGES_VALIDATOR_DATA);
 
     Ok(())
 }
