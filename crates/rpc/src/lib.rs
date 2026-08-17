@@ -613,8 +613,7 @@ fn build_api_block(
     }
 }
 
-// Below the finalized tip every slot is decided, so a block still off the
-// finalized chain there was skip-certified.
+// Below the finalized tip, a block off the finalized chain was skip-certified.
 fn mark_dead_blocks_skipped(all_blocks: &mut [Block]) {
     let finalized_tip = all_blocks
         .iter()
@@ -2426,7 +2425,6 @@ mod tests {
                 SlotStatus::Proposed
             },
         };
-        // Slot 47612 finalized with parent 47609; 47610/47611 proposed but dead.
         let state = SharedState {
             blocks: Arc::new(tokio::sync::RwLock::new(vec![
                 mk(47609, 47608, true),
