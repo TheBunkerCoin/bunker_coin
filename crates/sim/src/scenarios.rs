@@ -970,9 +970,10 @@ pub async fn multi_node_consensus_simulation_with_api(
                     let finalized_by_cert = is_finalized && pool_finalized_slot >= slot_id;
 
                     if is_skip_certified && !is_finalized {
-                        if let Some(idx) = blocks_guard.iter().position(|b| {
-                            b.slot() == slot && matches!(b, rpc::Block::Block { .. })
-                        }) {
+                        if let Some(idx) = blocks_guard
+                            .iter()
+                            .position(|b| b.slot() == slot && matches!(b, rpc::Block::Block { .. }))
+                        {
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
