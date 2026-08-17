@@ -11,7 +11,7 @@ use axum::{
 use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::{Transaction as CoreTransaction, TransactionBody};
 use bunker_coin_core::types::MAX_TICKER_LEN;
-use bunkerglow::consensus::Blockstore;
+use bunkerglow::consensus::{Blockstore, Pool};
 use bunkerglow::crypto::merkle::{DoubleMerkleRoot, MerkleRoot};
 use bunkerglow::crypto::Hash;
 use bunkerglow::snapshot::{SnapshotManifest, SnapshotStore};
@@ -19,7 +19,7 @@ use bunkerglow::Slot;
 use ed25519_dalek::SigningKey;
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -186,7 +186,7 @@ pub struct NodeStatus {
     pub finalized_slot: u64,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub struct RadioStats {
     pub bandwidth_bps: u32,
     pub packet_loss_percent: f32,
@@ -363,6 +363,7 @@ pub struct SharedState {
     pub radio_stats: Arc<RwLock<RadioStats>>,
     pub updates: broadcast::Sender<WebSocketUpdate>,
     pub blockstore: Option<Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>>,
+    pub pool: Option<Arc<RwLock<Box<dyn Pool + Send + Sync>>>>,
     pub mempool: Arc<RwLock<Vec<MempoolEntry>>>,
     pub tx_sender: Option<mpsc::UnboundedSender<CoreTransaction>>,
     pub execution_state: Arc<RwLock<ExecutionState>>,
@@ -592,7 +593,7 @@ fn build_api_block(
 ) -> Block {
     let (producer, proposed_timestamp, finalized_timestamp) = match metadata {
         Some(m) => (m.producer, m.proposed_timestamp, m.finalized_timestamp),
-        None => (0, 0, Some(0)),
+        None => (0, 0, None),
     };
 
     let status = if finalized_timestamp.is_some() {
@@ -610,6 +611,47 @@ fn build_api_block(
         proposed_timestamp,
         finalized_timestamp,
         status,
+    }
+}
+
+// Only blocks the walked finalized chain provably bypassed were skip-certified.
+fn mark_dead_blocks_skipped(all_blocks: &mut [Block], walked_low: Option<u64>) {
+    let Some(low) = walked_low else { return };
+    let finalized_tip = all_blocks
+        .iter()
+        .filter(|b| {
+            matches!(
+                b,
+                Block::Block {
+                    status: SlotStatus::Finalized,
+                    ..
+                }
+            )
+        })
+        .map(|b| b.slot())
+        .max();
+    let Some(tip) = finalized_tip else { return };
+    for b in all_blocks.iter_mut() {
+        if b.slot() <= low || b.slot() >= tip {
+            continue;
+        }
+        if let Block::Block {
+            slot,
+            proposed_timestamp,
+            status,
+            ..
+        } = b
+        {
+            if *status != SlotStatus::Finalized {
+                *b = Block::Skip {
+                    slot: *slot,
+                    hash: format!("skip-{}", *slot),
+                    proposed_timestamp: *proposed_timestamp,
+                    finalized_timestamp: None,
+                    status: SlotStatus::Finalized,
+                };
+            }
+        }
     }
 }
 
@@ -785,9 +827,13 @@ async fn blocks(
         blocks.clone()
     };
 
-    if let Some(bs_arc) = &state.blockstore {
-        let bs = bs_arc.read().await;
+    let bs_opt = match &state.blockstore {
+        Some(bs_arc) => Some(bs_arc.read().await),
+        None => None,
+    };
+    let mut scan_low = 0u64;
 
+    if let Some(bs) = &bs_opt {
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
         // Persistent nodes may have no in-memory blocks; use finalized height with headroom.
         let highest_finalized_slot = current_slot(&state).await;
@@ -797,6 +843,7 @@ async fn blocks(
         let want = offset + limit;
         let window = (want * 3).max(400) as u64;
         let low = top.saturating_sub(window);
+        scan_low = low;
 
         for slot_u64 in low..=top {
             if all_blocks.iter().any(|b| b.slot() == slot_u64) {
@@ -816,50 +863,101 @@ async fn blocks(
         }
     }
 
+    // The pool's finalization cert names the true chain tip; metadata-derived
+    // status is only the fallback when no pool is wired in.
+    let pool_tip = match &state.pool {
+        Some(pool) => {
+            let pg = pool.read().await;
+            let f = pg.finalized_slot();
+            pg.finalized_block_hash(f).map(|h| hex::encode(h.as_hash()))
+        }
+        None => None,
+    };
+
     // Finalized blocks finalize ancestors; walk parent links instead of using a
     // slot frontier so skip-certified dead blocks are not falsely finalized.
-    {
+    let walked_low = {
         let mut index_by_hash: HashMap<String, usize> = HashMap::new();
         for (i, b) in all_blocks.iter().enumerate() {
             if let Block::Block { hash, .. } = b {
                 index_by_hash.insert(hash.clone(), i);
             }
         }
-        let mut cursor = all_blocks
-            .iter()
-            .filter(|b| {
-                matches!(
-                    b,
-                    Block::Block {
-                        status: SlotStatus::Finalized,
-                        ..
-                    }
-                )
-            })
-            .max_by_key(|b| b.slot())
-            .and_then(|b| match b {
-                Block::Block { hash, .. } => Some(hash.clone()),
-                _ => None,
-            });
+        let mut cursor = pool_tip.or_else(|| {
+            all_blocks
+                .iter()
+                .filter(|b| {
+                    matches!(
+                        b,
+                        Block::Block {
+                            status: SlotStatus::Finalized,
+                            ..
+                        }
+                    )
+                })
+                .max_by_key(|b| b.slot())
+                .and_then(|b| match b {
+                    Block::Block { hash, .. } => Some(hash.clone()),
+                    _ => None,
+                })
+        });
+        let mut low = None;
+        let mut visited: HashSet<String> = HashSet::new();
         while let Some(h) = cursor {
-            let Some(&i) = index_by_hash.get(&h) else {
+            // The visited set guards against corrupt parent cycles.
+            if !visited.insert(h.clone()) {
                 break;
+            }
+            let i = match index_by_hash.get(&h) {
+                Some(&i) => i,
+                // The canonical pointer for a slot can name a dead fork block;
+                // the chain block is still in the blockstore under its hash.
+                None => match &bs_opt {
+                    Some(bs) => {
+                        let Some(arr) = decode_hash32(&h).ok() else {
+                            break;
+                        };
+                        let hash = Hash::from(arr);
+                        let Some((slot, blk)) = bs.load_block_by_hash(hash.clone()) else {
+                            break;
+                        };
+                        if slot.inner() < scan_low {
+                            break;
+                        }
+                        let metadata = bs.load_block_metadata(slot, hash);
+                        let api_block = build_api_block(slot.inner(), h.clone(), &blk, metadata);
+                        match all_blocks.iter().position(|b| b.slot() == slot.inner()) {
+                            Some(j) => {
+                                all_blocks[j] = api_block;
+                                j
+                            }
+                            None => {
+                                all_blocks.push(api_block);
+                                all_blocks.len() - 1
+                            }
+                        }
+                    }
+                    None => break,
+                },
             };
-            // Removing each hash guards against corrupt parent cycles.
-            index_by_hash.remove(&h);
             cursor = match &mut all_blocks[i] {
                 Block::Block {
+                    slot,
                     status,
                     parent_hash,
                     ..
                 } => {
                     *status = SlotStatus::Finalized;
+                    low = Some(*slot);
                     Some(parent_hash.clone())
                 }
                 _ => None,
             };
         }
-    }
+        low
+    };
+
+    mark_dead_blocks_skipped(&mut all_blocks, walked_low);
 
     all_blocks.sort_by_key(|b| std::cmp::Reverse(b.slot()));
 
@@ -2365,6 +2463,133 @@ mod tests {
         let resp = TransactionBodyResponse::UnJail;
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"type\":\"UnJail\""));
+    }
+
+    #[tokio::test]
+    async fn blocks_endpoint_reports_bypassed_slots_as_skipped() {
+        let mk = |slot: u64, parent_slot: u64, finalized: bool| Block::Block {
+            slot,
+            hash: format!("h{}", slot),
+            parent_slot,
+            parent_hash: format!("h{}", parent_slot),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: finalized.then_some(200),
+            status: if finalized {
+                SlotStatus::Finalized
+            } else {
+                SlotStatus::Proposed
+            },
+        };
+        let state = SharedState {
+            blocks: Arc::new(tokio::sync::RwLock::new(vec![
+                mk(47606, 47605, false),
+                mk(47609, 47608, true),
+                mk(47610, 47609, false),
+                mk(47611, 47610, false),
+                mk(47612, 47609, true),
+            ])),
+            nodes: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            radio_stats: Arc::new(tokio::sync::RwLock::new(RadioStats::default())),
+            updates: tokio::sync::broadcast::channel(8).0,
+            blockstore: None,
+            pool: None,
+            mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            tx_sender: None,
+            execution_state: Arc::new(tokio::sync::RwLock::new(
+                bunker_coin_core::execution::State::new(),
+            )),
+            tx_results: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            genesis_signing_key: None,
+            snapshot_store: None,
+        };
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let status_of = |slot: u64| {
+            result
+                .iter()
+                .find(|b| b.slot() == slot)
+                .map(|b| match b {
+                    Block::Skip { .. } => "skip",
+                    Block::Block { .. } => "block",
+                })
+                .unwrap()
+        };
+        assert_eq!(status_of(47609), "block");
+        assert_eq!(status_of(47610), "skip");
+        assert_eq!(status_of(47611), "skip");
+        assert_eq!(status_of(47612), "block");
+        assert_eq!(status_of(47606), "block");
+    }
+
+    #[test]
+    fn dead_blocks_below_finalized_tip_become_skips() {
+        let mk = |slot: u64, status: SlotStatus| Block::Block {
+            slot,
+            hash: format!("h{}", slot),
+            parent_slot: slot - 1,
+            parent_hash: format!("h{}", slot - 1),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: None,
+            status,
+        };
+        let mut blocks = vec![
+            mk(12, SlotStatus::Finalized),
+            mk(11, SlotStatus::Proposed),
+            mk(10, SlotStatus::Notarized),
+            mk(9, SlotStatus::Finalized),
+            mk(13, SlotStatus::Proposed),
+            mk(7, SlotStatus::Proposed),
+        ];
+        mark_dead_blocks_skipped(&mut blocks, Some(9));
+
+        for b in &blocks {
+            match b.slot() {
+                10 | 11 => assert!(matches!(b, Block::Skip { .. }), "slot {}", b.slot()),
+                _ => assert!(matches!(b, Block::Block { .. }), "slot {}", b.slot()),
+            }
+        }
+        assert_eq!(blocks[4].status(), SlotStatus::Proposed);
+        assert_eq!(blocks[5].status(), SlotStatus::Proposed);
+
+        let mut untouched = vec![mk(5, SlotStatus::Finalized), mk(4, SlotStatus::Proposed)];
+        mark_dead_blocks_skipped(&mut untouched, None);
+        assert!(untouched.iter().all(|b| matches!(b, Block::Block { .. })));
+    }
+
+    #[test]
+    fn build_api_block_without_metadata_is_not_finalized() {
+        let zeros = vec![0u8; 32];
+        let blk: bunkerglow::Block = serde_json::from_value(serde_json::json!({
+            "slot": 7,
+            "hash": zeros,
+            "parent": 6,
+            "parent_hash": zeros,
+            "epoch_transition": null,
+            "transactions": [],
+        }))
+        .unwrap();
+
+        match build_api_block(7, "aa".repeat(32), &blk, None) {
+            Block::Block {
+                status,
+                finalized_timestamp,
+                ..
+            } => {
+                assert_eq!(status, SlotStatus::Proposed);
+                assert_eq!(finalized_timestamp, None);
+            }
+            _ => panic!("expected a block entry"),
+        }
     }
 }
 

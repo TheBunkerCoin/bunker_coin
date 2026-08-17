@@ -969,6 +969,34 @@ pub async fn multi_node_consensus_simulation_with_api(
                     let pool_finalized_slot = pool_guard.finalized_slot();
                     let finalized_by_cert = is_finalized && pool_finalized_slot >= slot_id;
 
+                    if is_skip_certified && !is_finalized {
+                        if let Some(idx) = blocks_guard
+                            .iter()
+                            .position(|b| b.slot() == slot && matches!(b, rpc::Block::Block { .. }))
+                        {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            let skip_block = rpc::Block::Skip {
+                                slot,
+                                hash: format!("skip-{}", slot),
+                                proposed_timestamp: blocks_guard[idx].proposed_timestamp(),
+                                finalized_timestamp: Some(now),
+                                status: rpc::SlotStatus::Finalized,
+                            };
+                            println!(
+                                "Slot {} skip-certified: replacing dead block entry with skip",
+                                slot
+                            );
+                            blocks_guard[idx] = skip_block.clone();
+                            let _ = updates_tx.send(rpc::WebSocketUpdate::BlockUpdate(
+                                rpc::BlockUpdate::UpdateSlot(skip_block),
+                            ));
+                            continue;
+                        }
+                    }
+
                     let current_status = if finalized_by_cert || is_skip_certified {
                         rpc::SlotStatus::Finalized
                     } else if is_notarized || is_notarized_fallback {
