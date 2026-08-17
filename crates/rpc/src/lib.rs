@@ -592,7 +592,7 @@ fn build_api_block(
 ) -> Block {
     let (producer, proposed_timestamp, finalized_timestamp) = match metadata {
         Some(m) => (m.producer, m.proposed_timestamp, m.finalized_timestamp),
-        None => (0, 0, Some(0)),
+        None => (0, 0, None),
     };
 
     let status = if finalized_timestamp.is_some() {
@@ -2365,6 +2365,32 @@ mod tests {
         let resp = TransactionBodyResponse::UnJail;
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"type\":\"UnJail\""));
+    }
+
+    #[test]
+    fn build_api_block_without_metadata_is_not_finalized() {
+        let zeros = vec![0u8; 32];
+        let blk: bunkerglow::Block = serde_json::from_value(serde_json::json!({
+            "slot": 7,
+            "hash": zeros,
+            "parent": 6,
+            "parent_hash": zeros,
+            "epoch_transition": null,
+            "transactions": [],
+        }))
+        .unwrap();
+
+        match build_api_block(7, "aa".repeat(32), &blk, None) {
+            Block::Block {
+                status,
+                finalized_timestamp,
+                ..
+            } => {
+                assert_eq!(status, SlotStatus::Proposed);
+                assert_eq!(finalized_timestamp, None);
+            }
+            _ => panic!("expected a block entry"),
+        }
     }
 }
 
