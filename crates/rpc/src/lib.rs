@@ -19,7 +19,7 @@ use bunkerglow::Slot;
 use ed25519_dalek::SigningKey;
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -826,9 +826,13 @@ async fn blocks(
         blocks.clone()
     };
 
-    if let Some(bs_arc) = &state.blockstore {
-        let bs = bs_arc.read().await;
+    let bs_opt = match &state.blockstore {
+        Some(bs_arc) => Some(bs_arc.read().await),
+        None => None,
+    };
+    let mut scan_low = 0u64;
 
+    if let Some(bs) = &bs_opt {
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
         // Persistent nodes may have no in-memory blocks; use finalized height with headroom.
         let highest_finalized_slot = current_slot(&state).await;
@@ -838,6 +842,7 @@ async fn blocks(
         let want = offset + limit;
         let window = (want * 3).max(400) as u64;
         let low = top.saturating_sub(window);
+        scan_low = low;
 
         for slot_u64 in low..=top {
             if all_blocks.iter().any(|b| b.slot() == slot_u64) {
@@ -883,12 +888,44 @@ async fn blocks(
                 _ => None,
             });
         let mut low = None;
+        let mut visited: HashSet<String> = HashSet::new();
         while let Some(h) = cursor {
-            let Some(&i) = index_by_hash.get(&h) else {
+            // The visited set guards against corrupt parent cycles.
+            if !visited.insert(h.clone()) {
                 break;
+            }
+            let i = match index_by_hash.get(&h) {
+                Some(&i) => i,
+                // The canonical pointer for a slot can name a dead fork block;
+                // the chain block is still in the blockstore under its hash.
+                None => match &bs_opt {
+                    Some(bs) => {
+                        let Some(arr) = decode_hash32(&h).ok() else {
+                            break;
+                        };
+                        let hash = Hash::from(arr);
+                        let Some((slot, blk)) = bs.load_block_by_hash(hash.clone()) else {
+                            break;
+                        };
+                        if slot.inner() < scan_low {
+                            break;
+                        }
+                        let metadata = bs.load_block_metadata(slot, hash);
+                        let api_block = build_api_block(slot.inner(), h.clone(), &blk, metadata);
+                        match all_blocks.iter().position(|b| b.slot() == slot.inner()) {
+                            Some(j) => {
+                                all_blocks[j] = api_block;
+                                j
+                            }
+                            None => {
+                                all_blocks.push(api_block);
+                                all_blocks.len() - 1
+                            }
+                        }
+                    }
+                    None => break,
+                },
             };
-            // Removing each hash guards against corrupt parent cycles.
-            index_by_hash.remove(&h);
             cursor = match &mut all_blocks[i] {
                 Block::Block {
                     slot,
