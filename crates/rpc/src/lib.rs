@@ -186,7 +186,7 @@ pub struct NodeStatus {
     pub finalized_slot: u64,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub struct RadioStats {
     pub bandwidth_bps: u32,
     pub packet_loss_percent: f32,
@@ -613,6 +613,47 @@ fn build_api_block(
     }
 }
 
+// Below the finalized tip every slot is decided, so a block still off the
+// finalized chain there was skip-certified.
+fn mark_dead_blocks_skipped(all_blocks: &mut [Block]) {
+    let finalized_tip = all_blocks
+        .iter()
+        .filter(|b| {
+            matches!(
+                b,
+                Block::Block {
+                    status: SlotStatus::Finalized,
+                    ..
+                }
+            )
+        })
+        .map(|b| b.slot())
+        .max();
+    let Some(tip) = finalized_tip else { return };
+    for b in all_blocks.iter_mut() {
+        if b.slot() >= tip {
+            continue;
+        }
+        if let Block::Block {
+            slot,
+            proposed_timestamp,
+            status,
+            ..
+        } = b
+        {
+            if *status != SlotStatus::Finalized {
+                *b = Block::Skip {
+                    slot: *slot,
+                    hash: format!("skip-{}", *slot),
+                    proposed_timestamp: *proposed_timestamp,
+                    finalized_timestamp: None,
+                    status: SlotStatus::Finalized,
+                };
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Pagination {
     limit: Option<usize>,
@@ -860,6 +901,8 @@ async fn blocks(
             };
         }
     }
+
+    mark_dead_blocks_skipped(&mut all_blocks);
 
     all_blocks.sort_by_key(|b| std::cmp::Reverse(b.slot()));
 
@@ -2365,6 +2408,99 @@ mod tests {
         let resp = TransactionBodyResponse::UnJail;
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"type\":\"UnJail\""));
+    }
+
+    #[tokio::test]
+    async fn blocks_endpoint_reports_bypassed_slots_as_skipped() {
+        let mk = |slot: u64, parent_slot: u64, finalized: bool| Block::Block {
+            slot,
+            hash: format!("h{}", slot),
+            parent_slot,
+            parent_hash: format!("h{}", parent_slot),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: finalized.then_some(200),
+            status: if finalized {
+                SlotStatus::Finalized
+            } else {
+                SlotStatus::Proposed
+            },
+        };
+        // Slot 47612 finalized with parent 47609; 47610/47611 proposed but dead.
+        let state = SharedState {
+            blocks: Arc::new(tokio::sync::RwLock::new(vec![
+                mk(47609, 47608, true),
+                mk(47610, 47609, false),
+                mk(47611, 47610, false),
+                mk(47612, 47609, true),
+            ])),
+            nodes: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            radio_stats: Arc::new(tokio::sync::RwLock::new(RadioStats::default())),
+            updates: tokio::sync::broadcast::channel(8).0,
+            blockstore: None,
+            mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            tx_sender: None,
+            execution_state: Arc::new(tokio::sync::RwLock::new(
+                bunker_coin_core::execution::State::new(),
+            )),
+            tx_results: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            genesis_signing_key: None,
+            snapshot_store: None,
+        };
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let status_of = |slot: u64| {
+            result
+                .iter()
+                .find(|b| b.slot() == slot)
+                .map(|b| match b {
+                    Block::Skip { .. } => "skip",
+                    Block::Block { .. } => "block",
+                })
+                .unwrap()
+        };
+        assert_eq!(status_of(47609), "block");
+        assert_eq!(status_of(47610), "skip");
+        assert_eq!(status_of(47611), "skip");
+        assert_eq!(status_of(47612), "block");
+    }
+
+    #[test]
+    fn dead_blocks_below_finalized_tip_become_skips() {
+        let mk = |slot: u64, status: SlotStatus| Block::Block {
+            slot,
+            hash: format!("h{}", slot),
+            parent_slot: slot - 1,
+            parent_hash: format!("h{}", slot - 1),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: None,
+            status,
+        };
+        let mut blocks = vec![
+            mk(12, SlotStatus::Finalized),
+            mk(11, SlotStatus::Proposed),
+            mk(10, SlotStatus::Notarized),
+            mk(9, SlotStatus::Finalized),
+            mk(13, SlotStatus::Proposed),
+        ];
+        mark_dead_blocks_skipped(&mut blocks);
+
+        for b in &blocks {
+            match b.slot() {
+                10 | 11 => assert!(matches!(b, Block::Skip { .. }), "slot {}", b.slot()),
+                _ => assert!(matches!(b, Block::Block { .. }), "slot {}", b.slot()),
+            }
+        }
+        assert_eq!(blocks[4].status(), SlotStatus::Proposed);
     }
 
     #[test]
