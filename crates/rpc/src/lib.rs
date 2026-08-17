@@ -869,8 +869,7 @@ async fn blocks(
         Some(pool) => {
             let pg = pool.read().await;
             let f = pg.finalized_slot();
-            pg.finalized_block_hash(f)
-                .map(|h| hex::encode(h.as_hash()))
+            pg.finalized_block_hash(f).map(|h| hex::encode(h.as_hash()))
         }
         None => None,
     };
