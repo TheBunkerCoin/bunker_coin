@@ -613,8 +613,9 @@ fn build_api_block(
     }
 }
 
-// Below the finalized tip, a block off the finalized chain was skip-certified.
-fn mark_dead_blocks_skipped(all_blocks: &mut [Block]) {
+// Only blocks the walked finalized chain provably bypassed were skip-certified.
+fn mark_dead_blocks_skipped(all_blocks: &mut [Block], walked_low: Option<u64>) {
+    let Some(low) = walked_low else { return };
     let finalized_tip = all_blocks
         .iter()
         .filter(|b| {
@@ -630,7 +631,7 @@ fn mark_dead_blocks_skipped(all_blocks: &mut [Block]) {
         .max();
     let Some(tip) = finalized_tip else { return };
     for b in all_blocks.iter_mut() {
-        if b.slot() >= tip {
+        if b.slot() <= low || b.slot() >= tip {
             continue;
         }
         if let Block::Block {
@@ -858,7 +859,7 @@ async fn blocks(
 
     // Finalized blocks finalize ancestors; walk parent links instead of using a
     // slot frontier so skip-certified dead blocks are not falsely finalized.
-    {
+    let walked_low = {
         let mut index_by_hash: HashMap<String, usize> = HashMap::new();
         for (i, b) in all_blocks.iter().enumerate() {
             if let Block::Block { hash, .. } = b {
@@ -881,6 +882,7 @@ async fn blocks(
                 Block::Block { hash, .. } => Some(hash.clone()),
                 _ => None,
             });
+        let mut low = None;
         while let Some(h) = cursor {
             let Some(&i) = index_by_hash.get(&h) else {
                 break;
@@ -889,19 +891,22 @@ async fn blocks(
             index_by_hash.remove(&h);
             cursor = match &mut all_blocks[i] {
                 Block::Block {
+                    slot,
                     status,
                     parent_hash,
                     ..
                 } => {
                     *status = SlotStatus::Finalized;
+                    low = Some(*slot);
                     Some(parent_hash.clone())
                 }
                 _ => None,
             };
         }
-    }
+        low
+    };
 
-    mark_dead_blocks_skipped(&mut all_blocks);
+    mark_dead_blocks_skipped(&mut all_blocks, walked_low);
 
     all_blocks.sort_by_key(|b| std::cmp::Reverse(b.slot()));
 
@@ -2427,6 +2432,7 @@ mod tests {
         };
         let state = SharedState {
             blocks: Arc::new(tokio::sync::RwLock::new(vec![
+                mk(47606, 47605, false),
                 mk(47609, 47608, true),
                 mk(47610, 47609, false),
                 mk(47611, 47610, false),
@@ -2469,6 +2475,7 @@ mod tests {
         assert_eq!(status_of(47610), "skip");
         assert_eq!(status_of(47611), "skip");
         assert_eq!(status_of(47612), "block");
+        assert_eq!(status_of(47606), "block");
     }
 
     #[test]
@@ -2489,8 +2496,9 @@ mod tests {
             mk(10, SlotStatus::Notarized),
             mk(9, SlotStatus::Finalized),
             mk(13, SlotStatus::Proposed),
+            mk(7, SlotStatus::Proposed),
         ];
-        mark_dead_blocks_skipped(&mut blocks);
+        mark_dead_blocks_skipped(&mut blocks, Some(9));
 
         for b in &blocks {
             match b.slot() {
@@ -2499,6 +2507,11 @@ mod tests {
             }
         }
         assert_eq!(blocks[4].status(), SlotStatus::Proposed);
+        assert_eq!(blocks[5].status(), SlotStatus::Proposed);
+
+        let mut untouched = vec![mk(5, SlotStatus::Finalized), mk(4, SlotStatus::Proposed)];
+        mark_dead_blocks_skipped(&mut untouched, None);
+        assert!(untouched.iter().all(|b| matches!(b, Block::Block { .. })));
     }
 
     #[test]
