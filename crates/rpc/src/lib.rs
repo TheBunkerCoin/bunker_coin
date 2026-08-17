@@ -11,7 +11,7 @@ use axum::{
 use bunker_coin_core::execution::State as ExecutionState;
 use bunker_coin_core::transaction::{Transaction as CoreTransaction, TransactionBody};
 use bunker_coin_core::types::MAX_TICKER_LEN;
-use bunkerglow::consensus::Blockstore;
+use bunkerglow::consensus::{Blockstore, Pool};
 use bunkerglow::crypto::merkle::{DoubleMerkleRoot, MerkleRoot};
 use bunkerglow::crypto::Hash;
 use bunkerglow::snapshot::{SnapshotManifest, SnapshotStore};
@@ -363,6 +363,7 @@ pub struct SharedState {
     pub radio_stats: Arc<RwLock<RadioStats>>,
     pub updates: broadcast::Sender<WebSocketUpdate>,
     pub blockstore: Option<Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>>,
+    pub pool: Option<Arc<RwLock<Box<dyn Pool + Send + Sync>>>>,
     pub mempool: Arc<RwLock<Vec<MempoolEntry>>>,
     pub tx_sender: Option<mpsc::UnboundedSender<CoreTransaction>>,
     pub execution_state: Arc<RwLock<ExecutionState>>,
@@ -862,6 +863,18 @@ async fn blocks(
         }
     }
 
+    // The pool's finalization cert names the true chain tip; metadata-derived
+    // status is only the fallback when no pool is wired in.
+    let pool_tip = match &state.pool {
+        Some(pool) => {
+            let pg = pool.read().await;
+            let f = pg.finalized_slot();
+            pg.finalized_block_hash(f)
+                .map(|h| hex::encode(h.as_hash()))
+        }
+        None => None,
+    };
+
     // Finalized blocks finalize ancestors; walk parent links instead of using a
     // slot frontier so skip-certified dead blocks are not falsely finalized.
     let walked_low = {
@@ -871,22 +884,24 @@ async fn blocks(
                 index_by_hash.insert(hash.clone(), i);
             }
         }
-        let mut cursor = all_blocks
-            .iter()
-            .filter(|b| {
-                matches!(
-                    b,
-                    Block::Block {
-                        status: SlotStatus::Finalized,
-                        ..
-                    }
-                )
-            })
-            .max_by_key(|b| b.slot())
-            .and_then(|b| match b {
-                Block::Block { hash, .. } => Some(hash.clone()),
-                _ => None,
-            });
+        let mut cursor = pool_tip.or_else(|| {
+            all_blocks
+                .iter()
+                .filter(|b| {
+                    matches!(
+                        b,
+                        Block::Block {
+                            status: SlotStatus::Finalized,
+                            ..
+                        }
+                    )
+                })
+                .max_by_key(|b| b.slot())
+                .and_then(|b| match b {
+                    Block::Block { hash, .. } => Some(hash.clone()),
+                    _ => None,
+                })
+        });
         let mut low = None;
         let mut visited: HashSet<String> = HashSet::new();
         while let Some(h) = cursor {
@@ -2479,6 +2494,7 @@ mod tests {
             radio_stats: Arc::new(tokio::sync::RwLock::new(RadioStats::default())),
             updates: tokio::sync::broadcast::channel(8).0,
             blockstore: None,
+            pool: None,
             mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             tx_sender: None,
             execution_state: Arc::new(tokio::sync::RwLock::new(

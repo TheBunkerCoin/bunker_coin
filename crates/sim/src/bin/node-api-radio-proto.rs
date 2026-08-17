@@ -85,6 +85,7 @@ async fn main() {
         radio_stats: radio_stats.clone(),
         updates: updates_tx.clone(),
         blockstore: None,
+        pool: None,
         mempool: mempool.clone(),
         tx_sender: None,
         execution_state: execution_state.clone(),

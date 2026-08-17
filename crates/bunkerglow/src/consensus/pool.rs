@@ -26,7 +26,7 @@ use self::finality_tracker::FinalityTracker;
 use super::blockstore::Blockstore;
 use super::votor::VotorEvent;
 use super::{Cert, EpochInfo, Vote};
-use crate::consensus::cert::NotarCert;
+use crate::consensus::cert::{FastFinalCert, NotarCert};
 use crate::consensus::pool::finality_tracker::FinalizationEvent;
 use crate::crypto::merkle::{BlockHash, MerkleRoot};
 use crate::types::{SLOTS_PER_EPOCH, SLOTS_PER_WINDOW};
@@ -102,6 +102,7 @@ pub trait Pool {
     async fn add_block(&mut self, block_id: BlockId, parent_id: BlockId);
     async fn recover_from_standstill(&self);
     fn finalized_slot(&self) -> Slot;
+    fn finalized_block_hash(&self, slot: Slot) -> Option<BlockHash>;
     fn has_notar_or_fallback_cert(&self, slot: Slot) -> bool;
     fn has_final_cert(&self, slot: Slot) -> bool;
     fn has_notar_cert(&self, slot: Slot) -> bool;
@@ -473,6 +474,19 @@ impl PoolImpl {
             .and_then(|state| state.certificates.notar.as_ref().map(NotarCert::block_hash))
     }
 
+    /// Returns the hash of the block a finalization cert names for the slot.
+    pub fn finalized_block_hash(&self, slot: Slot) -> Option<BlockHash> {
+        self.slot_states.get(&slot).and_then(|state| {
+            state
+                .certificates
+                .fast_finalize
+                .as_ref()
+                .map(FastFinalCert::block_hash)
+                .or_else(|| state.certificates.notar.as_ref().map(NotarCert::block_hash))
+                .cloned()
+        })
+    }
+
     /// Returns `true` iff the pool contains a (fast) finalization certificate for the slot.
     pub fn has_final_cert(&self, slot: Slot) -> bool {
         self.slot_states.get(&slot).is_some_and(|state| {
@@ -674,6 +688,10 @@ impl Pool for PoolImpl {
         self.finality_tracker
             .highest_finalized_slot()
             .max(self.highest_finalized_slot)
+    }
+
+    fn finalized_block_hash(&self, slot: Slot) -> Option<BlockHash> {
+        self.finalized_block_hash(slot)
     }
 
     fn has_notar_or_fallback_cert(&self, slot: Slot) -> bool {

@@ -120,6 +120,9 @@ struct Args {
 type SharedBlockstore =
     Arc<tokio::sync::RwLock<Box<dyn bunkerglow::consensus::Blockstore + Send + Sync>>>;
 
+/// Consensus pool shared by a node and the RPC server.
+type SharedPool = Arc<tokio::sync::RwLock<Box<dyn bunkerglow::consensus::Pool + Send + Sync>>>;
+
 /// RPC-facing transaction, execution, node, and radio state.
 #[derive(Clone)]
 struct TxContext {
@@ -438,13 +441,18 @@ fn spawn_radio_stats_sampler(counters: Arc<LinkCounters>, tx: &TxContext) {
 }
 
 /// Build RPC state backed by the live blockstore and transaction context.
-fn rpc_state_for(blockstore: SharedBlockstore, tx: &TxContext) -> rpc::SharedState {
+fn rpc_state_for(
+    blockstore: SharedBlockstore,
+    pool: Option<SharedPool>,
+    tx: &TxContext,
+) -> rpc::SharedState {
     rpc::SharedState {
         blocks: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         nodes: tx.nodes.clone(),
         radio_stats: tx.radio_stats.clone(),
         updates: tx.updates.clone(),
         blockstore: Some(blockstore),
+        pool,
         mempool: tx.mempool.clone(),
         tx_sender: Some(tx.tx_sender.clone()),
         execution_state: tx.execution_state.clone(),
@@ -455,9 +463,9 @@ fn rpc_state_for(blockstore: SharedBlockstore, tx: &TxContext) -> rpc::SharedSta
 }
 
 /// Spawn RPC for the simulated, non-reconnect path.
-fn spawn_rpc(blockstore: SharedBlockstore, tx: &TxContext) {
+fn spawn_rpc(blockstore: SharedBlockstore, pool: Option<SharedPool>, tx: &TxContext) {
     println!("RPC API serving on http://127.0.0.1:3001 (try /blocks, POST /transactions)");
-    tokio::spawn(rpc::run_api(rpc_state_for(blockstore, tx)));
+    tokio::spawn(rpc::run_api(rpc_state_for(blockstore, pool, tx)));
 }
 
 /// Current per-session mempool; `None` while hardware is between links.
@@ -959,7 +967,7 @@ async fn run_inspect(
     // Offline inspect has no tx bridge; `/submit` is a no-op.
     let exec = Arc::new(tokio::sync::RwLock::new(cluster.genesis_state()));
     let (tx_ctx, _tx_rx) = TxContext::new(&cluster, exec);
-    spawn_rpc(blockstore, &tx_ctx);
+    spawn_rpc(blockstore, None, &tx_ctx);
 
     run_until(duration).await;
     Ok(())
@@ -1078,7 +1086,7 @@ async fn run_simulated(
     );
 
     if rpc {
-        spawn_rpc(node_a.get_blockstore(), &tx_a);
+        spawn_rpc(node_a.get_blockstore(), Some(node_a.get_pool()), &tx_a);
     }
 
     let until = deadline_for(duration);
@@ -1263,6 +1271,7 @@ async fn run_hardware(
         let rpc_task = if args.rpc {
             Some(tokio::spawn(rpc::run_api(rpc_state_for(
                 node.get_blockstore(),
+                Some(node.get_pool()),
                 &session_tx,
             ))))
         } else {
