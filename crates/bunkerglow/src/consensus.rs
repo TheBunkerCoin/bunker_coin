@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use block_producer::BlockProducer;
-pub use blockstore::{BlockInfo, BlockMetadata, Blockstore, BlockstoreImpl};
+pub use blockstore::{BlockInfo, BlockMetadata, Blockstore, BlockstoreImpl, MockBlockstore};
 pub use cert::Cert;
 use color_eyre::Result;
 pub use epoch_info::EpochInfo;

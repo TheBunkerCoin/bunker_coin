@@ -832,6 +832,7 @@ async fn blocks(
         None => None,
     };
     let mut scan_low = 0u64;
+    let mut scan_top = 0u64;
 
     if let Some(bs) = &bs_opt {
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
@@ -844,6 +845,7 @@ async fn blocks(
         let window = (want * 3).max(400) as u64;
         let low = top.saturating_sub(window);
         scan_low = low;
+        scan_top = top;
 
         for slot_u64 in low..=top {
             if all_blocks.iter().any(|b| b.slot() == slot_u64) {
@@ -859,6 +861,39 @@ async fn blocks(
                     let api_block = build_api_block(slot_u64, hex::encode(hash), &blk, metadata);
                     all_blocks.push(api_block);
                 }
+            }
+        }
+    }
+
+    // Persisted skip certs decide a slot outright; a finalized chain block
+    // still wins because the walk below re-fetches chain blocks by hash.
+    if let Some(bs) = &bs_opt {
+        for slot_u64 in scan_low..=scan_top {
+            let Some(ts) = bs.slot_skipped_at(Slot::new(slot_u64)) else {
+                continue;
+            };
+            let entry = Block::Skip {
+                slot: slot_u64,
+                hash: format!("skip-{}", slot_u64),
+                proposed_timestamp: ts,
+                finalized_timestamp: Some(ts),
+                status: SlotStatus::Finalized,
+            };
+            match all_blocks.iter_mut().find(|b| b.slot() == slot_u64) {
+                Some(b) => {
+                    if matches!(
+                        b,
+                        Block::Block {
+                            status: SlotStatus::Pending
+                                | SlotStatus::Proposed
+                                | SlotStatus::Notarized,
+                            ..
+                        }
+                    ) {
+                        *b = entry;
+                    }
+                }
+                None => all_blocks.push(entry),
             }
         }
     }
@@ -2463,6 +2498,88 @@ mod tests {
         let resp = TransactionBodyResponse::UnJail;
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"type\":\"UnJail\""));
+    }
+
+    fn test_state(blocks: Vec<Block>) -> SharedState {
+        SharedState {
+            blocks: Arc::new(tokio::sync::RwLock::new(blocks)),
+            nodes: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            radio_stats: Arc::new(tokio::sync::RwLock::new(RadioStats::default())),
+            updates: tokio::sync::broadcast::channel(8).0,
+            blockstore: None,
+            pool: None,
+            mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            tx_sender: None,
+            execution_state: Arc::new(tokio::sync::RwLock::new(
+                bunker_coin_core::execution::State::new(),
+            )),
+            tx_results: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            genesis_signing_key: None,
+            snapshot_store: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_markers_decide_slots() {
+        let mk = |slot: u64, parent_slot: u64, finalized: bool| Block::Block {
+            slot,
+            hash: format!("h{}", slot),
+            parent_slot,
+            parent_hash: format!("h{}", parent_slot),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: finalized.then_some(200),
+            status: if finalized {
+                SlotStatus::Finalized
+            } else {
+                SlotStatus::Proposed
+            },
+        };
+
+        let mut bs = bunkerglow::consensus::MockBlockstore::new();
+        bs.expect_canonical_block_hash().returning(|_| None);
+        bs.expect_load_block_by_hash().returning(|_| None);
+        // Markers: 96 (below the walk's reach), 98 (dead block entry),
+        // 99 (no entry at all), 97 (finalized chain block — must NOT flip).
+        bs.expect_slot_skipped_at()
+            .returning(|slot| matches!(slot.inner(), 96 | 97 | 98 | 99).then_some(5));
+
+        let mut state = test_state(vec![
+            mk(100, 97, true),
+            mk(98, 97, false),
+            mk(97, 96, true),
+            mk(95, 94, false),
+        ]);
+        state.blockstore = Some(Arc::new(tokio::sync::RwLock::new(Box::new(bs))));
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let kind = |slot: u64| {
+            result
+                .iter()
+                .find(|b| b.slot() == slot)
+                .map(|b| match b {
+                    Block::Skip { .. } => "skip",
+                    Block::Block { status, .. } => match status {
+                        SlotStatus::Finalized => "finalized",
+                        _ => "other",
+                    },
+                })
+                .unwrap_or("missing")
+        };
+        assert_eq!(kind(100), "finalized");
+        assert_eq!(kind(99), "skip");
+        assert_eq!(kind(98), "skip");
+        assert_eq!(kind(97), "finalized");
+        assert_eq!(kind(96), "skip");
+        assert_eq!(kind(95), "other");
     }
 
     #[tokio::test]

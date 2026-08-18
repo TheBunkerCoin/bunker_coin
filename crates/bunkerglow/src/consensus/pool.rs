@@ -301,6 +301,18 @@ impl PoolImpl {
             }
             Cert::Skip(_) => {
                 warn!("skipped slot {slot}");
+                if let Some(ref blockstore) = self.blockstore {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    let blockstore = Arc::clone(blockstore);
+                    // Detached write: awaiting the blockstore under the pool
+                    // lock can deadlock against shred ingest.
+                    tokio::spawn(async move {
+                        blockstore.read().await.mark_slot_skipped(slot, timestamp);
+                    });
+                }
                 let new_parents_ready = self.parent_ready_tracker.mark_skipped(slot);
                 self.send_parent_ready_events(new_parents_ready).await;
             }

@@ -278,6 +278,10 @@ pub trait Blockstore {
 
     fn update_finalized_timestamp(&self, slot: Slot, hash: Hash, timestamp: u64);
 
+    fn mark_slot_skipped(&self, slot: Slot, timestamp: u64);
+
+    fn slot_skipped_at(&self, slot: Slot) -> Option<u64>;
+
     fn clean_beyond_finalized(&mut self, highest_finalized_slot: Slot);
 
     /// Drops cold in-memory finalized slots while keeping RocksDB as the fallback.
@@ -465,6 +469,19 @@ impl Blockstore for BlockstoreImpl {
         }
     }
 
+    fn mark_slot_skipped(&self, slot: Slot, timestamp: u64) {
+        let key = format!("skip|{:016X}", slot);
+        let _ = self.db.put(key.as_bytes(), timestamp.to_le_bytes());
+    }
+
+    fn slot_skipped_at(&self, slot: Slot) -> Option<u64> {
+        let key = format!("skip|{:016X}", slot);
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(v)) => v.as_slice().try_into().ok().map(u64::from_le_bytes),
+            _ => None,
+        }
+    }
+
     fn prune_finalized(&mut self, finalized_slot: Slot) {
         let cutoff = Slot::new(finalized_slot.inner().saturating_sub(HOT_BLOCK_LIMIT));
         self.prune(cutoff);
@@ -518,6 +535,20 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    #[test]
+    fn skip_marker_roundtrip_persists() {
+        let (tx, _rx) = mpsc::channel(100);
+        let (_sk, blockstore) = test_setup(tx);
+        let slot = Slot::new(rand::random::<u64>() | (1 << 62));
+        assert_eq!(blockstore.slot_skipped_at(slot), None);
+        blockstore.mark_slot_skipped(slot, 1234);
+        assert_eq!(blockstore.slot_skipped_at(slot), Some(1234));
+        assert_eq!(
+            blockstore.slot_skipped_at(Slot::new(slot.inner() - 1)),
+            None
+        );
+    }
 
     /// Same-process DB reopens must hit the shared handle cache.
     #[test]
