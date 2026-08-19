@@ -967,9 +967,10 @@ mod tests {
 
     #[tokio::test]
     async fn stamp_finalized_chain_covers_unstamped_ancestors() {
+        use std::sync::Mutex;
+
         use crate::consensus::blockstore::{BlockMetadata, MockBlockstore};
         use crate::crypto::Hash;
-        use std::sync::Mutex;
 
         let mk_block = |slot: u8, parent: u8| -> crate::Block {
             serde_json::from_value(serde_json::json!({
