@@ -865,13 +865,34 @@ async fn blocks(
         }
     }
 
-    // Persisted skip certs decide a slot outright; a finalized chain block
-    // still wins because the walk below re-fetches chain blocks by hash.
+    // Live pool certs cover skips the persisted markers predate.
+    let (pool_tip, pool_skips) = match &state.pool {
+        Some(pool) => {
+            let pg = pool.read().await;
+            let f = pg.finalized_slot();
+            let tip = pg.finalized_block_hash(f).map(|h| hex::encode(h.as_hash()));
+            let skips: HashSet<u64> = (scan_low..=scan_top)
+                .filter(|s| pg.has_skip_cert(Slot::new(*s)))
+                .collect();
+            (tip, skips)
+        }
+        None => (None, HashSet::new()),
+    };
+
+    // Skip certs decide a slot outright; a finalized chain block still wins
+    // because the walk below re-fetches chain blocks by hash.
     if let Some(bs) = &bs_opt {
         for slot_u64 in scan_low..=scan_top {
-            let Some(ts) = bs.slot_skipped_at(Slot::new(slot_u64)) else {
+            let marker = bs.slot_skipped_at(Slot::new(slot_u64));
+            if marker.is_none() && !pool_skips.contains(&slot_u64) {
                 continue;
-            };
+            }
+            let ts = marker.unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            });
             let entry = Block::Skip {
                 slot: slot_u64,
                 hash: format!("skip-{}", slot_u64),
@@ -897,17 +918,6 @@ async fn blocks(
             }
         }
     }
-
-    // The pool's finalization cert names the true chain tip; metadata-derived
-    // status is only the fallback when no pool is wired in.
-    let pool_tip = match &state.pool {
-        Some(pool) => {
-            let pg = pool.read().await;
-            let f = pg.finalized_slot();
-            pg.finalized_block_hash(f).map(|h| hex::encode(h.as_hash()))
-        }
-        None => None,
-    };
 
     // Finalized blocks finalize ancestors; walk parent links instead of using a
     // slot frontier so skip-certified dead blocks are not falsely finalized.
@@ -2580,6 +2590,52 @@ mod tests {
         assert_eq!(kind(97), "finalized");
         assert_eq!(kind(96), "skip");
         assert_eq!(kind(95), "other");
+    }
+
+    #[tokio::test]
+    async fn pool_skip_cert_shows_slot_skipped_without_marker() {
+        let mut bs = bunkerglow::consensus::MockBlockstore::new();
+        bs.expect_canonical_block_hash().returning(|_| None);
+        bs.expect_load_block_by_hash().returning(|_| None);
+        bs.expect_slot_skipped_at().returning(|_| None);
+
+        let mut pool = bunkerglow::consensus::MockPool::new();
+        pool.expect_finalized_slot().returning(|| Slot::new(78));
+        pool.expect_finalized_block_hash().returning(|_| None);
+        pool.expect_has_skip_cert()
+            .returning(|slot| slot.inner() == 79);
+
+        let mut state = test_state(vec![Block::Block {
+            slot: 78,
+            hash: "h78".into(),
+            parent_slot: 77,
+            parent_hash: "h77".into(),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: Some(200),
+            status: SlotStatus::Finalized,
+        }]);
+        state.blockstore = Some(Arc::new(tokio::sync::RwLock::new(Box::new(bs))));
+        state.pool = Some(Arc::new(tokio::sync::RwLock::new(Box::new(pool))));
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let at_79 = result.iter().find(|b| b.slot() == 79).unwrap();
+        assert!(matches!(at_79, Block::Skip { .. }));
+        assert!(matches!(
+            result.iter().find(|b| b.slot() == 78).unwrap(),
+            Block::Block {
+                status: SlotStatus::Finalized,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

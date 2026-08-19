@@ -30,7 +30,8 @@ use fastrace::future::FutureExt;
 pub use link_liveness::{LinkLiveness, NoLiveness, SwappableLiveness};
 use log::{error, info, trace, warn};
 pub use pool::{
-    AddVoteError, EpochBoundaryEvent, FinalizedSlotEvent, Pool, PoolError, PoolImpl, SlashingReport,
+    AddVoteError, EpochBoundaryEvent, FinalizedSlotEvent, MockPool, Pool, PoolError, PoolImpl,
+    SlashingReport,
 };
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
