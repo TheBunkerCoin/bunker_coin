@@ -239,6 +239,30 @@ impl PoolImpl {
 
     /// Sets the blockstore reference for updating finalized timestamps.
     pub fn set_blockstore(&mut self, blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>) {
+        // Backfill markers for skip certs persisted before markers existed.
+        let skip_slots: Vec<Slot> = self
+            .slot_states
+            .iter()
+            .filter(|(_, st)| st.certificates.skip.is_some())
+            .map(|(s, _)| *s)
+            .collect();
+        if !skip_slots.is_empty()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let bs = Arc::clone(&blockstore);
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            handle.spawn(async move {
+                let g = bs.read().await;
+                for slot in skip_slots {
+                    if g.slot_skipped_at(slot).is_none() {
+                        g.mark_slot_skipped(slot, timestamp);
+                    }
+                }
+            });
+        }
         self.blockstore = Some(blockstore);
     }
 
