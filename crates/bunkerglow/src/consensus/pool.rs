@@ -358,12 +358,11 @@ impl PoolImpl {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64;
-                    // Do not drop finalized-status writes under transient lock contention.
-                    blockstore.read().await.update_finalized_timestamp(
-                        slot,
+                    tokio::spawn(stamp_finalized_chain(
+                        Arc::clone(blockstore),
                         hash.as_hash().clone(),
                         timestamp,
-                    );
+                    ));
                 }
                 // Avoid blockstore.write() here: pool lock + shred-ingest await can deadlock.
                 self.prune();
@@ -384,12 +383,11 @@ impl PoolImpl {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64;
-                    // Do not drop finalized-status writes under transient lock contention.
-                    blockstore.read().await.update_finalized_timestamp(
-                        slot,
+                    tokio::spawn(stamp_finalized_chain(
+                        Arc::clone(blockstore),
                         hash.as_hash().clone(),
                         timestamp,
-                    );
+                    ));
                 }
 
                 self.prune();
@@ -938,9 +936,90 @@ impl PoolImpl {
     }
 }
 
+/// Ancestry finalization happens the moment the descendant's cert lands, so
+/// unstamped ancestors get that same timestamp.
+async fn stamp_finalized_chain(
+    blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
+    mut hash: crate::crypto::Hash,
+    timestamp: u64,
+) {
+    let g = blockstore.read().await;
+    for _ in 0..10_000 {
+        let Some((slot, block)) = g.load_block_by_hash(hash.clone()) else {
+            break;
+        };
+        if let Some(meta) = g.load_block_metadata(slot, hash.clone())
+            && meta.finalized_timestamp.is_some()
+        {
+            break;
+        }
+        g.update_finalized_timestamp(slot, hash, timestamp);
+        if block.parent() >= slot {
+            break;
+        }
+        hash = block.parent_hash().as_hash().clone();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn stamp_finalized_chain_covers_unstamped_ancestors() {
+        use crate::consensus::blockstore::{BlockMetadata, MockBlockstore};
+        use crate::crypto::Hash;
+        use std::sync::Mutex;
+
+        let mk_block = |slot: u8, parent: u8| -> crate::Block {
+            serde_json::from_value(serde_json::json!({
+                "slot": slot,
+                "hash": vec![slot; 32],
+                "parent": parent,
+                "parent_hash": vec![parent; 32],
+                "epoch_transition": null,
+                "transactions": [],
+            }))
+            .unwrap()
+        };
+        let (b5, b4, b3) = (mk_block(5, 4), mk_block(4, 3), mk_block(3, 2));
+
+        let stamped: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut bs = MockBlockstore::new();
+        bs.expect_load_block_by_hash().returning(move |h| {
+            if h == Hash::from([5u8; 32]) {
+                Some((Slot::new(5), b5.clone()))
+            } else if h == Hash::from([4u8; 32]) {
+                Some((Slot::new(4), b4.clone()))
+            } else if h == Hash::from([3u8; 32]) {
+                Some((Slot::new(3), b3.clone()))
+            } else {
+                None
+            }
+        });
+        // Slot 3 is already stamped; the walk must stop there.
+        bs.expect_load_block_metadata().returning(|slot, hash| {
+            Some(BlockMetadata {
+                slot,
+                hash,
+                producer: 0,
+                proposed_timestamp: 1,
+                finalized_timestamp: (slot == Slot::new(3)).then_some(42),
+            })
+        });
+        let rec = Arc::clone(&stamped);
+        bs.expect_update_finalized_timestamp()
+            .returning(move |slot, _, ts| {
+                rec.lock().unwrap().push(slot.inner());
+                assert_eq!(ts, 777);
+            });
+
+        let store: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>> =
+            Arc::new(RwLock::new(Box::new(bs)));
+        stamp_finalized_chain(store, Hash::from([5u8; 32]), 777).await;
+
+        assert_eq!(*stamped.lock().unwrap(), vec![5, 4]);
+    }
 
     use super::*;
     use crate::consensus::cert::{FastFinalCert, NotarCert, SkipCert};
