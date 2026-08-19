@@ -278,6 +278,9 @@ pub trait Blockstore {
 
     fn update_finalized_timestamp(&self, slot: Slot, hash: Hash, timestamp: u64);
 
+    /// Best-effort display-only skip-cert marker, read solely by the RPC; a
+    /// finalized chain block wins over it. Consensus-side consumers would
+    /// need a synchronous acked write instead.
     fn mark_slot_skipped(&self, slot: Slot, timestamp: u64);
 
     fn slot_skipped_at(&self, slot: Slot) -> Option<u64>;
@@ -498,6 +501,10 @@ impl Blockstore for BlockstoreImpl {
         let mut deleted_meta_count = 0;
         for (k, _v) in self.db.iterator(IteratorMode::Start).flatten() {
             let finalized = highest_finalized_slot.inner();
+            // Skip markers persist: a skip cert is fork-independent.
+            if k.starts_with(b"skip|") {
+                continue;
+            }
             if k.starts_with(b"meta|") {
                 if k.len() >= 21
                     && let Ok(slot_hex) = std::str::from_utf8(&k[5..21])

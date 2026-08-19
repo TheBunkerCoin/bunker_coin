@@ -2583,6 +2583,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_chain_wins_over_skip_marker() {
+        let hx = |n: u8| hex::encode([n; 32]);
+        let chain_block: bunkerglow::Block = serde_json::from_value(serde_json::json!({
+            "slot": 97,
+            "hash": vec![97u8; 32],
+            "parent": 96,
+            "parent_hash": vec![96u8; 32],
+            "epoch_transition": null,
+            "transactions": [],
+        }))
+        .unwrap();
+
+        let mut bs = bunkerglow::consensus::MockBlockstore::new();
+        bs.expect_canonical_block_hash().returning(|_| None);
+        bs.expect_slot_skipped_at()
+            .returning(|slot| (slot.inner() == 97).then_some(5));
+        bs.expect_load_block_metadata().returning(|_, _| None);
+        bs.expect_load_block_by_hash().returning(move |h| {
+            (h == Hash::from([97u8; 32])).then(|| (Slot::new(97), chain_block.clone()))
+        });
+
+        let mut state = test_state(vec![Block::Block {
+            slot: 100,
+            hash: hx(100),
+            parent_slot: 97,
+            parent_hash: hx(97),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: Some(200),
+            status: SlotStatus::Finalized,
+        }]);
+        state.blockstore = Some(Arc::new(tokio::sync::RwLock::new(Box::new(bs))));
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let at_97 = result.iter().find(|b| b.slot() == 97).unwrap();
+        assert!(
+            matches!(
+                at_97,
+                Block::Block {
+                    status: SlotStatus::Finalized,
+                    ..
+                }
+            ),
+            "chain block must displace the skip marker"
+        );
+        assert_eq!(at_97.hash(), hx(97));
+    }
+
+    #[tokio::test]
     async fn blocks_endpoint_reports_bypassed_slots_as_skipped() {
         let mk = |slot: u64, parent_slot: u64, finalized: bool| Block::Block {
             slot,
