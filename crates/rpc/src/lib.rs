@@ -2656,6 +2656,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_nodes_frontier_keeps_scans_at_pool_tip() {
+        let mut bs = bunkerglow::consensus::MockBlockstore::new();
+        bs.expect_canonical_block_hash().returning(|slot| {
+            assert!(slot.inner() >= 79_500, "scan escaped tip window: {slot}");
+            None
+        });
+        bs.expect_slot_skipped_at().returning(|slot| {
+            assert!(
+                slot.inner() >= 79_500,
+                "marker scan escaped tip window: {slot}"
+            );
+            None
+        });
+        bs.expect_load_block_by_hash().returning(|_| None);
+
+        let mut pool = bunkerglow::consensus::MockPool::new();
+        pool.expect_finalized_slot().returning(|| Slot::new(79_780));
+        pool.expect_finalized_block_hash().returning(|_| None);
+        pool.expect_has_skip_cert().returning(|slot| {
+            assert!(
+                slot.inner() >= 79_500,
+                "cert scan escaped tip window: {slot}"
+            );
+            false
+        });
+
+        let mut state = test_state(Vec::new());
+        state.blockstore = Some(Arc::new(tokio::sync::RwLock::new(Box::new(bs))));
+        state.pool = Some(Arc::new(tokio::sync::RwLock::new(Box::new(pool))));
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
     async fn pool_skip_cert_shows_slot_skipped_without_marker() {
         let mut bs = bunkerglow::consensus::MockBlockstore::new();
         bs.expect_canonical_block_hash().returning(|_| None);
@@ -2914,15 +2956,23 @@ fn b58(bytes: &[u8]) -> String {
 }
 
 /// Highest finalized slot exposed as wallet-visible context.
+// The /nodes sampler lags after a restart; the pool's finalized slot keeps
+// every tip-anchored scan window near the real tip (a collapsed window sent
+// the /blocks chain walk unbounded to genesis — the 79780 hang).
 async fn current_slot(state: &SharedState) -> u64 {
-    state
+    let sampled = state
         .nodes
         .read()
         .await
         .iter()
         .map(|n| n.finalized_slot)
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let pool_finalized = match &state.pool {
+        Some(pool) => pool.read().await.finalized_slot().inner(),
+        None => 0,
+    };
+    sampled.max(pool_finalized)
 }
 
 /// Parses a wallet transaction id into the node's lowercase hex key.
