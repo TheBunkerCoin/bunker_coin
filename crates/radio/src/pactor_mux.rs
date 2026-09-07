@@ -544,6 +544,9 @@ impl PactorMux {
                     return;
                 }
                 turn.holds_turn.store(false, Ordering::SeqCst);
+                // Only inbound advances writer_activity, so the silence gate is already
+                // open here; without this stamp the caller reclaims its own grant at once.
+                last_reclaim_ms = now_ms();
             }
         });
 
@@ -1138,6 +1141,51 @@ mod tests {
         let got_at_a = tokio::time::timeout(Duration::from_secs(10), a_chan.receive())
             .await
             .expect("B must reclaim the turn after the lost grant and deliver its message")
+            .unwrap();
+        assert_eq!(got_at_a, b"from-b");
+
+        unsafe {
+            std::env::remove_var("BUNKER_TURN_RECLAIM_MS");
+            std::env::remove_var("BUNKER_RECLAIM_STAGGER_MS");
+        }
+    }
+
+    // The caller must not reclaim the turn it just granted before the peer replies:
+    // its own long TX never advances writer_activity, so the silence gate is already
+    // open at release time and only the post-grant reclaim stamp holds it off.
+    #[tokio::test(start_paused = true)]
+    async fn caller_does_not_reclaim_its_own_grant_before_peer_replies() {
+        // SAFETY: single-threaded test shortens reclaim timers via process env.
+        unsafe {
+            std::env::set_var("BUNKER_TURN_RECLAIM_MS", "300");
+            std::env::set_var("BUNKER_RECLAIM_STAGGER_MS", "150");
+        }
+
+        let (a, b) = LoopbackTransport::pair();
+
+        let mut mux_a = PactorMux::new_half_duplex(a, true);
+        let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
+        let _ha = mux_a.spawn();
+
+        let mut mux_b = PactorMux::new_half_duplex(b, false);
+        let b_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_b.channel(Channel::All2All);
+        let _hb = mux_b.spawn();
+
+        let addr = "127.0.0.1:1".parse().unwrap();
+        // Caller sends first (holds the turn), then must cleanly hand off.
+        a_chan.send(&b"from-a".to_vec(), addr).await.unwrap();
+        let got_at_b = tokio::time::timeout(Duration::from_secs(120), b_chan.receive())
+            .await
+            .expect("caller->listener must deliver")
+            .unwrap();
+        assert_eq!(got_at_b, b"from-a");
+
+        // The listener replies only while it holds the turn. If the caller reclaimed
+        // its own grant immediately this never arrives.
+        b_chan.send(&b"from-b".to_vec(), addr).await.unwrap();
+        let got_at_a = tokio::time::timeout(Duration::from_secs(120), a_chan.receive())
+            .await
+            .expect("listener->caller must deliver after a clean grant")
             .unwrap();
         assert_eq!(got_at_a, b"from-b");
 

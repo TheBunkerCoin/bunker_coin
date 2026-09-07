@@ -13,6 +13,9 @@ use crate::hostmode::{
 };
 use crate::{PactorLinkEvent, PactorLinkStatus, PactorTransport, ScsPactorError};
 
+/// Modem TX-FIFO drain allowance before Ctrl-Z so the grant leads the changeover.
+const CHANGEOVER_SETTLE: Duration = Duration::from_secs(2);
+
 const STATUS_CHANNEL: u8 = 254;
 const EXTENDED_POLL_CHANNEL: u8 = 255;
 const MAX_HOSTMODE_RETRIES: u8 = 3;
@@ -839,6 +842,9 @@ impl PactorTransport for UsbPactorTransport {
 
     async fn changeover(&self) -> Result<(), ScsPactorError> {
         // Ctrl-Z hands over the transmit turn locally; it is not sent over the air.
+        // The modem TX FIFO may still be clocking the grant line out at floor
+        // speed; settle so the grant reaches the peer before the ARQ turnaround.
+        tokio::time::sleep(CHANGEOVER_SETTLE).await;
         debug!("[changeover] handing transmit turn to peer (Ctrl-Z)");
         self.write_raw(&[0x1a]).await
     }
