@@ -20,8 +20,12 @@ use super::epoch_info::EpochInfo;
 use super::votor::VotorEvent;
 use crate::consensus::blockstore::slot_block_data::BlockData;
 use crate::crypto::Hash;
-use crate::crypto::merkle::{BlockHash, DoubleMerkleProof, MerkleRoot, SliceRoot};
-use crate::shredder::{RegularShredder, Shred, ShredIndex, ShredderPool, ValidatedShred};
+use crate::crypto::merkle::{
+    BlockHash, DoubleMerkleProof, DoubleMerkleTree, MerkleRoot, SliceRoot,
+};
+use crate::shredder::{
+    DATA_SHREDS, RegularShredder, Shred, ShredIndex, ShredderPool, ValidatedShred,
+};
 use crate::types::SliceIndex;
 use crate::{Block, BlockId, Slot};
 
@@ -90,6 +94,23 @@ fn metadata_bytes_finalized(bytes: &[u8]) -> bool {
         .is_ok_and(|(m, _)| m.finalized_timestamp.is_some())
 }
 
+/// Row holding a block's ordered slice roots; rebuilds the double-Merkle tree
+/// so repair proofs can be served after a restart empties the in-memory data.
+fn repair_roots_key(slot: Slot, hash: &Hash) -> String {
+    format!("roots|{:016X}{}", slot, hex::encode(hash))
+}
+
+/// Row holding one persisted data shred for post-restart repair serving.
+fn repair_shred_key(slot: Slot, hash: &Hash, slice: SliceIndex, index: ShredIndex) -> String {
+    format!(
+        "shred|{:016X}{}|{:04X}|{:02X}",
+        slot,
+        hex::encode(hash),
+        slice.inner(),
+        *index
+    )
+}
+
 /// Blockstore is the fundamental data structure holding block data per slot.
 pub struct BlockstoreImpl {
     block_data: BTreeMap<Slot, SlotBlockData>,
@@ -147,6 +168,7 @@ impl BlockstoreImpl {
                 let block_id = (*slot, block_info.hash.clone());
                 if let Some(block) = self.get_block(&block_id) {
                     self.persist_block(*slot, &hash, &block);
+                    self.persist_repair_data(&block_id);
                 }
 
                 self.votor_channel.send(event).await.unwrap();
@@ -182,6 +204,47 @@ impl BlockstoreImpl {
                 let _ = self.db.put(meta_key.as_bytes(), value);
             }
         }
+    }
+
+    /// Persists slice roots and data shreds so repair stays servable after a
+    /// restart; the in-memory shred data does not survive one.
+    fn persist_repair_data(&self, block_id: &BlockId) {
+        let Some(block_data) = self.get_block_data(block_id) else {
+            return;
+        };
+        let Some(last_slice) = block_data.last_slice else {
+            return;
+        };
+        let (slot, block_hash) = block_id;
+        let hash = block_hash.as_hash();
+        let mut roots = Vec::with_capacity(last_slice.inner() + 1);
+        for (slice_index, shreds) in &block_data.shreds {
+            let Some(any_shred) = shreds.iter().flatten().next() else {
+                return;
+            };
+            roots.push(any_shred.merkle_root.clone());
+            // Data shreds alone reconstruct the slice; skipping coding shreds halves storage.
+            for shred in shreds[..DATA_SHREDS].iter().flatten() {
+                let key = repair_shred_key(*slot, hash, *slice_index, shred.payload().shred_index);
+                if let Ok(bytes) = wincode::serialize(&**shred) {
+                    let _ = self.db.put(key.as_bytes(), bytes);
+                }
+            }
+        }
+        if roots.len() == last_slice.inner() + 1
+            && let Ok(bytes) = wincode::serialize(&roots)
+        {
+            let _ = self.db.put(repair_roots_key(*slot, hash).as_bytes(), bytes);
+        }
+    }
+
+    /// Loads a block's persisted slice roots, verifying they rebuild its hash.
+    fn load_repair_roots(&self, block_id: &BlockId) -> Option<Vec<SliceRoot>> {
+        let key = repair_roots_key(block_id.0, block_id.1.as_hash());
+        let bytes = self.db.get(key.as_bytes()).ok()??;
+        let roots: Vec<SliceRoot> = wincode::deserialize(&bytes).ok()?;
+        (!roots.is_empty() && DoubleMerkleTree::new(roots.iter()).get_root() == block_id.1)
+            .then_some(roots)
     }
 
     /// True when the persisted metadata for this block key carries a finalized stamp.
@@ -376,8 +439,12 @@ impl Blockstore for BlockstoreImpl {
 
     /// Returns the last slice index once known.
     fn get_last_slice_index(&self, block_id: &BlockId) -> Option<SliceIndex> {
-        let block_data = self.get_block_data(block_id)?;
-        block_data.last_slice
+        if let Some(last) = self.get_block_data(block_id).and_then(|d| d.last_slice) {
+            return Some(last);
+        }
+        // In-memory data may be empty after a restart; serve repair from RocksDB.
+        let roots = self.load_repair_roots(block_id)?;
+        Some(SliceIndex::new_unchecked(roots.len() - 1))
     }
 
     /// Returns a stored shred by block, slice, and shred index.
@@ -387,9 +454,20 @@ impl Blockstore for BlockstoreImpl {
         slice_index: SliceIndex,
         shred_index: ShredIndex,
     ) -> Option<ValidatedShred> {
-        let block_data = self.get_block_data(block_id)?;
-        let slice_shreds = block_data.shreds.get(&slice_index)?;
-        slice_shreds[*shred_index].clone()
+        if let Some(shred) = self
+            .get_block_data(block_id)
+            .and_then(|d| d.shreds.get(&slice_index))
+            .and_then(|s| s[*shred_index].clone())
+        {
+            return Some(shred);
+        }
+        let key = repair_shred_key(block_id.0, block_id.1.as_hash(), slice_index, shred_index);
+        let bytes = self.db.get(key.as_bytes()).ok()??;
+        let shred: Shred = wincode::deserialize(&bytes).ok()?;
+        // Re-validate on load; a corrupted row must not be served with our name on it.
+        let leader_pk = self.epoch_info.leader(block_id.0).pubkey;
+        let mut scratch = BTreeMap::new();
+        ValidatedShred::try_new(shred, scratch.entry(slice_index), &leader_pk).ok()
     }
 
     /// Builds a double-Merkle proof for a stored block slice.
@@ -398,14 +476,27 @@ impl Blockstore for BlockstoreImpl {
         block_id: &BlockId,
         slice_index: SliceIndex,
     ) -> Option<DoubleMerkleProof> {
-        let block_data = self.get_block_data(block_id)?;
-        let tree = block_data.double_merkle_tree.as_ref()?;
-        Some(tree.create_proof(slice_index.inner()))
+        if let Some(tree) = self
+            .get_block_data(block_id)
+            .and_then(|d| d.double_merkle_tree.as_ref())
+        {
+            return Some(tree.create_proof(slice_index.inner()));
+        }
+        let roots = self.load_repair_roots(block_id)?;
+        (slice_index.inner() < roots.len())
+            .then(|| DoubleMerkleTree::new(roots.iter()).create_proof(slice_index.inner()))
     }
 
     fn get_slice_root(&self, block_id: &BlockId, slice_index: SliceIndex) -> Option<SliceRoot> {
-        let block_data = self.get_block_data(block_id)?;
-        block_data.merkle_root_cache.get(&slice_index).cloned()
+        if let Some(root) = self
+            .get_block_data(block_id)
+            .and_then(|d| d.merkle_root_cache.get(&slice_index).cloned())
+        {
+            return Some(root);
+        }
+        self.load_repair_roots(block_id)?
+            .get(slice_index.inner())
+            .cloned()
     }
 
     fn load_block_from_db(&self, slot: Slot, hash: Hash) -> Option<Block> {
@@ -501,6 +592,23 @@ impl Blockstore for BlockstoreImpl {
 
     fn prune_finalized(&mut self, finalized_slot: Slot) {
         let cutoff = Slot::new(finalized_slot.inner().saturating_sub(HOT_BLOCK_LIMIT));
+        // Repair rows below the hot window would otherwise grow without bound.
+        let mut batch = WriteBatch::default();
+        for prefix in [&b"roots|"[..], &b"shred|"[..]] {
+            for (k, _v) in self.db.prefix_iterator(prefix).flatten() {
+                if !k.starts_with(prefix) {
+                    break;
+                }
+                if k.len() >= 22
+                    && let Ok(slot_hex) = std::str::from_utf8(&k[6..22])
+                    && let Ok(slot_val) = u64::from_str_radix(slot_hex, 16)
+                    && slot_val < cutoff.inner()
+                {
+                    batch.delete(&k);
+                }
+            }
+        }
+        let _ = self.db.write(batch);
         self.prune(cutoff);
     }
 
@@ -519,6 +627,19 @@ impl Blockstore for BlockstoreImpl {
             let finalized = highest_finalized_slot.inner();
             // Skip markers persist: a skip cert is fork-independent.
             if k.starts_with(b"skip|") {
+                continue;
+            }
+            // Repair rows follow their block's fate.
+            if k.starts_with(b"roots|") || k.starts_with(b"shred|") {
+                if k.len() >= 86
+                    && let Ok(slot_hex) = std::str::from_utf8(&k[6..22])
+                    && let Ok(slot_val) = u64::from_str_radix(slot_hex, 16)
+                    && slot_val > finalized
+                    && self.slot_skipped_at(Slot::new(slot_val)).is_some()
+                    && !self.block_meta_finalized(&k[6..86])
+                {
+                    batch.delete(&k);
+                }
                 continue;
             }
             if k.starts_with(b"meta|") {
@@ -562,6 +683,75 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    /// Repair must stay servable after a restart empties the in-memory data.
+    #[tokio::test]
+    async fn repair_data_served_from_db_after_restart() -> Result<()> {
+        let sk = SecretKey::new(&mut rand::rng());
+        let voting_sk = aggsig::SecretKey::new(&mut rand::rng());
+        let info = ValidatorInfo {
+            id: 0,
+            stake: 1,
+            pubkey: sk.to_pk(),
+            voting_pubkey: voting_sk.to_pk(),
+            all2all_address: dontcare_sockaddr(),
+            disseminator_address: dontcare_sockaddr(),
+            repair_request_address: dontcare_sockaddr(),
+            repair_response_address: dontcare_sockaddr(),
+            location: None,
+        };
+        let epoch_info = Arc::new(EpochInfo::new(0, 0, vec![info]));
+        let (tx, _rx) = mpsc::channel(1000);
+
+        let slot = Slot::new(2222);
+        let (block_hash, _tree, shreds) = create_random_shredded_block(slot, 2, &sk);
+        let block_id = (slot, block_hash.clone());
+        {
+            let mut store = BlockstoreImpl::new(epoch_info.clone(), tx.clone());
+            for shred in shreds.into_iter().flatten() {
+                add_shred_ignore_duplicate(&mut store, shred.into_shred()).await?;
+            }
+            assert!(store.disseminated_block_hash(slot).is_some());
+        }
+
+        // A fresh instance over the same RocksDB simulates the post-restart state.
+        let restarted = BlockstoreImpl::new(epoch_info, tx);
+        let last = restarted
+            .get_last_slice_index(&block_id)
+            .expect("last slice index must come from the DB");
+        assert_eq!(last.inner(), 1);
+
+        for slice in [SliceIndex::first(), last] {
+            let root = restarted
+                .get_slice_root(&block_id, slice)
+                .expect("slice root must come from the DB");
+            let proof = restarted
+                .create_double_merkle_proof(&block_id, slice)
+                .expect("proof must come from the DB");
+            // Exactly what the repair requester validates on its side.
+            assert!(DoubleMerkleTree::check_proof(
+                &root,
+                slice.inner(),
+                &block_hash,
+                &proof
+            ));
+            if slice == last {
+                assert!(DoubleMerkleTree::check_proof_last(
+                    &root,
+                    slice.inner(),
+                    &block_hash,
+                    &proof
+                ));
+            }
+            for index in ShredIndex::all().take(DATA_SHREDS) {
+                let shred = restarted
+                    .get_shred(&block_id, slice, index)
+                    .expect("data shred must come from the DB");
+                assert!(shred.verify_path_only(&root));
+            }
+        }
+        Ok(())
+    }
 
     /// Only skip-marked, unfinalized slots above the floor may be cleaned.
     #[tokio::test]
@@ -617,6 +807,28 @@ mod tests {
                 .load_block_from_db(finalized, hashes[&finalized].clone())
                 .is_some(),
             "finalized-stamped block must survive even above the floor"
+        );
+
+        // Repair rows follow their block's fate; drop in-memory data to hit the DB.
+        blockstore.prune(Slot::new(100));
+        let shred_of = |bs: &BlockstoreImpl, slot: Slot| {
+            bs.get_shred(
+                &(slot, hashes[&slot].clone().into()),
+                SliceIndex::first(),
+                ShredIndex::all().next().unwrap(),
+            )
+        };
+        assert!(
+            shred_of(&blockstore, virgin).is_some(),
+            "unskipped repair rows must survive the clean"
+        );
+        assert!(
+            shred_of(&blockstore, skipped).is_none(),
+            "skip-marked repair rows must be cleaned"
+        );
+        assert!(
+            shred_of(&blockstore, finalized).is_some(),
+            "finalized-stamped repair rows must survive"
         );
         Ok(())
     }
