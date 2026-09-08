@@ -144,10 +144,16 @@ where
             // After a restart this loop starts at genesis while the pool floor
             // is ahead; without this skip the leader re-produces every
             // historical window before emitting anything new.
-            let finalized = self.pool.read().await.finalized_slot();
-            if last_slot_in_window <= finalized {
+            let (finalized, first_slot_skip_certed) = {
+                let pool = self.pool.read().await;
+                (
+                    pool.finalized_slot(),
+                    pool.has_skip_cert(first_slot_in_window),
+                )
+            };
+            if window_already_decided(first_slot_in_window, finalized, first_slot_skip_certed) {
                 debug!(
-                    "[val {}] not producing in window {first_slot_in_window}..{last_slot_in_window}, already finalized up to {finalized}",
+                    "[val {}] not producing in window {first_slot_in_window}..{last_slot_in_window}, already decided (finalized {finalized}, first-slot skip cert: {first_slot_skip_certed})",
                     self.epoch_info.own_id
                 );
                 continue;
@@ -214,6 +220,15 @@ where
                         "[val {}] epoch {} ready, resuming block production",
                         self.epoch_info.own_id, current_epoch
                     );
+                }
+
+                // Catch-up can finalize past us mid-window; further blocks are unvotable.
+                if self.pool.read().await.finalized_slot() >= slot {
+                    warn!(
+                        "[val {}] abandoning window at slot {slot}, finality moved past it",
+                        self.epoch_info.own_id
+                    );
+                    break;
                 }
 
                 let start = Instant::now();
@@ -573,6 +588,20 @@ where
     (payload, ret, terminal_empty)
 }
 
+/// Finality at the first slot (genesis: last slot) or a first-slot skip cert
+/// means votes are spent; a late block can never be notarized.
+fn window_already_decided(first_slot: Slot, finalized: Slot, first_slot_skip_certed: bool) -> bool {
+    if first_slot_skip_certed {
+        return true;
+    }
+    let decided_at = if first_slot.is_genesis() {
+        first_slot.last_slot_in_window()
+    } else {
+        first_slot
+    };
+    finalized >= decided_at
+}
+
 /// Outcome of [`wait_for_first_slot`].
 #[derive(Debug)]
 enum SlotReady {
@@ -733,6 +762,26 @@ mod tests {
         assert_eq!(payload.parent, parent);
         assert!(payload.data.len() <= MAX_DATA_PER_SLICE);
         assert!(payload.data.len() > MAX_DATA_PER_SLICE - MAX_TRANSACTION_SIZE);
+    }
+
+    /// Decided windows must not be produced; doomed blocks waste radio airtime.
+    #[test]
+    fn decided_windows_are_not_produced() {
+        let w = Slot::windows().nth(10).unwrap();
+        assert!(window_already_decided(w, w, false));
+        assert!(window_already_decided(w, w.next(), false));
+        assert!(!window_already_decided(w, w.prev(), false));
+        // A skip cert on the first slot dooms any late block.
+        assert!(window_already_decided(w, Slot::genesis(), true));
+        // The genesis window only counts as decided past its last slot.
+        let g = Slot::genesis();
+        assert!(!window_already_decided(g, g, false));
+        assert!(!window_already_decided(
+            g,
+            g.last_slot_in_window().prev(),
+            false
+        ));
+        assert!(window_already_decided(g, g.last_slot_in_window(), false));
     }
 
     #[tokio::test]

@@ -343,6 +343,7 @@ impl PoolImpl {
             Cert::FastFinal(_) => {
                 info!("fast finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
+                self.persist_finalized_floor();
                 if let Some(hash) = cert.block_hash() {
                     let finalization_event = self
                         .finality_tracker
@@ -370,6 +371,7 @@ impl PoolImpl {
             Cert::Final(_) => {
                 info!("slow finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
+                self.persist_finalized_floor();
                 let finalization_event = self.finality_tracker.mark_finalized(slot);
                 self.notify_finalization_event(&finalization_event).await;
                 self.handle_finalization(finalization_event).await;
@@ -396,6 +398,14 @@ impl PoolImpl {
 
         let event = VotorEvent::CertCreated(Box::new(cert));
         self.votor_event_channel.send(event).await.unwrap();
+    }
+
+    /// Persisted at cert time so a later-invalidated cert row cannot roll the floor back.
+    fn persist_finalized_floor(&self) {
+        let _ = self.db.put(
+            b"meta|final_slot",
+            self.highest_finalized_slot.inner().to_be_bytes(),
+        );
     }
 
     /// Mutably accesses or creates the [`SlotState`] for `slot`.
@@ -777,6 +787,8 @@ impl PoolImpl {
         }
         let mut raw_certs: Vec<Cert> = Vec::new();
         let mut highest_nf_slot = Slot::genesis();
+        // Skip certs above the floor must survive reloads or reconnects re-earn them on air.
+        let mut highest_skip_slot = Slot::genesis();
         let mut invalid_keys: Vec<Box<[u8]>> = Vec::new();
         for item in self.db.iterator(IteratorMode::Start) {
             if let Ok((k, v)) = item
@@ -801,7 +813,9 @@ impl PoolImpl {
                     Cert::Notar(_) | Cert::NotarFallback(_) => {
                         highest_nf_slot = highest_nf_slot.max(cert.slot());
                     }
-                    _ => {}
+                    Cert::Skip(_) => {
+                        highest_skip_slot = highest_skip_slot.max(cert.slot());
+                    }
                 }
                 raw_certs.push(cert);
             }
@@ -815,7 +829,9 @@ impl PoolImpl {
             self.highest_finalized_slot = self.highest_finalized_slot.max(meta_slot);
         }
 
-        let retain_up_to = highest_nf_slot.max(self.highest_finalized_slot);
+        let retain_up_to = highest_nf_slot
+            .max(highest_skip_slot)
+            .max(self.highest_finalized_slot);
 
         let certs: Vec<Cert> = raw_certs
             .into_iter()
@@ -1185,6 +1201,86 @@ mod tests {
         }
         assert!(!pool.has_final_cert(Slot::new(2)));
         assert_eq!(pool.finalized_slot(), Slot::new(1));
+    }
+
+    /// Skip certs above the floor must survive a reload or reconnects re-earn them on air.
+    #[tokio::test]
+    async fn reload_retains_skip_certs_above_finalized_floor() {
+        let (sks, epoch_info) = generate_validators(11);
+        let db_path = format!(
+            "{}/bunker-pool-skip-retain-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let floor = Slot::new(1);
+        let hash: BlockHash = Hash::random_for_test().into();
+
+        {
+            let (votor_tx, _votor_rx) = mpsc::channel(1024);
+            let (repair_tx, _repair_rx) = mpsc::channel(1024);
+            let mut pool = PoolImpl::new_at(epoch_info.clone(), votor_tx, repair_tx, &db_path);
+            // 9 of 11 notar votes fast-finalize the floor slot.
+            for v in 0..9 {
+                let vote = Vote::new_notar(floor, hash.clone(), &sks[v as usize], v);
+                assert_eq!(pool.add_vote(vote).await, Ok(()));
+            }
+            assert_eq!(Pool::finalized_slot(&pool), floor);
+            for s in 2..=3u64 {
+                for v in 0..7 {
+                    let vote = Vote::new_skip(Slot::new(s), &sks[v as usize], v);
+                    assert_eq!(pool.add_vote(vote).await, Ok(()));
+                }
+                assert!(pool.has_skip_cert(Slot::new(s)));
+            }
+        }
+
+        let (votor_tx, _votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
+        assert_eq!(Pool::finalized_slot(&pool), floor);
+        assert!(
+            pool.has_skip_cert(Slot::new(2)) && pool.has_skip_cert(Slot::new(3)),
+            "skip certs above the floor must survive the reload"
+        );
+    }
+
+    /// The floor persists at cert time; a later-invalidated cert row must not roll it back.
+    #[tokio::test]
+    async fn finalized_floor_persisted_at_cert_time() {
+        let (sks, epoch_info) = generate_validators(11);
+        let db_path = format!(
+            "{}/bunker-pool-floor-meta-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let floor = Slot::new(1);
+        let hash: BlockHash = Hash::random_for_test().into();
+
+        let (votor_tx, _votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let mut pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
+        for v in 0..9 {
+            let vote = Vote::new_notar(floor, hash.clone(), &sks[v as usize], v);
+            assert_eq!(pool.add_vote(vote).await, Ok(()));
+        }
+        assert_eq!(Pool::finalized_slot(&pool), floor);
+
+        let db = crate::consensus::blockstore::open_db_with_retry(
+            &rocksdb::Options::default(),
+            &db_path,
+        )
+        .unwrap();
+        let val = db
+            .get(b"meta|final_slot")
+            .unwrap()
+            .expect("floor meta row must exist");
+        assert_eq!(
+            u64::from_be_bytes(val[..8].try_into().unwrap()),
+            floor.inner(),
+            "floor must be persisted at cert time, not only at load"
+        );
     }
 
     #[tokio::test]

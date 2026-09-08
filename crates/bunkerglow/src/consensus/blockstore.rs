@@ -84,6 +84,12 @@ impl From<&Block> for BlockInfo {
 /// Recent finalized slots kept hot for repair; older blocks fall back to RocksDB.
 const HOT_BLOCK_LIMIT: u64 = 200;
 
+/// True when serialized [`BlockMetadata`] carries a finalized timestamp.
+fn metadata_bytes_finalized(bytes: &[u8]) -> bool {
+    bincode::serde::decode_from_slice::<BlockMetadata, _>(bytes, bincode::config::standard())
+        .is_ok_and(|(m, _)| m.finalized_timestamp.is_some())
+}
+
 /// Blockstore is the fundamental data structure holding block data per slot.
 pub struct BlockstoreImpl {
     block_data: BTreeMap<Slot, SlotBlockData>,
@@ -176,6 +182,14 @@ impl BlockstoreImpl {
                 let _ = self.db.put(meta_key.as_bytes(), value);
             }
         }
+    }
+
+    /// True when the persisted metadata for this block key carries a finalized stamp.
+    fn block_meta_finalized(&self, block_key: &[u8]) -> bool {
+        let mut meta_key = Vec::with_capacity(block_key.len() + 5);
+        meta_key.extend_from_slice(b"meta|");
+        meta_key.extend_from_slice(block_key);
+        matches!(self.db.get(&meta_key), Ok(Some(v)) if metadata_bytes_finalized(&v))
     }
 
     /// Finds disseminated or repaired block data for `block_id`.
@@ -490,16 +504,18 @@ impl Blockstore for BlockstoreImpl {
         self.prune(cutoff);
     }
 
+    /// Deletes only skip-marked, non-finalized slots above the floor: unmarked
+    /// blocks are the live tip; finalized stamps protect history behind a stale floor.
     fn clean_beyond_finalized(&mut self, highest_finalized_slot: Slot) {
         println!(
-            "[Blockstore::clean_beyond_finalized] pruning blocks beyond slot {}",
+            "[Blockstore::clean_beyond_finalized] pruning skipped blocks beyond slot {}",
             highest_finalized_slot
         );
 
         let mut batch = WriteBatch::default();
         let mut deleted_count = 0;
         let mut deleted_meta_count = 0;
-        for (k, _v) in self.db.iterator(IteratorMode::Start).flatten() {
+        for (k, v) in self.db.iterator(IteratorMode::Start).flatten() {
             let finalized = highest_finalized_slot.inner();
             // Skip markers persist: a skip cert is fork-independent.
             if k.starts_with(b"skip|") {
@@ -510,6 +526,8 @@ impl Blockstore for BlockstoreImpl {
                     && let Ok(slot_hex) = std::str::from_utf8(&k[5..21])
                     && let Ok(slot_val) = u64::from_str_radix(slot_hex, 16)
                     && slot_val > finalized
+                    && self.slot_skipped_at(Slot::new(slot_val)).is_some()
+                    && !metadata_bytes_finalized(&v)
                 {
                     batch.delete(&k);
                     deleted_meta_count += 1;
@@ -518,6 +536,8 @@ impl Blockstore for BlockstoreImpl {
                 && let Ok(slot_hex) = std::str::from_utf8(&k[0..16])
                 && let Ok(slot_val) = u64::from_str_radix(slot_hex, 16)
                 && slot_val > finalized
+                && self.slot_skipped_at(Slot::new(slot_val)).is_some()
+                && !self.block_meta_finalized(&k)
             {
                 batch.delete(&k);
                 deleted_count += 1;
@@ -542,6 +562,64 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    /// Only skip-marked, unfinalized slots above the floor may be cleaned.
+    #[tokio::test]
+    async fn clean_beyond_finalized_spares_unskipped_and_finalized() -> Result<()> {
+        let (tx, _rx) = mpsc::channel(1000);
+        let (sk, mut blockstore) = test_setup(tx);
+        let floor = Slot::new(10);
+        let virgin = Slot::new(12);
+        let skipped = Slot::new(13);
+        let finalized = Slot::new(14);
+
+        let mut hashes = std::collections::HashMap::new();
+        for slot in [virgin, skipped, finalized] {
+            let (block_hash, _tree, shreds) = create_random_shredded_block(slot, 1, &sk);
+            for shred in shreds.into_iter().flatten() {
+                add_shred_ignore_duplicate(&mut blockstore, shred.into_shred()).await?;
+            }
+            hashes.insert(slot, block_hash.as_hash().clone());
+        }
+        blockstore.mark_slot_skipped(skipped, 111);
+        // A stale skip marker must never delete finalized history.
+        blockstore.mark_slot_skipped(finalized, 111);
+        blockstore.update_finalized_timestamp(finalized, hashes[&finalized].clone(), 222);
+
+        blockstore.clean_beyond_finalized(floor);
+
+        assert!(
+            blockstore
+                .load_block_from_db(virgin, hashes[&virgin].clone())
+                .is_some(),
+            "unskipped block above the floor must survive the clean"
+        );
+        assert!(
+            blockstore
+                .load_block_metadata(virgin, hashes[&virgin].clone())
+                .is_some(),
+            "unskipped metadata above the floor must survive the clean"
+        );
+        assert!(
+            blockstore
+                .load_block_from_db(skipped, hashes[&skipped].clone())
+                .is_none(),
+            "skip-marked block must be cleaned"
+        );
+        assert!(
+            blockstore
+                .load_block_metadata(skipped, hashes[&skipped].clone())
+                .is_none(),
+            "skip-marked metadata must be cleaned"
+        );
+        assert!(
+            blockstore
+                .load_block_from_db(finalized, hashes[&finalized].clone())
+                .is_some(),
+            "finalized-stamped block must survive even above the floor"
+        );
+        Ok(())
+    }
 
     #[test]
     fn skip_marker_roundtrip_persists() {
