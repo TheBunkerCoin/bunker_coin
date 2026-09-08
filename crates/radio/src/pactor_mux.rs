@@ -71,8 +71,34 @@ fn reclaim_role_stagger() -> Duration {
         .unwrap_or(Duration::from_secs(40))
 }
 
+/// Caller-only ceiling on turnless time; inbound does not defer it, else a
+/// peer's buffered TX backlog pins the silence gate shut while the listener yields.
+fn turnless_reclaim_ceiling() -> Duration {
+    std::env::var("BUNKER_TURNLESS_RECLAIM_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(300))
+}
+
+/// Payload bytes one turn may enqueue before granting; MAX_TURN_HOLD bounds
+/// only app-side drain time, and a modem-buffered backlog would bury the grant.
+fn turn_byte_budget() -> usize {
+    std::env::var("BUNKER_TURN_BYTE_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(8 * 1024)
+}
+
+/// Write-retry back-off; a writer that exits on error mutes the node forever.
+const WRITE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
 /// Blind-reclaim threshold after which the listener yields to the caller.
 const LISTENER_LIVELOCK_RECLAIMS: u32 = 2;
+
+/// Yields a listener may override into a Take while it has its own block queued;
+/// bounded so a two-sided fade still cedes to the caller after the burst.
+const LISTENER_OUTBOUND_TAKE_BUDGET: u32 = 2;
 
 #[derive(Debug, PartialEq, Eq)]
 enum ReclaimAction {
@@ -134,14 +160,16 @@ impl ReclaimDecider {
     }
 
     /// Clear livelock backoff once inbound proves the link is flowing.
-    fn note_turn_held(&mut self, activity_now: u64) {
-        if self.is_listener
+    /// Returns whether inbound advanced (the link is two-sided again).
+    fn note_turn_held(&mut self, activity_now: u64) -> bool {
+        let advanced = self.is_listener
             && self
                 .activity_at_last_reclaim
-                .is_some_and(|prev| activity_now > prev)
-        {
+                .is_some_and(|prev| activity_now > prev);
+        if advanced {
             self.blind_reclaims = 0;
         }
+        advanced
     }
 }
 
@@ -397,8 +425,9 @@ impl PactorMux {
                     )
                     .await
                     {
-                        warn!("[mux:writer] write_data failed: {e}");
-                        return;
+                        // Drop the message and keep the writer alive; consensus re-sends.
+                        warn!("[mux:writer] write_data failed: {e}; dropping message");
+                        tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
                     }
                 }
                 debug!("[mux:writer] outbound queue closed; writer stopping");
@@ -415,13 +444,27 @@ impl PactorMux {
             let mut last_reclaim_ms = 0u64;
             let is_listener = !turn.starts_with_turn;
             let mut decider = ReclaimDecider::new(is_listener);
-            loop {
+            let mut outbound_take_budget = LISTENER_OUTBOUND_TAKE_BUDGET;
+            'turn: loop {
                 // Poll for the turn so a lost grant can recover via silence reclaim.
+                let turnless_since = now_ms();
                 while !turn.holds_turn.load(Ordering::SeqCst) {
                     let now = now_ms();
                     let activity = writer_activity.load(Ordering::Relaxed);
                     let silence = now.saturating_sub(activity);
                     let since_last_reclaim = now.saturating_sub(last_reclaim_ms);
+
+                    // Inbound is not proof the peer holds the turn; cap turnless time too.
+                    let turnless = now.saturating_sub(turnless_since);
+                    if !is_listener && turnless >= turnless_reclaim_ceiling().as_millis() as u64 {
+                        warn!(
+                            "[mux:writer] caller without the turn for {turnless}ms despite \
+                             inbound activity — reclaiming to restore two-way flow"
+                        );
+                        last_reclaim_ms = now;
+                        turn.holds_turn.store(true, Ordering::SeqCst);
+                        break;
+                    }
 
                     let effective_reclaim_after =
                         decider.effective_window(reclaim_after, reclaim_role_stagger());
@@ -430,19 +473,29 @@ impl PactorMux {
                         && since_last_reclaim >= effective_reclaim_after.as_millis() as u64
                     {
                         last_reclaim_ms = now;
-                        match decider.on_reclaim_due(activity) {
+                        let mut action = decider.on_reclaim_due(activity);
+                        // The reclaim loop is otherwise blind to pending outbound: a
+                        // listener with its own block queued must take the turn to send it.
+                        if action == ReclaimAction::Yield
+                            && !outbound_rx.is_empty()
+                            && outbound_take_budget > 0
+                        {
+                            outbound_take_budget -= 1;
+                            action = ReclaimAction::Take;
+                        }
+                        match action {
                             ReclaimAction::Yield => {
                                 warn!(
                                     "[mux:writer] listener yielding: blind reclaims with no \
-                                     inbound — ceding link to caller to break mutual-reclaim \
-                                     livelock"
+                                     inbound and no queued data — ceding link to caller to \
+                                     break mutual-reclaim livelock"
                                 );
                                 continue;
                             }
                             ReclaimAction::Take => {
                                 warn!(
                                     "[mux:writer] link silent {silence}ms with no turn — \
-                                     reclaiming (lost turn-grant or peer gone)"
+                                     reclaiming (lost turn-grant, pending outbound, or peer gone)"
                                 );
                                 turn.holds_turn.store(true, Ordering::SeqCst);
                                 break;
@@ -457,15 +510,20 @@ impl PactorMux {
                 }
 
                 // Clear livelock backoff if inbound activity resumed.
-                decider.note_turn_held(writer_activity.load(Ordering::Relaxed));
+                let activity_on_hold = writer_activity.load(Ordering::Relaxed);
+                if decider.note_turn_held(activity_on_hold) {
+                    // Two-sided again: refresh the override for the next leader window.
+                    outbound_take_budget = LISTENER_OUTBOUND_TAKE_BUDGET;
+                }
 
                 // Keepalive immediately after acquiring an idle turn.
                 if outbound_rx.is_empty() {
                     if let Err(e) =
                         write_message(&writer_transport, &counter, KEEPALIVE_TAG, &[]).await
                     {
-                        warn!("[mux:writer] post-changeover keepalive failed: {e}");
-                        return;
+                        warn!("[mux:writer] post-changeover keepalive failed: {e}; backing off");
+                        tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
+                        continue 'turn;
                     }
                 }
 
@@ -488,12 +546,14 @@ impl PactorMux {
                             if let Err(e) =
                                 write_message(&writer_transport, &counter, KEEPALIVE_TAG, &[]).await
                             {
-                                warn!("[mux:writer] keepalive write failed: {e}");
-                                return;
+                                warn!("[mux:writer] keepalive write failed: {e}; backing off");
+                                tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
+                                continue 'turn;
                             }
                         }
                     }
                 }
+                let mut turn_bytes = 0usize;
                 if let Some(item) = first_item {
                     if let Err(e) = write_message(
                         &writer_transport,
@@ -503,14 +563,18 @@ impl PactorMux {
                     )
                     .await
                     {
-                        warn!("[mux:writer] write_data failed: {e}");
-                        return;
+                        warn!("[mux:writer] write_data failed: {e}; dropping message");
+                        tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
+                        continue 'turn;
                     }
+                    turn_bytes += item.payload.len();
                 }
-                // Drain a burst with a short grace so a slot can fit in one turn.
+                // Drain a burst with a short grace; the byte budget bounds on-air backlog.
                 let turn_deadline = tokio::time::Instant::now() + MAX_TURN_HOLD;
                 loop {
-                    if tokio::time::Instant::now() >= turn_deadline {
+                    if tokio::time::Instant::now() >= turn_deadline
+                        || turn_bytes >= turn_byte_budget()
+                    {
                         break;
                     }
                     match tokio::time::timeout(TURN_DRAIN_GRACE, outbound_rx.recv()).await {
@@ -523,9 +587,11 @@ impl PactorMux {
                             )
                             .await
                             {
-                                warn!("[mux:writer] write_data failed: {e}");
-                                return;
+                                warn!("[mux:writer] write_data failed: {e}; dropping message");
+                                tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
+                                continue 'turn;
                             }
+                            turn_bytes += item.payload.len();
                         }
                         Ok(None) => return,
                         // No follow-up: grant the turn so the peer can respond.
@@ -536,12 +602,15 @@ impl PactorMux {
                 if let Err(e) =
                     write_message(&writer_transport, &counter, TURN_GRANT_TAG, &[]).await
                 {
-                    warn!("[mux:writer] turn-grant write failed: {e}");
-                    return;
+                    warn!("[mux:writer] turn-grant write failed: {e}; keeping the turn");
+                    tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
+                    continue 'turn;
                 }
                 if let Err(e) = writer_transport.changeover().await {
-                    warn!("[mux:writer] changeover failed: {e}");
-                    return;
+                    // The grant may already be queued; a duplicate next cycle is harmless.
+                    warn!("[mux:writer] changeover failed: {e}; keeping the turn");
+                    tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
+                    continue 'turn;
                 }
                 turn.holds_turn.store(false, Ordering::SeqCst);
                 // Only inbound advances writer_activity, so the silence gate is already
@@ -1344,6 +1413,237 @@ mod tests {
         unsafe {
             std::env::remove_var("BUNKER_TURN_RECLAIM_MS");
             std::env::remove_var("BUNKER_RECLAIM_STAGGER_MS");
+        }
+    }
+
+    /// The outbound override converts Yield->Take only a bounded number of times,
+    /// so a sustained fade still cedes to the caller and cannot re-open the livelock.
+    #[test]
+    fn listener_outbound_take_budget_is_bounded() {
+        let mut d = ReclaimDecider::new(true);
+        let mut budget = LISTENER_OUTBOUND_TAKE_BUDGET;
+        // Force the permanent-yield state.
+        for _ in 0..=LISTENER_LIVELOCK_RECLAIMS {
+            d.on_reclaim_due(1000);
+        }
+        assert_eq!(d.on_reclaim_due(1000), ReclaimAction::Yield);
+
+        // With data queued, only `budget` yields become takes; the rest still yield.
+        let mut overrides = 0u32;
+        let mut yields_after_budget = 0u32;
+        for _ in 0..10 {
+            let action = d.on_reclaim_due(1000);
+            if action == ReclaimAction::Yield && budget > 0 {
+                budget -= 1;
+                overrides += 1;
+            } else if action == ReclaimAction::Yield {
+                yields_after_budget += 1;
+            }
+        }
+        assert_eq!(
+            overrides, LISTENER_OUTBOUND_TAKE_BUDGET,
+            "override must be bounded so a two-sided fade still yields"
+        );
+        assert!(
+            yields_after_budget > 0,
+            "listener must resume yielding once its take budget is spent"
+        );
+    }
+
+    /// Inbound resuming clears the backoff and signals the override may be restored.
+    #[test]
+    fn note_turn_held_reports_inbound_resumed() {
+        let mut d = ReclaimDecider::new(true);
+        for _ in 0..=LISTENER_LIVELOCK_RECLAIMS {
+            d.on_reclaim_due(1000);
+        }
+        // Unchanged activity: no advance, budget must not reset.
+        assert!(!d.note_turn_held(1000));
+        // Advanced activity: two-sided again.
+        assert!(d.note_turn_held(2000));
+    }
+
+    /// A caller starved of the turn must reclaim even while inbound keeps flowing,
+    /// else a peer's stale TX backlog deadlocks it against a yielded listener.
+    #[tokio::test]
+    async fn caller_reclaims_after_turnless_ceiling_despite_inbound() {
+        // SAFETY: single test process env; silence path parked far out of reach.
+        unsafe {
+            std::env::set_var("BUNKER_TURNLESS_RECLAIM_MS", "1500");
+            std::env::set_var("BUNKER_TURN_RECLAIM_MS", "600000");
+        }
+
+        let (a, b) = LoopbackTransport::pair();
+        let mut mux_a = PactorMux::new_half_duplex(a, true);
+        let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
+        let _ha = mux_a.spawn();
+
+        // Hand-driven peer: keepalives refresh A's activity clock but never grant.
+        let b_writer = b.clone();
+        let feeder = tokio::spawn(async move {
+            let mut id = 0u64;
+            loop {
+                for line in fragment_message(id, &[KEEPALIVE_TAG]) {
+                    if b_writer.write_data(&line).await.is_err() {
+                        return;
+                    }
+                }
+                id += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+
+        let addr = "127.0.0.1:1".parse().unwrap();
+        // First message makes A spend its initial turn and grant it away.
+        a_chan.send(&b"first".to_vec(), addr).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        // Queued while turnless; only the ceiling reclaim can ever send it.
+        a_chan.send(&b"second".to_vec(), addr).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        let mut reassembler = Reassembler::new();
+        let mut got_second = false;
+        while tokio::time::Instant::now() < deadline && !got_second {
+            let line = tokio::time::timeout(Duration::from_millis(500), async {
+                b.in_rx.lock().await.recv().await
+            })
+            .await;
+            let Ok(Some(line)) = line else { continue };
+            if let Some(msg) = reassembler.push_line(&line) {
+                got_second = msg.first().copied() == Some(Channel::All2All as u8)
+                    && msg.ends_with(b"second");
+            }
+        }
+        feeder.abort();
+        assert!(
+            got_second,
+            "caller must reclaim past the turnless ceiling and deliver queued data \
+             even though peer inbound never went silent"
+        );
+
+        unsafe {
+            std::env::remove_var("BUNKER_TURNLESS_RECLAIM_MS");
+            std::env::remove_var("BUNKER_TURN_RECLAIM_MS");
+        }
+    }
+
+    /// Fails the first N writes, then delegates; models a transient modem error.
+    struct FlakyTransport {
+        inner: Arc<LoopbackTransport>,
+        failures_left: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl PactorTransport for FlakyTransport {
+        async fn set_mycall(&self, c: &str) -> Result<(), ScsPactorError> {
+            self.inner.set_mycall(c).await
+        }
+        async fn connect_peer(&self, c: &str) -> Result<(), ScsPactorError> {
+            self.inner.connect_peer(c).await
+        }
+        async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
+            if self
+                .failures_left
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(ScsPactorError::Timeout);
+            }
+            self.inner.write_data(data).await
+        }
+        async fn read_data(&self, n: usize) -> Result<Vec<u8>, ScsPactorError> {
+            self.inner.read_data(n).await
+        }
+        async fn disconnect(&self) -> Result<(), ScsPactorError> {
+            self.inner.disconnect().await
+        }
+        async fn next_event(&self, t: Option<Duration>) -> Result<PactorLinkEvent, ScsPactorError> {
+            self.inner.next_event(t).await
+        }
+    }
+
+    /// A transient write failure must not kill the writer: a dead writer mutes
+    /// the node while the link looks alive and the wedge watchdog sees nothing.
+    #[tokio::test]
+    async fn writer_survives_transient_write_failure() {
+        let (a_raw, b) = LoopbackTransport::pair();
+        let a = Arc::new(FlakyTransport {
+            inner: a_raw,
+            failures_left: std::sync::atomic::AtomicU32::new(1),
+        });
+
+        let mut mux_a = PactorMux::new(a);
+        let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
+        let ha = mux_a.spawn();
+
+        let mut mux_b = PactorMux::new(b);
+        let b_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_b.channel(Channel::All2All);
+        let _hb = mux_b.spawn();
+
+        let addr = "127.0.0.1:1".parse().unwrap();
+        // First message hits the write failure and is dropped.
+        a_chan.send(&b"dropped".to_vec(), addr).await.unwrap();
+        a_chan.send(&b"delivered".to_vec(), addr).await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(10), b_chan.receive())
+            .await
+            .expect("writer must survive a transient write failure and keep sending")
+            .unwrap();
+        assert_eq!(got, b"delivered");
+        assert!(!ha.writer.is_finished(), "writer task must stay alive");
+    }
+
+    /// The byte budget must force a grant even with a deep queue, else one turn
+    /// buries the grant behind an unbounded TX backlog.
+    #[tokio::test]
+    async fn turn_grants_after_byte_budget_despite_queued_backlog() {
+        // SAFETY: only this test reads the budget override.
+        unsafe {
+            std::env::set_var("BUNKER_TURN_BYTE_BUDGET", "250");
+        }
+
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
+        let chan: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
+
+        // Deep backlog queued before the writer starts its first turn.
+        let addr = "127.0.0.1:1".parse().unwrap();
+        for i in 0..5u8 {
+            chan.send(&vec![i; 100], addr).await.unwrap();
+        }
+        let _h = mux.spawn();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        // Judge only the first turn: a later silence-reclaim may validly send more.
+        let lines = transport.written.lock().await.clone();
+        let mut reassembler = Reassembler::new();
+        let mut data_msgs = 0u32;
+        let mut grant_seen = false;
+        for line in &lines {
+            if let Some(msg) = reassembler.push_line(line) {
+                match msg.first().copied() {
+                    Some(TURN_GRANT_TAG) => {
+                        grant_seen = true;
+                        break;
+                    }
+                    Some(KEEPALIVE_TAG) | None => {}
+                    Some(_) => data_msgs += 1,
+                }
+            }
+        }
+        assert!(grant_seen, "budget-exhausted turn must still end in a grant");
+        assert!(
+            (1..5).contains(&data_msgs),
+            "byte budget must cut the turn before the whole backlog drains \
+             (sent {data_msgs} of 5)"
+        );
+
+        unsafe {
+            std::env::remove_var("BUNKER_TURN_BYTE_BUDGET");
         }
     }
 }
