@@ -444,7 +444,7 @@ impl Blockstore for BlockstoreImpl {
         }
         // In-memory data may be empty after a restart; serve repair from RocksDB.
         let roots = self.load_repair_roots(block_id)?;
-        Some(SliceIndex::new_unchecked(roots.len() - 1))
+        SliceIndex::all().nth(roots.len() - 1)
     }
 
     /// Returns a stored shred by block, slice, and shred index.
