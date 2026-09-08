@@ -168,6 +168,20 @@ where
                 continue;
             }
 
+            let stored = self
+                .blockstore
+                .read()
+                .await
+                .canonical_block_hash(first_slot_in_window)
+                .is_some();
+            if window_already_produced(first_slot_in_window, stored) {
+                info!(
+                    "[val {}] not re-producing window {first_slot_in_window}..{last_slot_in_window}, block already stored — peers repair the original",
+                    self.epoch_info.own_id
+                );
+                continue;
+            }
+
             let slot_ready = wait_for_first_slot(
                 self.pool.clone(),
                 self.blockstore.clone(),
@@ -588,6 +602,12 @@ where
     (payload, ret, terminal_empty)
 }
 
+/// A stored first-slot block means the window was produced before a restart;
+/// re-producing with a drifted mempool forks the slot and burns airtime.
+fn window_already_produced(first_slot: Slot, first_slot_block_stored: bool) -> bool {
+    first_slot_block_stored && !first_slot.is_genesis()
+}
+
 /// Finality at the first slot (genesis: last slot) or a first-slot skip cert
 /// means votes are spent; a late block can never be notarized.
 fn window_already_decided(first_slot: Slot, finalized: Slot, first_slot_skip_certed: bool) -> bool {
@@ -782,6 +802,16 @@ mod tests {
             false
         ));
         assert!(window_already_decided(g, g.last_slot_in_window(), false));
+    }
+
+    /// A window whose first-slot block is already stored must not be re-produced.
+    #[test]
+    fn stored_windows_are_not_reproduced() {
+        let w = Slot::windows().nth(10).unwrap();
+        assert!(window_already_produced(w, true));
+        assert!(!window_already_produced(w, false));
+        // The genesis block always exists; its window still produces slots 1..3.
+        assert!(!window_already_produced(Slot::genesis(), true));
     }
 
     #[tokio::test]
