@@ -220,6 +220,12 @@ impl Channel {
             other => other,
         }
     }
+
+    /// Votes/certs and repair requests are tiny and gate liveness; a decisive
+    /// vote must not wait behind minutes of queued shreds.
+    fn is_priority(self) -> bool {
+        matches!(self, Channel::All2All | Channel::Repair)
+    }
 }
 
 struct Outbound {
@@ -227,12 +233,36 @@ struct Outbound {
     payload: Vec<u8>,
 }
 
+/// Two-lane outbound senders: tiny liveness-gating messages (votes, certs,
+/// repair requests) preempt bulk shred and repair-response traffic.
+#[derive(Clone)]
+struct OutboundQueues {
+    high: mpsc::Sender<Outbound>,
+    low: mpsc::Sender<Outbound>,
+}
+
+impl OutboundQueues {
+    fn for_channel(&self, channel: Channel) -> &mpsc::Sender<Outbound> {
+        if channel.is_priority() {
+            &self.high
+        } else {
+            &self.low
+        }
+    }
+
+    fn queued(&self) -> u64 {
+        let high = (self.high.max_capacity() - self.high.capacity()) as u64;
+        let low = (self.low.max_capacity() - self.low.capacity()) as u64;
+        high + low
+    }
+}
+
 /// Owns one PACTOR modem and exposes logical [`MuxChannel`] networks over it.
 pub struct PactorMux {
     transport: Arc<dyn PactorTransport>,
     max_read_len: usize,
-    outbound_tx: mpsc::Sender<Outbound>,
-    outbound_rx: Option<mpsc::Receiver<Outbound>>,
+    outbound: OutboundQueues,
+    outbound_rx: Option<(mpsc::Receiver<Outbound>, mpsc::Receiver<Outbound>)>,
     /// Inbound routing: per-channel sender the reader forwards demuxed bytes to.
     inbound_tx: [Option<mpsc::Sender<Vec<u8>>>; Channel::COUNT],
     /// Per-channel inbound receivers, handed out by [`channel`](Self::channel).
@@ -262,7 +292,8 @@ impl PactorMux {
     }
 
     fn build(transport: Arc<dyn PactorTransport>, turn: Option<Arc<TurnState>>) -> Self {
-        let (outbound_tx, outbound_rx) = mpsc::channel(CHANNEL_QUEUE_DEPTH);
+        let (high_tx, high_rx) = mpsc::channel(CHANNEL_QUEUE_DEPTH);
+        let (low_tx, low_rx) = mpsc::channel(CHANNEL_QUEUE_DEPTH);
         let mut inbound_tx: [Option<mpsc::Sender<Vec<u8>>>; Channel::COUNT] = Default::default();
         let mut inbound_rx: [Option<mpsc::Receiver<Vec<u8>>>; Channel::COUNT] = Default::default();
         for i in 0..Channel::COUNT {
@@ -273,8 +304,11 @@ impl PactorMux {
         Self {
             transport,
             max_read_len: DEFAULT_MAX_READ_LEN,
-            outbound_tx,
-            outbound_rx: Some(outbound_rx),
+            outbound: OutboundQueues {
+                high: high_tx,
+                low: low_tx,
+            },
+            outbound_rx: Some((high_rx, low_rx)),
             inbound_tx,
             inbound_rx,
             // Session-unique ids prevent stale reassembler fragments from a
@@ -306,7 +340,7 @@ impl PactorMux {
     pub fn injector(&self, channel: Channel) -> MuxInjector {
         MuxInjector {
             channel,
-            outbound_tx: self.outbound_tx.clone(),
+            outbound: self.outbound.clone(),
             self_delivery: self.inbound_tx[channel as usize].clone(),
         }
     }
@@ -322,7 +356,7 @@ impl PactorMux {
         };
         MuxChannel {
             channel,
-            outbound_tx: self.outbound_tx.clone(),
+            outbound: self.outbound.clone(),
             inbound_rx: Mutex::new(inbound_rx),
             self_delivery,
             _msg_types: PhantomData,
@@ -334,7 +368,10 @@ impl PactorMux {
         let transport = self.transport.clone();
         let max_read_len = self.max_read_len;
         let inbound_tx = self.inbound_tx.clone();
-        let outbound_rx = self.outbound_rx.take().expect("spawn called twice");
+        let (high_rx, low_rx) = self.outbound_rx.take().expect("spawn called twice");
+        // The writer keeps sender clones so one lane closing early cannot
+        // asymmetrically end the biased receive; shutdown aborts the task.
+        let outbound_keepalive = self.outbound.clone();
         let message_counter = self.message_counter.clone();
         let turn = self.turn.clone();
         let last_activity_ms = self.last_activity_ms.clone();
@@ -395,7 +432,9 @@ impl PactorMux {
         let writer_transport = transport.clone();
         let writer_activity = last_activity_ms.clone();
         let writer = tokio::spawn(async move {
-            let mut outbound_rx = outbound_rx;
+            let _outbound_keepalive = outbound_keepalive;
+            let mut high_rx = high_rx;
+            let mut low_rx = low_rx;
             let counter = message_counter;
 
             async fn write_message(
@@ -414,9 +453,21 @@ impl PactorMux {
                 Ok(())
             }
 
+            // Priority receive: the high lane drains fully before the low lane.
+            async fn recv_prio(
+                high: &mut mpsc::Receiver<Outbound>,
+                low: &mut mpsc::Receiver<Outbound>,
+            ) -> Option<Outbound> {
+                tokio::select! {
+                    biased;
+                    item = high.recv() => item,
+                    item = low.recv() => item,
+                }
+            }
+
             // Full-duplex mode (simulator / TCP): transmit whenever we have data.
             let Some(turn) = turn else {
-                while let Some(item) = outbound_rx.recv().await {
+                while let Some(item) = recv_prio(&mut high_rx, &mut low_rx).await {
                     if let Err(e) = write_message(
                         &writer_transport,
                         &counter,
@@ -477,7 +528,7 @@ impl PactorMux {
                         // The reclaim loop is otherwise blind to pending outbound: a
                         // listener with its own block queued must take the turn to send it.
                         if action == ReclaimAction::Yield
-                            && !outbound_rx.is_empty()
+                            && !(high_rx.is_empty() && low_rx.is_empty())
                             && outbound_take_budget > 0
                         {
                             outbound_take_budget -= 1;
@@ -517,7 +568,7 @@ impl PactorMux {
                 }
 
                 // Keepalive immediately after acquiring an idle turn.
-                if outbound_rx.is_empty() {
+                if high_rx.is_empty() && low_rx.is_empty() {
                     if let Err(e) =
                         write_message(&writer_transport, &counter, KEEPALIVE_TAG, &[]).await
                     {
@@ -533,7 +584,7 @@ impl PactorMux {
                 loop {
                     let wait = KEEPALIVE_INTERVAL
                         .min(idle_until.saturating_duration_since(tokio::time::Instant::now()));
-                    match tokio::time::timeout(wait, outbound_rx.recv()).await {
+                    match tokio::time::timeout(wait, recv_prio(&mut high_rx, &mut low_rx)).await {
                         Ok(Some(item)) => {
                             first_item = Some(item);
                             break;
@@ -577,7 +628,12 @@ impl PactorMux {
                     {
                         break;
                     }
-                    match tokio::time::timeout(TURN_DRAIN_GRACE, outbound_rx.recv()).await {
+                    match tokio::time::timeout(
+                        TURN_DRAIN_GRACE,
+                        recv_prio(&mut high_rx, &mut low_rx),
+                    )
+                    .await
+                    {
                         Ok(Some(item)) => {
                             if let Err(e) = write_message(
                                 &writer_transport,
@@ -621,11 +677,10 @@ impl PactorMux {
 
         // Sample from a separate task so the gauge updates while the writer is parked.
         let gauge_task = self.queued_gauge.take().map(|gauge| {
-            let tx = self.outbound_tx.clone();
+            let queues = self.outbound.clone();
             tokio::spawn(async move {
                 loop {
-                    let queued = (tx.max_capacity() - tx.capacity()) as u64;
-                    gauge.store(queued, Ordering::Relaxed);
+                    gauge.store(queues.queued(), Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             })
@@ -709,7 +764,7 @@ impl PactorMuxHandle {
 /// One logical [`Network`] over the shared PACTOR link.
 pub struct MuxChannel<S, R> {
     channel: Channel,
-    outbound_tx: mpsc::Sender<Outbound>,
+    outbound: OutboundQueues,
     inbound_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Local loopback sender used by [`PactorMux::channel_self_delivering`].
     self_delivery: Option<mpsc::Sender<Vec<u8>>>,
@@ -720,7 +775,7 @@ pub struct MuxChannel<S, R> {
 #[derive(Clone)]
 pub struct MuxInjector {
     channel: Channel,
-    outbound_tx: mpsc::Sender<Outbound>,
+    outbound: OutboundQueues,
     /// Optional local loopback sender for self-delivering channels.
     self_delivery: Option<mpsc::Sender<Vec<u8>>>,
 }
@@ -736,7 +791,8 @@ impl MuxInjector {
         if let Some(self_tx) = &self.self_delivery {
             let _ = self_tx.try_send(payload.clone());
         }
-        self.outbound_tx
+        self.outbound
+            .for_channel(self.channel)
             .send(Outbound {
                 channel: self.channel.outbound_tag(),
                 payload,
@@ -757,7 +813,8 @@ where
         if let Some(self_tx) = &self.self_delivery {
             let _ = self_tx.try_send(payload.clone());
         }
-        self.outbound_tx
+        self.outbound
+            .for_channel(self.channel)
             .send(Outbound {
                 channel: self.channel.outbound_tag(),
                 payload,
@@ -1595,6 +1652,38 @@ mod tests {
             .unwrap();
         assert_eq!(got, b"delivered");
         assert!(!ha.writer.is_finished(), "writer task must stay alive");
+    }
+
+    /// A decisive vote must not wait behind minutes of queued shreds.
+    #[tokio::test]
+    async fn all2all_preempts_queued_bulk_traffic() {
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
+        let shreds: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
+        let votes: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
+
+        // Bulk backlog enqueued first, the vote last — priority must invert that.
+        let addr = "127.0.0.1:1".parse().unwrap();
+        for i in 0..3u8 {
+            shreds.send(&vec![i; 60], addr).await.unwrap();
+        }
+        votes.send(&b"vote".to_vec(), addr).await.unwrap();
+        let _h = mux.spawn();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let lines = transport.written.lock().await.clone();
+        let mut reassembler = Reassembler::new();
+        let first_data_tag = lines.iter().find_map(|line| {
+            reassembler
+                .push_line(line)
+                .and_then(|msg| msg.first().copied())
+                .filter(|tag| *tag != KEEPALIVE_TAG && *tag != TURN_GRANT_TAG)
+        });
+        assert_eq!(
+            first_data_tag,
+            Some(Channel::All2All as u8),
+            "the vote must be transmitted before the queued shreds"
+        );
     }
 
     /// The byte budget must force a grant even with a deep queue, else one turn
