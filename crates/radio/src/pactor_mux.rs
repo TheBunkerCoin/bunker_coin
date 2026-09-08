@@ -1635,7 +1635,10 @@ mod tests {
                 }
             }
         }
-        assert!(grant_seen, "budget-exhausted turn must still end in a grant");
+        assert!(
+            grant_seen,
+            "budget-exhausted turn must still end in a grant"
+        );
         assert!(
             (1..5).contains(&data_msgs),
             "byte budget must cut the turn before the whole backlog drains \
