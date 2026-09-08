@@ -18,6 +18,7 @@ pub(crate) mod votor;
 
 use std::marker::{Send, Sync};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use block_producer::BlockProducer;
@@ -81,6 +82,12 @@ fn delta_standstill() -> Duration {
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(300))
 }
+/// A due rebroadcast fires only with an empty outbound queue: at radio rates a
+/// still-queued bundle means re-queuing duplicates that starve the reverse path.
+fn standstill_should_fire(since_progress: Duration, dry_recoveries: u32, backlog: u64) -> bool {
+    backlog == 0 && since_progress > delta_standstill() * 2u32.pow(dry_recoveries)
+}
+
 /// Max time to produce and send the first slice of a block.
 pub(crate) fn delta_first_slice() -> Duration {
     scaled(30_000)
@@ -145,6 +152,8 @@ where
     pending_epoch_transitions: Arc<RwLock<std::collections::BTreeMap<u64, Vec<u8>>>>,
     /// Swappable link-liveness source consulted by Votor's crashed-leader timeout.
     link_liveness: Arc<SwappableLiveness>,
+    /// Outbound-queue depth; standstill rebroadcasts defer while it is non-zero.
+    outbound_backlog: Arc<AtomicU64>,
 }
 
 impl<A, D, T> Alpenglow<A, D, T>
@@ -281,12 +290,19 @@ where
             snapshot_store: Some(snapshot_store),
             pending_epoch_transitions,
             link_liveness,
+            outbound_backlog: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Swaps Votor's crashed-leader timeout liveness source.
     pub fn set_link_liveness(&self, liveness: Arc<dyn LinkLiveness>) {
         self.link_liveness.set(liveness);
+    }
+
+    /// Injects the transport's outbound-queue gauge; a zeroed default keeps
+    /// non-radio nodes rebroadcasting unconditionally.
+    pub fn set_outbound_backlog_gauge(&mut self, gauge: Arc<AtomicU64>) {
+        self.outbound_backlog = gauge;
     }
 
     /// Starts the Alpenglow node tasks.
@@ -450,7 +466,11 @@ where
                 finalized_slot = slot;
                 last_progress = Instant::now();
                 dry_recoveries = 0;
-            } else if last_progress.elapsed() > delta_standstill() * 2u32.pow(dry_recoveries) {
+            } else if standstill_should_fire(
+                last_progress.elapsed(),
+                dry_recoveries,
+                self.outbound_backlog.load(Ordering::Relaxed),
+            ) {
                 self.pool.read().await.recover_from_standstill().await;
                 last_progress = Instant::now();
                 dry_recoveries = (dry_recoveries + 1).min(2);
@@ -721,5 +741,26 @@ async fn finalized_checkpoint_loop(
                 event.slot, e
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A queued backlog must defer a due rebroadcast; it fires once drained.
+    #[test]
+    fn standstill_defers_while_outbound_backlog_pending() {
+        let overdue = delta_standstill() * 2 + Duration::from_secs(1);
+        assert!(!standstill_should_fire(overdue, 0, 3));
+        assert!(standstill_should_fire(overdue, 0, 0));
+        assert!(!standstill_should_fire(Duration::from_secs(1), 0, 0));
+        // Backoff doubling still applies with an empty queue.
+        assert!(!standstill_should_fire(
+            delta_standstill() + Duration::from_secs(1),
+            1,
+            0
+        ));
+        assert!(standstill_should_fire(overdue, 1, 0));
     }
 }
