@@ -658,6 +658,7 @@ async fn route_terminal_line(
             }))
             .await;
     } else if body.starts_with("DISCONNECTED") {
+        warn!("[link] modem reported link end: {body:?}");
         let _ = event_tx
             .send(PactorLinkEvent::Status(PactorLinkStatus::Disconnected))
             .await;
@@ -665,13 +666,19 @@ async fn route_terminal_line(
     } else if body.starts_with("LINK FAILURE")
         || body.starts_with("CONNECT FAILED")
         || body.starts_with("NO CONNECT")
-        || body.starts_with("STBY")
     {
-        // STBY is treated as link failure only by terminal-line routing.
+        warn!("[link] modem reported link end: {body:?}");
         let _ = event_tx
             .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
             .await;
         link_down = true;
+    } else if body.starts_with("STBY") {
+        // A stray standby echo must not kill an established link; connect-time
+        // failure detection is event-driven, and real deaths print DISCONNECTED.
+        warn!("[link] modem standby banner (not treated as session-fatal): {body:?}");
+        let _ = event_tx
+            .send(PactorLinkEvent::Status(PactorLinkStatus::LinkFailure))
+            .await;
     } else if let Some(event) = parse_quality_banner(body) {
         // Terminal mode must not poll status; parse only volunteered quality banners.
         let _ = event_tx.send(event).await;
@@ -941,6 +948,23 @@ mod tests {
     use tokio::io::{duplex, AsyncRead, AsyncReadExt};
 
     use super::*;
+
+    /// STBY must not kill an established session; only real link-end banners may.
+    #[tokio::test]
+    async fn stby_banner_is_not_session_fatal() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        assert!(!route_terminal_line("*** STBY", &cmd_tx, &event_tx).await);
+        match event_rx.recv().await.unwrap() {
+            PactorLinkEvent::Status(PactorLinkStatus::LinkFailure) => {}
+            other => panic!("STBY must still signal connect-time failure, got {other:?}"),
+        }
+        let _ = cmd_rx.recv().await;
+
+        assert!(route_terminal_line("*** DISCONNECTED AT - 00:00:00", &cmd_tx, &event_tx).await);
+        assert!(route_terminal_line("LINK FAILURE", &cmd_tx, &event_tx).await);
+    }
 
     #[test]
     fn data_line_assembler_roundtrip() {
