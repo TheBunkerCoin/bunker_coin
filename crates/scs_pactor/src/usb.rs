@@ -13,19 +13,78 @@ use crate::hostmode::{
 };
 use crate::{PactorLinkEvent, PactorLinkStatus, PactorTransport, ScsPactorError};
 
+/// Modem TX-FIFO drain allowance before Ctrl-Z so the grant leads the changeover.
+const CHANGEOVER_SETTLE: Duration = Duration::from_secs(2);
+
 const STATUS_CHANNEL: u8 = 254;
 const EXTENDED_POLL_CHANNEL: u8 = 255;
 const MAX_HOSTMODE_RETRIES: u8 = 3;
 
-/// Prefix for printable terminal-mode data lines (`#<hex>\r`).
+/// Prefix for printable terminal-mode data lines (`#<len:4-hex><hex>\r`).
 const DATA_LINE_MARKER: &str = "#";
 
-fn decode_hex_line(hex: &str) -> Option<Vec<u8>> {
-    let hex = hex.trim();
-    if hex.is_empty() {
-        return None;
+fn encode_data_line(data: &[u8]) -> String {
+    format!(
+        "{DATA_LINE_MARKER}{:04x}{}\r",
+        data.len(),
+        hex::encode(data)
+    )
+}
+
+enum LineKind {
+    Data(Vec<u8>),
+    Status,
+    Partial,
+}
+
+/// Re-stitches data lines split by modem status output interleaving mid-line.
+#[derive(Default)]
+struct DataLineAssembler {
+    pending: Option<String>,
+}
+
+impl DataLineAssembler {
+    fn target_len(buf: &str) -> Option<usize> {
+        let len = usize::from_str_radix(buf.get(..4)?, 16).ok()?;
+        Some(4 + len * 2)
     }
-    hex::decode(hex).ok()
+
+    fn check(buf: String) -> (Option<String>, LineKind) {
+        match Self::target_len(&buf) {
+            None if buf.len() < 4 && buf.chars().all(|c| c.is_ascii_hexdigit()) => {
+                (Some(buf), LineKind::Partial)
+            }
+            None => (None, LineKind::Status),
+            Some(target) if buf.len() < target => (Some(buf), LineKind::Partial),
+            Some(target) if buf.len() == target => match hex::decode(&buf[4..]) {
+                Ok(bytes) => (None, LineKind::Data(bytes)),
+                Err(_) => (None, LineKind::Status),
+            },
+            Some(_) => (None, LineKind::Status),
+        }
+    }
+
+    fn on_line(&mut self, line: &str) -> LineKind {
+        if let Some(rest) = line.strip_prefix(DATA_LINE_MARKER) {
+            if self.pending.take().is_some() {
+                warn!("[data] dropping interrupted data line superseded by a new one");
+            }
+            let (pending, kind) = Self::check(rest.to_string());
+            self.pending = pending;
+            return kind;
+        }
+        if let Some(mut buf) = self.pending.take() {
+            if !line.is_empty() && line.chars().all(|c| c.is_ascii_hexdigit()) {
+                buf.push_str(line);
+                let (pending, kind) = Self::check(buf);
+                self.pending = pending;
+                return kind;
+            }
+            // A real status line interleaved mid-data-line: keep waiting.
+            self.pending = Some(buf);
+        }
+        LineKind::Status
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +203,7 @@ impl UsbPactorTransport {
         let read_task = tokio::spawn(async move {
             let mut decoder = HostmodeDecoder::new();
             let mut term_line: Vec<u8> = Vec::new();
+            let mut assembler = DataLineAssembler::default();
             let mut buf = [0u8; 1024];
             debug!("[reader:{label}] task started");
 
@@ -176,25 +236,29 @@ impl UsbPactorTransport {
                         if !term_line.is_empty() {
                             let line = String::from_utf8_lossy(&term_line).trim().to_string();
                             if !line.is_empty() {
-                                // `#<hex>` lines are data; other terminal lines are status.
-                                if let Some(hex) = line.strip_prefix(DATA_LINE_MARKER) {
-                                    if let Some(bytes) = decode_hex_line(hex) {
+                                match assembler.on_line(&line) {
+                                    LineKind::Data(bytes) => {
                                         debug!(
                                             "[reader:{label}] data line -> {} bytes routed",
                                             bytes.len()
                                         );
                                         let _ = data_tx.send(bytes).await;
-                                    } else {
-                                        warn!(
-                                            "[reader:{label}] bad data line (hex decode failed): {line:?}"
+                                    }
+                                    LineKind::Partial => {
+                                        debug!(
+                                            "[reader:{label}] partial data line held for resume"
                                         );
                                     }
-                                } else {
-                                    let link_down =
-                                        route_terminal_line(&line, &command_tx, &event_tx).await;
-                                    if link_down {
-                                        // Wake blocked reads on link drop.
-                                        let _ = link_down_tx.send(true);
+                                    LineKind::Status => {
+                                        let link_down =
+                                            route_terminal_line(&line, &command_tx, &event_tx)
+                                                .await;
+                                        if link_down {
+                                            // A dead link never completes a pending line.
+                                            assembler.pending = None;
+                                            // Wake blocked reads on link drop.
+                                            let _ = link_down_tx.send(true);
+                                        }
                                     }
                                 }
                             }
@@ -778,13 +842,16 @@ impl PactorTransport for UsbPactorTransport {
 
     async fn changeover(&self) -> Result<(), ScsPactorError> {
         // Ctrl-Z hands over the transmit turn locally; it is not sent over the air.
+        // The modem TX FIFO may still be clocking the grant line out at floor
+        // speed; settle so the grant reaches the peer before the ARQ turnaround.
+        tokio::time::sleep(CHANGEOVER_SETTLE).await;
         debug!("[changeover] handing transmit turn to peer (Ctrl-Z)");
         self.write_raw(&[0x1a]).await
     }
 
     async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
         // Payloads travel as printable `#<hex>\r` terminal lines.
-        let line = format!("{DATA_LINE_MARKER}{}\r", hex::encode(data));
+        let line = encode_data_line(data);
         trace!("[data] write_data: {} bytes -> {:?}", data.len(), &line);
         let r = self.write_raw(line.as_bytes()).await;
         if let Err(e) = &r {
@@ -874,6 +941,59 @@ mod tests {
     use tokio::io::{duplex, AsyncRead, AsyncReadExt};
 
     use super::*;
+
+    #[test]
+    fn data_line_assembler_roundtrip() {
+        let mut a = DataLineAssembler::default();
+        let line = encode_data_line(b"hello world");
+        match a.on_line(line.trim_end_matches('\r')) {
+            LineKind::Data(b) => assert_eq!(b, b"hello world"),
+            _ => panic!("expected data"),
+        }
+    }
+
+    #[test]
+    fn data_line_assembler_resumes_after_interleaved_status() {
+        let mut a = DataLineAssembler::default();
+        let full = encode_data_line(&[0xab; 40]);
+        let full = full.trim_end_matches('\r');
+        let (head, tail) = full.split_at(20);
+        assert!(matches!(a.on_line(head), LineKind::Partial));
+        assert!(matches!(a.on_line("*** SPEED LEVEL 1"), LineKind::Status));
+        assert!(matches!(a.on_line("cmd:"), LineKind::Status));
+        match a.on_line(tail) {
+            LineKind::Data(b) => assert_eq!(b, vec![0xab; 40]),
+            _ => panic!("expected resumed data"),
+        }
+    }
+
+    #[test]
+    fn data_line_assembler_split_inside_length_prefix() {
+        let mut a = DataLineAssembler::default();
+        let full = encode_data_line(&[0x5a; 12]);
+        let full = full.trim_end_matches('\r');
+        let (head, tail) = full.split_at(3);
+        assert!(matches!(a.on_line(head), LineKind::Partial));
+        match a.on_line(tail) {
+            LineKind::Data(b) => assert_eq!(b, vec![0x5a; 12]),
+            _ => panic!("expected resumed data"),
+        }
+    }
+
+    #[test]
+    fn new_marker_supersedes_interrupted_line() {
+        let mut a = DataLineAssembler::default();
+        let first = encode_data_line(&[1; 30]);
+        assert!(matches!(
+            a.on_line(&first.trim_end_matches('\r')[..10]),
+            LineKind::Partial
+        ));
+        let second = encode_data_line(&[2; 5]);
+        match a.on_line(second.trim_end_matches('\r')) {
+            LineKind::Data(b) => assert_eq!(b, vec![2; 5]),
+            _ => panic!("expected second message"),
+        }
+    }
     use crate::hostmode::{
         decode_frame, encode_repeat_request, TYPE_COMMAND, TYPE_COMMAND_COUNTER, TYPE_DATA,
     };
@@ -1224,7 +1344,7 @@ mod tests {
 
         let mut buf = [0u8; 1024];
         let n = modem_side.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"#68656c6c6f\r");
+        assert_eq!(&buf[..n], b"#000568656c6c6f\r");
     }
 
     #[tokio::test]
@@ -1236,7 +1356,7 @@ mod tests {
             .write_all(b"\r\n*** CONNECTED TO NODE\r\n")
             .await
             .unwrap();
-        modem_side.write_all(b"#68656c6c6f\r").await.unwrap();
+        modem_side.write_all(b"#000568656c6c6f\r").await.unwrap();
 
         let data = transport.read_data(1024).await.unwrap();
         assert_eq!(data, b"hello");

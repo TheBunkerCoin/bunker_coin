@@ -615,24 +615,13 @@ fn build_api_block(
 }
 
 // Only blocks the walked finalized chain provably bypassed were skip-certified.
-fn mark_dead_blocks_skipped(all_blocks: &mut [Block], walked_low: Option<u64>) {
-    let Some(low) = walked_low else { return };
-    let finalized_tip = all_blocks
-        .iter()
-        .filter(|b| {
-            matches!(
-                b,
-                Block::Block {
-                    status: SlotStatus::Finalized,
-                    ..
-                }
-            )
-        })
-        .map(|b| b.slot())
-        .max();
-    let Some(tip) = finalized_tip else { return };
+fn mark_dead_blocks_skipped(all_blocks: &mut [Block], walked_segments: &[(u64, u64)]) {
     for b in all_blocks.iter_mut() {
-        if b.slot() <= low || b.slot() >= tip {
+        let slot = b.slot();
+        if !walked_segments
+            .iter()
+            .any(|(lo, hi)| slot > *lo && slot < *hi)
+        {
             continue;
         }
         if let Block::Block {
@@ -832,6 +821,7 @@ async fn blocks(
         None => None,
     };
     let mut scan_low = 0u64;
+    let mut scan_top = 0u64;
 
     if let Some(bs) = &bs_opt {
         let highest_mem_slot = all_blocks.iter().map(|b| b.slot()).max().unwrap_or(0);
@@ -844,6 +834,7 @@ async fn blocks(
         let window = (want * 3).max(400) as u64;
         let low = top.saturating_sub(window);
         scan_low = low;
+        scan_top = top;
 
         for slot_u64 in low..=top {
             if all_blocks.iter().any(|b| b.slot() == slot_u64) {
@@ -863,101 +854,159 @@ async fn blocks(
         }
     }
 
-    // The pool's finalization cert names the true chain tip; metadata-derived
-    // status is only the fallback when no pool is wired in.
-    let pool_tip = match &state.pool {
+    // Live pool certs cover skips the persisted markers predate.
+    let (pool_tip, pool_skips) = match &state.pool {
         Some(pool) => {
             let pg = pool.read().await;
             let f = pg.finalized_slot();
-            pg.finalized_block_hash(f).map(|h| hex::encode(h.as_hash()))
+            let tip = pg.finalized_block_hash(f).map(|h| hex::encode(h.as_hash()));
+            let skips: HashSet<u64> = (scan_low..=scan_top)
+                .filter(|s| pg.has_skip_cert(Slot::new(*s)))
+                .collect();
+            (tip, skips)
         }
-        None => None,
+        None => (None, HashSet::new()),
     };
+
+    // Skip certs decide a slot outright; a finalized chain block still wins
+    // because the walk below re-fetches chain blocks by hash.
+    if let Some(bs) = &bs_opt {
+        for slot_u64 in scan_low..=scan_top {
+            let marker = bs.slot_skipped_at(Slot::new(slot_u64));
+            if marker.is_none() && !pool_skips.contains(&slot_u64) {
+                continue;
+            }
+            let ts = marker.unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            });
+            let entry = Block::Skip {
+                slot: slot_u64,
+                hash: format!("skip-{}", slot_u64),
+                proposed_timestamp: ts,
+                finalized_timestamp: Some(ts),
+                status: SlotStatus::Finalized,
+            };
+            match all_blocks.iter_mut().find(|b| b.slot() == slot_u64) {
+                Some(b) => {
+                    if matches!(
+                        b,
+                        Block::Block {
+                            status: SlotStatus::Pending
+                                | SlotStatus::Proposed
+                                | SlotStatus::Notarized,
+                            ..
+                        }
+                    ) {
+                        *b = entry;
+                    }
+                }
+                None => all_blocks.push(entry),
+            }
+        }
+    }
 
     // Finalized blocks finalize ancestors; walk parent links instead of using a
     // slot frontier so skip-certified dead blocks are not falsely finalized.
-    let walked_low = {
+    // Every finalized entry seeds a walk: a missing block body breaks one
+    // segment without unanchoring the finalized islands below it.
+    let walked_segments = {
         let mut index_by_hash: HashMap<String, usize> = HashMap::new();
         for (i, b) in all_blocks.iter().enumerate() {
             if let Block::Block { hash, .. } = b {
                 index_by_hash.insert(hash.clone(), i);
             }
         }
-        let mut cursor = pool_tip.or_else(|| {
-            all_blocks
-                .iter()
-                .filter(|b| {
-                    matches!(
-                        b,
-                        Block::Block {
-                            status: SlotStatus::Finalized,
-                            ..
-                        }
-                    )
-                })
-                .max_by_key(|b| b.slot())
-                .and_then(|b| match b {
-                    Block::Block { hash, .. } => Some(hash.clone()),
-                    _ => None,
-                })
-        });
-        let mut low = None;
-        let mut visited: HashSet<String> = HashSet::new();
-        while let Some(h) = cursor {
-            // The visited set guards against corrupt parent cycles.
-            if !visited.insert(h.clone()) {
-                break;
-            }
-            let i = match index_by_hash.get(&h) {
-                Some(&i) => i,
-                // The canonical pointer for a slot can name a dead fork block;
-                // the chain block is still in the blockstore under its hash.
-                None => match &bs_opt {
-                    Some(bs) => {
-                        let Some(arr) = decode_hash32(&h).ok() else {
-                            break;
-                        };
-                        let hash = Hash::from(arr);
-                        let Some((slot, blk)) = bs.load_block_by_hash(hash.clone()) else {
-                            break;
-                        };
-                        if slot.inner() < scan_low {
-                            break;
-                        }
-                        let metadata = bs.load_block_metadata(slot, hash);
-                        let api_block = build_api_block(slot.inner(), h.clone(), &blk, metadata);
-                        match all_blocks.iter().position(|b| b.slot() == slot.inner()) {
-                            Some(j) => {
-                                all_blocks[j] = api_block;
-                                j
-                            }
-                            None => {
-                                all_blocks.push(api_block);
-                                all_blocks.len() - 1
-                            }
-                        }
-                    }
-                    None => break,
-                },
-            };
-            cursor = match &mut all_blocks[i] {
+        let mut seeds: Vec<String> = pool_tip.into_iter().collect();
+        let mut finalized_entries: Vec<(u64, String)> = all_blocks
+            .iter()
+            .filter_map(|b| match b {
                 Block::Block {
-                    slot,
-                    status,
-                    parent_hash,
+                    status: SlotStatus::Finalized,
+                    hash,
                     ..
-                } => {
-                    *status = SlotStatus::Finalized;
-                    low = Some(*slot);
-                    Some(parent_hash.clone())
-                }
+                } => Some((b.slot(), hash.clone())),
                 _ => None,
-            };
+            })
+            .collect();
+        finalized_entries.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+        seeds.extend(finalized_entries.into_iter().map(|(_, h)| h));
+
+        let mut segments: Vec<(u64, u64)> = Vec::new();
+        let mut visited: HashMap<String, u64> = HashMap::new();
+        for seed in seeds {
+            let mut cursor = Some(seed);
+            let mut seg: Option<(u64, u64)> = None;
+            while let Some(h) = cursor {
+                // The visited map guards against corrupt parent cycles and
+                // joins segments that meet an already-walked chain.
+                if let Some(&s) = visited.get(&h) {
+                    if let Some(seg) = seg.as_mut() {
+                        seg.0 = seg.0.min(s);
+                    }
+                    break;
+                }
+                let i = match index_by_hash.get(&h) {
+                    Some(&i) => i,
+                    // The canonical pointer for a slot can name a dead fork
+                    // block; the chain block is still stored under its hash.
+                    None => match &bs_opt {
+                        Some(bs) => {
+                            let Some(arr) = decode_hash32(&h).ok() else {
+                                break;
+                            };
+                            let hash = Hash::from(arr);
+                            let Some((slot, blk)) = bs.load_block_by_hash(hash.clone()) else {
+                                break;
+                            };
+                            if slot.inner() < scan_low {
+                                break;
+                            }
+                            let metadata = bs.load_block_metadata(slot, hash);
+                            let api_block =
+                                build_api_block(slot.inner(), h.clone(), &blk, metadata);
+                            match all_blocks.iter().position(|b| b.slot() == slot.inner()) {
+                                Some(j) => {
+                                    all_blocks[j] = api_block;
+                                    j
+                                }
+                                None => {
+                                    all_blocks.push(api_block);
+                                    all_blocks.len() - 1
+                                }
+                            }
+                        }
+                        None => break,
+                    },
+                };
+                cursor = match &mut all_blocks[i] {
+                    Block::Block {
+                        slot,
+                        status,
+                        parent_hash,
+                        ..
+                    } => {
+                        *status = SlotStatus::Finalized;
+                        visited.insert(h, *slot);
+                        seg = Some(match seg {
+                            Some((lo, hi)) => (lo.min(*slot), hi.max(*slot)),
+                            None => (*slot, *slot),
+                        });
+                        Some(parent_hash.clone())
+                    }
+                    _ => None,
+                };
+            }
+            if let Some(seg) = seg {
+                segments.push(seg);
+            }
         }
-        low
+        segments
     };
 
-    mark_dead_blocks_skipped(&mut all_blocks, walked_low);
+    mark_dead_blocks_skipped(&mut all_blocks, &walked_segments);
 
     all_blocks.sort_by_key(|b| std::cmp::Reverse(b.slot()));
 
@@ -2465,6 +2514,292 @@ mod tests {
         assert!(json.contains("\"type\":\"UnJail\""));
     }
 
+    fn test_state(blocks: Vec<Block>) -> SharedState {
+        SharedState {
+            blocks: Arc::new(tokio::sync::RwLock::new(blocks)),
+            nodes: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            radio_stats: Arc::new(tokio::sync::RwLock::new(RadioStats::default())),
+            updates: tokio::sync::broadcast::channel(8).0,
+            blockstore: None,
+            pool: None,
+            mempool: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            tx_sender: None,
+            execution_state: Arc::new(tokio::sync::RwLock::new(
+                bunker_coin_core::execution::State::new(),
+            )),
+            tx_results: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            genesis_signing_key: None,
+            snapshot_store: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_markers_decide_slots() {
+        let mk = |slot: u64, parent_slot: u64, finalized: bool| Block::Block {
+            slot,
+            hash: format!("h{}", slot),
+            parent_slot,
+            parent_hash: format!("h{}", parent_slot),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: finalized.then_some(200),
+            status: if finalized {
+                SlotStatus::Finalized
+            } else {
+                SlotStatus::Proposed
+            },
+        };
+
+        let mut bs = bunkerglow::consensus::MockBlockstore::new();
+        bs.expect_canonical_block_hash().returning(|_| None);
+        bs.expect_load_block_by_hash().returning(|_| None);
+        // Markers: 96 (below the walk's reach), 98 (dead block entry),
+        // 99 (no entry at all), 97 (finalized chain block — must NOT flip).
+        bs.expect_slot_skipped_at()
+            .returning(|slot| matches!(slot.inner(), 96 | 97 | 98 | 99).then_some(5));
+
+        let mut state = test_state(vec![
+            mk(100, 97, true),
+            mk(98, 97, false),
+            mk(97, 96, true),
+            mk(95, 94, false),
+        ]);
+        state.blockstore = Some(Arc::new(tokio::sync::RwLock::new(Box::new(bs))));
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let kind = |slot: u64| {
+            result
+                .iter()
+                .find(|b| b.slot() == slot)
+                .map(|b| match b {
+                    Block::Skip { .. } => "skip",
+                    Block::Block { status, .. } => match status {
+                        SlotStatus::Finalized => "finalized",
+                        _ => "other",
+                    },
+                })
+                .unwrap_or("missing")
+        };
+        assert_eq!(kind(100), "finalized");
+        assert_eq!(kind(99), "skip");
+        assert_eq!(kind(98), "skip");
+        assert_eq!(kind(97), "finalized");
+        assert_eq!(kind(96), "skip");
+        assert_eq!(kind(95), "other");
+    }
+
+    #[tokio::test]
+    async fn lower_finalized_island_still_anchors_its_ancestors() {
+        let mk = |slot: u64, parent_slot: u64, finalized: bool| Block::Block {
+            slot,
+            hash: format!("h{}", slot),
+            parent_slot,
+            parent_hash: format!("h{}", parent_slot),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: finalized.then_some(200),
+            status: if finalized {
+                SlotStatus::Finalized
+            } else {
+                SlotStatus::Proposed
+            },
+        };
+        // Tip island at 78 breaks immediately (h50 unresolvable); the lower
+        // island 12 -> 9 must still finalize 9, and 10/11 still infer skipped.
+        // 40 sits in the unwalked break gap and must stay proposed.
+        let state = test_state(vec![
+            mk(78, 50, true),
+            mk(40, 39, false),
+            mk(12, 9, true),
+            mk(11, 10, false),
+            mk(10, 9, false),
+            mk(9, 8, false),
+        ]);
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let kind = |slot: u64| {
+            result
+                .iter()
+                .find(|b| b.slot() == slot)
+                .map(|b| match b {
+                    Block::Skip { .. } => "skip",
+                    Block::Block {
+                        status: SlotStatus::Finalized,
+                        ..
+                    } => "finalized",
+                    Block::Block { .. } => "other",
+                })
+                .unwrap()
+        };
+        assert_eq!(kind(78), "finalized");
+        assert_eq!(kind(40), "other");
+        assert_eq!(kind(12), "finalized");
+        assert_eq!(kind(11), "skip");
+        assert_eq!(kind(10), "skip");
+        assert_eq!(kind(9), "finalized");
+    }
+
+    #[tokio::test]
+    async fn stale_nodes_frontier_keeps_scans_at_pool_tip() {
+        let mut bs = bunkerglow::consensus::MockBlockstore::new();
+        bs.expect_canonical_block_hash().returning(|slot| {
+            assert!(slot.inner() >= 79_500, "scan escaped tip window: {slot}");
+            None
+        });
+        bs.expect_slot_skipped_at().returning(|slot| {
+            assert!(
+                slot.inner() >= 79_500,
+                "marker scan escaped tip window: {slot}"
+            );
+            None
+        });
+        bs.expect_load_block_by_hash().returning(|_| None);
+
+        let mut pool = bunkerglow::consensus::MockPool::new();
+        pool.expect_finalized_slot().returning(|| Slot::new(79_780));
+        pool.expect_finalized_block_hash().returning(|_| None);
+        pool.expect_has_skip_cert().returning(|slot| {
+            assert!(
+                slot.inner() >= 79_500,
+                "cert scan escaped tip window: {slot}"
+            );
+            false
+        });
+
+        let mut state = test_state(Vec::new());
+        state.blockstore = Some(Arc::new(tokio::sync::RwLock::new(Box::new(bs))));
+        state.pool = Some(Arc::new(tokio::sync::RwLock::new(Box::new(pool))));
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pool_skip_cert_shows_slot_skipped_without_marker() {
+        let mut bs = bunkerglow::consensus::MockBlockstore::new();
+        bs.expect_canonical_block_hash().returning(|_| None);
+        bs.expect_load_block_by_hash().returning(|_| None);
+        bs.expect_slot_skipped_at().returning(|_| None);
+
+        let mut pool = bunkerglow::consensus::MockPool::new();
+        pool.expect_finalized_slot().returning(|| Slot::new(78));
+        pool.expect_finalized_block_hash().returning(|_| None);
+        pool.expect_has_skip_cert()
+            .returning(|slot| slot.inner() == 79);
+
+        let mut state = test_state(vec![Block::Block {
+            slot: 78,
+            hash: "h78".into(),
+            parent_slot: 77,
+            parent_hash: "h77".into(),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: Some(200),
+            status: SlotStatus::Finalized,
+        }]);
+        state.blockstore = Some(Arc::new(tokio::sync::RwLock::new(Box::new(bs))));
+        state.pool = Some(Arc::new(tokio::sync::RwLock::new(Box::new(pool))));
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let at_79 = result.iter().find(|b| b.slot() == 79).unwrap();
+        assert!(matches!(at_79, Block::Skip { .. }));
+        assert!(matches!(
+            result.iter().find(|b| b.slot() == 78).unwrap(),
+            Block::Block {
+                status: SlotStatus::Finalized,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalized_chain_wins_over_skip_marker() {
+        let hx = |n: u8| hex::encode([n; 32]);
+        let chain_block: bunkerglow::Block = serde_json::from_value(serde_json::json!({
+            "slot": 97,
+            "hash": vec![97u8; 32],
+            "parent": 96,
+            "parent_hash": vec![96u8; 32],
+            "epoch_transition": null,
+            "transactions": [],
+        }))
+        .unwrap();
+
+        let mut bs = bunkerglow::consensus::MockBlockstore::new();
+        bs.expect_canonical_block_hash().returning(|_| None);
+        bs.expect_slot_skipped_at()
+            .returning(|slot| (slot.inner() == 97).then_some(5));
+        bs.expect_load_block_metadata().returning(|_, _| None);
+        bs.expect_load_block_by_hash().returning(move |h| {
+            (h == Hash::from([97u8; 32])).then(|| (Slot::new(97), chain_block.clone()))
+        });
+
+        let mut state = test_state(vec![Block::Block {
+            slot: 100,
+            hash: hx(100),
+            parent_slot: 97,
+            parent_hash: hx(97),
+            producer: 0,
+            proposed_timestamp: 100,
+            finalized_timestamp: Some(200),
+            status: SlotStatus::Finalized,
+        }]);
+        state.blockstore = Some(Arc::new(tokio::sync::RwLock::new(Box::new(bs))));
+
+        let Json(result) = blocks(
+            Query(Pagination {
+                limit: None,
+                offset: None,
+            }),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let at_97 = result.iter().find(|b| b.slot() == 97).unwrap();
+        assert!(
+            matches!(
+                at_97,
+                Block::Block {
+                    status: SlotStatus::Finalized,
+                    ..
+                }
+            ),
+            "chain block must displace the skip marker"
+        );
+        assert_eq!(at_97.hash(), hx(97));
+    }
+
     #[tokio::test]
     async fn blocks_endpoint_reports_bypassed_slots_as_skipped() {
         let mk = |slot: u64, parent_slot: u64, finalized: bool| Block::Block {
@@ -2550,7 +2885,7 @@ mod tests {
             mk(13, SlotStatus::Proposed),
             mk(7, SlotStatus::Proposed),
         ];
-        mark_dead_blocks_skipped(&mut blocks, Some(9));
+        mark_dead_blocks_skipped(&mut blocks, &[(9, 12)]);
 
         for b in &blocks {
             match b.slot() {
@@ -2562,7 +2897,7 @@ mod tests {
         assert_eq!(blocks[5].status(), SlotStatus::Proposed);
 
         let mut untouched = vec![mk(5, SlotStatus::Finalized), mk(4, SlotStatus::Proposed)];
-        mark_dead_blocks_skipped(&mut untouched, None);
+        mark_dead_blocks_skipped(&mut untouched, &[]);
         assert!(untouched.iter().all(|b| matches!(b, Block::Block { .. })));
     }
 
@@ -2621,15 +2956,23 @@ fn b58(bytes: &[u8]) -> String {
 }
 
 /// Highest finalized slot exposed as wallet-visible context.
+// The /nodes sampler lags after a restart; the pool's finalized slot keeps
+// every tip-anchored scan window near the real tip (a collapsed window sent
+// the /blocks chain walk unbounded to genesis — the 79780 hang).
 async fn current_slot(state: &SharedState) -> u64 {
-    state
+    let sampled = state
         .nodes
         .read()
         .await
         .iter()
         .map(|n| n.finalized_slot)
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let pool_finalized = match &state.pool {
+        Some(pool) => pool.read().await.finalized_slot().inner(),
+        None => 0,
+    };
+    sampled.max(pool_finalized)
 }
 
 /// Parses a wallet transaction id into the node's lowercase hex key.

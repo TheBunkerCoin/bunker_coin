@@ -769,7 +769,7 @@ fn build_node(
         None => PactorMux::new(transport),
         Some(starts_with_turn) => PactorMux::new_half_duplex(transport, starts_with_turn),
     };
-    mux.set_queued_gauge(queued_gauge);
+    mux.set_queued_gauge(queued_gauge.clone());
     // All2All needs self-delivery because the single mux link has no socket loopback.
     let all2all_net: MuxAll2All = mux.channel_self_delivering(Channel::All2All);
     let shred_net: MuxShred = mux.channel(Channel::Disseminator);
@@ -801,6 +801,9 @@ fn build_node(
     // Identical genesis plus finalized blocks keeps node execution state aligned.
     let execution_state = Arc::new(tokio::sync::RwLock::new(cluster.genesis_state()));
     node.set_execution_state(execution_state.clone());
+
+    // Standstill rebroadcasts defer while earlier traffic still waits for airtime.
+    node.set_outbound_backlog_gauge(queued_gauge);
 
     // Half-duplex links feed keepalive liveness into Votor so slow reverse paths
     // re-arm crashed-leader timeouts instead of jumping ahead.

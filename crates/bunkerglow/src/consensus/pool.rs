@@ -239,6 +239,30 @@ impl PoolImpl {
 
     /// Sets the blockstore reference for updating finalized timestamps.
     pub fn set_blockstore(&mut self, blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>) {
+        // Backfill markers for skip certs persisted before markers existed.
+        let skip_slots: Vec<Slot> = self
+            .slot_states
+            .iter()
+            .filter(|(_, st)| st.certificates.skip.is_some())
+            .map(|(s, _)| *s)
+            .collect();
+        if !skip_slots.is_empty()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let bs = Arc::clone(&blockstore);
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            handle.spawn(async move {
+                let g = bs.read().await;
+                for slot in skip_slots {
+                    if g.slot_skipped_at(slot).is_none() {
+                        g.mark_slot_skipped(slot, timestamp);
+                    }
+                }
+            });
+        }
         self.blockstore = Some(blockstore);
     }
 
@@ -301,12 +325,25 @@ impl PoolImpl {
             }
             Cert::Skip(_) => {
                 warn!("skipped slot {slot}");
+                if let Some(ref blockstore) = self.blockstore {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    let blockstore = Arc::clone(blockstore);
+                    // Detached write: awaiting the blockstore under the pool
+                    // lock can deadlock against shred ingest.
+                    tokio::spawn(async move {
+                        blockstore.read().await.mark_slot_skipped(slot, timestamp);
+                    });
+                }
                 let new_parents_ready = self.parent_ready_tracker.mark_skipped(slot);
                 self.send_parent_ready_events(new_parents_ready).await;
             }
             Cert::FastFinal(_) => {
                 info!("fast finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
+                self.persist_finalized_floor();
                 if let Some(hash) = cert.block_hash() {
                     let finalization_event = self
                         .finality_tracker
@@ -322,12 +359,11 @@ impl PoolImpl {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64;
-                    // Do not drop finalized-status writes under transient lock contention.
-                    blockstore.read().await.update_finalized_timestamp(
-                        slot,
+                    tokio::spawn(stamp_finalized_chain(
+                        Arc::clone(blockstore),
                         hash.as_hash().clone(),
                         timestamp,
-                    );
+                    ));
                 }
                 // Avoid blockstore.write() here: pool lock + shred-ingest await can deadlock.
                 self.prune();
@@ -335,6 +371,7 @@ impl PoolImpl {
             Cert::Final(_) => {
                 info!("slow finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
+                self.persist_finalized_floor();
                 let finalization_event = self.finality_tracker.mark_finalized(slot);
                 self.notify_finalization_event(&finalization_event).await;
                 self.handle_finalization(finalization_event).await;
@@ -348,12 +385,11 @@ impl PoolImpl {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64;
-                    // Do not drop finalized-status writes under transient lock contention.
-                    blockstore.read().await.update_finalized_timestamp(
-                        slot,
+                    tokio::spawn(stamp_finalized_chain(
+                        Arc::clone(blockstore),
                         hash.as_hash().clone(),
                         timestamp,
-                    );
+                    ));
                 }
 
                 self.prune();
@@ -362,6 +398,14 @@ impl PoolImpl {
 
         let event = VotorEvent::CertCreated(Box::new(cert));
         self.votor_event_channel.send(event).await.unwrap();
+    }
+
+    /// Persisted at cert time so a later-invalidated cert row cannot roll the floor back.
+    fn persist_finalized_floor(&self) {
+        let _ = self.db.put(
+            b"meta|final_slot",
+            self.highest_finalized_slot.inner().to_be_bytes(),
+        );
     }
 
     /// Mutably accesses or creates the [`SlotState`] for `slot`.
@@ -743,6 +787,8 @@ impl PoolImpl {
         }
         let mut raw_certs: Vec<Cert> = Vec::new();
         let mut highest_nf_slot = Slot::genesis();
+        // Skip certs above the floor must survive reloads or reconnects re-earn them on air.
+        let mut highest_skip_slot = Slot::genesis();
         let mut invalid_keys: Vec<Box<[u8]>> = Vec::new();
         for item in self.db.iterator(IteratorMode::Start) {
             if let Ok((k, v)) = item
@@ -767,7 +813,9 @@ impl PoolImpl {
                     Cert::Notar(_) | Cert::NotarFallback(_) => {
                         highest_nf_slot = highest_nf_slot.max(cert.slot());
                     }
-                    _ => {}
+                    Cert::Skip(_) => {
+                        highest_skip_slot = highest_skip_slot.max(cert.slot());
+                    }
                 }
                 raw_certs.push(cert);
             }
@@ -781,7 +829,9 @@ impl PoolImpl {
             self.highest_finalized_slot = self.highest_finalized_slot.max(meta_slot);
         }
 
-        let retain_up_to = highest_nf_slot.max(self.highest_finalized_slot);
+        let retain_up_to = highest_nf_slot
+            .max(highest_skip_slot)
+            .max(self.highest_finalized_slot);
 
         let certs: Vec<Cert> = raw_certs
             .into_iter()
@@ -902,9 +952,91 @@ impl PoolImpl {
     }
 }
 
+/// Ancestry finalization happens the moment the descendant's cert lands, so
+/// unstamped ancestors get that same timestamp.
+async fn stamp_finalized_chain(
+    blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
+    mut hash: crate::crypto::Hash,
+    timestamp: u64,
+) {
+    let g = blockstore.read().await;
+    for _ in 0..10_000 {
+        let Some((slot, block)) = g.load_block_by_hash(hash.clone()) else {
+            break;
+        };
+        if let Some(meta) = g.load_block_metadata(slot, hash.clone())
+            && meta.finalized_timestamp.is_some()
+        {
+            break;
+        }
+        g.update_finalized_timestamp(slot, hash, timestamp);
+        if block.parent() >= slot {
+            break;
+        }
+        hash = block.parent_hash().as_hash().clone();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn stamp_finalized_chain_covers_unstamped_ancestors() {
+        use std::sync::Mutex;
+
+        use crate::consensus::blockstore::{BlockMetadata, MockBlockstore};
+        use crate::crypto::Hash;
+
+        let mk_block = |slot: u8, parent: u8| -> crate::Block {
+            serde_json::from_value(serde_json::json!({
+                "slot": slot,
+                "hash": vec![slot; 32],
+                "parent": parent,
+                "parent_hash": vec![parent; 32],
+                "epoch_transition": null,
+                "transactions": [],
+            }))
+            .unwrap()
+        };
+        let (b5, b4, b3) = (mk_block(5, 4), mk_block(4, 3), mk_block(3, 2));
+
+        let stamped: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut bs = MockBlockstore::new();
+        bs.expect_load_block_by_hash().returning(move |h| {
+            if h == Hash::from([5u8; 32]) {
+                Some((Slot::new(5), b5.clone()))
+            } else if h == Hash::from([4u8; 32]) {
+                Some((Slot::new(4), b4.clone()))
+            } else if h == Hash::from([3u8; 32]) {
+                Some((Slot::new(3), b3.clone()))
+            } else {
+                None
+            }
+        });
+        // Slot 3 is already stamped; the walk must stop there.
+        bs.expect_load_block_metadata().returning(|slot, hash| {
+            Some(BlockMetadata {
+                slot,
+                hash,
+                producer: 0,
+                proposed_timestamp: 1,
+                finalized_timestamp: (slot == Slot::new(3)).then_some(42),
+            })
+        });
+        let rec = Arc::clone(&stamped);
+        bs.expect_update_finalized_timestamp()
+            .returning(move |slot, _, ts| {
+                rec.lock().unwrap().push(slot.inner());
+                assert_eq!(ts, 777);
+            });
+
+        let store: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>> =
+            Arc::new(RwLock::new(Box::new(bs)));
+        stamp_finalized_chain(store, Hash::from([5u8; 32]), 777).await;
+
+        assert_eq!(*stamped.lock().unwrap(), vec![5, 4]);
+    }
 
     use super::*;
     use crate::consensus::cert::{FastFinalCert, NotarCert, SkipCert};
@@ -1069,6 +1201,86 @@ mod tests {
         }
         assert!(!pool.has_final_cert(Slot::new(2)));
         assert_eq!(pool.finalized_slot(), Slot::new(1));
+    }
+
+    /// Skip certs above the floor must survive a reload or reconnects re-earn them on air.
+    #[tokio::test]
+    async fn reload_retains_skip_certs_above_finalized_floor() {
+        let (sks, epoch_info) = generate_validators(11);
+        let db_path = format!(
+            "{}/bunker-pool-skip-retain-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let floor = Slot::new(1);
+        let hash: BlockHash = Hash::random_for_test().into();
+
+        {
+            let (votor_tx, _votor_rx) = mpsc::channel(1024);
+            let (repair_tx, _repair_rx) = mpsc::channel(1024);
+            let mut pool = PoolImpl::new_at(epoch_info.clone(), votor_tx, repair_tx, &db_path);
+            // 9 of 11 notar votes fast-finalize the floor slot.
+            for v in 0..9 {
+                let vote = Vote::new_notar(floor, hash.clone(), &sks[v as usize], v);
+                assert_eq!(pool.add_vote(vote).await, Ok(()));
+            }
+            assert_eq!(Pool::finalized_slot(&pool), floor);
+            for s in 2..=3u64 {
+                for v in 0..7 {
+                    let vote = Vote::new_skip(Slot::new(s), &sks[v as usize], v);
+                    assert_eq!(pool.add_vote(vote).await, Ok(()));
+                }
+                assert!(pool.has_skip_cert(Slot::new(s)));
+            }
+        }
+
+        let (votor_tx, _votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
+        assert_eq!(Pool::finalized_slot(&pool), floor);
+        assert!(
+            pool.has_skip_cert(Slot::new(2)) && pool.has_skip_cert(Slot::new(3)),
+            "skip certs above the floor must survive the reload"
+        );
+    }
+
+    /// The floor persists at cert time; a later-invalidated cert row must not roll it back.
+    #[tokio::test]
+    async fn finalized_floor_persisted_at_cert_time() {
+        let (sks, epoch_info) = generate_validators(11);
+        let db_path = format!(
+            "{}/bunker-pool-floor-meta-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let floor = Slot::new(1);
+        let hash: BlockHash = Hash::random_for_test().into();
+
+        let (votor_tx, _votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let mut pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
+        for v in 0..9 {
+            let vote = Vote::new_notar(floor, hash.clone(), &sks[v as usize], v);
+            assert_eq!(pool.add_vote(vote).await, Ok(()));
+        }
+        assert_eq!(Pool::finalized_slot(&pool), floor);
+
+        let db = crate::consensus::blockstore::open_db_with_retry(
+            &rocksdb::Options::default(),
+            &db_path,
+        )
+        .unwrap();
+        let val = db
+            .get(b"meta|final_slot")
+            .unwrap()
+            .expect("floor meta row must exist");
+        assert_eq!(
+            u64::from_be_bytes(val[..8].try_into().unwrap()),
+            floor.inner(),
+            "floor must be persisted at cert time, not only at load"
+        );
     }
 
     #[tokio::test]
