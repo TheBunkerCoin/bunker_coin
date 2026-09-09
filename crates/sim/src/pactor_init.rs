@@ -159,9 +159,9 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
     let commands = [
         format!("MYcall {}", cfg.callsign),
         format!("PTCH {PACTOR_CHANNEL}"),
-        // ~3 min of ARQ fade ride-through; 35 (~45s) tore the link down on every
+        // Max fade ride-through (~5 min); 35 (~45s) tore the link down on every
         // deep fade and each reconnect costs minutes plus a risky handshake.
-        "MAXE 150".to_owned(),
+        "MAXE 255".to_owned(),
         "REM 0".to_owned(),
         "CHOB 0".to_owned(),
         // Ctrl-Z lets the ISS hand the transmit turn to the peer in converse mode.
