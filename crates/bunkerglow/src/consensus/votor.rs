@@ -209,8 +209,9 @@ impl<A: All2All> Votor<A> {
     /// Handle consensus voting events and broadcast resulting votes.
     #[fastrace::trace]
     pub async fn voting_loop(&mut self) -> Result<()> {
-        // Re-send restored votes once; peers deduplicate identical votes.
-        for vote in std::mem::take(&mut self.restored_votes) {
+        // Re-send restored votes once, newest first: short radio sessions truncate
+        // the queue, and the tip votes are the ones the peer is missing.
+        for vote in std::mem::take(&mut self.restored_votes).into_iter().rev() {
             debug!("rebroadcasting restored vote for slot {}", vote.slot());
             self.all2all.broadcast(&vote.into()).await.unwrap();
         }
@@ -831,6 +832,76 @@ mod tests {
         assert!(
             got.is_err(),
             "restored votor must not skip a slot it already notar-voted, but sent: {got:?}"
+        );
+    }
+
+    /// Restored votes rebroadcast newest first; truncated radio sessions must
+    /// carry the tip votes the peer is missing, not old duplicates.
+    #[tokio::test]
+    async fn restored_votes_rebroadcast_newest_first() {
+        let db_path = format!(
+            "{}/bunkerglow-votor-newestfirst-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+
+        let (sks, epoch_info) = generate_validators(2);
+        let slot1 = Slot::genesis().next();
+        let slot2 = slot1.next();
+        let hash1: BlockHash = Hash::random_for_test().into();
+        let hash2: BlockHash = Hash::random_for_test().into();
+
+        // First life records notar votes for two chained slots.
+        {
+            let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
+            let (tx, rx) = mpsc::channel(100);
+            let other_a2a = a2a.pop().unwrap();
+            let votor_a2a = a2a.pop().unwrap();
+            let mut votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+            votor.set_vote_history(VoteHistory::open_at(&db_path), Slot::genesis());
+            tokio::spawn(async move {
+                votor.voting_loop().await.unwrap();
+            });
+
+            for (slot, hash, parent) in [
+                (slot1, hash1.clone(), (Slot::genesis(), GENESIS_BLOCK_HASH)),
+                (slot2, hash2.clone(), (slot1, hash1.clone())),
+            ] {
+                tx.send(VotorEvent::Block {
+                    slot,
+                    block_info: BlockInfo { hash, parent },
+                })
+                .await
+                .unwrap();
+                let vote = match other_a2a.receive().await.unwrap() {
+                    ConsensusMessage::Vote(v) => v,
+                    m => panic!("expected notar vote, got {m:?}"),
+                };
+                assert!(vote.is_notar());
+                assert_eq!(vote.slot(), slot);
+            }
+        }
+
+        // Restart: the newest vote must be rebroadcast first.
+        let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
+        let (tx, rx) = mpsc::channel(100);
+        let other_a2a = a2a.pop().unwrap();
+        let votor_a2a = a2a.pop().unwrap();
+        let mut votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+        votor.set_vote_history(VoteHistory::open_at(&db_path), Slot::genesis());
+        tokio::spawn(async move {
+            votor.voting_loop().await.unwrap();
+        });
+
+        let first = match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Vote(v) => v,
+            m => panic!("expected rebroadcast vote, got {m:?}"),
+        };
+        assert_eq!(
+            first.slot(),
+            slot2,
+            "restored rebroadcast must lead with the newest vote"
         );
     }
 

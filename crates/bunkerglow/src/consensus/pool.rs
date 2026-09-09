@@ -708,11 +708,15 @@ impl Pool for PoolImpl {
         }
         // Include the floor slot itself; lagging peers may need its certs/votes.
         certs.extend(self.get_certs(slot..));
-        let votes = self.get_own_votes(slot..);
+        let mut votes = self.get_own_votes(slot..);
         if certs.is_empty() && votes.is_empty() {
             warn!("standstill recovery at slot {slot}: nothing at all to re-broadcast");
             return;
         }
+        // Newest first: short radio sessions truncate the bundle, and the tip
+        // messages are the ones the peer is missing; the old ones only dedupe.
+        certs.reverse();
+        votes.reverse();
 
         warn!("recovering from standstill at slot {slot}");
         debug!(
@@ -1201,6 +1205,39 @@ mod tests {
         }
         assert!(!pool.has_final_cert(Slot::new(2)));
         assert_eq!(pool.finalized_slot(), Slot::new(1));
+    }
+
+    /// Standstill bundles lead with the newest certs and votes; truncated radio
+    /// sessions must carry the tip, not old duplicates.
+    #[tokio::test]
+    async fn standstill_bundle_is_newest_first() {
+        let (sks, epoch_info) = generate_validators(11);
+        let db_path = format!(
+            "{}/bunker-pool-standstill-order-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let (votor_tx, mut votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let mut pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
+
+        for s in 1..=2u64 {
+            for v in 0..7 {
+                let vote = Vote::new_skip(Slot::new(s), &sks[v as usize], v);
+                assert_eq!(pool.add_vote(vote).await, Ok(()));
+            }
+        }
+        pool.recover_from_standstill().await;
+
+        let (certs, votes) = loop {
+            match votor_rx.recv().await.expect("standstill event") {
+                VotorEvent::Standstill(_, certs, votes) => break (certs, votes),
+                _ => continue,
+            }
+        };
+        assert!(certs.first().unwrap().slot() > certs.last().unwrap().slot());
+        assert!(votes.first().unwrap().slot() > votes.last().unwrap().slot());
     }
 
     /// Skip certs above the floor must survive a reload or reconnects re-earn them on air.

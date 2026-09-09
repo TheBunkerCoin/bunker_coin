@@ -83,11 +83,12 @@ fn turnless_reclaim_ceiling() -> Duration {
 
 /// Payload bytes one turn may enqueue before granting; MAX_TURN_HOLD bounds
 /// only app-side drain time, and a modem-buffered backlog would bury the grant.
+/// Default sized so a turn completes within a ~1-minute 200 Bd session.
 fn turn_byte_budget() -> usize {
     std::env::var("BUNKER_TURN_BYTE_BUDGET")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(8 * 1024)
+        .unwrap_or(1024)
 }
 
 /// Write-retry back-off; a writer that exits on error mutes the node forever.
