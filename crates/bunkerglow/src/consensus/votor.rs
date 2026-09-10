@@ -357,6 +357,27 @@ impl<A: All2All> Votor<A> {
                 VotorEvent::Timeout(slot) => {
                     trace!("timeout for slot {slot}");
                     if !self.voted.contains(&slot) {
+                        // Same liveness gate as TimeoutCrashedLeader: on a slow
+                        // but alive link a leader's trailing window slots are
+                        // still crossing when this fires — skipping them orphans
+                        // valid blocks (node1's 4th slot repeatedly skip-certed).
+                        // Pause and re-arm while the link is up and the shreds
+                        // have not arrived; skip once the link is down or the
+                        // bounded re-arm budget is spent (a truly crashed leader).
+                        if !self.received_shred.contains(&slot) {
+                            let rearms = self.crashed_leader_rearms.entry(slot).or_insert(0);
+                            if self.link_liveness.is_link_alive()
+                                && *rearms < Self::MAX_CRASHED_LEADER_REARMS
+                            {
+                                *rearms += 1;
+                                let sender = self.event_sender.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delta_timeout()).await;
+                                    let _ = sender.send(VotorEvent::Timeout(slot)).await;
+                                });
+                                continue;
+                            }
+                        }
                         self.try_skip_window(slot).await;
                     }
                 }
@@ -626,6 +647,46 @@ mod tests {
             got.is_err(),
             "link alive: must pause, not skip — but saw a vote: {got:?}"
         );
+    }
+
+    /// A plain per-slot Timeout (the trailing window slots) must ALSO pause
+    /// when the link is alive — a leader's later slots are still crossing a slow
+    /// link. Without this only the window's first slot was liveness-gated, so
+    /// node1's 4th slot was repeatedly skip-certed while its block was in transit.
+    #[tokio::test]
+    async fn plain_timeout_pauses_when_link_alive() {
+        let (other_a2a, tx, _) =
+            start_votor_with_liveness(Some(Arc::new(TestLiveness(true)))).await;
+
+        // A trailing window slot with no shred received yet.
+        let slot = Slot::new(6);
+        assert!(!slot.is_start_of_window());
+        tx.send(VotorEvent::Timeout(slot)).await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await;
+        assert!(
+            got.is_err(),
+            "link alive: plain timeout must pause, not skip — but saw a vote: {got:?}"
+        );
+    }
+
+    /// A plain per-slot Timeout still skips when the link is down, so a genuinely
+    /// crashed leader is not deferred forever.
+    #[tokio::test]
+    async fn plain_timeout_skips_when_link_down() {
+        let (other_a2a, tx, _) =
+            start_votor_with_liveness(Some(Arc::new(TestLiveness(false)))).await;
+
+        let slot = Slot::new(6);
+        assert!(!slot.is_start_of_window());
+        tx.send(VotorEvent::Timeout(slot)).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await {
+            Ok(Ok(ConsensusMessage::Vote(v))) => {
+                assert!(v.is_skip(), "expected skip vote, got {v:?}");
+            }
+            other => panic!("expected a skip vote, got {other:?}"),
+        }
     }
 
     #[tokio::test]
