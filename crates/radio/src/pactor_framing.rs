@@ -54,7 +54,6 @@ pub(crate) fn frame_fragment(header: &FragmentHeader, chunk: &[u8]) -> Vec<u8> {
     packet
 }
 
-/// Decode a fragment line into its header and chunk bytes.
 /// True when `bytes` parse as one framed mux fragment — genuine peer traffic,
 /// as opposed to modem echoes or corrupted lines. Watchdogs must key on this:
 /// raw serial lines can self-refresh forever on a dead link.
@@ -62,6 +61,7 @@ pub fn is_framed_line(bytes: &[u8]) -> bool {
     parse_fragment(bytes).is_some()
 }
 
+/// Decode a fragment line into its header and chunk bytes.
 pub(crate) fn parse_fragment(bytes: &[u8]) -> Option<(FragmentHeader, Vec<u8>)> {
     let (header, consumed): (FragmentHeader, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard()).ok()?;
