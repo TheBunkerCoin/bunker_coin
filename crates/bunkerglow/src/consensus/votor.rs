@@ -82,6 +82,11 @@ pub struct Votor<A: All2All> {
     restored_votes: Vec<Vote>,
     /// Re-armed after restart so slow-final liveness survives a grace-window crash.
     restored_final_deadlines: Vec<(Slot, BlockHash)>,
+    /// Slots with a deferred-final intent restored at startup: their grace
+    /// already elapsed pre-crash, so cast the finalize vote as soon as the
+    /// enabling notar cert arrives rather than waiting a fresh grace (a node
+    /// restarting faster than the grace would otherwise never finalize them).
+    finalize_on_notar_cert: BTreeSet<Slot>,
     /// Events below this pruned floor are dropped to avoid conflicting stale votes.
     finalized_floor: Slot,
 }
@@ -132,6 +137,7 @@ impl<A: All2All> Votor<A> {
             vote_history: VoteHistory::disabled(),
             restored_votes: Vec::new(),
             restored_final_deadlines: Vec::new(),
+            finalize_on_notar_cert: BTreeSet::new(),
             finalized_floor: Slot::genesis(),
         };
         votor.set_timeouts(Slot::new(0));
@@ -172,6 +178,9 @@ impl<A: All2All> Votor<A> {
             .load_and_prune_pending_finals(finalized_slot)
         {
             if !self.retired_slots.contains(&slot) {
+                // The notar cert may already be present (restored) or arrive
+                // shortly; fire on its arrival, and keep the timer as a fallback.
+                self.finalize_on_notar_cert.insert(slot);
                 self.restored_final_deadlines.push((slot, hash));
             } else {
                 self.vote_history.clear_pending_final(slot, &hash);
@@ -200,6 +209,7 @@ impl<A: All2All> Votor<A> {
         self.pending_blocks = self.pending_blocks.split_off(&floor);
         self.retired_slots = self.retired_slots.split_off(&floor);
         self.fast_finalized = self.fast_finalized.split_off(&floor);
+        self.finalize_on_notar_cert = self.finalize_on_notar_cert.split_off(&floor);
         self.parents_ready.retain(|(slot, _, _)| *slot >= floor);
     }
 
@@ -215,7 +225,11 @@ impl<A: All2All> Votor<A> {
             debug!("rebroadcasting restored vote for slot {}", vote.slot());
             self.all2all.broadcast(&vote.into()).await.unwrap();
         }
-        // Use the live-path grace delay; the enabling notar cert may arrive after restart.
+        // Timer fallback for restored deferred-finals. The primary driver is the
+        // CertCreated(Notar) arm firing `finalize_on_notar_cert` — a node that
+        // restarts faster than the grace would otherwise never reach this
+        // deadline, freezing the floor. The timer still backstops the case where
+        // the notar cert never re-arrives (only the block does).
         for (slot, hash) in std::mem::take(&mut self.restored_final_deadlines) {
             debug!("re-arming deferred-final deadline for slot {slot} after restart");
             let sender = self.event_sender.clone();
@@ -275,12 +289,18 @@ impl<A: All2All> Votor<A> {
                 VotorEvent::CertCreated(cert) => {
                     match cert.as_ref() {
                         Cert::Notar(_) => {
-                            self.block_notarized
-                                .insert(cert.slot(), cert.block_hash().cloned().unwrap());
-                            // Deferred mode waits for the grace deadline before slow-final voting.
-                            if !self.defer_final_vote {
-                                self.try_final(cert.slot(), cert.block_hash().cloned().unwrap())
-                                    .await;
+                            let cslot = cert.slot();
+                            let chash = cert.block_hash().cloned().unwrap();
+                            self.block_notarized.insert(cslot, chash.clone());
+                            // Non-deferred: finalize on the cert. Deferred: normally
+                            // wait for the grace, EXCEPT a slot whose deferred-final
+                            // intent was restored at startup — its grace already
+                            // elapsed pre-crash, so finalize now that the enabling
+                            // notar cert is in hand (else a node restarting faster
+                            // than the grace never finalizes it).
+                            if !self.defer_final_vote || self.finalize_on_notar_cert.remove(&cslot)
+                            {
+                                self.try_final(cslot, chash).await;
                             }
                         }
                         Cert::FastFinal(_) => {
@@ -967,6 +987,12 @@ mod tests {
         };
         assert!(rebroadcast.is_notar());
 
+        // A restored deferred-final slot must finalize as soon as its enabling
+        // notar cert arrives — its grace already elapsed pre-crash. A node that
+        // restarts faster than a fresh grace (a lossy radio link) would otherwise
+        // never cast this vote, freezing the floor (production stuck at 79811,
+        // 2026-09-10). So the FINAL vote must arrive PROMPTLY after the cert, not
+        // after another full delta_final_vote_grace.
         let notar_cert = Cert::Notar(NotarCert::new_unchecked(
             std::slice::from_ref(&rebroadcast),
             &epoch_info.validators,
@@ -974,23 +1000,19 @@ mod tests {
         tx.send(VotorEvent::CertCreated(Box::new(notar_cert)))
             .await
             .unwrap();
-        match other_a2a.receive().await.unwrap() {
-            ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::Notar(_))),
-            ConsensusMessage::Vote(v) => panic!("unexpected vote before deadline: {v:?}"),
-        }
 
-        // Allow for the re-armed grace timer to drive the final vote.
-        let final_vote = tokio::time::timeout(Duration::from_secs(30), async {
+        let final_vote = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match other_a2a.receive().await.unwrap() {
                     ConsensusMessage::Vote(v) if v.is_final() => break v,
                     ConsensusMessage::Vote(v) => panic!("unexpected non-final vote: {v:?}"),
+                    // The re-broadcast notar cert may echo back first; skip it.
                     ConsensusMessage::Cert(_) => continue,
                 }
             }
         })
         .await
-        .expect("re-armed deferred-final deadline must send the finalization vote");
+        .expect("restored deferred-final must fire on the notar cert, not a fresh full grace");
         assert!(final_vote.is_final());
         assert_eq!(final_vote.slot(), slot);
     }
