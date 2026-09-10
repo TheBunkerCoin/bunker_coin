@@ -81,14 +81,17 @@ fn turnless_reclaim_ceiling() -> Duration {
         .unwrap_or(Duration::from_secs(300))
 }
 
-/// Payload bytes one turn may enqueue before granting; MAX_TURN_HOLD bounds
-/// only app-side drain time, and a modem-buffered backlog would bury the grant.
-/// Default sized so a turn completes within a ~1-minute 200 Bd session.
+/// Payload bytes one turn may enqueue before granting. Sized to carry a whole
+/// block's shreds (TOTAL_SHREDS × MAX_DATA_PER_SHRED = 6 KiB) in one turn: a
+/// tighter cap ships one shred per turn, so a block needs six turn-cycles and
+/// dissemination collapses to minutes per block. MAX_TURN_HOLD still bounds
+/// airtime and the priority lane still preempts with votes, so this cannot
+/// bury a handshake; a marginal link can lower it via BUNKER_TURN_BYTE_BUDGET.
 fn turn_byte_budget() -> usize {
     std::env::var("BUNKER_TURN_BYTE_BUDGET")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(1024)
+        .unwrap_or(8 * 1024)
 }
 
 /// Write-retry back-off; a writer that exits on error mutes the node forever.
@@ -880,6 +883,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that set `BUNKER_TURN_BYTE_BUDGET`: the process env is
+    /// shared, so two concurrent budget tests clobber each other's value.
+    static BUDGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use scs_pactor::{PactorLinkEvent, ScsPactorError};
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -1691,7 +1698,8 @@ mod tests {
     /// buries the grant behind an unbounded TX backlog.
     #[tokio::test]
     async fn turn_grants_after_byte_budget_despite_queued_backlog() {
-        // SAFETY: only this test reads the budget override.
+        let _env = BUDGET_ENV_LOCK.lock().unwrap();
+        // SAFETY: env-lock held; serialized against the other budget test.
         unsafe {
             std::env::set_var("BUNKER_TURN_BYTE_BUDGET", "250");
         }
@@ -1733,6 +1741,60 @@ mod tests {
             (1..5).contains(&data_msgs),
             "byte budget must cut the turn before the whole backlog drains \
              (sent {data_msgs} of 5)"
+        );
+
+        unsafe {
+            std::env::remove_var("BUNKER_TURN_BYTE_BUDGET");
+        }
+    }
+
+    /// A block's worth of shreds must ship in ONE turn under a whole-block
+    /// budget. A too-tight budget shipped one ~1 KiB shred per turn, so a
+    /// 6-shred block took six turn-cycles and dissemination collapsed to
+    /// minutes per block. Pins the shipped default (8 KiB) explicitly because
+    /// the process-wide env is shared with sibling budget tests.
+    #[tokio::test]
+    async fn default_budget_ships_a_full_block_in_one_turn() {
+        let _env = BUDGET_ENV_LOCK.lock().unwrap();
+        // SAFETY: env-lock held; pin the value this test asserts on.
+        unsafe {
+            std::env::set_var("BUNKER_TURN_BYTE_BUDGET", "8192");
+        }
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
+        let chan: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
+
+        // A block's worth of near-full shreds (TOTAL_SHREDS=6, ~1 KiB each).
+        let addr = "127.0.0.1:1".parse().unwrap();
+        for i in 0..6u8 {
+            chan.send(&vec![i; 1024], addr).await.unwrap();
+        }
+        let _h = mux.spawn();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        // Count data messages transmitted before the FIRST turn grant.
+        let lines = transport.written.lock().await.clone();
+        let mut reassembler = Reassembler::new();
+        let mut data_before_grant = 0u32;
+        for line in &lines {
+            if let Some(msg) = reassembler.push_line(line) {
+                match msg.first().copied() {
+                    Some(TURN_GRANT_TAG) => break,
+                    Some(KEEPALIVE_TAG) | None => {}
+                    Some(_) => data_before_grant += 1,
+                }
+            }
+        }
+        assert_eq!(
+            data_before_grant, 6,
+            "an 8 KiB budget must ship all 6 block shreds in one turn, not \
+             throttle to one shred per turn (sent {data_before_grant})"
+        );
+        // The shipped default must be at least a full block, or steady-state
+        // dissemination throttles to one shred per turn on air.
+        assert!(
+            turn_byte_budget() >= 6 * 1024,
+            "default turn budget must carry a whole block's shreds"
         );
 
         unsafe {
