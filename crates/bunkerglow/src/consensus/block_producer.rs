@@ -21,7 +21,7 @@ use crate::consensus::{Blockstore, EpochInfo, Pool};
 use crate::crypto::merkle::{BlockHash, GENESIS_BLOCK_HASH, MerkleRoot};
 use crate::crypto::signature;
 use crate::network::{Network, TransactionNetwork};
-use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder};
+use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, ShredIndex, Shredder};
 use crate::types::{Slice, SliceHeader, SliceIndex, SlicePayload, Slot};
 use crate::{BlockId, BlockPayload, Disseminator, MAX_TRANSACTION_SIZE, Transaction};
 
@@ -175,10 +175,17 @@ where
                 .canonical_block_hash(first_slot_in_window)
                 .is_some();
             if window_already_produced(first_slot_in_window, stored) {
+                // Re-produce would fork (drifted mempool), but a peer that never
+                // received our tail shreds before a restart cannot repair a block
+                // it can't name (repair is hash-addressed) — it times out and
+                // skip-certs our valid block permanently. Re-disseminate the exact
+                // STORED shreds instead: byte-identical, so no fork, and the peer
+                // reconstructs and notar-votes the slots it was missing.
                 info!(
-                    "[val {}] not re-producing window {first_slot_in_window}..{last_slot_in_window}, block already stored — peers repair the original",
+                    "[val {}] window {first_slot_in_window}..{last_slot_in_window} already stored — re-disseminating stored shreds after restart",
                     self.epoch_info.own_id
                 );
+                self.redisseminate_stored_window(first_slot_in_window).await;
                 continue;
             }
 
@@ -432,6 +439,39 @@ where
             }
         }
         unreachable!()
+    }
+
+    /// Re-sends the already-stored data shreds for every stored slot in the
+    /// window, sourced verbatim from the blockstore (no mempool re-read, so the
+    /// block hash is unchanged and no fork is possible). Used on restart for a
+    /// window we produced before crashing: a peer that missed our tail shreds
+    /// cannot repair a block it never learned the hash of, so we must re-push.
+    /// One-shot, data shreds only, and bounded to the slots actually stored (a
+    /// window truncated by a mid-window crash stops at its last stored slot).
+    async fn redisseminate_stored_window(&self, first_slot: Slot) {
+        for slot in first_slot.slots_in_window() {
+            let bs = self.blockstore.read().await;
+            let Some(hash) = bs.canonical_block_hash(slot) else {
+                break; // no more stored slots in this window (crash truncated it)
+            };
+            let block_id: BlockId = (slot, BlockHash::from(hash));
+            let Some(last_slice) = bs.get_last_slice_index(&block_id) else {
+                break;
+            };
+            for slice in last_slice.until() {
+                for shred_index in ShredIndex::all() {
+                    if let Some(shred) = bs.get_shred(&block_id, slice, shred_index) {
+                        // Deref ValidatedShred -> Shred; original bytes, not re-shredded.
+                        if let Err(e) = self.disseminator.send(&shred).await {
+                            warn!(
+                                "[val {}] re-disseminate slot {slot} shred failed: {e}",
+                                self.epoch_info.own_id
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Shreds and disseminates the slice payload.
@@ -706,7 +746,7 @@ mod tests {
     use crate::crypto::Hash;
     use crate::disseminator::MockDisseminator;
     use crate::network::{UdpNetwork, localhost_ip_sockaddr};
-    use crate::shredder::TOTAL_SHREDS;
+    use crate::shredder::{DATA_SHREDS, TOTAL_SHREDS};
     use crate::test_utils::generate_validators;
 
     #[tokio::test]
@@ -1036,5 +1076,78 @@ mod tests {
         assert_eq!(slot, ret.0);
         assert_eq!(new_block_info.hash, ret.1);
         assert_eq!(new_block_info.parent, new_parent);
+    }
+
+    /// On restart, an already-produced window must RE-DISSEMINATE its stored
+    /// shreds so a peer that missed the tail (and cannot repair a block it never
+    /// learned the hash of) receives and notar-votes it — instead of timing out
+    /// and skip-certing a valid block permanently. Iteration stops at the first
+    /// slot with no stored block (a window truncated by a mid-window crash).
+    #[tokio::test]
+    async fn redisseminate_stored_window_resends_stored_shreds() {
+        use crate::test_utils::create_random_shredded_block;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sk = signature::SecretKey::new(&mut rand::rng());
+        let first = Slot::windows().nth(10).unwrap();
+        // Only the first two slots of the window are stored (crash truncated the
+        // tail): the re-send must cover exactly these and stop at the third.
+        let stored: Vec<Slot> = vec![first, first.next()];
+        let mut blocks = std::collections::HashMap::new();
+        for &slot in &stored {
+            let (hash, _tree, shreds) = create_random_shredded_block(slot, 1, &sk);
+            blocks.insert(slot, (hash, shreds));
+        }
+
+        let mut blockstore = MockBlockstore::new();
+        let b = blocks.clone();
+        blockstore
+            .expect_canonical_block_hash()
+            .returning(move |slot| b.get(&slot).map(|(h, _)| h.as_hash().clone()));
+        let b = blocks.clone();
+        blockstore
+            .expect_get_last_slice_index()
+            .returning(move |block_id| {
+                b.get(&block_id.0).map(|_| SliceIndex::first()) // one slice per stored block
+            });
+        let b = blocks.clone();
+        blockstore
+            .expect_get_shred()
+            .returning(move |block_id, slice, shred_index| {
+                let (_h, shreds) = b.get(&block_id.0)?;
+                let slice_shreds = shreds.get(slice.inner())?;
+                // Mirror production: persist_repair_data stores only the DATA_SHREDS
+                // data shreds, so coding-shred indices return None from the DB.
+                if *shred_index >= DATA_SHREDS {
+                    return None;
+                }
+                slice_shreds.get(*shred_index).cloned()
+            });
+
+        // Count re-sent shreds; only the data shreds (not coding) are stored.
+        let sent = Arc::new(AtomicUsize::new(0));
+        let mut disseminator = MockDisseminator::new();
+        let sent_c = sent.clone();
+        disseminator.expect_send().returning(move |_| {
+            sent_c.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+
+        let bp = setup(
+            blockstore,
+            MockPool::new(),
+            disseminator,
+            Duration::from_micros(0),
+            Duration::from_millis(0),
+        );
+
+        bp.redisseminate_stored_window(first).await;
+
+        // 2 stored slots x 1 slice x DATA_SHREDS persisted shreds each.
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            stored.len() * DATA_SHREDS,
+            "must re-disseminate exactly the stored data shreds of the stored slots"
+        );
     }
 }
