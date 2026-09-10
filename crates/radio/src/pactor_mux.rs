@@ -707,13 +707,19 @@ pub struct MuxLiveness {
 }
 
 /// Inbound-activity window for link liveness; must exceed the longest normal
-/// inbound gap (slow changeovers), else Votor reads the link as dead and skips.
+/// inbound gap (slow changeovers), else Votor reads the link as dead and skips
+/// a leader's still-in-transit block. It MUST be at least the RX-stall watchdog
+/// threshold (BUNKER_RX_STALL_SECS, default 600s): the watchdog treats the link
+/// as UP until that much silence, so liveness must too — otherwise there is a
+/// window where the session is still up (block crawling across) yet Votor sees
+/// "dead" and skips it. Observed fades run 110–559s of silence, well past the
+/// old 90s default, which is exactly why node1's trailing window slot was lost.
 fn liveness_window() -> Duration {
     std::env::var("BUNKER_LIVENESS_WINDOW_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(90))
+        .unwrap_or(Duration::from_secs(660))
 }
 
 impl LinkLiveness for MuxLiveness {
@@ -887,6 +893,32 @@ mod tests {
     /// Serializes tests that set `BUNKER_TURN_BYTE_BUDGET`: the process env is
     /// shared, so two concurrent budget tests clobber each other's value.
     static BUDGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The default liveness window must span a realistic fade — the link stays
+    /// silent 110–559s but is NOT down (RX-stall watchdog only fires at 600s).
+    /// A shorter window made Votor read "dead" mid-fade and skip a leader's
+    /// still-in-transit block (node1's trailing window slot was lost this way).
+    /// The window must sit above the worst fade yet at/above the 600s watchdog,
+    /// so liveness and the watchdog agree on when the link is actually down.
+    #[test]
+    fn default_liveness_window_spans_a_realistic_fade() {
+        // No env override: exercise the shipped default.
+        // SAFETY: single-threaded test; no other test sets this var.
+        unsafe {
+            std::env::remove_var("BUNKER_LIVENESS_WINDOW_MS");
+        }
+        let window = liveness_window();
+        assert!(
+            window >= Duration::from_secs(560),
+            "liveness window {window:?} must exceed the worst observed fade (559s), \
+             else Votor reads a live-but-fading link as dead and skips the leader's block"
+        );
+        assert!(
+            window >= Duration::from_secs(600),
+            "liveness window {window:?} must be at least the RX-stall watchdog \
+             threshold (600s) so liveness and the watchdog agree the link is up"
+        );
+    }
     use scs_pactor::{PactorLinkEvent, ScsPactorError};
     use std::collections::VecDeque;
     use std::time::Duration;
