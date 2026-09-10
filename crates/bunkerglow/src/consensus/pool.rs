@@ -676,8 +676,11 @@ impl Pool for PoolImpl {
 
         self.slot_state(*slot)
             .notify_parent_known(block_hash.clone());
+        // A repaired block whose parent finalized normally must still promote:
+        // gating only on a notar-FALLBACK parent left forked nodes unable to
+        // reconcile once the real (notar/finalized) parent cert was in hand.
         if let Some(parent_state) = self.slot_states.get(parent_slot)
-            && parent_state.is_notar_fallback(parent_hash)
+            && parent_state.is_parent_certified(parent_hash)
             && let Some(output) = self
                 .slot_state(*slot)
                 .notify_parent_certified(block_hash.clone())
@@ -2025,5 +2028,81 @@ mod tests {
             }
             _ => unreachable!("unexpected event {event:?}"),
         }
+    }
+
+    /// A node that skip-voted a slot must still emit SafeToNotar once it repairs
+    /// the block and sees a peer notar vote — even when the parent was certified
+    /// by a plain notar/finalization cert rather than a notar-fallback. This is
+    /// the fork-reconciliation path: without it two nodes that split (one
+    /// notarized, one skipped) can never converge (production slots 79796-99).
+    #[tokio::test]
+    async fn skip_voter_reconciles_via_safe_to_notar_with_finalized_parent() {
+        let (sks, epoch_info) = generate_validators(2);
+        let db_path = format!(
+            "{}/bunker-pool-reconcile-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let (votor_tx, mut votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        // own_id defaults to 0; validator 1 is the peer.
+        let mut pool = PoolImpl::new_at(epoch_info.clone(), votor_tx, repair_tx, &db_path);
+
+        let parent = Slot::windows().nth(1).unwrap();
+        let child = parent.next();
+        let parent_hash: BlockHash = Hash::random_for_test().into();
+        let child_hash: BlockHash = Hash::random_for_test().into();
+
+        // Reproduce the post-restart parent state: load_from_db replays a
+        // persisted NOTAR cert (add_cert sets only `notar`, never the
+        // vote-derived `notar_fallback`). This is exactly what a finalized
+        // parent looks like after a reconnect — the state the bug mishandled.
+        let parent_votes: Vec<Vote> = (0..2)
+            .map(|v| Vote::new_notar(parent, parent_hash.clone(), &sks[v as usize], v as u64))
+            .collect();
+        let notar_cert = NotarCert::try_new(&parent_votes, &epoch_info.validators).unwrap();
+        pool.add_cert(Cert::Notar(notar_cert)).await.unwrap();
+        assert!(pool.has_notar_cert(parent), "parent must hold a notar cert");
+        assert!(
+            !pool.slot_states[&parent].is_notar_fallback(&parent_hash),
+            "post-restart parent is notar-certified only, NOT notar-fallback — the bug's blind spot"
+        );
+
+        // Our node (v0) skip-voted the child; the peer (v1) notar-voted it.
+        assert_eq!(
+            pool.add_vote(Vote::new_skip(child, &sks[0], 0)).await,
+            Ok(())
+        );
+        assert_eq!(
+            pool.add_vote(Vote::new_notar(child, child_hash.clone(), &sks[1], 1))
+                .await,
+            Ok(())
+        );
+
+        // Drain the events emitted so far so we can isolate what add_block drives.
+        while votor_rx.try_recv().is_ok() {}
+
+        // The repaired child block finally lands: add_block must re-run the
+        // safe-to-notar check and, because the parent is certified (finalized),
+        // emit SafeToNotar for the child.
+        pool.add_block((child, child_hash.clone()), (parent, parent_hash.clone()))
+            .await;
+
+        let mut saw_safe_to_notar = false;
+        while let Ok(event) = votor_rx.try_recv() {
+            if let VotorEvent::SafeToNotar(s, h) = event {
+                assert_eq!(s, child);
+                assert_eq!(h, child_hash);
+                saw_safe_to_notar = true;
+            }
+        }
+        assert!(
+            saw_safe_to_notar,
+            "skip-voter must emit SafeToNotar for the repaired child once its \
+             finalized parent is certified — otherwise the fork never heals"
+        );
+
+        let _ = std::fs::remove_dir_all(&db_path);
     }
 }
