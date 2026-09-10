@@ -473,7 +473,9 @@ where
             ) {
                 self.pool.read().await.recover_from_standstill().await;
                 last_progress = Instant::now();
-                dry_recoveries = (dry_recoveries + 1).min(2);
+                // Repeated bundles are pure duplicates (new certs/votes broadcast
+                // live); back off hard or they starve repair of airtime.
+                dry_recoveries = (dry_recoveries + 1).min(4);
             }
             // Fixed cadence avoids adding a full scaled block window of detection latency.
             tokio::time::sleep(delta_block().min(Duration::from_secs(60))).await;
