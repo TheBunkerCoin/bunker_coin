@@ -6,19 +6,19 @@
 
 \title{BunkerCoin: A Low Bandwidth, Shortwave Radio-Compatible Blockchain Protocol}
 \author{Anatoly Yakovenko\thanks{Parts of the abstract and most core concepts by Anatoly Yakovenko. This paper is currently expanded and maintained by the BunkerCoin Team and external contributors, i.e. do not automatically expect content (especially beyond the abstract) to be endorsed by Anatoly.} \and{Elia Hilse}}
-\date{February 1st, 2026\\Version 0.1.1 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
+\date{September 12, 2026\\Version 0.2.0 \\[1em] \textbf{--- WORKING DOCUMENT ---}}
 
 \begin{document}
 
 \maketitle
 
 \begin{abstract}
-The rapid evolution of blockchain technology has demanded innovative solutions that extend beyond conventional digital landscapes. This paper introduces BunkerCoin, a groundbreaking blockchain protocol designed to operate under the constraints of low bandwidth networks, specifically through shortwave radio channels. At the heart of BunkerCoin is the Alpenglow consensus mechanism, which is adapted to the unique challenges of shortwave radio.
+BunkerCoin is a blockchain protocol designed for low-bandwidth networks, including shortwave radio links. Its consensus engine, Bunkerglow, adapts Alpenglow~\cite{alpenglow} to the constraints of radio communication.
 
-The protocol's network architecture is defined by two key components: a dynamic networking layer that leverages both broadcast and reliable P2P links, and a location-aware routing service (called Sherpa). Sherpa maintains a map of the nodes and peer information, allowing the system to route data efficiently across the globe. One central challenge lies in using this setup to aggregate the BLS multi-signatures required for voting within Alpenglow's consensus flow efficiently (routing and aggregating via optimal paths), minimizing the amount of data that needs to be transmitted for voting. The propagation of blocks and votes over shortwave radio is meticulously engineered to accommodate the protocol's 300-byte Maximum Transmission Unit (MTU). Each transmission is either disseminated through a series of 32:96 erasure coded frames, ensuring reliability and redundancy in the face of packet loss, or transferred via reliable  (TCP-like) ARQ links.
-
-BunkerCoin's architecture not only challenges traditional blockchain paradigms but also paves the way for secure, decentralized communications in bandwidth-constrained environments worldwide, marking a significant leap forward in the field of distributed ledger technology.
+The proposed network architecture combines reliable P2P links, opportunistic broadcasts, and a location-aware routing service called Sherpa. Sherpa maintains topology and peer information to support block propagation and voting. A central design challenge is aggregating BLS multi-signatures along radio paths to reduce voting traffic. The design targets a 300-byte Maximum Transmission Unit (MTU), with 32:96 erasure coding for broadcast data and reliable ARQ links for P2P transfers.
 \end{abstract}
+
+\noindent\textbf{Implementation status.} This working document describes both the current BunkerCoin prototype and proposed protocol extensions. The private testnet implements Bunkerglow consensus and transaction processing over PACTOR radio links. The bridge, verified messaging, and location-attestation mechanisms remain under development.
 
 %------------------------------------------------------------
 \section{Physical (Network) Layer}
@@ -132,7 +132,7 @@ The reference implementation will be validated through field trials across urban
 \section{Consensus Layer}
 \label{sec:consensus}
 
-BunkerCoin adopts Alpenglow, an advanced consensus protocol originally proposed for the Solana blockchain, to achieve rapid block finality under constrained network conditions. Alpenglow replaces legacy mechanisms like Proof of History and Tower BFT with a streamlined dual-component design, achieving deterministic finality in record time.
+BunkerCoin adopts Alpenglow~\cite{alpenglow}, a consensus protocol originally proposed for the Solana blockchain, to achieve block finality under constrained network conditions. Alpenglow replaces Proof of History and Tower BFT with separate voting and block-dissemination components.
 
 \subsection{Staking and Validator Selection}
 \label{sec:staking}
@@ -214,13 +214,13 @@ Once the transition block achieves consensus, normal block production resumes wi
 BunkerCoin is engineered for resilience in contested and unreliable network environments. Its fault tolerance model is built on redundancy at every layer of the stack, from physical data transmission to consensus.
 
 \begin{itemize}
-    \item \textbf{Network Partitions and Link Failure:} The protocol's P2P-first strategy (see Section~\ref{sec:physical}) ensures a baseline of connectivity. If direct links fail, the Sherpa routing service dynamically finds alternative paths through the multi-hop radio mesh. Erasure coding in broadcast modes and the reliable ARQ protocol for P2P links protect against transient packet loss. In the event of a large-scale network partition, nodes within each disconnected segment can continue to operate and will automatically repair and synchronize state once connectivity is restored.
+    \item \textbf{Network Partitions and Link Failure:} The protocol's P2P-first strategy (see Section~\ref{sec:physical}) provides the baseline transport. If direct links fail, the Sherpa routing service seeks alternative paths through the multi-hop radio mesh. Erasure coding in broadcast modes and ARQ for P2P links protect against transient packet loss. During a network partition, finalization requires sufficient communicating stake to form the required quorums, under the consensus protocol's fault assumptions. Nodes in segments without a quorum pause finalization and repair missing data once connectivity is restored.
 
-    \item \textbf{Validator Downtime:} The Alpenglow consensus mechanism is intrinsically tolerant to validator downtime. While Fast-Finalization requires high participation ($\geq 80\%$), the standard finalization path can succeed with only $\geq 60\%$ of stake online. This allows the chain to continue making progress even if a significant portion of the network is temporarily unreachable.
+    \item \textbf{Validator Downtime:} While Fast-Finalization requires $\geq 80\%$ stake approval, the standard finalization path uses two rounds of $\geq 60\%$ stake approval. Progress depends on Alpenglow's Byzantine-fault and network assumptions~\cite{alpenglow}; quorum thresholds alone do not specify the protocol's fault tolerance.
 
     \item \textbf{Catastrophic Data Loss:} The epoch-end state snapshot mechanism is the ultimate backstop for data integrity. A validator that suffers a catastrophic failure (e.g., total data loss) does not need to synchronize the entire blockchain history over a low-bandwidth link. Instead, it can bootstrap from the latest multi-signed state snapshot, verifying data chunks with Merkle proofs, enabling rapid and secure recovery.
 
-    \item \textbf{Bridge Pauses:} The interoperability bridge is designed to fail safely. If fewer than two-thirds of the total staked weight has stable internet connectivity required to sign Bridge Certificates (BCerts), the bridge automatically pauses all operations. No funds can be moved until sufficient stake comes back online. This prevents a smaller, potentially compromised subset of validators from controlling the bridge, ensuring bridge security is never weaker than the main consensus.
+    \item \textbf{Bridge Pauses:} In the proposed bridge, a Bridge Certificate (BCert) requires signatures representing at least two-thirds of the total staked weight authorized by the latest Validator Set Update Certificate (VSCert). If insufficient stake is reachable to meet this threshold, bridge transfers pause. Loss of internet connectivity does not reduce the required signing threshold.
 \end{itemize}
 
 %------------------------------------------------------------
@@ -250,7 +250,7 @@ Tokens are created via special mint transactions that assign a unique 4-byte tok
     \item \textbf{Metadata Hash:} SHA-256 of off-chain JSON file containing name, description, logo, etc.
 \end{itemize}
 
-This design keeps account entries compact—most accounts will hold only 1-5 different tokens, requiring just 8 bytes per token type (4 for ID, 8 for amount when packed efficiently).
+This design keeps account entries compact—most accounts will hold only 1-5 different tokens. A fixed-width token balance entry requires 12 bytes (4 for the ID and 8 for the amount), excluding container and serialization overhead.
 
 \subsection{State Snapshots for Network Bootstrapping}
 
@@ -296,7 +296,7 @@ preventing free-riders from benefiting without contributing.
 \section{Bridging and Interoperability}
 \label{sec:bridge}
 
-One of BunkerCoin's primary value propositions is serving as a resilient custody layer for digital assets during periods of internet instability or outright failure. To fulfill this role, the protocol must support trustless asset transfers between BunkerCoin and high-throughput networks like Solana or similar chains. This section describes a cryptographically secure bridge architecture that leverages BunkerCoin's existing consensus mechanisms, offering security guarantees superior to federated or multisig-based models.
+One of BunkerCoin's primary value propositions is serving as a resilient custody layer for digital assets during periods of internet instability or outright failure. To fulfill this role, the protocol must support asset transfers between BunkerCoin and high-throughput networks like Solana or similar chains. This section describes a proposed bridge architecture that derives signing authority from BunkerCoin's validator set.
 
 \subsection{A Native Consensus Bridge}
 
@@ -305,7 +305,7 @@ The bridge is not an external or secondary system; it is a native extension of t
 \begin{enumerate}
     \item \textbf{The Full Validator Set}, which uses the core radio-based consensus mechanism at each epoch boundary to produce a signed \emph{Validator Set Update Certificate} (VSCert). This certificate is the ultimate source of authority for the bridge.
     \item \textbf{An Internet-Connected Validator Subset}, composed of validators with stable IP connectivity. This dynamic subset is authorized---as per its stake recorded in the most recent VSCert---to produce and sign \emph{Bridge Certificates} (BCerts) for individual asset transfers, keeping this high-volume traffic off the radio network.
-    \item \textbf{An Immutable On-Chain Program} on the target chain (e.g., Solana) that verifies both certificate types. It only accepts a BCert if it is signed by a super-majority of the internet-connected validators authorized by the most recent VSCert.
+    \item \textbf{An Immutable On-Chain Program} on the target chain (e.g., Solana) that verifies both certificate types. It only accepts a BCert if its signers represent at least two-thirds of the total staked weight authorized by the most recent VSCert.
     \item \textbf{A Permissionless Relayer Network}, composed of off-chain actors who submit these certificates to the destination chain. Relayers are trusted for liveness only.
 \end{enumerate}
 
@@ -313,22 +313,21 @@ The bridge is not an external or secondary system; it is a native extension of t
 To allow for future upgrades without compromising the security of existing deployments, all certificates are versioned. An on-chain program can support multiple certificate versions, allowing for a seamless transition to new bridge contracts over time while ensuring old, immutable contracts remain fully functional and secure.
 
 \subsubsection{Validator Set Update Certificates (VSCerts)}
-The bridge's root of trust is established by VSCerts. At the end of each epoch, as part of the main state snapshot process, the entire validator set signs a message containing the version, the complete list of public keys, and stake weights for the upcoming epoch. This aggregated signature and validator list form the VSCert. Because this process is part of the core, radio-based consensus, it is as secure and censorship-resistant as BunkerCoin itself. A relayer submits this VSCert to the on-chain program, which verifies it against the previous validator set, thus securely rotating the authorized set for the new epoch.
+The bridge's root of trust is established by VSCerts. At the end of each epoch, as part of the main state snapshot process, validators certify a message containing the version, the complete list of public keys, and stake weights for the upcoming epoch through the core radio-based consensus. The certificate is ratified under the consensus rules of the previous validator set; it does not require every validator to be online. A relayer submits this VSCert to the on-chain program, which verifies it against the previous validator set to rotate the authorized set for the new epoch.
 
 \subsubsection{Bridge Certificates (BCerts)}
-BCerts authorize individual asset transfers, primarily to facilitate the movement of external assets onto BunkerCoin for secure custody. For example, when a user locks native \texttt{SOL} in the bridge program on Solana, internet-connected validators observe the event and produce a BCert to authorize the minting of wrapped \texttt{SOL} on BunkerCoin. Conversely, when a user burns wrapped \texttt{SOL} on BunkerCoin, the validators generate a BCert to authorize the release of the native \texttt{SOL} on Solana. This signed message contains the certificate version and transfer details (amount, asset, source, destination, nonce). The on-chain program verifies the BCert against the public keys of the currently authorized internet-connected validators. If valid, the mint or release is executed. If fewer than 2/3 of the total stake has internet connectivity, no BCerts can be produced, and the bridge pauses until connectivity is restored.
+BCerts authorize individual asset transfers, primarily to facilitate the movement of external assets onto BunkerCoin for secure custody. For example, when a user locks native \texttt{SOL} in the bridge program on Solana, internet-connected validators observe the event and produce a BCert to authorize the minting of wrapped \texttt{SOL} on BunkerCoin. Conversely, when a user burns wrapped \texttt{SOL} on BunkerCoin, the validators generate a BCert to authorize the release of the native \texttt{SOL} on Solana. This signed message contains the certificate version and transfer details (amount, asset, source, destination, nonce). The receiving chain verifies the BCert's signatures and requires its signers to represent at least two-thirds of the total staked weight authorized by the most recent VSCert. If valid, the mint or release is executed. If insufficient stake has internet connectivity to meet this threshold, bridge transfers pause until connectivity is restored.
 
-\subsection{Superiority over Federated Models}
-This native, two-tiered design is fundamentally more secure than common trust-based bridge models. Systems like Wormhole rely on a fixed, permissioned set of so-called Guardian nodes, while many Layer 2 rollups secure their bridges with a small multisig. In these models, the security of the bridge is delegated to a committee that is external to and significantly smaller than the full validator set of the chains they serve.
+\subsection{Relationship to Federated Models}
+Federated bridge models delegate signing authority to a separate committee. BunkerCoin's proposed bridge instead derives that authority from the validator set ratified by its radio-based consensus. Although only internet-reachable validators participate in BCert signing, each BCert must represent at least two-thirds of the total staked weight authorized by the latest VSCert. Transfers pause if this threshold cannot be met.
 
-BunkerCoin's bridge suffers from no such security degradation. Although only validators with stable IP connectivity can physically transmit their signatures, the BCert itself must carry an aggregated signature representing at least two-thirds of \emph{all} staked weight.  If this threshold is not met—because insufficient stake is online—the bridge simply pauses rather than falling back to a weaker committee.  The authority to produce BCerts therefore remains identical to that of the base chain; the internet-reachable validators are merely the portion of the full set that can currently participate.  The VSCerts that ratify this arrangement each epoch are signed by the 
-entire validator set over the radio network, so no smaller group can hijack the bridge.  Consequently, an attacker’s only viable path to stealing funds is to corrupt $\geq$\,2/3 of BunkerCoin’s total stake—the exact same condition required to break main-chain consensus.
+The BCert signing threshold is distinct from Alpenglow's Byzantine-fault assumptions~\cite{alpenglow}. It does not establish a universal attack-cost bound or, by itself, prove security equivalent to the base chain. Bridge security also depends on correct certificate verification, validator-set rotation, and source-chain finality.
 
 \subsection{Merkle Root Anchoring for Enhanced Security}
 Beyond basic asset transfers, the bridge could \emph{optionally} leverage BunkerCoin's existing state snapshot mechanism (Section~\ref{sec:transaction_state}) to post periodic commitments on external chains. These Merkle root anchors serve a dual purpose:
 
 \begin{enumerate}
-    \item \textbf{Checkpoint Finality:} Once BunkerCoin's state root is included in the consensus of Solana or a similar chain, reverting BunkerCoin's history would require reorganizing the external chain—a massive increase in attack cost.
+    \item \textbf{Checkpoint Verification:} A state root finalized on an external chain provides an independently verifiable checkpoint. Using it to reject conflicting BunkerCoin histories requires explicit rules for selecting and enforcing trusted checkpoints; those rules remain to be specified.
     \item \textbf{Generalized State Proofs:} Applications can verify arbitrary BunkerCoin state claims using Merkle proofs against these anchored roots, enabling complex cross-chain protocols beyond simple transfers.
 \end{enumerate}
 
@@ -356,9 +355,9 @@ The protocol's security model assumes a sophisticated adversary capable of both 
             \item \textbf{Validator Level:} A cabal of validators could attempt to censor transactions by refusing to include them in blocks. Because block producers are selected on a rotating basis, this would require sustained collusion. Furthermore, the store-and-forward messaging system (Section~\ref{sec:messaging}) provides a parallel, albeit slower, path for data propagation that is difficult to censor system-wide.
         \end{itemize}
 
-    \item \textbf{Long-Range and Re-org Attacks:} The cost of a 51\% attack is equivalent to acquiring a majority of the total stake, which is economically significant. The use of epoch-end state snapshots, especially when anchored to a high-throughput chain (Section~\ref{sec:bridge}), dramatically increases the cost of attempting a long-range rewrite of history. To revert a finalized snapshot, an attacker would not only need to corrupt BunkerCoin but also the external chain where the snapshot is anchored.
+    \item \textbf{Long-Range and Re-org Attacks:} Consensus safety depends on Alpenglow's fault assumptions~\cite{alpenglow}. Nodes bootstrapping from snapshots also need an authenticated validator history or a trusted checkpoint. Roots anchored on an external chain (Section~\ref{sec:bridge}) can support checkpoint verification. Protection against long-range rewrites requires explicit rules for selecting and enforcing checkpoints.
 
-    \item \textbf{Bridge Security:} The native consensus bridge is designed to be as secure as the L1 itself. Its security relies on the VSCerts being signed by the full radio-capable validator set and BCerts requiring a super-majority of staked weight. An attacker cannot drain funds from the bridge without compromising the economic majority of the entire BunkerCoin network, eliminating the risk of a small committee being the single point of failure.
+    \item \textbf{Bridge Security:} The proposed bridge derives its validator-set authority from radio-based consensus and requires each BCert to represent at least two-thirds of the total staked weight authorized by the latest VSCert. This threshold remains fixed during connectivity loss. Correct certificate verification, validator-set rotation, and source-chain finality are also required for bridge security; these mechanisms remain under development.
 \end{itemize}
 
 \section{Future Work}
@@ -378,5 +377,13 @@ LEO satellites can serve as transparent 1:1 bridges: receive a BunkerCoin frame 
 \section{Call for Contribution}
 
 This paper serves as a working foundation for the BunkerCoin protocol and is under active development. We welcome contributions from the community to expand, refine, and challenge the concepts outlined here. For further information on how to contribute, and to join the ongoing technical discussions, please join our community on Discord: \url{https://discord.gg/DGBqm92VQm}.
+
+\begin{thebibliography}{1}
+\bibitem{alpenglow}
+Quentin Kniep, Jakub Sliwinski, and Roger Wattenhofer.
+\emph{Solana Alpenglow Consensus: Increased Bandwidth, Reduced Latency}.
+White paper, version 1.1, July 22, 2025.
+\url{https://www.anza.xyz/alpenglow-1-1}.
+\end{thebibliography}
 
 \end{document}
