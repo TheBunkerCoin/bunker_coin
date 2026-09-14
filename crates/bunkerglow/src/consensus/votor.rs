@@ -358,25 +358,24 @@ impl<A: All2All> Votor<A> {
                     trace!("timeout for slot {slot}");
                     if !self.voted.contains(&slot) {
                         // Same liveness gate as TimeoutCrashedLeader: on a slow
-                        // but alive link a leader's trailing window slots are
-                        // still crossing when this fires — skipping them orphans
-                        // valid blocks (node1's 4th slot repeatedly skip-certed).
-                        // Pause and re-arm while the link is up and the shreds
-                        // have not arrived; skip once the link is down or the
-                        // bounded re-arm budget is spent (a truly crashed leader).
-                        if !self.received_shred.contains(&slot) {
-                            let rearms = self.crashed_leader_rearms.entry(slot).or_insert(0);
-                            if self.link_liveness.is_link_alive()
-                                && *rearms < Self::MAX_CRASHED_LEADER_REARMS
-                            {
-                                *rearms += 1;
-                                let sender = self.event_sender.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(delta_timeout()).await;
-                                    let _ = sender.send(VotorEvent::Timeout(slot)).await;
-                                });
-                                continue;
-                            }
+                        // but alive link a leader's blocks are still crossing
+                        // when this fires — a 7 KB block at 10 B/s takes longer
+                        // than delta_block. Skipping one that is mid-flight
+                        // wastes the airtime already spent and poisons the slot
+                        // with mixed votes, so a block with shreds seen gets the
+                        // same bounded patience as an absent one; skip once the
+                        // link is down or the re-arm budget is spent.
+                        let rearms = self.crashed_leader_rearms.entry(slot).or_insert(0);
+                        if self.link_liveness.is_link_alive()
+                            && *rearms < Self::MAX_CRASHED_LEADER_REARMS
+                        {
+                            *rearms += 1;
+                            let sender = self.event_sender.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delta_timeout()).await;
+                                let _ = sender.send(VotorEvent::Timeout(slot)).await;
+                            });
+                            continue;
                         }
                         self.try_skip_window(slot).await;
                     }
