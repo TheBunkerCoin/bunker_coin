@@ -124,36 +124,125 @@ fn turn_byte_budget() -> usize {
 /// Write-retry back-off; a writer that exits on error mutes the node forever.
 const WRITE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Estimated on-air serial line rate (hex `#…\r` lines), bytes/sec. The writer
-/// paces enqueues to this so a software turn approximates the on-air turn:
-/// unpaced, a turn floods the modem TX FIFO in milliseconds and drains for
-/// minutes at PACTOR-1 rates, so the peer sees the turn-grant only after the
-/// whole backlog — both sides' reclaim timers then fire mid-drain and forced
+/// Manually pinned on-air serial line rate, bytes/sec. Set, it disables the
+/// adaptive estimator and paces at exactly this rate; unset, pacing starts at
+/// [`ADAPTIVE_START_BPS`] and follows the measured link. The writer paces
+/// enqueues so a software turn approximates the on-air turn: unpaced, a turn
+/// floods the modem TX FIFO in milliseconds and drains for minutes at
+/// PACTOR-1 rates, so the peer sees the turn-grant only after the whole
+/// backlog — both sides' reclaim timers then fire mid-drain and forced
 /// changeovers chop in-flight lines (observed: tip frozen 24h+ in turn thrash).
-/// Conservative default for 200 Bd PACTOR-1; raise via env on faster links.
-fn link_pace_bytes_per_sec() -> u64 {
-    std::env::var("BUNKER_LINK_PACE_BPS")
+fn pinned_pace_bps() -> Option<u64> {
+    let pinned = std::env::var("BUNKER_LINK_PACE_BPS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(if cfg!(test) { u64::MAX } else { 32 })
+        .filter(|v| *v > 0);
+    if pinned.is_none() && cfg!(test) {
+        // Tests run unpaced unless they pin a rate themselves.
+        return Some(u64::MAX);
+    }
+    pinned
 }
+
+/// Adaptive pacing start/floor: worst-case 200 Bd PACTOR-1. The estimator
+/// only raises the rate from here on measured evidence, so a cold start or a
+/// deep fade can never pace faster than the slowest mode the link falls to.
+const ADAPTIVE_START_BPS: u64 = 32;
+
+/// Adaptive pacing ceiling; PACTOR-3 tops out around ~300 B/s serial-side.
+const ADAPTIVE_MAX_BPS: u64 = 256;
+
+/// Fraction of the measured link rate to pace at; the margin absorbs
+/// estimation noise so the modem FIFO keeps draining ahead of the pacer.
+const ADAPTIVE_SAFETY_NUM: u64 = 4;
+const ADAPTIVE_SAFETY_DEN: u64 = 5;
 
 /// Unsent backlog the pacer tolerates in the modem TX FIFO; keeps short
 /// messages from serializing per-line while bounding grant delivery lag.
 const PACE_BURST: Duration = Duration::from_secs(3);
 
+/// Grant-response lag bounds driving the writer's AIMD rate probe. After we
+/// grant, the peer cannot transmit until OUR modem FIFO physically drains,
+/// so its first line arriving promptly proves the pace kept up with the real
+/// link — probe higher. A late answer means the paced turn overran the link
+/// (or a fade ate the grant) — cut hard. Between the two, hold.
+const GRANT_LAG_RAISE_MS: u64 = 30_000;
+const GRANT_LAG_CUT_MS: u64 = 60_000;
+
+/// Applies one AIMD step from an observed grant-response lag.
+fn adjust_pace_on_grant_lag(rate: &AtomicU64, lag_ms: u64) {
+    let cur = rate.load(Ordering::Relaxed);
+    let next = if lag_ms <= GRANT_LAG_RAISE_MS {
+        cur + cur / 10 + 1
+    } else if lag_ms >= GRANT_LAG_CUT_MS {
+        cur * 7 / 10
+    } else {
+        return;
+    };
+    rate.store(
+        next.clamp(ADAPTIVE_START_BPS, ADAPTIVE_MAX_BPS),
+        Ordering::Relaxed,
+    );
+}
+
+/// Raise-only floor from inbound line spacing. While the peer drains a
+/// multi-fragment message its lines arrive back-to-back, so bytes/gap is the
+/// rate the peer is PROVING the channel sustains — adopt it when it exceeds
+/// ours (fresh restarts jump straight to the peer's ramped rate instead of
+/// re-probing from the floor). It never lowers the rate: cuts belong to the
+/// writer's grant-lag AIMD, and this only publishes on fresh samples so a
+/// stale pre-fade estimate cannot fight those cuts. Keepalive-sized lines
+/// and long gaps (idle holds, changeovers) are not back-to-back evidence.
+struct LinkRateEstimator {
+    last_line: Option<tokio::time::Instant>,
+    ewma_bps: f64,
+    shared: Arc<AtomicU64>,
+}
+
+impl LinkRateEstimator {
+    /// Only gaps in this range separate back-to-back lines: shorter is one
+    /// ARQ frame carrying several lines, longer spans a turn boundary.
+    const MIN_GAP: Duration = Duration::from_millis(200);
+    const MAX_GAP: Duration = Duration::from_secs(30);
+    /// Serial size below which a line is control chatter, not a data fragment.
+    const MIN_DATA_LINE: u64 = 150;
+
+    fn new(shared: Arc<AtomicU64>) -> Self {
+        Self {
+            last_line: None,
+            ewma_bps: ADAPTIVE_START_BPS as f64,
+            shared,
+        }
+    }
+
+    /// Records one inbound line of `serial_bytes` and republishes the paced rate.
+    fn observe(&mut self, serial_bytes: u64, now: tokio::time::Instant) {
+        let gap = self.last_line.map(|t| now.saturating_duration_since(t));
+        self.last_line = Some(now);
+        let Some(gap) = gap else { return };
+        if serial_bytes < Self::MIN_DATA_LINE || gap < Self::MIN_GAP || gap > Self::MAX_GAP {
+            return;
+        }
+        let sample = (serial_bytes as f64 / gap.as_secs_f64()).clamp(8.0, 512.0);
+        self.ewma_bps = self.ewma_bps * 0.8 + sample * 0.2;
+        let paced = (self.ewma_bps as u64 * ADAPTIVE_SAFETY_NUM / ADAPTIVE_SAFETY_DEN)
+            .clamp(ADAPTIVE_START_BPS, ADAPTIVE_MAX_BPS);
+        self.shared.fetch_max(paced, Ordering::Relaxed);
+    }
+}
+
 /// Paces serial writes at the estimated on-air rate so the modem TX FIFO
-/// never holds more than ~[`PACE_BURST`] of undrained data.
+/// never holds more than ~[`PACE_BURST`] of undrained data. The rate cell is
+/// shared with the reader's [`LinkRateEstimator`] unless a rate is pinned.
 struct LinkPacer {
-    rate_bps: u64,
+    rate_bps: Arc<AtomicU64>,
     drain_until: tokio::time::Instant,
 }
 
 impl LinkPacer {
-    fn new() -> Self {
+    fn new(rate_bps: Arc<AtomicU64>) -> Self {
         Self {
-            rate_bps: link_pace_bytes_per_sec().max(1),
+            rate_bps,
             drain_until: tokio::time::Instant::now(),
         }
     }
@@ -161,7 +250,7 @@ impl LinkPacer {
     /// No-op pacer for full-duplex transports (simulator / TCP flow control).
     fn unpaced() -> Self {
         Self {
-            rate_bps: u64::MAX,
+            rate_bps: Arc::new(AtomicU64::new(u64::MAX)),
             drain_until: tokio::time::Instant::now(),
         }
     }
@@ -169,8 +258,9 @@ impl LinkPacer {
     /// Account one written serial line and sleep until the modem FIFO is back
     /// under the burst allowance at the estimated drain rate.
     async fn pace(&mut self, line_bytes: usize) {
+        let rate = self.rate_bps.load(Ordering::Relaxed).max(1);
         let now = tokio::time::Instant::now();
-        let cost = Duration::from_millis((line_bytes as u64).saturating_mul(1000) / self.rate_bps);
+        let cost = Duration::from_millis((line_bytes as u64).saturating_mul(1000) / rate);
         self.drain_until = self.drain_until.max(now) + cost;
         if let Some(sleep_until) = self.drain_until.checked_sub(PACE_BURST) {
             if sleep_until > now {
@@ -463,6 +553,11 @@ impl PactorMux {
         let turn = self.turn.clone();
         let last_activity_ms = self.last_activity_ms.clone();
 
+        // Pace rate cell: pinned by env, or driven by the inbound estimator.
+        let pace_rate = Arc::new(AtomicU64::new(
+            pinned_pace_bps().unwrap_or(ADAPTIVE_START_BPS),
+        ));
+
         // Reader: read, reassemble, strip tag, route to a channel queue.
         let reader_transport = transport.clone();
         let reader_turn = turn.clone();
@@ -471,6 +566,9 @@ impl PactorMux {
         // its idle-hold length on whether the peer is mid-transfer.
         let last_data_ms = Arc::new(AtomicU64::new(0));
         let reader_data = last_data_ms.clone();
+        // Estimate only on half-duplex links with no pinned rate.
+        let mut estimator = (turn.is_some() && pinned_pace_bps().is_none())
+            .then(|| LinkRateEstimator::new(pace_rate.clone()));
         let reader = tokio::spawn(async move {
             let mut reassembler = Reassembler::new();
             loop {
@@ -478,6 +576,10 @@ impl PactorMux {
                     Ok(line) => {
                         // Stamp activity before routing so MuxLiveness sees it.
                         reader_activity.store(now_ms(), Ordering::Relaxed);
+                        if let Some(est) = &mut estimator {
+                            let serial = line.len() as u64 * 2 + 6;
+                            est.observe(serial, tokio::time::Instant::now());
+                        }
                         line
                     }
                     // Idle timeout: keep waiting, never tear down inbound queues.
@@ -595,13 +697,26 @@ impl PactorMux {
             let mut decider = ReclaimDecider::new(is_listener);
             let mut outbound_take_budget = LISTENER_OUTBOUND_TAKE_BUDGET;
             // Persists across turns: the modem FIFO does not reset at a grant.
-            let mut pacer = LinkPacer::new();
+            let writer_rate = pace_rate.clone();
+            let adaptive = pinned_pace_bps().is_none();
+            let mut pacer = LinkPacer::new(pace_rate);
+            // now_ms of the last turn-grant, until its response lag is judged.
+            let mut grant_probe: Option<u64> = None;
             'turn: loop {
                 // Poll for the turn so a lost grant can recover via silence reclaim.
                 let turnless_since = now_ms();
                 while !turn.holds_turn.load(Ordering::SeqCst) {
                     let now = now_ms();
                     let activity = writer_activity.load(Ordering::Relaxed);
+                    // First inbound after a grant closes that grant's rate probe.
+                    if let Some(granted_at) = grant_probe {
+                        if adaptive && activity > granted_at {
+                            adjust_pace_on_grant_lag(&writer_rate, activity - granted_at);
+                        }
+                        if activity > granted_at {
+                            grant_probe = None;
+                        }
+                    }
                     let silence = now.saturating_sub(activity);
                     let since_last_reclaim = now.saturating_sub(last_reclaim_ms);
 
@@ -662,6 +777,15 @@ impl PactorMux {
 
                 // Clear livelock backoff if inbound activity resumed.
                 let activity_on_hold = writer_activity.load(Ordering::Relaxed);
+                if let Some(granted_at) = grant_probe {
+                    // Judge the probe even when a reclaim retook the turn first.
+                    if adaptive && activity_on_hold > granted_at {
+                        adjust_pace_on_grant_lag(&writer_rate, activity_on_hold - granted_at);
+                    }
+                    if activity_on_hold > granted_at {
+                        grant_probe = None;
+                    }
+                }
                 if decider.note_turn_held(activity_on_hold) {
                     // Two-sided again: refresh the override for the next leader window.
                     outbound_take_budget = LISTENER_OUTBOUND_TAKE_BUDGET;
@@ -787,6 +911,7 @@ impl PactorMux {
                 // Only inbound advances writer_activity, so the silence gate is already
                 // open here; without this stamp the caller reclaims its own grant at once.
                 last_reclaim_ms = now_ms();
+                grant_probe = Some(last_reclaim_ms);
             }
         });
 
@@ -1187,6 +1312,62 @@ mod tests {
         probe.abort();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn estimator_follows_measured_rate_within_bounds() {
+        let shared = Arc::new(AtomicU64::new(ADAPTIVE_START_BPS));
+        let mut est = LinkRateEstimator::new(shared.clone());
+        let mut now = tokio::time::Instant::now();
+        // ~300-byte fragments every 2s = 150 B/s; converge from the 32 floor.
+        for _ in 0..40 {
+            now += Duration::from_secs(2);
+            est.observe(300, now);
+        }
+        let paced = shared.load(Ordering::Relaxed);
+        // 150 B/s measured × 4/5 safety = 120 paced.
+        assert!(
+            (100..=130).contains(&paced),
+            "expected ~120 B/s paced, got {paced}"
+        );
+
+        // Keepalive-sized lines and turn-boundary gaps leave the rate alone.
+        now += Duration::from_secs(5);
+        est.observe(20, now);
+        now += Duration::from_secs(120);
+        est.observe(300, now);
+        assert_eq!(shared.load(Ordering::Relaxed), paced);
+
+        // The estimator is raise-only: slow fragments never lower the shared
+        // rate (cuts belong to the grant-lag AIMD).
+        for _ in 0..80 {
+            now += Duration::from_secs(15);
+            est.observe(300, now);
+        }
+        assert_eq!(shared.load(Ordering::Relaxed), paced);
+    }
+
+    #[test]
+    fn grant_lag_aimd_probes_up_and_cuts_hard() {
+        let rate = AtomicU64::new(100);
+        // Prompt response: multiplicative-ish probe upward.
+        adjust_pace_on_grant_lag(&rate, 10_000);
+        assert_eq!(rate.load(Ordering::Relaxed), 111);
+        // Dead zone: hold.
+        adjust_pace_on_grant_lag(&rate, 45_000);
+        assert_eq!(rate.load(Ordering::Relaxed), 111);
+        // Late response (overrun or lost grant): cut to 70%.
+        adjust_pace_on_grant_lag(&rate, 90_000);
+        assert_eq!(rate.load(Ordering::Relaxed), 77);
+        // Cuts bottom out at the P1 floor, raises cap at the ceiling.
+        for _ in 0..10 {
+            adjust_pace_on_grant_lag(&rate, 90_000);
+        }
+        assert_eq!(rate.load(Ordering::Relaxed), ADAPTIVE_START_BPS);
+        for _ in 0..40 {
+            adjust_pace_on_grant_lag(&rate, 1_000);
+        }
+        assert_eq!(rate.load(Ordering::Relaxed), ADAPTIVE_MAX_BPS);
+    }
+
     #[test]
     fn idle_hold_shortens_only_during_active_transfer() {
         // Never received data (fresh clock included): long hold.
@@ -1202,7 +1383,7 @@ mod tests {
     async fn pacer_bounds_modem_fifo_backlog() {
         let t0 = tokio::time::Instant::now();
         let mut pacer = LinkPacer {
-            rate_bps: 1000,
+            rate_bps: Arc::new(AtomicU64::new(1000)),
             drain_until: t0,
         };
         // 1s of backlog fits inside the burst allowance: no sleep.
