@@ -271,28 +271,7 @@ impl LinkPacer {
             }
         }
     }
-
-    /// Sleep until every enqueued byte should have left the modem, plus a
-    /// grace for estimate error. MUST run before a changeover: Ctrl-Z acts
-    /// immediately while up to [`PACE_BURST`] of tail is still in the TX
-    /// FIFO, so the turn-grant written last never transmits — observed live
-    /// as every data turn's grant dying while its data arrived, degrading
-    /// every handoff to a 200–300s reclaim ladder (and the stranded tail
-    /// squirting out as a stale grant on the next retake).
-    async fn flush(&self) {
-        if self.rate_bps.load(Ordering::Relaxed) == u64::MAX {
-            return; // unpaced (tests / full-duplex): nothing queues
-        }
-        let target = self.drain_until + CHANGEOVER_FLUSH_GRACE;
-        if target > tokio::time::Instant::now() {
-            tokio::time::sleep_until(target).await;
-        }
-    }
 }
-
-/// Extra wait after the estimated drain before Ctrl-Z, absorbing pace
-/// overestimation so the grant is truly on air when the modem flips.
-const CHANGEOVER_FLUSH_GRACE: Duration = Duration::from_secs(5);
 
 /// Blind-reclaim threshold after which the listener yields to the caller.
 const LISTENER_LIVELOCK_RECLAIMS: u32 = 2;
@@ -815,20 +794,6 @@ impl PactorMux {
                     outbound_take_budget = LISTENER_OUTBOUND_TAKE_BUDGET;
                 }
 
-                // Fade guard: our last grant was never answered, so the link
-                // is suspect — probe with keepalives instead of pouring queued
-                // blocks into a modem FIFO that is not draining. Post-fade
-                // that stale backlog re-creates the very livelock pacing
-                // exists to prevent; the mux queues keep the data until the
-                // first inbound line resolves the probe.
-                if grant_probe.is_some_and(|g| now_ms().saturating_sub(g) >= GRANT_LAG_CUT_MS) {
-                    let _ =
-                        write_message(&writer_transport, &counter, &mut pacer, KEEPALIVE_TAG, &[])
-                            .await;
-                    tokio::time::sleep(KEEPALIVE_INTERVAL).await;
-                    continue 'turn;
-                }
-
                 // Keepalive immediately after acquiring an idle turn.
                 if high_rx.is_empty() && low_rx.is_empty() {
                     if let Err(e) =
@@ -939,8 +904,6 @@ impl PactorMux {
                 // strands both sides turnless for a ~2-minute reclaim cycle.
                 let _ = write_message(&writer_transport, &counter, &mut pacer, TURN_GRANT_TAG, &[])
                     .await;
-                // The grants must be ON AIR before Ctrl-Z flips the modem.
-                pacer.flush().await;
                 if let Err(e) = writer_transport.changeover().await {
                     // The grant may already be queued; a duplicate next cycle is harmless.
                     warn!("[mux:writer] changeover failed: {e}; keeping the turn");
@@ -1435,20 +1398,10 @@ mod tests {
             tokio::time::Instant::now(),
             t0 + Duration::from_secs(6) - PACE_BURST
         );
-        // Flush waits out the full backlog plus the changeover grace, so the
-        // grant is on air before Ctrl-Z flips the modem.
-        pacer.flush().await;
-        assert_eq!(
-            tokio::time::Instant::now(),
-            t0 + Duration::from_secs(6) + CHANGEOVER_FLUSH_GRACE
-        );
-
         // The unpaced variant never sleeps regardless of volume.
         let mut unpaced = LinkPacer::unpaced();
         let before = tokio::time::Instant::now();
         unpaced.pace(usize::MAX).await;
-        assert_eq!(tokio::time::Instant::now(), before);
-        unpaced.flush().await;
         assert_eq!(tokio::time::Instant::now(), before);
     }
 
