@@ -81,12 +81,10 @@ fn turnless_reclaim_ceiling() -> Duration {
         .unwrap_or(Duration::from_secs(300))
 }
 
-/// Payload bytes one turn may enqueue before granting. Sized to carry a whole
-/// block's shreds (TOTAL_SHREDS × MAX_DATA_PER_SHRED = 6 KiB) in one turn: a
-/// tighter cap ships one shred per turn, so a block needs six turn-cycles and
-/// dissemination collapses to minutes per block. MAX_TURN_HOLD still bounds
-/// airtime and the priority lane still preempts with votes, so this cannot
-/// bury a handshake; a marginal link can lower it via BUNKER_TURN_BYTE_BUDGET.
+/// Payload bytes one turn may enqueue before granting — an upper bound only:
+/// [`LinkPacer`] makes writes take real airtime, so MAX_TURN_HOLD cuts a turn
+/// long before this cap on slow links; the cap matters only when
+/// BUNKER_LINK_PACE_BPS is raised to match a fast link.
 fn turn_byte_budget() -> usize {
     std::env::var("BUNKER_TURN_BYTE_BUDGET")
         .ok()
@@ -96,6 +94,62 @@ fn turn_byte_budget() -> usize {
 
 /// Write-retry back-off; a writer that exits on error mutes the node forever.
 const WRITE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Estimated on-air serial line rate (hex `#…\r` lines), bytes/sec. The writer
+/// paces enqueues to this so a software turn approximates the on-air turn:
+/// unpaced, a turn floods the modem TX FIFO in milliseconds and drains for
+/// minutes at PACTOR-1 rates, so the peer sees the turn-grant only after the
+/// whole backlog — both sides' reclaim timers then fire mid-drain and forced
+/// changeovers chop in-flight lines (observed: tip frozen 24h+ in turn thrash).
+/// Conservative default for 200 Bd PACTOR-1; raise via env on faster links.
+fn link_pace_bytes_per_sec() -> u64 {
+    std::env::var("BUNKER_LINK_PACE_BPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(if cfg!(test) { u64::MAX } else { 32 })
+}
+
+/// Unsent backlog the pacer tolerates in the modem TX FIFO; keeps short
+/// messages from serializing per-line while bounding grant delivery lag.
+const PACE_BURST: Duration = Duration::from_secs(3);
+
+/// Paces serial writes at the estimated on-air rate so the modem TX FIFO
+/// never holds more than ~[`PACE_BURST`] of undrained data.
+struct LinkPacer {
+    rate_bps: u64,
+    drain_until: tokio::time::Instant,
+}
+
+impl LinkPacer {
+    fn new() -> Self {
+        Self {
+            rate_bps: link_pace_bytes_per_sec().max(1),
+            drain_until: tokio::time::Instant::now(),
+        }
+    }
+
+    /// No-op pacer for full-duplex transports (simulator / TCP flow control).
+    fn unpaced() -> Self {
+        Self {
+            rate_bps: u64::MAX,
+            drain_until: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Account one written serial line and sleep until the modem FIFO is back
+    /// under the burst allowance at the estimated drain rate.
+    async fn pace(&mut self, line_bytes: usize) {
+        let now = tokio::time::Instant::now();
+        let cost = Duration::from_millis((line_bytes as u64).saturating_mul(1000) / self.rate_bps);
+        self.drain_until = self.drain_until.max(now) + cost;
+        if let Some(sleep_until) = self.drain_until.checked_sub(PACE_BURST) {
+            if sleep_until > now {
+                tokio::time::sleep_until(sleep_until).await;
+            }
+        }
+    }
+}
 
 /// Blind-reclaim threshold after which the listener yields to the caller.
 const LISTENER_LIVELOCK_RECLAIMS: u32 = 2;
@@ -444,6 +498,7 @@ impl PactorMux {
             async fn write_message(
                 transport: &Arc<dyn PactorTransport>,
                 counter: &AtomicU64,
+                pacer: &mut LinkPacer,
                 tag: u8,
                 payload: &[u8],
             ) -> Result<(), ScsPactorError> {
@@ -453,6 +508,8 @@ impl PactorMux {
                 let message_id = counter.fetch_add(1, Ordering::Relaxed);
                 for line in fragment_message(message_id, &tagged) {
                     transport.write_data(&line).await?;
+                    // On-air cost of the hex line: `#` + 4-len + 2×data + `\r`.
+                    pacer.pace(line.len() * 2 + 6).await;
                 }
                 Ok(())
             }
@@ -471,10 +528,12 @@ impl PactorMux {
 
             // Full-duplex mode (simulator / TCP): transmit whenever we have data.
             let Some(turn) = turn else {
+                let mut pacer = LinkPacer::unpaced();
                 while let Some(item) = recv_prio(&mut high_rx, &mut low_rx).await {
                     if let Err(e) = write_message(
                         &writer_transport,
                         &counter,
+                        &mut pacer,
                         item.channel as u8,
                         &item.payload,
                     )
@@ -500,6 +559,8 @@ impl PactorMux {
             let is_listener = !turn.starts_with_turn;
             let mut decider = ReclaimDecider::new(is_listener);
             let mut outbound_take_budget = LISTENER_OUTBOUND_TAKE_BUDGET;
+            // Persists across turns: the modem FIFO does not reset at a grant.
+            let mut pacer = LinkPacer::new();
             'turn: loop {
                 // Poll for the turn so a lost grant can recover via silence reclaim.
                 let turnless_since = now_ms();
@@ -574,7 +635,8 @@ impl PactorMux {
                 // Keepalive immediately after acquiring an idle turn.
                 if high_rx.is_empty() && low_rx.is_empty() {
                     if let Err(e) =
-                        write_message(&writer_transport, &counter, KEEPALIVE_TAG, &[]).await
+                        write_message(&writer_transport, &counter, &mut pacer, KEEPALIVE_TAG, &[])
+                            .await
                     {
                         warn!("[mux:writer] post-changeover keepalive failed: {e}; backing off");
                         tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
@@ -598,8 +660,14 @@ impl PactorMux {
                             if tokio::time::Instant::now() >= idle_until {
                                 break; // idle long enough — grant the turn
                             }
-                            if let Err(e) =
-                                write_message(&writer_transport, &counter, KEEPALIVE_TAG, &[]).await
+                            if let Err(e) = write_message(
+                                &writer_transport,
+                                &counter,
+                                &mut pacer,
+                                KEEPALIVE_TAG,
+                                &[],
+                            )
+                            .await
                             {
                                 warn!("[mux:writer] keepalive write failed: {e}; backing off");
                                 tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
@@ -613,6 +681,7 @@ impl PactorMux {
                     if let Err(e) = write_message(
                         &writer_transport,
                         &counter,
+                        &mut pacer,
                         item.channel as u8,
                         &item.payload,
                     )
@@ -642,6 +711,7 @@ impl PactorMux {
                             if let Err(e) = write_message(
                                 &writer_transport,
                                 &counter,
+                                &mut pacer,
                                 item.channel as u8,
                                 &item.payload,
                             )
@@ -660,7 +730,8 @@ impl PactorMux {
                 }
 
                 if let Err(e) =
-                    write_message(&writer_transport, &counter, TURN_GRANT_TAG, &[]).await
+                    write_message(&writer_transport, &counter, &mut pacer, TURN_GRANT_TAG, &[])
+                        .await
                 {
                     warn!("[mux:writer] turn-grant write failed: {e}; keeping the turn");
                     tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
@@ -1074,6 +1145,29 @@ mod tests {
             "idle receive returned early (queue closed?)"
         );
         probe.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pacer_bounds_modem_fifo_backlog() {
+        let t0 = tokio::time::Instant::now();
+        let mut pacer = LinkPacer {
+            rate_bps: 1000,
+            drain_until: t0,
+        };
+        // 1s of backlog fits inside the burst allowance: no sleep.
+        pacer.pace(1000).await;
+        assert_eq!(tokio::time::Instant::now(), t0);
+        // 6s total backlog must sleep until only PACE_BURST remains unsent.
+        pacer.pace(5000).await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            t0 + Duration::from_secs(6) - PACE_BURST
+        );
+        // The unpaced variant never sleeps regardless of volume.
+        let mut unpaced = LinkPacer::unpaced();
+        let before = tokio::time::Instant::now();
+        unpaced.pace(usize::MAX).await;
+        assert_eq!(tokio::time::Instant::now(), before);
     }
 
     #[tokio::test(start_paused = true)]
