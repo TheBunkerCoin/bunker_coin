@@ -40,8 +40,15 @@ const TURN_GRANT_TAG: u8 = 0xFF;
 /// Control tag for idle traffic that keeps the ARQ link from timing out.
 const KEEPALIVE_TAG: u8 = 0xFE;
 
-/// Caps one-sided transmit bursts so the peer can send votes.
-const MAX_TURN_HOLD: Duration = Duration::from_secs(30);
+/// Caps one-sided transmit bursts so the peer can send votes. With paced
+/// writes this is real airtime: sized for ~2 shreds per turn (a paced shred
+/// is ~75s at the default rate), because a 30s cap shipped one shred per
+/// turn and every shred paid a full grant/changeover/return cycle — and each
+/// extra changeover is another chance to lose the grant line on a fade.
+/// Not larger: if the pace estimate overruns the real link, the grant lands
+/// (turn × overrun-factor) late, and it must still beat the caller's 300s
+/// turnless ceiling.
+const MAX_TURN_HOLD: Duration = Duration::from_secs(90);
 
 /// Wait for async follow-up messages before ending a data turn.
 const TURN_DRAIN_GRACE: Duration = Duration::from_secs(3);
@@ -51,6 +58,28 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7);
 
 /// Idle turn hold before grant; long to minimize fragile changeovers.
 const IDLE_TURN_GRANT: Duration = Duration::from_secs(60);
+
+/// Idle hold while the peer is mid-transfer: its last turn carried data, so
+/// it likely has more queued — sitting on an idle turn for the full
+/// [`IDLE_TURN_GRANT`] halves catch-up throughput with keepalives.
+const ACTIVE_IDLE_TURN_GRANT: Duration = Duration::from_secs(10);
+
+/// Inbound data younger than this marks the peer as mid-transfer.
+const ACTIVE_TRANSFER_WINDOW: Duration = Duration::from_secs(45);
+
+/// Idle-hold length before granting: short while the peer is mid-transfer
+/// (it granted with a full queue and every idle second here is its airtime),
+/// long otherwise to minimize fragile changeovers. A zero `last_data_ms`
+/// means no data was ever received (not "recent").
+fn idle_hold_for(last_data_ms: u64, now: u64) -> Duration {
+    if last_data_ms != 0
+        && now.saturating_sub(last_data_ms) <= ACTIVE_TRANSFER_WINDOW.as_millis() as u64
+    {
+        ACTIVE_IDLE_TURN_GRANT
+    } else {
+        IDLE_TURN_GRANT
+    }
+}
 
 /// Silent interval before a non-holder self-grants after a lost grant or dead peer.
 /// Must exceed normal keepalive/changeover gaps; test-overridable via env.
@@ -438,6 +467,10 @@ impl PactorMux {
         let reader_transport = transport.clone();
         let reader_turn = turn.clone();
         let reader_activity = last_activity_ms.clone();
+        // Data-bearing inbound only (not keepalives/grants): the writer keys
+        // its idle-hold length on whether the peer is mid-transfer.
+        let last_data_ms = Arc::new(AtomicU64::new(0));
+        let reader_data = last_data_ms.clone();
         let reader = tokio::spawn(async move {
             let mut reassembler = Reassembler::new();
             loop {
@@ -477,6 +510,7 @@ impl PactorMux {
                     warn!("[mux:reader] dropping message with unknown channel tag {tag}");
                     continue;
                 };
+                reader_data.store(now_ms(), Ordering::Relaxed);
                 if let Some(tx) = &inbound_tx[channel as usize] {
                     if tx.send(payload.to_vec()).await.is_err() {
                         debug!("[mux:reader] channel {channel:?} closed; dropping message");
@@ -489,6 +523,7 @@ impl PactorMux {
         // Writer: transmit while allowed, keepalive while idle, grant turns sparingly.
         let writer_transport = transport.clone();
         let writer_activity = last_activity_ms.clone();
+        let writer_data = last_data_ms.clone();
         let writer = tokio::spawn(async move {
             let _outbound_keepalive = outbound_keepalive;
             let mut high_rx = high_rx;
@@ -645,8 +680,9 @@ impl PactorMux {
                 }
 
                 // Hold an idle turn with periodic keepalives; real data breaks out immediately.
+                let idle_hold = idle_hold_for(writer_data.load(Ordering::Relaxed), now_ms());
                 let mut first_item = None;
-                let idle_until = tokio::time::Instant::now() + IDLE_TURN_GRANT;
+                let idle_until = tokio::time::Instant::now() + idle_hold;
                 loop {
                     let wait = KEEPALIVE_INTERVAL
                         .min(idle_until.saturating_duration_since(tokio::time::Instant::now()));
@@ -737,6 +773,10 @@ impl PactorMux {
                     tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
                     continue 'turn;
                 }
+                // Duplicate grant (~24 bytes on air): one corrupted grant line
+                // strands both sides turnless for a ~2-minute reclaim cycle.
+                let _ = write_message(&writer_transport, &counter, &mut pacer, TURN_GRANT_TAG, &[])
+                    .await;
                 if let Err(e) = writer_transport.changeover().await {
                     // The grant may already be queued; a duplicate next cycle is harmless.
                     warn!("[mux:writer] changeover failed: {e}; keeping the turn");
@@ -1145,6 +1185,17 @@ mod tests {
             "idle receive returned early (queue closed?)"
         );
         probe.abort();
+    }
+
+    #[test]
+    fn idle_hold_shortens_only_during_active_transfer() {
+        // Never received data (fresh clock included): long hold.
+        assert_eq!(idle_hold_for(0, 1_000), IDLE_TURN_GRANT);
+        // Peer sent data just now: short hold, its queue is likely full.
+        assert_eq!(idle_hold_for(100_000, 105_000), ACTIVE_IDLE_TURN_GRANT);
+        // Data older than the transfer window: back to the long hold.
+        let stale = ACTIVE_TRANSFER_WINDOW.as_millis() as u64 + 1;
+        assert_eq!(idle_hold_for(100_000, 100_000 + stale), IDLE_TURN_GRANT);
     }
 
     #[tokio::test(start_paused = true)]
