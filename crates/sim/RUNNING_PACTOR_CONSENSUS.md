@@ -342,13 +342,13 @@ experiments):
   disseminate, so raise `--delta-mult` if slots stop finalizing. Start around
   `BUNKER_BLOAT_BYTES=2000` on a healthy band and dial up/down from there.
   Unset / `0` = disabled (default).
-- `BUNKER_LINK_PACE_BPS` — on-air serial rate the half-duplex mux paces its
-  writes to (default 64 bytes/s). The modem arbitrates who transmits (an IRS
-  with buffered data breaks in), so this only keeps the modem's TX FIFO
-  shallow: a deep FIFO delays this node's own later votes/certs behind bulk
-  shreds, and the serial link runs without flow control. Raise toward ~100 on
-  a steady PACTOR-2/3 link; drop to ~32 if the modem banner shows 100–200 Bd
-  for long stretches.
+- `BUNKER_LINK_PACE_BPS` — cap on how fast the mux feeds hex line text into
+  the modem TX buffer (default 4000 bytes/s; an overflow guard, not link
+  pacing). The modem runs in SCS PACTOR duplex (`PDUPLEX 1`, set at init):
+  as ISS it changes over as soon as its buffer is empty, as IRS it breaks in
+  when it holds data. Feeding it slower than it transmits would therefore
+  hand the turn away between lines and cost a ~12s break-in per line — leave
+  this far above any PACTOR speed.
 - `BUNKER_RX_STALL_SECS` — seconds without a single received byte before the
   whole modem session is declared dead and rebuilt (default 600). Catches a
   modem stuck in a stale "connected" state that accepts writes but passes

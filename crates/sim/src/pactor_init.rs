@@ -166,6 +166,12 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
         "CHOB 0".to_owned(),
         // Ctrl-Z lets the ISS hand the transmit turn to the peer in converse mode.
         "CHO 26".to_owned(),
+        // PACTOR duplex: the modem arbitrates the turn itself — as ISS it
+        // changes over once its TX buffer is empty, as IRS it breaks in when
+        // it holds data. Without it the caller stays ISS forever and the
+        // listener's writes never leave its modem (observed: node0 rx 0 for
+        // 13 min while node1 kept transmitting into its own buffer).
+        PDUPLEX_ON.to_owned(),
         "TONES 4".to_owned(),
         "MARK 1600".to_owned(),
         "SPACE 1400".to_owned(),
@@ -174,7 +180,8 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
         "MODE 0".to_owned(),
     ];
     for command in &commands {
-        send_ascii(&mut serial, command).await?;
+        let resp = send_ascii(&mut serial, command).await?;
+        warn_if_rejected(command, &resp);
     }
 
     if cfg.listen {
@@ -241,6 +248,10 @@ pub async fn light_init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPacto
     tokio::time::sleep(Duration::from_millis(300)).await;
     drain_serial(&mut serial).await;
 
+    // Cheap to re-assert; a link without it is one-way (see init_modem).
+    let resp = send_ascii(&mut serial, PDUPLEX_ON).await?;
+    warn_if_rejected(PDUPLEX_ON, &resp);
+
     if cfg.listen {
         send_ascii(&mut serial, "LISTEN 1").await?;
     }
@@ -249,6 +260,19 @@ pub async fn light_init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPacto
     config.command_timeout = cfg.command_timeout;
     config.read_timeout = Some(Duration::from_secs(180));
     Ok(UsbPactorTransport::from_stream(serial, config))
+}
+
+/// SCS "PACTOR duplex": firmware-managed CHANGEOVER/BREAKIN so both stations
+/// transmit whenever they hold data.
+const PDUPLEX_ON: &str = "PDUPLEX 1";
+
+/// Terminal-mode config replies are best-effort text; only a rejection needs
+/// surfacing, because a silently ignored PDUPLEX leaves the link one-way.
+fn warn_if_rejected(command: &str, resp: &[u8]) {
+    let text = String::from_utf8_lossy(resp);
+    if text.contains("ERROR") || text.contains("No such command") {
+        eprintln!("[modem-init] {command} rejected: {}", text.trim());
+    }
 }
 
 /// Establish the PACTOR link from the caller side, retrying after brief settle delays.

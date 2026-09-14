@@ -3,14 +3,16 @@
 //! PACTOR is one half-duplex serial pipe, so the mux tags each outbound frame
 //! with a [`Channel`] and routes inbound payloads to typed [`MuxChannel`] queues.
 //!
-//! Turn discipline is the MODEM's job, not ours: in PACTOR converse mode an
-//! IRS with buffered data requests a break-in and the ISS yields at the next
-//! frame, so both sides simply write when they have something to say. An
-//! earlier software turn protocol (grant lines, Ctrl-Z changeovers, silence
-//! reclaims, a caller ceiling) fought that arbiter — stranded grants, 200–300s
-//! reclaim ladders, force-takes chopping frames — and was removed. What
-//! remains is priority lanes, pacing so the modem FIFO stays shallow, and idle
-//! keepalives for liveness.
+//! Turn discipline is the MODEM's job, not ours: the modem is brought up in
+//! SCS "PACTOR duplex" (`PDUPLEX 1`, see `pactor_init`), where the ISS
+//! changes over as soon as its TX buffer is empty and an IRS holding data
+//! breaks in after ~12s, so both sides simply write when they have something
+//! to say. An earlier software turn protocol (grant lines, Ctrl-Z
+//! changeovers, silence reclaims, a caller ceiling) fought that arbiter —
+//! stranded grants, 200–300s reclaim ladders, force-takes chopping frames —
+//! and was removed. What remains is priority lanes, whole-message bursts
+//! (never starve the modem mid-message, or it changes over per line), an
+//! overflow guard on the serial feed, and idle keepalives for liveness.
 
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -59,13 +61,13 @@ const STATS_INTERVAL: Duration = Duration::from_secs(60);
 /// Write-retry back-off; a writer that exits on error mutes the node forever.
 const WRITE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Estimated on-air serial line rate (hex `#…\r` lines), bytes/sec. Writes
-/// are paced to this so the modem TX FIFO stays shallow: a deep FIFO delays
-/// our own later priority messages behind bulk shreds (and FlowControl::None
-/// means an overrun loses data). Overestimating only costs that latency —
-/// the peer's break-in is modem-level and unaffected — so the default sits
-/// above worst-case PACTOR-1; pin via BUNKER_LINK_PACE_BPS for the link's
-/// real speed. Tests run unpaced unless they pin a rate.
+/// Serial feed cap for the modem TX buffer, bytes/sec of hex line text. This
+/// is an overflow guard, NOT link pacing: under PACTOR duplex the modem
+/// changes over the moment its buffer runs dry, so feeding it slower than it
+/// transmits would hand the turn away between every line and cost a ~12s
+/// break-in per line. The default sits far above any PACTOR speed; pin lower
+/// via BUNKER_LINK_PACE_BPS only to experiment. Tests run unpaced unless
+/// they pin a rate.
 fn pace_bytes_per_sec() -> u64 {
     let pinned = std::env::var("BUNKER_LINK_PACE_BPS")
         .ok()
@@ -78,7 +80,7 @@ fn pace_bytes_per_sec() -> u64 {
     })
 }
 
-const DEFAULT_PACE_BPS: u64 = 64;
+const DEFAULT_PACE_BPS: u64 = 4000;
 
 /// Unsent backlog the pacer tolerates in the modem TX FIFO; keeps short
 /// messages from serializing per-line while bounding priority inversion.
