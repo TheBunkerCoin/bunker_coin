@@ -165,9 +165,12 @@ const PACE_BURST: Duration = Duration::from_secs(3);
 /// grant, the peer cannot transmit until OUR modem FIFO physically drains,
 /// so its first line arriving promptly proves the pace kept up with the real
 /// link — probe higher. A late answer means the paced turn overran the link
-/// (or a fade ate the grant) — cut hard. Between the two, hold.
-const GRANT_LAG_RAISE_MS: u64 = 30_000;
-const GRANT_LAG_CUT_MS: u64 = 60_000;
+/// (or a fade ate the grant) — cut hard. Between the two, hold. Calibrated
+/// to a MEASURED healthy handoff of ~78s on 200 Bd PACTOR-1 (the ARQ
+/// turnaround alone is ~60s): a raise bound tighter than that reads every
+/// healthy handoff as distress and pins the rate at the floor.
+const GRANT_LAG_RAISE_MS: u64 = 120_000;
+const GRANT_LAG_CUT_MS: u64 = 210_000;
 
 /// Applies one AIMD step from an observed grant-response lag.
 fn adjust_pace_on_grant_lag(rate: &AtomicU64, lag_ms: u64) {
@@ -791,6 +794,20 @@ impl PactorMux {
                     outbound_take_budget = LISTENER_OUTBOUND_TAKE_BUDGET;
                 }
 
+                // Fade guard: our last grant was never answered, so the link
+                // is suspect — probe with keepalives instead of pouring queued
+                // blocks into a modem FIFO that is not draining. Post-fade
+                // that stale backlog re-creates the very livelock pacing
+                // exists to prevent; the mux queues keep the data until the
+                // first inbound line resolves the probe.
+                if grant_probe.is_some_and(|g| now_ms().saturating_sub(g) >= GRANT_LAG_CUT_MS) {
+                    let _ =
+                        write_message(&writer_transport, &counter, &mut pacer, KEEPALIVE_TAG, &[])
+                            .await;
+                    tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+                    continue 'turn;
+                }
+
                 // Keepalive immediately after acquiring an idle turn.
                 if high_rx.is_empty() && low_rx.is_empty() {
                     if let Err(e) =
@@ -1348,18 +1365,18 @@ mod tests {
     #[test]
     fn grant_lag_aimd_probes_up_and_cuts_hard() {
         let rate = AtomicU64::new(100);
-        // Prompt response: multiplicative-ish probe upward.
-        adjust_pace_on_grant_lag(&rate, 10_000);
+        // A normal handoff on this link (~78s measured) must read as healthy.
+        adjust_pace_on_grant_lag(&rate, 78_000);
         assert_eq!(rate.load(Ordering::Relaxed), 111);
         // Dead zone: hold.
-        adjust_pace_on_grant_lag(&rate, 45_000);
+        adjust_pace_on_grant_lag(&rate, 150_000);
         assert_eq!(rate.load(Ordering::Relaxed), 111);
         // Late response (overrun or lost grant): cut to 70%.
-        adjust_pace_on_grant_lag(&rate, 90_000);
+        adjust_pace_on_grant_lag(&rate, 240_000);
         assert_eq!(rate.load(Ordering::Relaxed), 77);
         // Cuts bottom out at the P1 floor, raises cap at the ceiling.
         for _ in 0..10 {
-            adjust_pace_on_grant_lag(&rate, 90_000);
+            adjust_pace_on_grant_lag(&rate, 240_000);
         }
         assert_eq!(rate.load(Ordering::Relaxed), ADAPTIVE_START_BPS);
         for _ in 0..40 {
