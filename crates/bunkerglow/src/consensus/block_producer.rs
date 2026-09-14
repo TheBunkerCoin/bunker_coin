@@ -141,24 +141,6 @@ where
 
             let last_slot_in_window = first_slot_in_window.last_slot_in_window();
 
-            // After a restart this loop starts at genesis while the pool floor
-            // is ahead; without this skip the leader re-produces every
-            // historical window before emitting anything new.
-            let (finalized, first_slot_skip_certed) = {
-                let pool = self.pool.read().await;
-                (
-                    pool.finalized_slot(),
-                    pool.has_skip_cert(first_slot_in_window),
-                )
-            };
-            if window_already_decided(first_slot_in_window, finalized, first_slot_skip_certed) {
-                debug!(
-                    "[val {}] not producing in window {first_slot_in_window}..{last_slot_in_window}, already decided (finalized {finalized}, first-slot skip cert: {first_slot_skip_certed})",
-                    self.epoch_info.own_id
-                );
-                continue;
-            }
-
             let leader = self.epoch_info.leader(first_slot_in_window);
             if leader.id != self.epoch_info.own_id {
                 debug!(
@@ -168,63 +150,105 @@ where
                 continue;
             }
 
-            let stored = self
-                .blockstore
-                .read()
-                .await
-                .canonical_block_hash(first_slot_in_window)
-                .is_some();
-            if window_already_produced(first_slot_in_window, stored) {
-                // Re-produce would fork (drifted mempool), but a peer that never
-                // received our tail shreds before a restart cannot repair a block
-                // it can't name (repair is hash-addressed) — it times out and
-                // skip-certs our valid block permanently. Re-disseminate the exact
-                // STORED shreds instead: byte-identical, so no fork, and the peer
-                // reconstructs and notar-votes the slots it was missing.
-                info!(
-                    "[val {}] window {first_slot_in_window}..{last_slot_in_window} already stored — re-disseminating stored shreds after restart",
-                    self.epoch_info.own_id
-                );
-                self.redisseminate_stored_window(first_slot_in_window).await;
-                continue;
-            }
-
-            let slot_ready = wait_for_first_slot(
-                self.pool.clone(),
-                self.blockstore.clone(),
-                first_slot_in_window,
-            )
-            .await;
-
-            let start = Instant::now();
-            let mut block_id = match slot_ready {
-                SlotReady::Skip => {
-                    warn!(
-                        "not producing in window {first_slot_in_window}..{last_slot_in_window}, saw later finalization"
+            // Production starts at the first slot finality has not covered.
+            // After a restart this loop starts at genesis while the pool floor
+            // is ahead, so decided windows are skipped outright; a window whose
+            // PREFIX is finalized (a peer's cert landed for slots we lost) is
+            // resumed right after finality instead of abandoned — its open
+            // slots are still votable, and leaving them unproduced costs the
+            // full crashed-leader timeout budget before anyone can skip them.
+            let mut start_slot = first_slot_in_window;
+            let first_block = loop {
+                let (finalized, first_slot_skip_certed) = {
+                    let pool = self.pool.read().await;
+                    (
+                        pool.finalized_slot(),
+                        pool.has_skip_cert(first_slot_in_window),
+                    )
+                };
+                let Some(resume) =
+                    window_resume_slot(first_slot_in_window, finalized, first_slot_skip_certed)
+                else {
+                    debug!(
+                        "[val {}] not producing in window {first_slot_in_window}..{last_slot_in_window}, already decided (finalized {finalized}, first-slot skip cert: {first_slot_skip_certed})",
+                        self.epoch_info.own_id
                     );
-                    continue;
+                    break None;
+                };
+                start_slot = start_slot.max(resume);
+
+                let stored = self
+                    .blockstore
+                    .read()
+                    .await
+                    .canonical_block_hash(start_slot)
+                    .is_some();
+                if window_already_produced(start_slot, stored) {
+                    // Re-produce would fork (drifted mempool), but a peer that never
+                    // received our tail shreds before a restart cannot repair a block
+                    // it can't name (repair is hash-addressed) — it times out and
+                    // skip-certs our valid block permanently. Re-disseminate the exact
+                    // STORED shreds instead: byte-identical, so no fork, and the peer
+                    // reconstructs and notar-votes the slots it was missing.
+                    info!(
+                        "[val {}] window {first_slot_in_window}..{last_slot_in_window} already stored — re-disseminating stored shreds after restart",
+                        self.epoch_info.own_id
+                    );
+                    self.redisseminate_stored_window(first_slot_in_window).await;
+                    break None;
                 }
-                SlotReady::Ready(parent) => {
-                    if first_slot_in_window.is_genesis() {
-                        // genesis block is already produced so skip it
-                        (first_slot_in_window, GENESIS_BLOCK_HASH)
-                    } else {
-                        self.produce_block_parent_ready(first_slot_in_window, parent)
+                if start_slot != first_slot_in_window {
+                    info!(
+                        "[val {}] resuming window {first_slot_in_window}..{last_slot_in_window} at slot {start_slot}: finality already covers {finalized}",
+                        self.epoch_info.own_id
+                    );
+                }
+
+                let slot_ready =
+                    wait_for_slot_ready(self.pool.clone(), self.blockstore.clone(), start_slot)
+                        .await;
+
+                let start = Instant::now();
+                let block_id = match slot_ready {
+                    SlotReady::Skip => {
+                        if self.pool.read().await.finalized_slot() < last_slot_in_window {
+                            // Finality landed inside our window while we waited;
+                            // recompute where to resume rather than abandon it.
+                            continue;
+                        }
+                        warn!(
+                            "not producing in window {first_slot_in_window}..{last_slot_in_window}, saw later finalization"
+                        );
+                        break None;
+                    }
+                    SlotReady::Ready(parent) => {
+                        if start_slot.is_genesis() {
+                            // genesis block is already produced so skip it
+                            (start_slot, GENESIS_BLOCK_HASH)
+                        } else {
+                            self.produce_block_parent_ready(start_slot, parent).await?
+                        }
+                    }
+                    SlotReady::ParentReadyNotSeen(parent, channel) => {
+                        self.produce_block_parent_not_ready(start_slot, parent, channel)
                             .await?
                     }
-                }
-                SlotReady::ParentReadyNotSeen(parent, channel) => {
-                    self.produce_block_parent_not_ready(first_slot_in_window, parent, channel)
-                        .await?
-                }
+                };
+                debug!(
+                    "produced block {} in {} ms",
+                    start_slot,
+                    start.elapsed().as_millis()
+                );
+                break Some(block_id);
             };
-            debug!(
-                "produced block {} in {} ms",
-                first_slot_in_window,
-                start.elapsed().as_millis()
-            );
+            let Some(mut block_id) = first_block else {
+                continue;
+            };
 
-            for slot in first_slot_in_window.slots_in_window().skip(1) {
+            for slot in first_slot_in_window.slots_in_window() {
+                if slot <= start_slot {
+                    continue;
+                }
                 let slot_epoch = slot.epoch();
                 if slot_epoch > current_epoch {
                     info!(
@@ -648,18 +672,28 @@ fn window_already_produced(first_slot: Slot, first_slot_block_stored: bool) -> b
     first_slot_block_stored && !first_slot.is_genesis()
 }
 
-/// Finality at the first slot (genesis: last slot) or a first-slot skip cert
-/// means votes are spent; a late block can never be notarized.
-fn window_already_decided(first_slot: Slot, finalized: Slot, first_slot_skip_certed: bool) -> bool {
+/// First slot of the window still open for production, or `None` when the
+/// window is decided: finality reached its last slot, or a first-slot skip
+/// cert spent the votes (a late block there can never be notarized). A
+/// finalized PREFIX resumes right after finality, whose block is the parent.
+/// The genesis window always starts at genesis (block 0 pre-exists).
+fn window_resume_slot(
+    first_slot: Slot,
+    finalized: Slot,
+    first_slot_skip_certed: bool,
+) -> Option<Slot> {
     if first_slot_skip_certed {
-        return true;
+        return None;
     }
-    let decided_at = if first_slot.is_genesis() {
-        first_slot.last_slot_in_window()
+    let last_slot = first_slot.last_slot_in_window();
+    if finalized >= last_slot {
+        return None;
+    }
+    if first_slot.is_genesis() || finalized < first_slot {
+        Some(first_slot)
     } else {
-        first_slot
-    };
-    finalized >= decided_at
+        Some(finalized.next())
+    }
 }
 
 /// Outcome of [`wait_for_first_slot`].
@@ -673,22 +707,22 @@ enum SlotReady {
     ParentReadyNotSeen(BlockId, oneshot::Receiver<BlockId>),
 }
 
-/// Waits for the window's first slot to become ready for production: either
-/// the pool emitted `ParentReady`, or the previous slot's block was stored.
-async fn wait_for_first_slot(
+/// Waits for the window's starting slot (its first slot, or the resume slot
+/// after a finalized prefix) to become ready for production: either the pool
+/// emitted `ParentReady`, or the previous slot's block was stored.
+async fn wait_for_slot_ready(
     pool: Arc<RwLock<Box<dyn Pool + Send + Sync>>>,
     blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
-    first_slot_in_window: Slot,
+    slot: Slot,
 ) -> SlotReady {
-    assert!(first_slot_in_window.is_start_of_window());
-    if first_slot_in_window.is_genesis_window() {
+    if slot.is_genesis_window() {
         return SlotReady::Ready((Slot::genesis(), GENESIS_BLOCK_HASH));
     }
 
     // if already have parent ready, return it, otherwise get a channel to await on
     let mut rx = {
         let mut guard = pool.write().await;
-        match guard.wait_for_parent_ready(first_slot_in_window) {
+        match guard.wait_for_parent_ready(slot) {
             Either::Left(parent) => {
                 return SlotReady::Ready(parent);
             }
@@ -710,13 +744,13 @@ async fn wait_for_first_slot(
             let handle = tokio::spawn(async move {
                 // PERF: These are burning a CPU. Can we use async here?
                 loop {
-                    let last_slot_in_prev_window = first_slot_in_window.prev();
+                    let prev_slot = slot.prev();
                     if let Some(hash) = blockstore.read().await
-                        .disseminated_block_hash(last_slot_in_prev_window)
+                        .disseminated_block_hash(prev_slot)
                     {
-                        return Some((last_slot_in_prev_window, hash.clone()));
+                        return Some((prev_slot, hash.clone()));
                     }
-                    if pool.read().await.finalized_slot() >= first_slot_in_window {
+                    if pool.read().await.finalized_slot() >= slot {
                         return None;
                     }
                     sleep(Duration::from_millis(1)).await;
@@ -824,24 +858,34 @@ mod tests {
         assert!(payload.data.len() > MAX_DATA_PER_SLICE - MAX_TRANSACTION_SIZE);
     }
 
-    /// Decided windows must not be produced; doomed blocks waste radio airtime.
+    /// Decided windows must not be produced (doomed blocks waste radio
+    /// airtime); a window whose prefix is finalized resumes right after it.
     #[test]
-    fn decided_windows_are_not_produced() {
+    fn windows_resume_after_finality_or_are_skipped_when_decided() {
         let w = Slot::windows().nth(10).unwrap();
-        assert!(window_already_decided(w, w, false));
-        assert!(window_already_decided(w, w.next(), false));
-        assert!(!window_already_decided(w, w.prev(), false));
+        let last = w.last_slot_in_window();
+        // Untouched window starts at its first slot.
+        assert_eq!(window_resume_slot(w, w.prev(), false), Some(w));
+        // First slot finalized by a peer's cert: resume at the second slot.
+        assert_eq!(window_resume_slot(w, w, false), Some(w.next()));
+        assert_eq!(
+            window_resume_slot(w, w.next(), false),
+            Some(w.next().next())
+        );
+        // Finality at or past the last slot: nothing left to produce.
+        assert_eq!(window_resume_slot(w, last, false), None);
+        assert_eq!(window_resume_slot(w, last.next(), false), None);
         // A skip cert on the first slot dooms any late block.
-        assert!(window_already_decided(w, Slot::genesis(), true));
-        // The genesis window only counts as decided past its last slot.
+        assert_eq!(window_resume_slot(w, Slot::genesis(), true), None);
+        // The genesis window always starts at genesis and is decided only past
+        // its last slot.
         let g = Slot::genesis();
-        assert!(!window_already_decided(g, g, false));
-        assert!(!window_already_decided(
-            g,
-            g.last_slot_in_window().prev(),
-            false
-        ));
-        assert!(window_already_decided(g, g.last_slot_in_window(), false));
+        assert_eq!(window_resume_slot(g, g, false), Some(g));
+        assert_eq!(
+            window_resume_slot(g, g.last_slot_in_window().prev(), false),
+            Some(g)
+        );
+        assert_eq!(window_resume_slot(g, g.last_slot_in_window(), false), None);
     }
 
     /// A window whose first-slot block is already stored must not be re-produced.
@@ -861,7 +905,7 @@ mod tests {
         let blockstore: Box<dyn Blockstore + Send + Sync> = Box::new(MockBlockstore::new());
         let blockstore = Arc::new(RwLock::new(blockstore));
 
-        let status = wait_for_first_slot(pool, blockstore, Slot::genesis()).await;
+        let status = wait_for_slot_ready(pool, blockstore, Slot::genesis()).await;
         assert!(matches!(status, SlotReady::Ready(_)));
     }
 
@@ -881,7 +925,7 @@ mod tests {
         let pool: Box<dyn Pool + Send + Sync> = Box::new(pool);
         let pool = Arc::new(RwLock::new(pool));
 
-        let status = wait_for_first_slot(pool, blockstore, slot).await;
+        let status = wait_for_slot_ready(pool, blockstore, slot).await;
         match status {
             SlotReady::Ready(p) => assert_eq!(p, parent),
             other => panic!("unexpected {other:?}"),
@@ -905,7 +949,7 @@ mod tests {
         let pool: Box<dyn Pool + Send + Sync> = Box::new(pool);
         let pool = Arc::new(RwLock::new(pool));
 
-        let status = wait_for_first_slot(pool, blockstore, slot).await;
+        let status = wait_for_slot_ready(pool, blockstore, slot).await;
         match status {
             SlotReady::Ready(p) => assert_eq!(p, parent),
             other => panic!("unexpected {other:?}"),
