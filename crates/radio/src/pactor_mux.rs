@@ -50,10 +50,14 @@ const TURN_GRANT_TAG: u8 = 0xFF;
 /// Control tag for idle traffic that keeps liveness clocks fresh.
 const KEEPALIVE_TAG: u8 = 0xFE;
 
-/// Send a keepalive once neither direction has carried anything for this
-/// long. Inbound traffic counts: a keepalive from the receiving side would
-/// force a modem break-in into the peer's stream for nothing.
-const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+/// Send a keepalive once WE have not transmitted for this long, whatever the
+/// peer is doing. On a half-duplex link a station streaming for minutes
+/// hears nothing, so its rx-stall watchdog and Votor liveness depend on the
+/// receiving side breaking in with a line now and then; suppressing that on
+/// inbound left the caller at `rx 0` while the listener stayed politely
+/// silent. Under PACTOR duplex each such break-in costs a few seconds of the
+/// sender's airtime, so this sits well under the 600s watchdog but not tight.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 
 /// Periodic traffic summary interval.
 const STATS_INTERVAL: Duration = Duration::from_secs(60);
@@ -464,9 +468,8 @@ impl PactorMux {
                     tx_bytes = 0;
                 }
                 let idle_since = |last_tx_tick: u64| {
-                    let last_rx_tick = writer_rx_tick.load(Ordering::Relaxed);
                     let now_tick = epoch.elapsed().as_millis() as u64;
-                    Duration::from_millis(now_tick.saturating_sub(last_tx_tick.max(last_rx_tick)))
+                    Duration::from_millis(now_tick.saturating_sub(last_tx_tick))
                 };
                 let keepalive_in = KEEPALIVE_IDLE.saturating_sub(idle_since(last_tx_tick));
                 let item = tokio::select! {
@@ -478,12 +481,7 @@ impl PactorMux {
                             return;
                         }
                     },
-                    // Re-check on wake: inbound that arrived mid-sleep means the
-                    // link is alive and a keepalive would only force a break-in.
-                    _ = tokio::time::sleep(keepalive_in) => {
-                        (idle_since(last_tx_tick) >= KEEPALIVE_IDLE)
-                            .then(|| (KEEPALIVE_TAG, Vec::new()))
-                    }
+                    _ = tokio::time::sleep(keepalive_in) => Some((KEEPALIVE_TAG, Vec::new())),
                 };
                 if let Some((tag, payload)) = item {
                     match write_message(&writer_transport, &counter, &mut pacer, tag, &payload)
@@ -960,24 +958,33 @@ mod tests {
         assert_eq!(transport.written_tags().await.len(), 2);
     }
 
-    /// Inbound traffic proves the link alive, so the receiving side stays
-    /// silent instead of forcing a modem break-in into the peer's stream.
+    /// A station that only receives must still break in with keepalives: the
+    /// streaming peer hears nothing on a half-duplex link, and its rx-stall
+    /// watchdog and Votor liveness depend on these lines.
     #[tokio::test(start_paused = true)]
-    async fn half_duplex_inbound_suppresses_keepalive() {
+    async fn half_duplex_keepalives_even_while_receiving() {
         let transport = Arc::new(RecordingTransport::new());
         let mut mux = PactorMux::new_half_duplex(transport.clone(), false);
         let _chan: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
         let _h = mux.spawn();
 
-        // A fragment arrives every 20s for two minutes: never idle long enough.
+        // A fragment arrives every 20s for two minutes.
         for _ in 0..6 {
             let line = fragment_message(7, &[Channel::Disseminator as u8, 1, 2, 3]).remove(0);
             transport.inbound.lock().await.push_back(line);
             tokio::time::sleep(Duration::from_secs(20)).await;
         }
-        assert!(
-            transport.written.lock().await.is_empty(),
-            "receiving side must not keepalive while inbound flows"
+        // Settle past the t=120s keepalive deadline before counting.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let keepalives = transport
+            .written_tags()
+            .await
+            .into_iter()
+            .filter(|t| *t == KEEPALIVE_TAG)
+            .count();
+        assert_eq!(
+            keepalives, 2,
+            "two minutes of pure receiving must produce one keepalive per KEEPALIVE_IDLE"
         );
     }
 
