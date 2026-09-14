@@ -67,7 +67,10 @@ const BULK_WINDOW: usize = 2;
 
 /// Give up waiting for a bulk ack after this long and release its window
 /// slot; PACTOR ARQ is lossless, so only a corrupted ack line gets here.
-const BULK_ACK_TIMEOUT: Duration = Duration::from_secs(240);
+/// Must exceed a full window's delivery on the slowest observed link (two
+/// ~1.7 KB shreds at ~10 B/s ≈ 340 s), else slots release on timeout instead
+/// of on ack.
+const BULK_ACK_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Send a keepalive once WE have not transmitted for this long, whatever the
 /// peer is doing. On a half-duplex link a station streaming for minutes
