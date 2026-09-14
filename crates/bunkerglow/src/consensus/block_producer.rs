@@ -176,6 +176,21 @@ where
                     break None;
                 };
                 start_slot = start_slot.max(resume);
+                // A slot already carrying a skip cert can never be notarized;
+                // a block produced into it only burns airtime (the peer voted
+                // skip long ago when our original block never reached it).
+                while start_slot <= last_slot_in_window
+                    && self.pool.read().await.has_skip_cert(start_slot)
+                {
+                    start_slot = start_slot.next();
+                }
+                if start_slot > last_slot_in_window {
+                    debug!(
+                        "[val {}] not producing in window {first_slot_in_window}..{last_slot_in_window}, remaining slots are skip-certified",
+                        self.epoch_info.own_id
+                    );
+                    break None;
+                }
 
                 let stored = self
                     .blockstore
@@ -268,12 +283,25 @@ where
                 }
 
                 // Catch-up can finalize past us mid-window; further blocks are unvotable.
-                if self.pool.read().await.finalized_slot() >= slot {
+                let (finalized, skip_certed) = {
+                    let pool = self.pool.read().await;
+                    (pool.finalized_slot(), pool.has_skip_cert(slot))
+                };
+                if finalized >= slot {
                     warn!(
                         "[val {}] abandoning window at slot {slot}, finality moved past it",
                         self.epoch_info.own_id
                     );
                     break;
+                }
+                // Skip-certified: unvotable, so chain the next slot onto our
+                // last block instead (a skipped slot between them is valid).
+                if skip_certed {
+                    warn!(
+                        "[val {}] slot {slot} already skip-certified; not producing a doomed block",
+                        self.epoch_info.own_id
+                    );
+                    continue;
                 }
 
                 let start = Instant::now();

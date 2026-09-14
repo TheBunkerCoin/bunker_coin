@@ -21,6 +21,17 @@ use crate::shredder::{Shred, ShredIndex};
 use crate::types::SliceIndex;
 use crate::{BlockId, ValidatorId};
 
+/// Doubling cap for repair retries: a slow radio link delivers a shred
+/// response in minutes, so a flat timeout re-requested every in-flight
+/// shred several times before it could land and the duplicates buried
+/// everything else in the peer's modem buffer.
+const MAX_REPAIR_BACKOFF_EXP: u32 = 3;
+
+/// Retry delay after `retries` unanswered attempts.
+fn retry_delay(retries: u32) -> Duration {
+    repair_timeout() * 2u32.pow(retries.min(MAX_REPAIR_BACKOFF_EXP))
+}
+
 /// Repair response timeout before retrying another peer.
 fn repair_timeout() -> Duration {
     delta() * 2
@@ -168,6 +179,8 @@ pub struct Repair<N: Network> {
     outstanding_requests: BTreeMap<Hash, RepairRequestType>,
     /// Retry deadlines, soonest first; `Reverse` makes the heap pop earliest due.
     request_timeouts: BinaryHeap<std::cmp::Reverse<(Instant, Hash)>>,
+    /// Unanswered retries per outstanding request, driving the backoff.
+    retries: BTreeMap<Hash, u32>,
     network: N,
     sampler: StakeWeightedSampler,
     epoch_info: Arc<EpochInfo>,
@@ -192,6 +205,7 @@ where
             slice_roots: BTreeMap::new(),
             outstanding_requests: BTreeMap::new(),
             request_timeouts: BinaryHeap::new(),
+            retries: BTreeMap::new(),
             network,
             sampler,
             epoch_info,
@@ -220,6 +234,7 @@ where
                     };
                     if let Some(request) = self.outstanding_requests.remove(&hash) {
                         debug!("retrying timed-out repair request {request:?}");
+                        *self.retries.entry(hash).or_insert(0) += 1;
                         self.send_request(request).await.unwrap();
                     }
                 }
@@ -251,6 +266,7 @@ where
             debug!("received repair response for already-settled request");
             return;
         };
+        self.retries.remove(&request_hash);
         // Re-arm malformed responses; one bad response must not kill repair.
         let handled: bool = 'validate: {
             match response {
@@ -359,7 +375,8 @@ where
     async fn send_request(&mut self, req_type: RepairRequestType) -> std::io::Result<()> {
         let hash = req_type.hash();
 
-        let expiry = Instant::now() + repair_timeout();
+        let retries = self.retries.get(&hash).copied().unwrap_or(0);
+        let expiry = Instant::now() + retry_delay(retries);
         self.outstanding_requests
             .insert(hash.clone(), req_type.clone());
         self.request_timeouts
@@ -402,6 +419,17 @@ mod tests {
     use tokio::sync::mpsc::Sender;
 
     use super::*;
+
+    /// Retries double until the cap so an in-flight response is never
+    /// re-requested more than once before it can land on a slow link.
+    #[test]
+    fn retry_delay_backs_off_and_caps() {
+        let base = repair_timeout();
+        assert_eq!(retry_delay(0), base);
+        assert_eq!(retry_delay(1), base * 2);
+        assert_eq!(retry_delay(3), base * 8);
+        assert_eq!(retry_delay(9), base * 8);
+    }
     use crate::consensus::{BlockstoreImpl, PoolImpl};
     use crate::crypto::signature::SecretKey;
     use crate::network::simulated::SimulatedNetworkCore;

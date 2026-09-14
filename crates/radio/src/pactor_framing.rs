@@ -125,8 +125,23 @@ impl Reassembler {
         self.push_line_at(line, std::time::Instant::now())
     }
 
+    /// Like [`push_line`](Self::push_line), also returning the sender's message id
+    /// so a receiver can acknowledge exactly what it reassembled.
+    pub fn push_line_with_id(&mut self, line: &[u8]) -> Option<(u64, Vec<u8>)> {
+        self.push_line_at_with_id(line, std::time::Instant::now())
+    }
+
     /// Test hook for driving TTL eviction with an explicit clock.
     fn push_line_at(&mut self, line: &[u8], now: std::time::Instant) -> Option<Vec<u8>> {
+        self.push_line_at_with_id(line, now)
+            .map(|(_, message)| message)
+    }
+
+    fn push_line_at_with_id(
+        &mut self,
+        line: &[u8],
+        now: std::time::Instant,
+    ) -> Option<(u64, Vec<u8>)> {
         // Lost fragments cannot pin message ids or memory past the TTL.
         self.partial
             .retain(|_, state| now.duration_since(state.created) < REASSEMBLY_TTL);
@@ -140,7 +155,7 @@ impl Reassembler {
         }
 
         if header.total_fragments == 1 {
-            return Some(chunk);
+            return Some((header.message_id, chunk));
         }
 
         // Cap concurrent reassemblies: make room by dropping the oldest.
@@ -190,7 +205,7 @@ impl Reassembler {
             }
         }
         self.partial.remove(&header.message_id);
-        Some(message)
+        Some((header.message_id, message))
     }
 }
 
