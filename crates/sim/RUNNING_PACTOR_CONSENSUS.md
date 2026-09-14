@@ -342,13 +342,13 @@ experiments):
   disseminate, so raise `--delta-mult` if slots stop finalizing. Start around
   `BUNKER_BLOAT_BYTES=2000` on a healthy band and dial up/down from there.
   Unset / `0` = disabled (default).
-- `BUNKER_TURN_RECLAIM_MS` — how long the half-duplex mux tolerates total
-  inbound silence with no transmit turn before reclaiming it (default 60000).
-  Recovery path for a turn-grant frame lost on the air.
-- `BUNKER_RECLAIM_STAGGER_MS` — extra reclaim delay on the listener side
-  (default 40000) so only the caller reclaims in the common case. Must exceed
-  a full changeover round-trip, or both sides reclaim together and their
-  grants collide.
+- `BUNKER_LINK_PACE_BPS` — on-air serial rate the half-duplex mux paces its
+  writes to (default 64 bytes/s). The modem arbitrates who transmits (an IRS
+  with buffered data breaks in), so this only keeps the modem's TX FIFO
+  shallow: a deep FIFO delays this node's own later votes/certs behind bulk
+  shreds, and the serial link runs without flow control. Raise toward ~100 on
+  a steady PACTOR-2/3 link; drop to ~32 if the modem banner shows 100–200 Bd
+  for long stretches.
 - `BUNKER_RX_STALL_SECS` — seconds without a single received byte before the
   whole modem session is declared dead and rebuilt (default 600). Catches a
   modem stuck in a stale "connected" state that accepts writes but passes

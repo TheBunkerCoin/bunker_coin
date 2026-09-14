@@ -2,18 +2,25 @@
 //!
 //! PACTOR is one half-duplex serial pipe, so the mux tags each outbound frame
 //! with a [`Channel`] and routes inbound payloads to typed [`MuxChannel`] queues.
-//! In half-duplex mode only the turn-holder writes; keepalives preserve ARQ
-//! liveness and silence-based reclaim recovers a lost turn grant.
+//!
+//! Turn discipline is the MODEM's job, not ours: in PACTOR converse mode an
+//! IRS with buffered data requests a break-in and the ISS yields at the next
+//! frame, so both sides simply write when they have something to say. An
+//! earlier software turn protocol (grant lines, Ctrl-Z changeovers, silence
+//! reclaims, a caller ceiling) fought that arbiter — stranded grants, 200–300s
+//! reclaim ladders, force-takes chopping frames — and was removed. What
+//! remains is priority lanes, pacing so the modem FIFO stays shallow, and idle
+//! keepalives for liveness.
 
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use bunkerglow::consensus::LinkLiveness;
 
-// Monotonic process-local clock for liveness and reclaim timestamps.
+// Monotonic process-local clock for liveness timestamps.
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 fn now_ms() -> u64 {
@@ -22,9 +29,9 @@ fn now_ms() -> u64 {
 
 use async_trait::async_trait;
 use bunkerglow::network::Network;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use scs_pactor::{PactorTransport, ScsPactorError};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex};
 use wincode::{SchemaRead, SchemaWrite};
 
 use crate::pactor_framing::{fragment_message, Reassembler};
@@ -34,236 +41,74 @@ const DEFAULT_MAX_READ_LEN: usize = 8192;
 /// Per-channel queue bound before backpressure reaches the single reader task.
 const CHANNEL_QUEUE_DEPTH: usize = 1024;
 
-/// Control tag used to hand the transmit turn to the peer.
+/// Legacy control tag from the removed software turn protocol; still ignored
+/// on receive so a peer running an older build cannot inject garbage.
 const TURN_GRANT_TAG: u8 = 0xFF;
 
-/// Control tag for idle traffic that keeps the ARQ link from timing out.
+/// Control tag for idle traffic that keeps liveness clocks fresh.
 const KEEPALIVE_TAG: u8 = 0xFE;
 
-/// Caps one-sided transmit bursts so the peer can send votes. With paced
-/// writes this is real airtime: sized for ~2 shreds per turn (a paced shred
-/// is ~75s at the default rate), because a 30s cap shipped one shred per
-/// turn and every shred paid a full grant/changeover/return cycle — and each
-/// extra changeover is another chance to lose the grant line on a fade.
-/// Not larger: if the pace estimate overruns the real link, the grant lands
-/// (turn × overrun-factor) late, and it must still beat the caller's 300s
-/// turnless ceiling.
-const MAX_TURN_HOLD: Duration = Duration::from_secs(90);
+/// Send a keepalive once neither direction has carried anything for this
+/// long. Inbound traffic counts: a keepalive from the receiving side would
+/// force a modem break-in into the peer's stream for nothing.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 
-/// Wait for async follow-up messages before ending a data turn.
-const TURN_DRAIN_GRACE: Duration = Duration::from_secs(3);
-
-/// Idle keepalive interval; kept under the modem's ~40s inactivity timeout.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7);
-
-/// Idle turn hold before grant; long to minimize fragile changeovers.
-const IDLE_TURN_GRANT: Duration = Duration::from_secs(60);
-
-/// Idle hold while the peer is mid-transfer: its last turn carried data, so
-/// it likely has more queued — sitting on an idle turn for the full
-/// [`IDLE_TURN_GRANT`] halves catch-up throughput with keepalives.
-const ACTIVE_IDLE_TURN_GRANT: Duration = Duration::from_secs(10);
-
-/// Inbound data younger than this marks the peer as mid-transfer.
-const ACTIVE_TRANSFER_WINDOW: Duration = Duration::from_secs(45);
-
-/// Idle-hold length before granting: short while the peer is mid-transfer
-/// (it granted with a full queue and every idle second here is its airtime),
-/// long otherwise to minimize fragile changeovers. A zero `last_data_ms`
-/// means no data was ever received (not "recent").
-fn idle_hold_for(last_data_ms: u64, now: u64) -> Duration {
-    if last_data_ms != 0
-        && now.saturating_sub(last_data_ms) <= ACTIVE_TRANSFER_WINDOW.as_millis() as u64
-    {
-        ACTIVE_IDLE_TURN_GRANT
-    } else {
-        IDLE_TURN_GRANT
-    }
-}
-
-/// Silent interval before a non-holder self-grants after a lost grant or dead peer.
-/// Must exceed normal keepalive/changeover gaps; test-overridable via env.
-fn turn_reclaim_silence() -> Duration {
-    std::env::var("BUNKER_TURN_RECLAIM_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(60))
-}
-
-/// Listener-only reclaim delay; keeps the caller first and avoids mutual-reclaim livelock.
-fn reclaim_role_stagger() -> Duration {
-    std::env::var("BUNKER_RECLAIM_STAGGER_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(40))
-}
-
-/// Caller-only ceiling on turnless time; inbound does not defer it, else a
-/// peer's buffered TX backlog pins the silence gate shut while the listener yields.
-fn turnless_reclaim_ceiling() -> Duration {
-    std::env::var("BUNKER_TURNLESS_RECLAIM_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(300))
-}
-
-/// Payload bytes one turn may enqueue before granting — an upper bound only:
-/// [`LinkPacer`] makes writes take real airtime, so MAX_TURN_HOLD cuts a turn
-/// long before this cap on slow links; the cap matters only when
-/// BUNKER_LINK_PACE_BPS is raised to match a fast link.
-fn turn_byte_budget() -> usize {
-    std::env::var("BUNKER_TURN_BYTE_BUDGET")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(8 * 1024)
-}
+/// Periodic traffic summary interval.
+const STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Write-retry back-off; a writer that exits on error mutes the node forever.
 const WRITE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Manually pinned on-air serial line rate, bytes/sec. Set, it disables the
-/// adaptive estimator and paces at exactly this rate; unset, pacing starts at
-/// [`ADAPTIVE_START_BPS`] and follows the measured link. The writer paces
-/// enqueues so a software turn approximates the on-air turn: unpaced, a turn
-/// floods the modem TX FIFO in milliseconds and drains for minutes at
-/// PACTOR-1 rates, so the peer sees the turn-grant only after the whole
-/// backlog — both sides' reclaim timers then fire mid-drain and forced
-/// changeovers chop in-flight lines (observed: tip frozen 24h+ in turn thrash).
-fn pinned_pace_bps() -> Option<u64> {
+/// Estimated on-air serial line rate (hex `#…\r` lines), bytes/sec. Writes
+/// are paced to this so the modem TX FIFO stays shallow: a deep FIFO delays
+/// our own later priority messages behind bulk shreds (and FlowControl::None
+/// means an overrun loses data). Overestimating only costs that latency —
+/// the peer's break-in is modem-level and unaffected — so the default sits
+/// above worst-case PACTOR-1; pin via BUNKER_LINK_PACE_BPS for the link's
+/// real speed. Tests run unpaced unless they pin a rate.
+fn pace_bytes_per_sec() -> u64 {
     let pinned = std::env::var("BUNKER_LINK_PACE_BPS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0);
-    if pinned.is_none() && cfg!(test) {
-        // Tests run unpaced unless they pin a rate themselves.
-        return Some(u64::MAX);
-    }
-    pinned
+    pinned.unwrap_or(if cfg!(test) {
+        u64::MAX
+    } else {
+        DEFAULT_PACE_BPS
+    })
 }
 
-/// Adaptive pacing start/floor: worst-case 200 Bd PACTOR-1. The estimator
-/// only raises the rate from here on measured evidence, so a cold start or a
-/// deep fade can never pace faster than the slowest mode the link falls to.
-const ADAPTIVE_START_BPS: u64 = 32;
-
-/// Adaptive pacing ceiling; PACTOR-3 tops out around ~300 B/s serial-side.
-const ADAPTIVE_MAX_BPS: u64 = 256;
-
-/// Fraction of the measured link rate to pace at; the margin absorbs
-/// estimation noise so the modem FIFO keeps draining ahead of the pacer.
-const ADAPTIVE_SAFETY_NUM: u64 = 4;
-const ADAPTIVE_SAFETY_DEN: u64 = 5;
+const DEFAULT_PACE_BPS: u64 = 64;
 
 /// Unsent backlog the pacer tolerates in the modem TX FIFO; keeps short
-/// messages from serializing per-line while bounding grant delivery lag.
+/// messages from serializing per-line while bounding priority inversion.
 const PACE_BURST: Duration = Duration::from_secs(3);
 
-/// Grant-response lag bounds driving the writer's AIMD rate probe. After we
-/// grant, the peer cannot transmit until OUR modem FIFO physically drains,
-/// so its first line arriving promptly proves the pace kept up with the real
-/// link — probe higher. A late answer means the paced turn overran the link
-/// (or a fade ate the grant) — cut hard. Between the two, hold. Calibrated
-/// to a MEASURED healthy handoff of ~78s on 200 Bd PACTOR-1 (the ARQ
-/// turnaround alone is ~60s): a raise bound tighter than that reads every
-/// healthy handoff as distress and pins the rate at the floor.
-const GRANT_LAG_RAISE_MS: u64 = 120_000;
-const GRANT_LAG_CUT_MS: u64 = 210_000;
-
-/// Applies one AIMD step from an observed grant-response lag.
-fn adjust_pace_on_grant_lag(rate: &AtomicU64, lag_ms: u64) {
-    let cur = rate.load(Ordering::Relaxed);
-    let next = if lag_ms <= GRANT_LAG_RAISE_MS {
-        cur + cur / 10 + 1
-    } else if lag_ms >= GRANT_LAG_CUT_MS {
-        cur * 7 / 10
-    } else {
-        return;
-    };
-    rate.store(
-        next.clamp(ADAPTIVE_START_BPS, ADAPTIVE_MAX_BPS),
-        Ordering::Relaxed,
-    );
-}
-
-/// Raise-only floor from inbound line spacing. While the peer drains a
-/// multi-fragment message its lines arrive back-to-back, so bytes/gap is the
-/// rate the peer is PROVING the channel sustains — adopt it when it exceeds
-/// ours (fresh restarts jump straight to the peer's ramped rate instead of
-/// re-probing from the floor). It never lowers the rate: cuts belong to the
-/// writer's grant-lag AIMD, and this only publishes on fresh samples so a
-/// stale pre-fade estimate cannot fight those cuts. Keepalive-sized lines
-/// and long gaps (idle holds, changeovers) are not back-to-back evidence.
-struct LinkRateEstimator {
-    last_line: Option<tokio::time::Instant>,
-    ewma_bps: f64,
-    shared: Arc<AtomicU64>,
-}
-
-impl LinkRateEstimator {
-    /// Only gaps in this range separate back-to-back lines: shorter is one
-    /// ARQ frame carrying several lines, longer spans a turn boundary.
-    const MIN_GAP: Duration = Duration::from_millis(200);
-    const MAX_GAP: Duration = Duration::from_secs(30);
-    /// Serial size below which a line is control chatter, not a data fragment.
-    const MIN_DATA_LINE: u64 = 150;
-
-    fn new(shared: Arc<AtomicU64>) -> Self {
-        Self {
-            last_line: None,
-            ewma_bps: ADAPTIVE_START_BPS as f64,
-            shared,
-        }
-    }
-
-    /// Records one inbound line of `serial_bytes` and republishes the paced rate.
-    fn observe(&mut self, serial_bytes: u64, now: tokio::time::Instant) {
-        let gap = self.last_line.map(|t| now.saturating_duration_since(t));
-        self.last_line = Some(now);
-        let Some(gap) = gap else { return };
-        if serial_bytes < Self::MIN_DATA_LINE || gap < Self::MIN_GAP || gap > Self::MAX_GAP {
-            return;
-        }
-        let sample = (serial_bytes as f64 / gap.as_secs_f64()).clamp(8.0, 512.0);
-        self.ewma_bps = self.ewma_bps * 0.8 + sample * 0.2;
-        let paced = (self.ewma_bps as u64 * ADAPTIVE_SAFETY_NUM / ADAPTIVE_SAFETY_DEN)
-            .clamp(ADAPTIVE_START_BPS, ADAPTIVE_MAX_BPS);
-        self.shared.fetch_max(paced, Ordering::Relaxed);
-    }
-}
-
 /// Paces serial writes at the estimated on-air rate so the modem TX FIFO
-/// never holds more than ~[`PACE_BURST`] of undrained data. The rate cell is
-/// shared with the reader's [`LinkRateEstimator`] unless a rate is pinned.
+/// never holds more than ~[`PACE_BURST`] of undrained data.
 struct LinkPacer {
-    rate_bps: Arc<AtomicU64>,
+    rate_bps: u64,
     drain_until: tokio::time::Instant,
 }
 
 impl LinkPacer {
-    fn new(rate_bps: Arc<AtomicU64>) -> Self {
+    fn new(rate_bps: u64) -> Self {
         Self {
-            rate_bps,
+            rate_bps: rate_bps.max(1),
             drain_until: tokio::time::Instant::now(),
         }
     }
 
     /// No-op pacer for full-duplex transports (simulator / TCP flow control).
     fn unpaced() -> Self {
-        Self {
-            rate_bps: Arc::new(AtomicU64::new(u64::MAX)),
-            drain_until: tokio::time::Instant::now(),
-        }
+        Self::new(u64::MAX)
     }
 
     /// Account one written serial line and sleep until the modem FIFO is back
     /// under the burst allowance at the estimated drain rate.
     async fn pace(&mut self, line_bytes: usize) {
-        let rate = self.rate_bps.load(Ordering::Relaxed).max(1);
         let now = tokio::time::Instant::now();
-        let cost = Duration::from_millis((line_bytes as u64).saturating_mul(1000) / rate);
+        let cost = Duration::from_millis((line_bytes as u64).saturating_mul(1000) / self.rate_bps);
         self.drain_until = self.drain_until.max(now) + cost;
         if let Some(sleep_until) = self.drain_until.checked_sub(PACE_BURST) {
             if sleep_until > now {
@@ -271,94 +116,6 @@ impl LinkPacer {
             }
         }
     }
-}
-
-/// Blind-reclaim threshold after which the listener yields to the caller.
-const LISTENER_LIVELOCK_RECLAIMS: u32 = 2;
-
-/// Yields a listener may override into a Take while it has its own block queued;
-/// bounded so a two-sided fade still cedes to the caller after the burst.
-const LISTENER_OUTBOUND_TAKE_BUDGET: u32 = 2;
-
-#[derive(Debug, PartialEq, Eq)]
-enum ReclaimAction {
-    Take,
-    Yield,
-}
-
-/// Testable reclaim policy: the caller always takes; the listener yields after blind repeats.
-#[derive(Default)]
-struct ReclaimDecider {
-    is_listener: bool,
-    blind_reclaims: u32,
-    /// Activity timestamp at the previous reclaim; `None` makes the first reclaim blind.
-    activity_at_last_reclaim: Option<u64>,
-}
-
-impl ReclaimDecider {
-    fn new(is_listener: bool) -> Self {
-        Self {
-            is_listener,
-            blind_reclaims: 0,
-            activity_at_last_reclaim: None,
-        }
-    }
-
-    /// Extended for yielding listeners so the caller gets several changeover round-trips.
-    fn effective_window(&self, base: Duration, stagger: Duration) -> Duration {
-        if self.is_listener && self.blind_reclaims >= LISTENER_LIVELOCK_RECLAIMS {
-            base + stagger * 3
-        } else {
-            base
-        }
-    }
-
-    /// Updates blind-reclaim state and decides whether to take or yield the turn.
-    fn on_reclaim_due(&mut self, activity_now: u64) -> ReclaimAction {
-        if !self.is_listener {
-            // The caller is the driver of last resort.
-            return ReclaimAction::Take;
-        }
-        // Blind iff no inbound advanced since the previous reclaim.
-        let advanced = self
-            .activity_at_last_reclaim
-            .is_some_and(|prev| activity_now > prev);
-        if advanced {
-            self.blind_reclaims = 0;
-        } else {
-            self.blind_reclaims = self.blind_reclaims.saturating_add(1);
-        }
-        self.activity_at_last_reclaim = Some(activity_now);
-
-        // First blind reclaim recovers a lost grant; repeated blind reclaims indicate livelock.
-        if self.blind_reclaims >= LISTENER_LIVELOCK_RECLAIMS {
-            self.blind_reclaims = LISTENER_LIVELOCK_RECLAIMS;
-            ReclaimAction::Yield
-        } else {
-            ReclaimAction::Take
-        }
-    }
-
-    /// Clear livelock backoff once inbound proves the link is flowing.
-    /// Returns whether inbound advanced (the link is two-sided again).
-    fn note_turn_held(&mut self, activity_now: u64) -> bool {
-        let advanced = self.is_listener
-            && self
-                .activity_at_last_reclaim
-                .is_some_and(|prev| activity_now > prev);
-        if advanced {
-            self.blind_reclaims = 0;
-        }
-        advanced
-    }
-}
-
-/// Shared half-duplex turn state between the mux reader and writer.
-struct TurnState {
-    holds_turn: AtomicBool,
-    granted: Notify,
-    /// Whether this side started with the turn; used to stagger reclaim.
-    starts_with_turn: bool,
 }
 
 /// Logical channel a multiplexed message belongs to. The discriminant is the
@@ -450,28 +207,26 @@ pub struct PactorMux {
     message_counter: Arc<AtomicU64>,
     /// Last inbound line timestamp; recent activity means [`MuxLiveness`] is up.
     last_activity_ms: Arc<AtomicU64>,
-    /// `None` writes freely; `Some` enforces one transmit turn at a time.
-    turn: Option<Arc<TurnState>>,
+    /// Half-duplex radio link: paced writes plus idle keepalives. Full-duplex
+    /// transports (simulator / TCP) write freely.
+    half_duplex: bool,
     queued_gauge: Option<Arc<AtomicU64>>,
 }
 
 impl PactorMux {
     /// Wrap an already-connected full-duplex transport.
     pub fn new(transport: Arc<dyn PactorTransport>) -> Self {
-        Self::build(transport, None)
+        Self::build(transport, false)
     }
 
-    /// Wrap a half-duplex PACTOR transport; only one side may start with the turn.
-    pub fn new_half_duplex(transport: Arc<dyn PactorTransport>, starts_with_turn: bool) -> Self {
-        let turn = Arc::new(TurnState {
-            holds_turn: AtomicBool::new(starts_with_turn),
-            granted: Notify::new(),
-            starts_with_turn,
-        });
-        Self::build(transport, Some(turn))
+    /// Wrap a half-duplex PACTOR transport. The modem arbitrates who transmits,
+    /// so `_is_caller` no longer changes behavior; it is kept for call-site
+    /// stability (the caller/listener roles still matter to link setup).
+    pub fn new_half_duplex(transport: Arc<dyn PactorTransport>, _is_caller: bool) -> Self {
+        Self::build(transport, true)
     }
 
-    fn build(transport: Arc<dyn PactorTransport>, turn: Option<Arc<TurnState>>) -> Self {
+    fn build(transport: Arc<dyn PactorTransport>, half_duplex: bool) -> Self {
         let (high_tx, high_rx) = mpsc::channel(CHANNEL_QUEUE_DEPTH);
         let (low_tx, low_rx) = mpsc::channel(CHANNEL_QUEUE_DEPTH);
         let mut inbound_tx: [Option<mpsc::Sender<Vec<u8>>>; Channel::COUNT] = Default::default();
@@ -495,7 +250,7 @@ impl PactorMux {
             // restarted peer merging with new messages.
             message_counter: Arc::new(AtomicU64::new(u64::from(rand::random::<u32>()) << 32)),
             last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
-            turn,
+            half_duplex,
             queued_gauge: None,
         }
     }
@@ -553,25 +308,21 @@ impl PactorMux {
         // asymmetrically end the biased receive; shutdown aborts the task.
         let outbound_keepalive = self.outbound.clone();
         let message_counter = self.message_counter.clone();
-        let turn = self.turn.clone();
+        let half_duplex = self.half_duplex;
         let last_activity_ms = self.last_activity_ms.clone();
-
-        // Pace rate cell: pinned by env, or driven by the inbound estimator.
-        let pace_rate = Arc::new(AtomicU64::new(
-            pinned_pace_bps().unwrap_or(ADAPTIVE_START_BPS),
-        ));
+        // Inbound line count for the periodic traffic summary.
+        let rx_lines = Arc::new(AtomicU64::new(0));
+        // Writer-side idle clock on the tokio timeline (virtual under paused
+        // tests, monotonic in production); `last_activity_ms` stays on the
+        // process clock for MuxLiveness.
+        let epoch = tokio::time::Instant::now();
+        let last_rx_tick = Arc::new(AtomicU64::new(0));
 
         // Reader: read, reassemble, strip tag, route to a channel queue.
         let reader_transport = transport.clone();
-        let reader_turn = turn.clone();
         let reader_activity = last_activity_ms.clone();
-        // Data-bearing inbound only (not keepalives/grants): the writer keys
-        // its idle-hold length on whether the peer is mid-transfer.
-        let last_data_ms = Arc::new(AtomicU64::new(0));
-        let reader_data = last_data_ms.clone();
-        // Estimate only on half-duplex links with no pinned rate.
-        let mut estimator = (turn.is_some() && pinned_pace_bps().is_none())
-            .then(|| LinkRateEstimator::new(pace_rate.clone()));
+        let reader_rx_lines = rx_lines.clone();
+        let reader_rx_tick = last_rx_tick.clone();
         let reader = tokio::spawn(async move {
             let mut reassembler = Reassembler::new();
             loop {
@@ -579,10 +330,8 @@ impl PactorMux {
                     Ok(line) => {
                         // Stamp activity before routing so MuxLiveness sees it.
                         reader_activity.store(now_ms(), Ordering::Relaxed);
-                        if let Some(est) = &mut estimator {
-                            let serial = line.len() as u64 * 2 + 6;
-                            est.observe(serial, tokio::time::Instant::now());
-                        }
+                        reader_rx_tick.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        reader_rx_lines.fetch_add(1, Ordering::Relaxed);
                         line
                     }
                     // Idle timeout: keep waiting, never tear down inbound queues.
@@ -601,21 +350,13 @@ impl PactorMux {
                     warn!("[mux:reader] dropping empty multiplexed message");
                     continue;
                 };
-                if tag == TURN_GRANT_TAG {
-                    if let Some(t) = &reader_turn {
-                        t.holds_turn.store(true, Ordering::SeqCst);
-                        t.granted.notify_one();
-                    }
-                    continue;
-                }
-                if tag == KEEPALIVE_TAG {
-                    continue; // link-keepalive from the turn-holder; ignore
+                if tag == KEEPALIVE_TAG || tag == TURN_GRANT_TAG {
+                    continue; // control chatter; activity was already stamped
                 }
                 let Some(channel) = Channel::from_tag(tag) else {
                     warn!("[mux:reader] dropping message with unknown channel tag {tag}");
                     continue;
                 };
-                reader_data.store(now_ms(), Ordering::Relaxed);
                 if let Some(tx) = &inbound_tx[channel as usize] {
                     if tx.send(payload.to_vec()).await.is_err() {
                         debug!("[mux:reader] channel {channel:?} closed; dropping message");
@@ -625,33 +366,39 @@ impl PactorMux {
             }
         });
 
-        // Writer: transmit while allowed, keepalive while idle, grant turns sparingly.
+        // Writer: drain the lanes (priority first), paced; keepalive when idle.
         let writer_transport = transport.clone();
-        let writer_activity = last_activity_ms.clone();
-        let writer_data = last_data_ms.clone();
+        let writer_rx_tick = last_rx_tick;
+        let writer_rx_lines = rx_lines;
+        let queues_for_stats = self.outbound.clone();
         let writer = tokio::spawn(async move {
             let _outbound_keepalive = outbound_keepalive;
             let mut high_rx = high_rx;
             let mut low_rx = low_rx;
             let counter = message_counter;
 
+            /// Writes one tagged message as paced fragment lines; returns the
+            /// serial bytes written.
             async fn write_message(
                 transport: &Arc<dyn PactorTransport>,
                 counter: &AtomicU64,
                 pacer: &mut LinkPacer,
                 tag: u8,
                 payload: &[u8],
-            ) -> Result<(), ScsPactorError> {
+            ) -> Result<usize, ScsPactorError> {
                 let mut tagged = Vec::with_capacity(payload.len() + 1);
                 tagged.push(tag);
                 tagged.extend_from_slice(payload);
                 let message_id = counter.fetch_add(1, Ordering::Relaxed);
+                let mut serial = 0usize;
                 for line in fragment_message(message_id, &tagged) {
                     transport.write_data(&line).await?;
                     // On-air cost of the hex line: `#` + 4-len + 2×data + `\r`.
-                    pacer.pace(line.len() * 2 + 6).await;
+                    let cost = line.len() * 2 + 6;
+                    serial += cost;
+                    pacer.pace(cost).await;
                 }
-                Ok(())
+                Ok(serial)
             }
 
             // Priority receive: the high lane drains fully before the low lane.
@@ -667,7 +414,7 @@ impl PactorMux {
             }
 
             // Full-duplex mode (simulator / TCP): transmit whenever we have data.
-            let Some(turn) = turn else {
+            if !half_duplex {
                 let mut pacer = LinkPacer::unpaced();
                 while let Some(item) = recv_prio(&mut high_rx, &mut low_rx).await {
                     if let Err(e) = write_message(
@@ -686,235 +433,72 @@ impl PactorMux {
                 }
                 debug!("[mux:writer] outbound queue closed; writer stopping");
                 return;
-            };
+            }
 
-            // Caller reclaims first; listener waits longer to avoid dual reclaim.
-            let reclaim_after = if turn.starts_with_turn {
-                turn_reclaim_silence()
-            } else {
-                turn_reclaim_silence() + reclaim_role_stagger()
-            };
-            // Floor reclaims during sustained silence to at most once per window.
-            let mut last_reclaim_ms = 0u64;
-            let is_listener = !turn.starts_with_turn;
-            let mut decider = ReclaimDecider::new(is_listener);
-            let mut outbound_take_budget = LISTENER_OUTBOUND_TAKE_BUDGET;
-            // Persists across turns: the modem FIFO does not reset at a grant.
-            let writer_rate = pace_rate.clone();
-            let adaptive = pinned_pace_bps().is_none();
-            let mut pacer = LinkPacer::new(pace_rate);
-            // now_ms of the last turn-grant, until its response lag is judged.
-            let mut grant_probe: Option<u64> = None;
-            'turn: loop {
-                // Poll for the turn so a lost grant can recover via silence reclaim.
-                let turnless_since = now_ms();
-                while !turn.holds_turn.load(Ordering::SeqCst) {
-                    let now = now_ms();
-                    let activity = writer_activity.load(Ordering::Relaxed);
-                    // First inbound after a grant closes that grant's rate probe.
-                    if let Some(granted_at) = grant_probe {
-                        if adaptive && activity > granted_at {
-                            adjust_pace_on_grant_lag(&writer_rate, activity - granted_at);
-                        }
-                        if activity > granted_at {
-                            grant_probe = None;
-                        }
-                    }
-                    let silence = now.saturating_sub(activity);
-                    let since_last_reclaim = now.saturating_sub(last_reclaim_ms);
-
-                    // Inbound is not proof the peer holds the turn; cap turnless time too.
-                    let turnless = now.saturating_sub(turnless_since);
-                    if !is_listener && turnless >= turnless_reclaim_ceiling().as_millis() as u64 {
-                        warn!(
-                            "[mux:writer] caller without the turn for {turnless}ms despite \
-                             inbound activity — reclaiming to restore two-way flow"
+            // Half-duplex radio: the modem arbitrates ISS/IRS (an IRS with
+            // buffered data breaks in), so we never wait for a turn — we just
+            // keep the FIFO shallow and stay quiet when the link is quiet.
+            let rate = pace_bytes_per_sec();
+            info!("[mux] half-duplex: modem-arbitrated turns, pacing {rate} B/s");
+            let mut pacer = LinkPacer::new(rate);
+            // Persists across iterations: the modem FIFO does not reset.
+            let mut last_tx_tick = 0u64;
+            let mut stats_at = tokio::time::Instant::now() + STATS_INTERVAL;
+            let (mut tx_lines, mut tx_bytes, mut rx_seen) = (0u64, 0u64, 0u64);
+            loop {
+                if tokio::time::Instant::now() >= stats_at {
+                    stats_at += STATS_INTERVAL;
+                    let rx_total = writer_rx_lines.load(Ordering::Relaxed);
+                    let rx_delta = rx_total - rx_seen;
+                    rx_seen = rx_total;
+                    if tx_lines + rx_delta > 0 {
+                        info!(
+                            "[mux] last {}s: tx {tx_lines} msgs / {tx_bytes} B on air, rx {rx_delta} lines, {} queued",
+                            STATS_INTERVAL.as_secs(),
+                            queues_for_stats.queued()
                         );
-                        last_reclaim_ms = now;
-                        turn.holds_turn.store(true, Ordering::SeqCst);
-                        break;
                     }
-
-                    let effective_reclaim_after =
-                        decider.effective_window(reclaim_after, reclaim_role_stagger());
-
-                    if silence >= effective_reclaim_after.as_millis() as u64
-                        && since_last_reclaim >= effective_reclaim_after.as_millis() as u64
-                    {
-                        last_reclaim_ms = now;
-                        let mut action = decider.on_reclaim_due(activity);
-                        // The reclaim loop is otherwise blind to pending outbound: a
-                        // listener with its own block queued must take the turn to send it.
-                        if action == ReclaimAction::Yield
-                            && !(high_rx.is_empty() && low_rx.is_empty())
-                            && outbound_take_budget > 0
-                        {
-                            outbound_take_budget -= 1;
-                            action = ReclaimAction::Take;
+                    tx_lines = 0;
+                    tx_bytes = 0;
+                }
+                let idle_since = |last_tx_tick: u64| {
+                    let last_rx_tick = writer_rx_tick.load(Ordering::Relaxed);
+                    let now_tick = epoch.elapsed().as_millis() as u64;
+                    Duration::from_millis(now_tick.saturating_sub(last_tx_tick.max(last_rx_tick)))
+                };
+                let keepalive_in = KEEPALIVE_IDLE.saturating_sub(idle_since(last_tx_tick));
+                let item = tokio::select! {
+                    biased;
+                    item = recv_prio(&mut high_rx, &mut low_rx) => match item {
+                        Some(item) => Some((item.channel as u8, item.payload)),
+                        None => {
+                            debug!("[mux:writer] outbound queue closed; writer stopping");
+                            return;
                         }
-                        match action {
-                            ReclaimAction::Yield => {
-                                warn!(
-                                    "[mux:writer] listener yielding: blind reclaims with no \
-                                     inbound and no queued data — ceding link to caller to \
-                                     break mutual-reclaim livelock"
-                                );
-                                continue;
-                            }
-                            ReclaimAction::Take => {
-                                warn!(
-                                    "[mux:writer] link silent {silence}ms with no turn — \
-                                     reclaiming (lost turn-grant, pending outbound, or peer gone)"
-                                );
-                                turn.holds_turn.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                        }
+                    },
+                    // Re-check on wake: inbound that arrived mid-sleep means the
+                    // link is alive and a keepalive would only force a break-in.
+                    _ = tokio::time::sleep(keepalive_in) => {
+                        (idle_since(last_tx_tick) >= KEEPALIVE_IDLE)
+                            .then(|| (KEEPALIVE_TAG, Vec::new()))
                     }
-                    // Poll promptly even when tests shrink the reclaim window.
-                    let poll = KEEPALIVE_INTERVAL
-                        .min(reclaim_after / 4)
-                        .max(Duration::from_millis(10));
-                    let _ = tokio::time::timeout(poll, turn.granted.notified()).await;
-                }
-
-                // Clear livelock backoff if inbound activity resumed.
-                let activity_on_hold = writer_activity.load(Ordering::Relaxed);
-                if let Some(granted_at) = grant_probe {
-                    // Judge the probe even when a reclaim retook the turn first.
-                    if adaptive && activity_on_hold > granted_at {
-                        adjust_pace_on_grant_lag(&writer_rate, activity_on_hold - granted_at);
-                    }
-                    if activity_on_hold > granted_at {
-                        grant_probe = None;
-                    }
-                }
-                if decider.note_turn_held(activity_on_hold) {
-                    // Two-sided again: refresh the override for the next leader window.
-                    outbound_take_budget = LISTENER_OUTBOUND_TAKE_BUDGET;
-                }
-
-                // Keepalive immediately after acquiring an idle turn.
-                if high_rx.is_empty() && low_rx.is_empty() {
-                    if let Err(e) =
-                        write_message(&writer_transport, &counter, &mut pacer, KEEPALIVE_TAG, &[])
-                            .await
-                    {
-                        warn!("[mux:writer] post-changeover keepalive failed: {e}; backing off");
-                        tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
-                        continue 'turn;
-                    }
-                }
-
-                // Hold an idle turn with periodic keepalives; real data breaks out immediately.
-                let idle_hold = idle_hold_for(writer_data.load(Ordering::Relaxed), now_ms());
-                let mut first_item = None;
-                let idle_until = tokio::time::Instant::now() + idle_hold;
-                loop {
-                    let wait = KEEPALIVE_INTERVAL
-                        .min(idle_until.saturating_duration_since(tokio::time::Instant::now()));
-                    match tokio::time::timeout(wait, recv_prio(&mut high_rx, &mut low_rx)).await {
-                        Ok(Some(item)) => {
-                            first_item = Some(item);
-                            break;
-                        }
-                        Ok(None) => return, // outbound closed
-                        Err(_) => {
-                            if tokio::time::Instant::now() >= idle_until {
-                                break; // idle long enough — grant the turn
-                            }
-                            if let Err(e) = write_message(
-                                &writer_transport,
-                                &counter,
-                                &mut pacer,
-                                KEEPALIVE_TAG,
-                                &[],
-                            )
-                            .await
-                            {
-                                warn!("[mux:writer] keepalive write failed: {e}; backing off");
-                                tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
-                                continue 'turn;
-                            }
-                        }
-                    }
-                }
-                let mut turn_bytes = 0usize;
-                if let Some(item) = first_item {
-                    if let Err(e) = write_message(
-                        &writer_transport,
-                        &counter,
-                        &mut pacer,
-                        item.channel as u8,
-                        &item.payload,
-                    )
-                    .await
-                    {
-                        warn!("[mux:writer] write_data failed: {e}; dropping message");
-                        tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
-                        continue 'turn;
-                    }
-                    turn_bytes += item.payload.len();
-                }
-                // Drain a burst with a short grace; the byte budget bounds on-air backlog.
-                let turn_deadline = tokio::time::Instant::now() + MAX_TURN_HOLD;
-                loop {
-                    if tokio::time::Instant::now() >= turn_deadline
-                        || turn_bytes >= turn_byte_budget()
-                    {
-                        break;
-                    }
-                    match tokio::time::timeout(
-                        TURN_DRAIN_GRACE,
-                        recv_prio(&mut high_rx, &mut low_rx),
-                    )
-                    .await
-                    {
-                        Ok(Some(item)) => {
-                            if let Err(e) = write_message(
-                                &writer_transport,
-                                &counter,
-                                &mut pacer,
-                                item.channel as u8,
-                                &item.payload,
-                            )
-                            .await
-                            {
-                                warn!("[mux:writer] write_data failed: {e}; dropping message");
-                                tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
-                                continue 'turn;
-                            }
-                            turn_bytes += item.payload.len();
-                        }
-                        Ok(None) => return,
-                        // No follow-up: grant the turn so the peer can respond.
-                        Err(_) => break,
-                    }
-                }
-
-                if let Err(e) =
-                    write_message(&writer_transport, &counter, &mut pacer, TURN_GRANT_TAG, &[])
+                };
+                if let Some((tag, payload)) = item {
+                    match write_message(&writer_transport, &counter, &mut pacer, tag, &payload)
                         .await
-                {
-                    warn!("[mux:writer] turn-grant write failed: {e}; keeping the turn");
-                    tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
-                    continue 'turn;
+                    {
+                        Ok(serial) => {
+                            last_tx_tick = epoch.elapsed().as_millis() as u64;
+                            tx_lines += 1;
+                            tx_bytes += serial as u64;
+                        }
+                        Err(e) => {
+                            // Drop the message and keep the writer alive; consensus re-sends.
+                            warn!("[mux:writer] write_data failed: {e}; dropping message");
+                            tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
+                        }
+                    }
                 }
-                // Duplicate grant (~24 bytes on air): one corrupted grant line
-                // strands both sides turnless for a ~2-minute reclaim cycle.
-                let _ = write_message(&writer_transport, &counter, &mut pacer, TURN_GRANT_TAG, &[])
-                    .await;
-                if let Err(e) = writer_transport.changeover().await {
-                    // The grant may already be queued; a duplicate next cycle is harmless.
-                    warn!("[mux:writer] changeover failed: {e}; keeping the turn");
-                    tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
-                    continue 'turn;
-                }
-                turn.holds_turn.store(false, Ordering::SeqCst);
-                // Only inbound advances writer_activity, so the silence gate is already
-                // open here; without this stamp the caller reclaims its own grant at once.
-                last_reclaim_ms = now_ms();
-                grant_probe = Some(last_reclaim_ms);
             }
         });
 
@@ -946,13 +530,12 @@ pub struct MuxLiveness {
 }
 
 /// Inbound-activity window for link liveness; must exceed the longest normal
-/// inbound gap (slow changeovers), else Votor reads the link as dead and skips
-/// a leader's still-in-transit block. It MUST be at least the RX-stall watchdog
-/// threshold (BUNKER_RX_STALL_SECS, default 600s): the watchdog treats the link
-/// as UP until that much silence, so liveness must too — otherwise there is a
-/// window where the session is still up (block crawling across) yet Votor sees
-/// "dead" and skips it. Observed fades run 110–559s of silence, well past the
-/// old 90s default, which is exactly why node1's trailing window slot was lost.
+/// inbound gap (fades), else Votor reads the link as dead and skips a leader's
+/// still-in-transit block. It MUST be at least the RX-stall watchdog threshold
+/// (BUNKER_RX_STALL_SECS, default 600s): the watchdog treats the link as UP
+/// until that much silence, so liveness must too — otherwise there is a window
+/// where the session is still up (block crawling across) yet Votor sees "dead"
+/// and skips it. Observed fades run 110–559s of silence.
 fn liveness_window() -> Duration {
     std::env::var("BUNKER_LIVENESS_WINDOW_MS")
         .ok()
@@ -968,7 +551,7 @@ impl LinkLiveness for MuxLiveness {
     }
 }
 
-/// Drives turn changeover and shutdown for a spawned [`PactorMux`].
+/// Owns the reader/writer tasks of a spawned [`PactorMux`].
 pub struct PactorMuxHandle {
     transport: Arc<dyn PactorTransport>,
     reader: tokio::task::JoinHandle<()>,
@@ -989,7 +572,8 @@ impl PactorMuxHandle {
         })
     }
 
-    /// Hand the transmit turn to the peer (PACTOR ARQ changeover).
+    /// Force a PACTOR ARQ changeover. The mux itself never issues one — the
+    /// modem arbitrates turns — this exists for operator tooling only.
     pub async fn changeover(&self) -> std::io::Result<()> {
         self.transport
             .changeover()
@@ -1129,10 +713,6 @@ where
 mod tests {
     use super::*;
 
-    /// Serializes tests that set `BUNKER_TURN_BYTE_BUDGET`: the process env is
-    /// shared, so two concurrent budget tests clobber each other's value.
-    static BUDGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// The default liveness window must span a realistic fade — the link stays
     /// silent 110–559s but is NOT down (RX-stall watchdog only fires at 600s).
     /// A shorter window made Votor read "dead" mid-fade and skip a leader's
@@ -1160,6 +740,7 @@ mod tests {
     }
     use scs_pactor::{PactorLinkEvent, ScsPactorError};
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicU32;
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -1223,10 +804,12 @@ mod tests {
         }
     }
 
-    /// Recording-only transport for writer-path tests.
+    /// Recording-only transport for writer-path tests; counts changeovers so
+    /// tests can prove the mux never issues one.
     struct RecordingTransport {
         written: TokioMutex<Vec<Vec<u8>>>,
         inbound: TokioMutex<VecDeque<Vec<u8>>>,
+        changeovers: AtomicU32,
     }
 
     impl RecordingTransport {
@@ -1234,7 +817,18 @@ mod tests {
             Self {
                 written: TokioMutex::new(Vec::new()),
                 inbound: TokioMutex::new(VecDeque::new()),
+                changeovers: AtomicU32::new(0),
             }
+        }
+
+        /// Tags of every complete message written so far.
+        async fn written_tags(&self) -> Vec<u8> {
+            let lines = self.written.lock().await.clone();
+            let mut reassembler = Reassembler::new();
+            lines
+                .iter()
+                .filter_map(|line| reassembler.push_line(line).and_then(|m| m.first().copied()))
+                .collect()
         }
     }
 
@@ -1258,6 +852,10 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+        }
+        async fn changeover(&self) -> Result<(), ScsPactorError> {
+            self.changeovers.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
         async fn disconnect(&self) -> Result<(), ScsPactorError> {
             Ok(())
@@ -1316,79 +914,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn estimator_follows_measured_rate_within_bounds() {
-        let shared = Arc::new(AtomicU64::new(ADAPTIVE_START_BPS));
-        let mut est = LinkRateEstimator::new(shared.clone());
-        let mut now = tokio::time::Instant::now();
-        // ~300-byte fragments every 2s = 150 B/s; converge from the 32 floor.
-        for _ in 0..40 {
-            now += Duration::from_secs(2);
-            est.observe(300, now);
-        }
-        let paced = shared.load(Ordering::Relaxed);
-        // 150 B/s measured × 4/5 safety = 120 paced.
-        assert!(
-            (100..=130).contains(&paced),
-            "expected ~120 B/s paced, got {paced}"
-        );
-
-        // Keepalive-sized lines and turn-boundary gaps leave the rate alone.
-        now += Duration::from_secs(5);
-        est.observe(20, now);
-        now += Duration::from_secs(120);
-        est.observe(300, now);
-        assert_eq!(shared.load(Ordering::Relaxed), paced);
-
-        // The estimator is raise-only: slow fragments never lower the shared
-        // rate (cuts belong to the grant-lag AIMD).
-        for _ in 0..80 {
-            now += Duration::from_secs(15);
-            est.observe(300, now);
-        }
-        assert_eq!(shared.load(Ordering::Relaxed), paced);
-    }
-
-    #[test]
-    fn grant_lag_aimd_probes_up_and_cuts_hard() {
-        let rate = AtomicU64::new(100);
-        // A normal handoff on this link (~78s measured) must read as healthy.
-        adjust_pace_on_grant_lag(&rate, 78_000);
-        assert_eq!(rate.load(Ordering::Relaxed), 111);
-        // Dead zone: hold.
-        adjust_pace_on_grant_lag(&rate, 150_000);
-        assert_eq!(rate.load(Ordering::Relaxed), 111);
-        // Late response (overrun or lost grant): cut to 70%.
-        adjust_pace_on_grant_lag(&rate, 240_000);
-        assert_eq!(rate.load(Ordering::Relaxed), 77);
-        // Cuts bottom out at the P1 floor, raises cap at the ceiling.
-        for _ in 0..10 {
-            adjust_pace_on_grant_lag(&rate, 240_000);
-        }
-        assert_eq!(rate.load(Ordering::Relaxed), ADAPTIVE_START_BPS);
-        for _ in 0..40 {
-            adjust_pace_on_grant_lag(&rate, 1_000);
-        }
-        assert_eq!(rate.load(Ordering::Relaxed), ADAPTIVE_MAX_BPS);
-    }
-
-    #[test]
-    fn idle_hold_shortens_only_during_active_transfer() {
-        // Never received data (fresh clock included): long hold.
-        assert_eq!(idle_hold_for(0, 1_000), IDLE_TURN_GRANT);
-        // Peer sent data just now: short hold, its queue is likely full.
-        assert_eq!(idle_hold_for(100_000, 105_000), ACTIVE_IDLE_TURN_GRANT);
-        // Data older than the transfer window: back to the long hold.
-        let stale = ACTIVE_TRANSFER_WINDOW.as_millis() as u64 + 1;
-        assert_eq!(idle_hold_for(100_000, 100_000 + stale), IDLE_TURN_GRANT);
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn pacer_bounds_modem_fifo_backlog() {
         let t0 = tokio::time::Instant::now();
-        let mut pacer = LinkPacer {
-            rate_bps: Arc::new(AtomicU64::new(1000)),
-            drain_until: t0,
-        };
+        let mut pacer = LinkPacer::new(1000);
         // 1s of backlog fits inside the burst allowance: no sleep.
         pacer.pace(1000).await;
         assert_eq!(tokio::time::Instant::now(), t0);
@@ -1405,32 +933,84 @@ mod tests {
         assert_eq!(tokio::time::Instant::now(), before);
     }
 
+    /// Half-duplex idles quietly, then keepalives once the link has carried
+    /// nothing in either direction for KEEPALIVE_IDLE.
     #[tokio::test(start_paused = true)]
-    async fn idle_turn_holder_keepalives_immediately_and_repeatedly() {
-        // The turn-holder must keep feeding ARQ during long idle periods.
+    async fn half_duplex_keepalives_only_after_quiet_period() {
         let transport = Arc::new(RecordingTransport::new());
         let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
         let _chan: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
         let _h = mux.spawn();
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let after_acquire = transport.written.lock().await.len();
+        tokio::time::sleep(KEEPALIVE_IDLE - Duration::from_secs(2)).await;
         assert!(
-            after_acquire >= 1,
-            "expected an immediate keepalive on acquiring the turn, got {after_acquire}"
+            transport.written.lock().await.is_empty(),
+            "no keepalive before the idle period elapses"
         );
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            transport.written_tags().await,
+            vec![KEEPALIVE_TAG],
+            "exactly one keepalive once idle"
+        );
+        // Quiet for another period: keepalives repeat at the idle cadence.
+        tokio::time::sleep(KEEPALIVE_IDLE).await;
+        assert_eq!(transport.written_tags().await.len(), 2);
+    }
 
-        tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
-        let later = transport.written.lock().await.len();
+    /// Inbound traffic proves the link alive, so the receiving side stays
+    /// silent instead of forcing a modem break-in into the peer's stream.
+    #[tokio::test(start_paused = true)]
+    async fn half_duplex_inbound_suppresses_keepalive() {
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new_half_duplex(transport.clone(), false);
+        let _chan: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
+        let _h = mux.spawn();
+
+        // A fragment arrives every 20s for two minutes: never idle long enough.
+        for _ in 0..6 {
+            let line = fragment_message(7, &[Channel::Disseminator as u8, 1, 2, 3]).remove(0);
+            transport.inbound.lock().await.push_back(line);
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
         assert!(
-            later >= after_acquire + 4,
-            "expected repeated keepalives over the quiet period, got {later} (was {after_acquire})"
+            transport.written.lock().await.is_empty(),
+            "receiving side must not keepalive while inbound flows"
+        );
+    }
+
+    /// The modem arbitrates turns: the mux must never write turn-grant control
+    /// messages or issue a changeover, in any half-duplex traffic pattern.
+    #[tokio::test]
+    async fn half_duplex_never_issues_turn_control() {
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
+        let shreds: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
+        let votes: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        for i in 0..6u8 {
+            shreds.send(&vec![i; 1024], addr).await.unwrap();
+        }
+        votes.send(&b"vote".to_vec(), addr).await.unwrap();
+        let _h = mux.spawn();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let tags = transport.written_tags().await;
+        assert_eq!(tags.len(), 7, "every queued message ships without a turn");
+        assert!(
+            tags.iter().all(|t| *t != TURN_GRANT_TAG),
+            "no turn-grant control messages"
+        );
+        assert_eq!(
+            transport.changeovers.load(Ordering::SeqCst),
+            0,
+            "the mux must never issue a modem changeover"
         );
     }
 
     #[tokio::test]
-    async fn half_duplex_turns_let_both_sides_send() {
-        // Both sides must send under turn discipline without deadlock.
+    async fn half_duplex_both_sides_send_without_turns() {
+        // Both sides write freely; the (modem-modelled) medium serializes them.
         let (a, b) = LoopbackTransport::pair();
 
         let mut mux_a = PactorMux::new_half_duplex(a, true);
@@ -1451,7 +1031,7 @@ mod tests {
             .unwrap();
         let got_at_a = tokio::time::timeout(Duration::from_secs(10), a_chan.receive())
             .await
-            .expect("A should receive B's message before timeout (turn handed over)")
+            .expect("A should receive B's message before timeout")
             .unwrap();
         assert_eq!(got_at_b, b"from-a");
         assert_eq!(got_at_a, b"from-b");
@@ -1565,398 +1145,10 @@ mod tests {
         let _second: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
     }
 
-    /// Drops the first configured turn-grant frames; all other lines pass through.
-    struct GrantDroppingTransport {
-        inner: Arc<LoopbackTransport>,
-        grants_to_drop: std::sync::atomic::AtomicU32,
-    }
-
-    #[async_trait]
-    impl PactorTransport for GrantDroppingTransport {
-        async fn set_mycall(&self, c: &str) -> Result<(), ScsPactorError> {
-            self.inner.set_mycall(c).await
-        }
-        async fn connect_peer(&self, c: &str) -> Result<(), ScsPactorError> {
-            self.inner.connect_peer(c).await
-        }
-        async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
-            // Turn grants are single-fragment control messages.
-            if let Some((_hdr, chunk)) = crate::pactor_framing::parse_fragment(data) {
-                if chunk.first().copied() == Some(TURN_GRANT_TAG)
-                    && self
-                        .grants_to_drop
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                        > 0
-                {
-                    self.grants_to_drop
-                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    // Simulate a lost grant: local write succeeds, peer hears nothing.
-                    return Ok(());
-                }
-            }
-            self.inner.write_data(data).await
-        }
-        async fn read_data(&self, n: usize) -> Result<Vec<u8>, ScsPactorError> {
-            self.inner.read_data(n).await
-        }
-        async fn disconnect(&self) -> Result<(), ScsPactorError> {
-            self.inner.disconnect().await
-        }
-        async fn next_event(&self, t: Option<Duration>) -> Result<PactorLinkEvent, ScsPactorError> {
-            self.inner.next_event(t).await
-        }
-    }
-
-    /// A lost turn grant must not deadlock; the listener reclaims and delivers queued data.
-    #[tokio::test]
-    async fn lost_turn_grant_recovers_via_reclaim() {
-        // SAFETY: single-threaded test shortens reclaim timers via process env.
-        unsafe {
-            std::env::set_var("BUNKER_TURN_RECLAIM_MS", "300");
-            std::env::set_var("BUNKER_RECLAIM_STAGGER_MS", "150");
-        }
-
-        let (a_raw, b) = LoopbackTransport::pair();
-        let a = Arc::new(GrantDroppingTransport {
-            inner: a_raw,
-            grants_to_drop: std::sync::atomic::AtomicU32::new(1),
-        });
-
-        let mut mux_a = PactorMux::new_half_duplex(a, true);
-        let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
-        let _ha = mux_a.spawn();
-
-        let mut mux_b = PactorMux::new_half_duplex(b, false);
-        let b_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_b.channel(Channel::All2All);
-        let _hb = mux_b.spawn();
-
-        let addr = "127.0.0.1:1".parse().unwrap();
-        b_chan.send(&b"from-b".to_vec(), addr).await.unwrap();
-
-        let got_at_a = tokio::time::timeout(Duration::from_secs(10), a_chan.receive())
-            .await
-            .expect("B must reclaim the turn after the lost grant and deliver its message")
-            .unwrap();
-        assert_eq!(got_at_a, b"from-b");
-
-        unsafe {
-            std::env::remove_var("BUNKER_TURN_RECLAIM_MS");
-            std::env::remove_var("BUNKER_RECLAIM_STAGGER_MS");
-        }
-    }
-
-    // The caller must not reclaim the turn it just granted before the peer replies:
-    // its own long TX never advances writer_activity, so the silence gate is already
-    // open at release time and only the post-grant reclaim stamp holds it off.
-    #[tokio::test(start_paused = true)]
-    async fn caller_does_not_reclaim_its_own_grant_before_peer_replies() {
-        // SAFETY: single-threaded test shortens reclaim timers via process env.
-        unsafe {
-            std::env::set_var("BUNKER_TURN_RECLAIM_MS", "300");
-            std::env::set_var("BUNKER_RECLAIM_STAGGER_MS", "150");
-        }
-
-        let (a, b) = LoopbackTransport::pair();
-
-        let mut mux_a = PactorMux::new_half_duplex(a, true);
-        let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
-        let _ha = mux_a.spawn();
-
-        let mut mux_b = PactorMux::new_half_duplex(b, false);
-        let b_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_b.channel(Channel::All2All);
-        let _hb = mux_b.spawn();
-
-        let addr = "127.0.0.1:1".parse().unwrap();
-        // Caller sends first (holds the turn), then must cleanly hand off.
-        a_chan.send(&b"from-a".to_vec(), addr).await.unwrap();
-        let got_at_b = tokio::time::timeout(Duration::from_secs(120), b_chan.receive())
-            .await
-            .expect("caller->listener must deliver")
-            .unwrap();
-        assert_eq!(got_at_b, b"from-a");
-
-        // The listener replies only while it holds the turn. If the caller reclaimed
-        // its own grant immediately this never arrives.
-        b_chan.send(&b"from-b".to_vec(), addr).await.unwrap();
-        let got_at_a = tokio::time::timeout(Duration::from_secs(120), a_chan.receive())
-            .await
-            .expect("listener->caller must deliver after a clean grant")
-            .unwrap();
-        assert_eq!(got_at_a, b"from-b");
-
-        unsafe {
-            std::env::remove_var("BUNKER_TURN_RECLAIM_MS");
-            std::env::remove_var("BUNKER_RECLAIM_STAGGER_MS");
-        }
-    }
-
-    /// Drops frames while a shared fade flag is set.
-    struct FadingTransport {
-        inner: Arc<LoopbackTransport>,
-        faded: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    #[async_trait]
-    impl PactorTransport for FadingTransport {
-        async fn set_mycall(&self, c: &str) -> Result<(), ScsPactorError> {
-            self.inner.set_mycall(c).await
-        }
-        async fn connect_peer(&self, c: &str) -> Result<(), ScsPactorError> {
-            self.inner.connect_peer(c).await
-        }
-        async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
-            if self.faded.load(std::sync::atomic::Ordering::SeqCst) {
-                // A fade looks like a successful local write with no peer delivery.
-                return Ok(());
-            }
-            self.inner.write_data(data).await
-        }
-        async fn read_data(&self, n: usize) -> Result<Vec<u8>, ScsPactorError> {
-            self.inner.read_data(n).await
-        }
-        async fn disconnect(&self) -> Result<(), ScsPactorError> {
-            self.inner.disconnect().await
-        }
-        async fn next_event(&self, t: Option<Duration>) -> Result<PactorLinkEvent, ScsPactorError> {
-            self.inner.next_event(t).await
-        }
-    }
-
-    /// The caller is the driver of last resort and never yields.
-    #[test]
-    fn caller_never_yields_on_blind_reclaims() {
-        let mut d = ReclaimDecider::new(false);
-        for _ in 0..10 {
-            assert_eq!(d.on_reclaim_due(1000), ReclaimAction::Take);
-        }
-        assert_eq!(
-            d.effective_window(Duration::from_secs(60), Duration::from_secs(40)),
-            Duration::from_secs(60)
-        );
-    }
-
-    /// A listener yields after blind repeats and extends its reclaim window.
-    #[test]
-    fn listener_yields_after_blind_reclaims_then_extends_window() {
-        assert!(
-            LISTENER_LIVELOCK_RECLAIMS >= 1,
-            "test assumes at least one Take before yielding"
-        );
-        let mut d = ReclaimDecider::new(true);
-        // Initial blind reclaims still recover a genuinely lost grant.
-        for _ in 0..(LISTENER_LIVELOCK_RECLAIMS - 1) {
-            assert_eq!(d.on_reclaim_due(1000), ReclaimAction::Take);
-        }
-        assert_eq!(d.on_reclaim_due(1000), ReclaimAction::Yield);
-        let base = Duration::from_secs(60);
-        let stagger = Duration::from_secs(40);
-        assert!(
-            d.effective_window(base, stagger) > base,
-            "listener must back off with a longer window once it has yielded"
-        );
-        assert_eq!(d.on_reclaim_due(1000), ReclaimAction::Yield);
-    }
-
-    /// Inbound activity resets listener livelock backoff.
-    #[test]
-    fn listener_recovers_when_inbound_resumes() {
-        let mut d = ReclaimDecider::new(true);
-        for _ in 0..=LISTENER_LIVELOCK_RECLAIMS {
-            d.on_reclaim_due(1000);
-        }
-        let base = Duration::from_secs(60);
-        let stagger = Duration::from_secs(40);
-        assert!(d.effective_window(base, stagger) > base);
-
-        assert_eq!(d.on_reclaim_due(2000), ReclaimAction::Take);
-        assert_eq!(
-            d.effective_window(base, stagger),
-            base,
-            "window returns to normal once inbound resumes"
-        );
-
-        for _ in 0..=LISTENER_LIVELOCK_RECLAIMS {
-            d.on_reclaim_due(2000);
-        }
-        assert!(d.effective_window(base, stagger) > base);
-        d.note_turn_held(3000); // grant arrived, inbound advanced
-        assert_eq!(d.effective_window(base, stagger), base);
-    }
-
-    /// A two-sided fade must recover without latching into mutual reclaim.
-    #[tokio::test]
-    async fn mutual_reclaim_fade_recovers_without_livelock() {
-        // SAFETY: single-threaded test; stagger stays above the shortened reclaim window.
-        unsafe {
-            std::env::set_var("BUNKER_TURN_RECLAIM_MS", "200");
-            std::env::set_var("BUNKER_RECLAIM_STAGGER_MS", "300");
-        }
-
-        let (a_raw, b_raw) = LoopbackTransport::pair();
-        let a_faded = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let b_faded = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let a = Arc::new(FadingTransport {
-            inner: a_raw,
-            faded: a_faded.clone(),
-        });
-        let b = Arc::new(FadingTransport {
-            inner: b_raw,
-            faded: b_faded.clone(),
-        });
-
-        let mut mux_a = PactorMux::new_half_duplex(a, true);
-        let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
-        let _ha = mux_a.spawn();
-
-        let mut mux_b = PactorMux::new_half_duplex(b, false);
-        let b_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_b.channel(Channel::All2All);
-        let _hb = mux_b.spawn();
-
-        let addr = "127.0.0.1:1".parse().unwrap();
-
-        // Silence both directions long enough to trigger repeated reclaim decisions.
-        a_faded.store(true, std::sync::atomic::Ordering::SeqCst);
-        b_faded.store(true, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(1600)).await;
-
-        a_faded.store(false, std::sync::atomic::Ordering::SeqCst);
-        b_faded.store(false, std::sync::atomic::Ordering::SeqCst);
-
-        b_chan.send(&b"after-fade".to_vec(), addr).await.unwrap();
-        let got = tokio::time::timeout(Duration::from_secs(10), a_chan.receive())
-            .await
-            .expect("link must recover from a two-sided fade, not latch into mutual reclaim")
-            .unwrap();
-        assert_eq!(got, b"after-fade");
-
-        a_chan.send(&b"a-to-b".to_vec(), addr).await.unwrap();
-        let got_b = tokio::time::timeout(Duration::from_secs(10), b_chan.receive())
-            .await
-            .expect("caller→listener must also flow after recovery")
-            .unwrap();
-        assert_eq!(got_b, b"a-to-b");
-
-        unsafe {
-            std::env::remove_var("BUNKER_TURN_RECLAIM_MS");
-            std::env::remove_var("BUNKER_RECLAIM_STAGGER_MS");
-        }
-    }
-
-    /// The outbound override converts Yield->Take only a bounded number of times,
-    /// so a sustained fade still cedes to the caller and cannot re-open the livelock.
-    #[test]
-    fn listener_outbound_take_budget_is_bounded() {
-        let mut d = ReclaimDecider::new(true);
-        let mut budget = LISTENER_OUTBOUND_TAKE_BUDGET;
-        // Force the permanent-yield state.
-        for _ in 0..=LISTENER_LIVELOCK_RECLAIMS {
-            d.on_reclaim_due(1000);
-        }
-        assert_eq!(d.on_reclaim_due(1000), ReclaimAction::Yield);
-
-        // With data queued, only `budget` yields become takes; the rest still yield.
-        let mut overrides = 0u32;
-        let mut yields_after_budget = 0u32;
-        for _ in 0..10 {
-            let action = d.on_reclaim_due(1000);
-            if action == ReclaimAction::Yield && budget > 0 {
-                budget -= 1;
-                overrides += 1;
-            } else if action == ReclaimAction::Yield {
-                yields_after_budget += 1;
-            }
-        }
-        assert_eq!(
-            overrides, LISTENER_OUTBOUND_TAKE_BUDGET,
-            "override must be bounded so a two-sided fade still yields"
-        );
-        assert!(
-            yields_after_budget > 0,
-            "listener must resume yielding once its take budget is spent"
-        );
-    }
-
-    /// Inbound resuming clears the backoff and signals the override may be restored.
-    #[test]
-    fn note_turn_held_reports_inbound_resumed() {
-        let mut d = ReclaimDecider::new(true);
-        for _ in 0..=LISTENER_LIVELOCK_RECLAIMS {
-            d.on_reclaim_due(1000);
-        }
-        // Unchanged activity: no advance, budget must not reset.
-        assert!(!d.note_turn_held(1000));
-        // Advanced activity: two-sided again.
-        assert!(d.note_turn_held(2000));
-    }
-
-    /// A caller starved of the turn must reclaim even while inbound keeps flowing,
-    /// else a peer's stale TX backlog deadlocks it against a yielded listener.
-    #[tokio::test]
-    async fn caller_reclaims_after_turnless_ceiling_despite_inbound() {
-        // SAFETY: single test process env; silence path parked far out of reach.
-        unsafe {
-            std::env::set_var("BUNKER_TURNLESS_RECLAIM_MS", "1500");
-            std::env::set_var("BUNKER_TURN_RECLAIM_MS", "600000");
-        }
-
-        let (a, b) = LoopbackTransport::pair();
-        let mut mux_a = PactorMux::new_half_duplex(a, true);
-        let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
-        let _ha = mux_a.spawn();
-
-        // Hand-driven peer: keepalives refresh A's activity clock but never grant.
-        let b_writer = b.clone();
-        let feeder = tokio::spawn(async move {
-            let mut id = 0u64;
-            loop {
-                for line in fragment_message(id, &[KEEPALIVE_TAG]) {
-                    if b_writer.write_data(&line).await.is_err() {
-                        return;
-                    }
-                }
-                id += 1;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        });
-
-        let addr = "127.0.0.1:1".parse().unwrap();
-        // First message makes A spend its initial turn and grant it away.
-        a_chan.send(&b"first".to_vec(), addr).await.unwrap();
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        // Queued while turnless; only the ceiling reclaim can ever send it.
-        a_chan.send(&b"second".to_vec(), addr).await.unwrap();
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-        let mut reassembler = Reassembler::new();
-        let mut got_second = false;
-        while tokio::time::Instant::now() < deadline && !got_second {
-            let line = tokio::time::timeout(Duration::from_millis(500), async {
-                b.in_rx.lock().await.recv().await
-            })
-            .await;
-            let Ok(Some(line)) = line else { continue };
-            if let Some(msg) = reassembler.push_line(&line) {
-                got_second = msg.first().copied() == Some(Channel::All2All as u8)
-                    && msg.ends_with(b"second");
-            }
-        }
-        feeder.abort();
-        assert!(
-            got_second,
-            "caller must reclaim past the turnless ceiling and deliver queued data \
-             even though peer inbound never went silent"
-        );
-
-        unsafe {
-            std::env::remove_var("BUNKER_TURNLESS_RECLAIM_MS");
-            std::env::remove_var("BUNKER_TURN_RECLAIM_MS");
-        }
-    }
-
     /// Fails the first N writes, then delegates; models a transient modem error.
     struct FlakyTransport {
         inner: Arc<LoopbackTransport>,
-        failures_left: std::sync::atomic::AtomicU32,
+        failures_left: AtomicU32,
     }
 
     #[async_trait]
@@ -1970,11 +1162,7 @@ mod tests {
         async fn write_data(&self, data: &[u8]) -> Result<(), ScsPactorError> {
             if self
                 .failures_left
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |n| n.checked_sub(1),
-                )
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 return Err(ScsPactorError::Timeout);
@@ -1999,14 +1187,14 @@ mod tests {
         let (a_raw, b) = LoopbackTransport::pair();
         let a = Arc::new(FlakyTransport {
             inner: a_raw,
-            failures_left: std::sync::atomic::AtomicU32::new(1),
+            failures_left: AtomicU32::new(1),
         });
 
-        let mut mux_a = PactorMux::new(a);
+        let mut mux_a = PactorMux::new_half_duplex(a, true);
         let a_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_a.channel(Channel::All2All);
         let ha = mux_a.spawn();
 
-        let mut mux_b = PactorMux::new(b);
+        let mut mux_b = PactorMux::new_half_duplex(b, false);
         let b_chan: MuxChannel<Vec<u8>, Vec<u8>> = mux_b.channel(Channel::All2All);
         let _hb = mux_b.spawn();
 
@@ -2040,126 +1228,15 @@ mod tests {
         let _h = mux.spawn();
         tokio::time::sleep(Duration::from_millis(400)).await;
 
-        let lines = transport.written.lock().await.clone();
-        let mut reassembler = Reassembler::new();
-        let first_data_tag = lines.iter().find_map(|line| {
-            reassembler
-                .push_line(line)
-                .and_then(|msg| msg.first().copied())
-                .filter(|tag| *tag != KEEPALIVE_TAG && *tag != TURN_GRANT_TAG)
-        });
+        let first_data_tag = transport
+            .written_tags()
+            .await
+            .into_iter()
+            .find(|tag| *tag != KEEPALIVE_TAG);
         assert_eq!(
             first_data_tag,
             Some(Channel::All2All as u8),
             "the vote must be transmitted before the queued shreds"
         );
-    }
-
-    /// The byte budget must force a grant even with a deep queue, else one turn
-    /// buries the grant behind an unbounded TX backlog.
-    #[tokio::test]
-    async fn turn_grants_after_byte_budget_despite_queued_backlog() {
-        let _env = BUDGET_ENV_LOCK.lock().unwrap();
-        // SAFETY: env-lock held; serialized against the other budget test.
-        unsafe {
-            std::env::set_var("BUNKER_TURN_BYTE_BUDGET", "250");
-        }
-
-        let transport = Arc::new(RecordingTransport::new());
-        let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
-        let chan: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
-
-        // Deep backlog queued before the writer starts its first turn.
-        let addr = "127.0.0.1:1".parse().unwrap();
-        for i in 0..5u8 {
-            chan.send(&vec![i; 100], addr).await.unwrap();
-        }
-        let _h = mux.spawn();
-        tokio::time::sleep(Duration::from_millis(800)).await;
-
-        // Judge only the first turn: a later silence-reclaim may validly send more.
-        let lines = transport.written.lock().await.clone();
-        let mut reassembler = Reassembler::new();
-        let mut data_msgs = 0u32;
-        let mut grant_seen = false;
-        for line in &lines {
-            if let Some(msg) = reassembler.push_line(line) {
-                match msg.first().copied() {
-                    Some(TURN_GRANT_TAG) => {
-                        grant_seen = true;
-                        break;
-                    }
-                    Some(KEEPALIVE_TAG) | None => {}
-                    Some(_) => data_msgs += 1,
-                }
-            }
-        }
-        assert!(
-            grant_seen,
-            "budget-exhausted turn must still end in a grant"
-        );
-        assert!(
-            (1..5).contains(&data_msgs),
-            "byte budget must cut the turn before the whole backlog drains \
-             (sent {data_msgs} of 5)"
-        );
-
-        unsafe {
-            std::env::remove_var("BUNKER_TURN_BYTE_BUDGET");
-        }
-    }
-
-    /// A block's worth of shreds must ship in ONE turn under a whole-block
-    /// budget. A too-tight budget shipped one ~1 KiB shred per turn, so a
-    /// 6-shred block took six turn-cycles and dissemination collapsed to
-    /// minutes per block. Pins the shipped default (8 KiB) explicitly because
-    /// the process-wide env is shared with sibling budget tests.
-    #[tokio::test]
-    async fn default_budget_ships_a_full_block_in_one_turn() {
-        let _env = BUDGET_ENV_LOCK.lock().unwrap();
-        // SAFETY: env-lock held; pin the value this test asserts on.
-        unsafe {
-            std::env::set_var("BUNKER_TURN_BYTE_BUDGET", "8192");
-        }
-        let transport = Arc::new(RecordingTransport::new());
-        let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
-        let chan: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
-
-        // A block's worth of near-full shreds (TOTAL_SHREDS=6, ~1 KiB each).
-        let addr = "127.0.0.1:1".parse().unwrap();
-        for i in 0..6u8 {
-            chan.send(&vec![i; 1024], addr).await.unwrap();
-        }
-        let _h = mux.spawn();
-        tokio::time::sleep(Duration::from_millis(800)).await;
-
-        // Count data messages transmitted before the FIRST turn grant.
-        let lines = transport.written.lock().await.clone();
-        let mut reassembler = Reassembler::new();
-        let mut data_before_grant = 0u32;
-        for line in &lines {
-            if let Some(msg) = reassembler.push_line(line) {
-                match msg.first().copied() {
-                    Some(TURN_GRANT_TAG) => break,
-                    Some(KEEPALIVE_TAG) | None => {}
-                    Some(_) => data_before_grant += 1,
-                }
-            }
-        }
-        assert_eq!(
-            data_before_grant, 6,
-            "an 8 KiB budget must ship all 6 block shreds in one turn, not \
-             throttle to one shred per turn (sent {data_before_grant})"
-        );
-        // The shipped default must be at least a full block, or steady-state
-        // dissemination throttles to one shred per turn on air.
-        assert!(
-            turn_byte_budget() >= 6 * 1024,
-            "default turn budget must carry a whole block's shreds"
-        );
-
-        unsafe {
-            std::env::remove_var("BUNKER_TURN_BYTE_BUDGET");
-        }
     }
 }
