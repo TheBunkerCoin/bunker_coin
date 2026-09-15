@@ -209,7 +209,7 @@ where
                         "[val {}] window {first_slot_in_window}..{last_slot_in_window} already stored — re-disseminating stored shreds after restart",
                         self.epoch_info.own_id
                     );
-                    self.redisseminate_stored_window(first_slot_in_window).await;
+                    self.redisseminate_stored_window(start_slot).await;
                     break None;
                 }
                 if start_slot != first_slot_in_window {
@@ -493,15 +493,20 @@ where
         unreachable!()
     }
 
-    /// Re-sends the already-stored data shreds for every stored slot in the
-    /// window, sourced verbatim from the blockstore (no mempool re-read, so the
-    /// block hash is unchanged and no fork is possible). Used on restart for a
-    /// window we produced before crashing: a peer that missed our tail shreds
+    /// Re-sends the already-stored data shreds from `start_slot` to the end of
+    /// its window, sourced verbatim from the blockstore (no mempool re-read, so
+    /// the block hash is unchanged and no fork is possible). Used on restart for
+    /// a window we produced before crashing: a peer that missed our tail shreds
     /// cannot repair a block it never learned the hash of, so we must re-push.
-    /// One-shot, data shreds only, and bounded to the slots actually stored (a
-    /// window truncated by a mid-window crash stops at its last stored slot).
-    async fn redisseminate_stored_window(&self, first_slot: Slot) {
-        for slot in first_slot.slots_in_window() {
+    /// Starts at the first undecided slot — finalized siblings are already on
+    /// the peer, and on the radio 10 KB of stale shreds ahead of the next window
+    /// cost it ten minutes. One-shot, data shreds only, and bounded to the slots
+    /// actually stored (a window truncated mid-crash stops at its last stored slot).
+    async fn redisseminate_stored_window(&self, start_slot: Slot) {
+        for slot in start_slot
+            .slots_in_window()
+            .skip_while(|slot| *slot < start_slot)
+        {
             let bs = self.blockstore.read().await;
             let Some(hash) = bs.canonical_block_hash(slot) else {
                 break; // no more stored slots in this window (crash truncated it)
@@ -1220,6 +1225,15 @@ mod tests {
             sent.load(Ordering::SeqCst),
             stored.len() * DATA_SHREDS,
             "must re-disseminate exactly the stored data shreds of the stored slots"
+        );
+
+        // Resuming after a finalized first slot re-sends only from the resume slot.
+        sent.store(0, Ordering::SeqCst);
+        bp.redisseminate_stored_window(first.next()).await;
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            DATA_SHREDS,
+            "finalized siblings before the resume slot must not be re-sent"
         );
     }
 }

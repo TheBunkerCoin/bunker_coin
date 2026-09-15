@@ -375,18 +375,19 @@ impl PactorMux {
         // tests, monotonic in production); `last_activity_ms` stays on the
         // process clock for MuxLiveness.
         let epoch = tokio::time::Instant::now();
-        let last_rx_tick = Arc::new(AtomicU64::new(0));
         // Peer acks flow reader -> writer to open our window; bulk we receive
         // flows reader -> writer as (id, on-air bytes) so the writer can ack
         // it cumulatively when it next transmits.
         let (ack_tx, ack_rx) = mpsc::unbounded_channel::<u64>();
         let (ack_due_tx, ack_due_rx) = mpsc::unbounded_channel::<(u64, usize)>();
+        // Bulk written but unacked: still undelivered, so the backlog gauge
+        // counts it — a standstill bundle must not pile onto a crossing window.
+        let unacked_msgs = Arc::new(AtomicU64::new(0));
 
         // Reader: read, reassemble, strip tag, route to a channel queue.
         let reader_transport = transport.clone();
         let reader_activity = last_activity_ms.clone();
         let reader_rx_lines = rx_lines.clone();
-        let reader_rx_tick = last_rx_tick.clone();
         let reader = tokio::spawn(async move {
             let mut reassembler = Reassembler::new();
             loop {
@@ -394,7 +395,6 @@ impl PactorMux {
                     Ok(line) => {
                         // Stamp activity before routing so MuxLiveness sees it.
                         reader_activity.store(now_ms(), Ordering::Relaxed);
-                        reader_rx_tick.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                         reader_rx_lines.fetch_add(1, Ordering::Relaxed);
                         line
                     }
@@ -443,9 +443,9 @@ impl PactorMux {
 
         // Writer: drain the lanes (priority first, bulk gated by acks); keepalive when idle.
         let writer_transport = transport.clone();
-        let writer_rx_tick = last_rx_tick;
         let writer_rx_lines = rx_lines;
         let queues_for_stats = self.outbound.clone();
+        let writer_unacked = unacked_msgs.clone();
         let writer = tokio::spawn(async move {
             let _outbound_keepalive = outbound_keepalive;
             let mut high_rx = high_rx;
@@ -533,6 +533,8 @@ impl PactorMux {
                 /// Highest bulk id received but not yet acked, and the on-air bytes it covers.
                 ack_pending: Option<u64>,
                 ack_pending_bytes: usize,
+                /// Mirrors `inflight.len()` for the backlog gauge.
+                unacked_gauge: Arc<AtomicU64>,
             }
             let mut tx = Tx {
                 pacer: LinkPacer::new(rate),
@@ -543,6 +545,7 @@ impl PactorMux {
                 inflight_bytes: 0,
                 ack_pending: None,
                 ack_pending_bytes: 0,
+                unacked_gauge: writer_unacked,
             };
 
             /// Write one message, account it, and keep the writer alive on error.
@@ -562,6 +565,8 @@ impl PactorMux {
                         if is_bulk_tag(tag) {
                             tx.inflight.push_back((id, tokio::time::Instant::now(), serial));
                             tx.inflight_bytes += serial;
+                            tx.unacked_gauge
+                                .store(tx.inflight.len() as u64, Ordering::Relaxed);
                         }
                         true
                     }
@@ -661,6 +666,8 @@ impl PactorMux {
                     Next::Acked(id) => {
                         tx.inflight.retain(|(inflight_id, _, _)| *inflight_id > id);
                         tx.inflight_bytes = tx.inflight.iter().map(|(_, _, b)| *b).sum();
+                        tx.unacked_gauge
+                            .store(tx.inflight.len() as u64, Ordering::Relaxed);
                     }
                     Next::AckDue(id, bytes) => {
                         tx.ack_pending = Some(id);
@@ -678,6 +685,7 @@ impl PactorMux {
                         );
                         tx.inflight.clear();
                         tx.inflight_bytes = 0;
+                        tx.unacked_gauge.store(0, Ordering::Relaxed);
                     }
                     // A pending ack is a line too, so it stands in for the keepalive.
                     Next::Keepalive => {
@@ -700,9 +708,13 @@ impl PactorMux {
         // Sample from a separate task so the gauge updates while the writer is parked.
         let gauge_task = self.queued_gauge.take().map(|gauge| {
             let queues = self.outbound.clone();
+            let unacked = unacked_msgs;
             tokio::spawn(async move {
                 loop {
-                    gauge.store(queues.queued(), Ordering::Relaxed);
+                    gauge.store(
+                        queues.queued() + unacked.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             })
@@ -1203,9 +1215,30 @@ mod tests {
         );
     }
 
+    /// On-air cost of one bulk message as the writer accounts it.
+    fn bulk_cost(payload: &[u8]) -> usize {
+        let mut tagged = vec![Channel::Disseminator as u8];
+        tagged.extend_from_slice(payload);
+        fragment_message(0, &tagged)
+            .iter()
+            .map(|line| on_air_cost(line.len()))
+            .sum()
+    }
+
+    /// Equal-cost shreds that ship before the byte window closes.
+    fn shreds_in_window(shred_cost: usize) -> usize {
+        BULK_WINDOW_BYTES.div_ceil(shred_cost)
+    }
+
+    fn ack_for(id: u64) -> Vec<u8> {
+        let mut ack = vec![BULK_ACK_TAG];
+        ack.extend_from_slice(&id.to_le_bytes());
+        ack
+    }
+
     /// The modem arbitrates turns: the mux must never write turn-grant control
-    /// messages or issue a changeover. Bulk is gated by the ack window, so of
-    /// six queued shreds only BULK_WINDOW ship until the peer acks.
+    /// messages or issue a changeover. Bulk is gated by the byte window, so of
+    /// twelve queued shreds only one window's worth ship until the peer acks.
     #[tokio::test]
     async fn half_duplex_never_issues_turn_control() {
         let transport = Arc::new(RecordingTransport::new());
@@ -1213,17 +1246,21 @@ mod tests {
         let shreds: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
         let votes: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
         let addr = "127.0.0.1:1".parse().unwrap();
-        for i in 0..6u8 {
+        // Spawn first: the half-duplex bulk lane is shallow on purpose and
+        // would otherwise block the twelfth send.
+        let _h = mux.spawn();
+        for i in 0..12u8 {
             shreds.send(&vec![i; 1024], addr).await.unwrap();
         }
         votes.send(&b"vote".to_vec(), addr).await.unwrap();
-        let _h = mux.spawn();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
+        let in_window = shreds_in_window(bulk_cost(&[0u8; 1024]));
+        assert!(in_window < 12, "test needs more shreds than one window holds");
         let tags = transport.written_tags().await;
         assert_eq!(
             tags.len(),
-            1 + BULK_WINDOW,
+            1 + in_window,
             "the vote plus one window of shreds ship immediately"
         );
         assert!(
@@ -1237,49 +1274,65 @@ mod tests {
         );
     }
 
-    /// Bulk stays bounded in the modem: a peer ack opens one slot, and an
-    /// unanswered slot is released after the ack timeout.
+    /// Bulk stays byte-bounded in the modem; one cumulative ack releases every
+    /// slot up to its id, and an unanswered window is released whole after the
+    /// ack timeout so a dead reverse path cannot stall streaming.
     #[tokio::test(start_paused = true)]
-    async fn bulk_window_advances_on_ack_and_timeout() {
+    async fn bulk_window_is_byte_bounded_with_cumulative_acks() {
         let transport = Arc::new(RecordingTransport::new());
         let mut mux = PactorMux::new_half_duplex(transport.clone(), true);
         let shreds: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
         let addr = "127.0.0.1:1".parse().unwrap();
-        for i in 0..4u8 {
-            shreds.send(&vec![i; 200], addr).await.unwrap();
-        }
+        let gauge = Arc::new(AtomicU64::new(0));
+        mux.set_queued_gauge(gauge.clone());
+        let shred = vec![7u8; 1024];
+        let in_window = shreds_in_window(bulk_cost(&shred));
+        assert!(in_window > 3, "window must hold more than the three shreds acked below");
+        let total = 2 * in_window;
         let _h = mux.spawn();
+        for _ in 0..total {
+            shreds.send(&shred, addr).await.unwrap();
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         let sent = transport.written_msgs().await;
-        assert_eq!(sent.len(), BULK_WINDOW, "window full: no third shred yet");
+        assert_eq!(sent.len(), in_window, "window full: nothing more ships");
+        assert_eq!(
+            gauge.load(Ordering::Relaxed) as usize,
+            total,
+            "backlog gauge counts queued and unacked bulk alike"
+        );
 
-        // Peer acks the first shred: exactly one more ships.
-        let first_id = sent[0].0;
-        let mut ack = vec![BULK_ACK_TAG];
-        ack.extend_from_slice(&first_id.to_le_bytes());
-        transport.push_inbound(777, &ack).await;
+        // Peer acks the third shred: the first three slots free at once.
+        transport.push_inbound(777, &ack_for(sent[2].0)).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(transport.written_msgs().await.len(), BULK_WINDOW + 1);
+        assert_eq!(
+            transport.written_msgs().await.len(),
+            in_window + 3,
+            "a cumulative ack frees every slot up to its id"
+        );
+        assert_eq!(gauge.load(Ordering::Relaxed) as usize, total - 3);
 
-        // No further acks: the oldest slot times out and the last shred ships.
+        // No further acks: the whole window releases on timeout and the rest streams.
         tokio::time::sleep(BULK_ACK_TIMEOUT + Duration::from_secs(1)).await;
-        let tags: Vec<u8> = transport
+        let bulk = transport
             .written_tags()
             .await
             .into_iter()
-            .filter(|t| *t != KEEPALIVE_TAG)
-            .collect();
-        assert_eq!(tags.len(), 4, "all four shreds eventually ship");
+            .filter(|t| *t == Channel::Disseminator as u8)
+            .count();
+        assert_eq!(bulk, total, "all shreds eventually ship");
     }
 
-    /// The receiver acks bulk messages (by the sender's id) and nothing else.
+    /// The receiver acks bulk lazily: a lone shred is not acked on its own,
+    /// the pending ack rides ahead of the next message we send anyway, and
+    /// priority inbound is never acked.
     #[tokio::test]
-    async fn receiver_acks_bulk_not_priority() {
+    async fn receiver_acks_bulk_lazily_and_piggybacks() {
         let transport = Arc::new(RecordingTransport::new());
         let mut mux = PactorMux::new_half_duplex(transport.clone(), false);
         let _shreds: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
-        let _votes: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
+        let votes: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::All2All);
         let _h = mux.spawn();
 
         transport
@@ -1289,6 +1342,41 @@ mod tests {
             .push_inbound(4243, &[Channel::All2All as u8, 1])
             .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            transport.written_msgs().await.is_empty(),
+            "a lone small bulk message must not cost the peer a break-in"
+        );
+
+        let addr = "127.0.0.1:1".parse().unwrap();
+        votes.send(&b"vote".to_vec(), addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let msgs = transport.written_msgs().await;
+        let tags: Vec<u8> = msgs.iter().map(|(_, t, _)| *t).collect();
+        assert_eq!(
+            tags,
+            vec![BULK_ACK_TAG, Channel::All2All as u8],
+            "the pending ack rides ahead of the vote"
+        );
+        assert_eq!(msgs[0].2, 4242u64.to_le_bytes().to_vec());
+    }
+
+    /// Half a window of unacked inbound bulk flushes one cumulative ack for
+    /// the latest id — before the sender's window can close on it.
+    #[tokio::test]
+    async fn receiver_flushes_ack_at_half_window() {
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new_half_duplex(transport.clone(), false);
+        let _shreds: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
+        let _h = mux.spawn();
+
+        let mut tagged = vec![Channel::Disseminator as u8];
+        tagged.extend_from_slice(&[3u8; 1024]);
+        // The reader accounts a received message by its reassembled length.
+        let needed = BULK_ACK_FLUSH_BYTES.div_ceil(on_air_cost(tagged.len())) as u64;
+        for i in 0..needed {
+            transport.push_inbound(1000 + i, &tagged).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let acks: Vec<Vec<u8>> = transport
             .written_msgs()
@@ -1297,7 +1385,36 @@ mod tests {
             .filter(|(_, t, _)| *t == BULK_ACK_TAG)
             .map(|(_, _, p)| p)
             .collect();
-        assert_eq!(acks, vec![4242u64.to_le_bytes().to_vec()]);
+        assert_eq!(
+            acks,
+            vec![(1000 + needed - 1).to_le_bytes().to_vec()],
+            "one cumulative ack for the latest id once half a window is pending"
+        );
+    }
+
+    /// A pending ack stands in for the idle keepalive: one line, not two.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_carries_pending_ack() {
+        let transport = Arc::new(RecordingTransport::new());
+        let mut mux = PactorMux::new_half_duplex(transport.clone(), false);
+        let _shreds: MuxChannel<Vec<u8>, Vec<u8>> = mux.channel(Channel::Disseminator);
+        let _h = mux.spawn();
+
+        transport
+            .push_inbound(55, &[Channel::Disseminator as u8, 1, 2, 3])
+            .await;
+        tokio::time::sleep(KEEPALIVE_IDLE + Duration::from_secs(2)).await;
+        assert_eq!(
+            transport.written_tags().await,
+            vec![BULK_ACK_TAG],
+            "the ack is the keepalive line"
+        );
+        // Nothing left to ack: the next idle period keepalives normally.
+        tokio::time::sleep(KEEPALIVE_IDLE).await;
+        assert_eq!(
+            transport.written_tags().await,
+            vec![BULK_ACK_TAG, KEEPALIVE_TAG]
+        );
     }
 
     #[tokio::test]
@@ -1559,3 +1676,4 @@ mod tests {
         );
     }
 }
+

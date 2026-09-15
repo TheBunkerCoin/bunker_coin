@@ -62,12 +62,8 @@ fn scaled(base_ms: u64) -> Duration {
     Duration::from_millis((base_ms as f64 * *DELTA_MULT) as u64)
 }
 
-/// Time bound assumed on network transmission delays during periods of synchrony.
-pub(crate) fn delta() -> Duration {
-    scaled(8_000)
-}
 /// Time the leader has for producing and sending the block.
-fn delta_block() -> Duration {
+pub(crate) fn delta_block() -> Duration {
     scaled(120_000)
 }
 /// Timeout to use when we have seen at least one shred from the leader's block.
