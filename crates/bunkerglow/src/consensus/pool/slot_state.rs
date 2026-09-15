@@ -469,6 +469,27 @@ impl SlotState {
             .iter()
             .any(|n| n.block_hash() == block_hash)
     }
+
+    /// Whether `block_hash` is certified as a valid parent by any notar,
+    /// notar-fallback, or finalization cert; the stronger certs must count too,
+    /// or a repaired block whose parent finalized normally never fires SafeToNotar.
+    pub fn is_parent_certified(&self, block_hash: &BlockHash) -> bool {
+        if self.is_notar_fallback(block_hash) {
+            return true;
+        }
+        let names = |h: Option<&BlockHash>| h == Some(block_hash);
+        names(self.certificates.notar.as_ref().map(NotarCert::block_hash))
+            || names(
+                self.certificates
+                    .fast_finalize
+                    .as_ref()
+                    .map(FastFinalCert::block_hash),
+            )
+            // A slow-final cert has no hash of its own; pair it with the notar
+            // cert it finalizes, which does name the block.
+            || (self.certificates.finalize.is_some()
+                && names(self.certificates.notar.as_ref().map(NotarCert::block_hash)))
+    }
 }
 
 impl SlotVotes {

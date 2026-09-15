@@ -326,6 +326,10 @@ pub trait Blockstore {
 
     fn disseminated_block_hash(&self, slot: Slot) -> Option<BlockHash>;
 
+    /// Disseminated shreds stored for `slot` without a completed block yet:
+    /// the leader's stream for this slot is still arriving.
+    fn has_partial_disseminated_block(&self, slot: Slot) -> bool;
+
     fn get_block(&self, block_id: &BlockId) -> Option<Block>;
 
     fn get_last_slice_index(&self, block_id: &BlockId) -> Option<SliceIndex>;
@@ -423,6 +427,16 @@ impl Blockstore for BlockstoreImpl {
             .completed
             .as_ref()
             .map(|c| c.0.clone())
+    }
+
+    fn has_partial_disseminated_block(&self, slot: Slot) -> bool {
+        self.slot_data(slot).is_some_and(|s| {
+            s.disseminated.completed.is_none()
+                && s.disseminated
+                    .shreds
+                    .values()
+                    .any(|shreds| shreds.iter().any(Option::is_some))
+        })
     }
 
     fn get_block(&self, block_id: &BlockId) -> Option<Block> {

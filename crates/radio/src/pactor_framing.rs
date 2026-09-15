@@ -54,6 +54,13 @@ pub(crate) fn frame_fragment(header: &FragmentHeader, chunk: &[u8]) -> Vec<u8> {
     packet
 }
 
+/// True when `bytes` parse as one framed mux fragment — genuine peer traffic,
+/// as opposed to modem echoes or corrupted lines. Watchdogs must key on this:
+/// raw serial lines can self-refresh forever on a dead link.
+pub fn is_framed_line(bytes: &[u8]) -> bool {
+    parse_fragment(bytes).is_some()
+}
+
 /// Decode a fragment line into its header and chunk bytes.
 pub(crate) fn parse_fragment(bytes: &[u8]) -> Option<(FragmentHeader, Vec<u8>)> {
     let (header, consumed): (FragmentHeader, usize) =
@@ -118,8 +125,23 @@ impl Reassembler {
         self.push_line_at(line, std::time::Instant::now())
     }
 
+    /// Like [`push_line`](Self::push_line), also returning the sender's message id
+    /// so a receiver can acknowledge exactly what it reassembled.
+    pub fn push_line_with_id(&mut self, line: &[u8]) -> Option<(u64, Vec<u8>)> {
+        self.push_line_at_with_id(line, std::time::Instant::now())
+    }
+
     /// Test hook for driving TTL eviction with an explicit clock.
     fn push_line_at(&mut self, line: &[u8], now: std::time::Instant) -> Option<Vec<u8>> {
+        self.push_line_at_with_id(line, now)
+            .map(|(_, message)| message)
+    }
+
+    fn push_line_at_with_id(
+        &mut self,
+        line: &[u8],
+        now: std::time::Instant,
+    ) -> Option<(u64, Vec<u8>)> {
         // Lost fragments cannot pin message ids or memory past the TTL.
         self.partial
             .retain(|_, state| now.duration_since(state.created) < REASSEMBLY_TTL);
@@ -133,7 +155,7 @@ impl Reassembler {
         }
 
         if header.total_fragments == 1 {
-            return Some(chunk);
+            return Some((header.message_id, chunk));
         }
 
         // Cap concurrent reassemblies: make room by dropping the oldest.
@@ -183,13 +205,25 @@ impl Reassembler {
             }
         }
         self.partial.remove(&header.message_id);
-        Some(message)
+        Some((header.message_id, message))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Watchdogs key on this: only framed peer traffic counts as alive.
+    #[test]
+    fn is_framed_line_rejects_echoes_and_garbage() {
+        let framed = fragment_message(7, &[0xFEu8, 1, 2, 3]);
+        assert!(is_framed_line(&framed[0]));
+        assert!(!is_framed_line(b"STBY >>"));
+        assert!(!is_framed_line(
+            b"e55f6f5c783ffabaac9d567d99b9d97af0000000000000000"
+        ));
+        assert!(!is_framed_line(b""));
+    }
 
     #[test]
     fn header_and_chunk_len_are_sane() {
