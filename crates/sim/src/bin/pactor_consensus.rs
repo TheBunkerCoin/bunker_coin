@@ -278,7 +278,7 @@ impl PactorTransport for CountingTransport {
     async fn read_data(&self, max_len: usize) -> Result<Vec<u8>, scs_pactor::ScsPactorError> {
         let payload = self.inner.read_data(max_len).await?;
         // Only framed peer traffic feeds the rx-stall watchdog: modem echoes on
-        // a dead link otherwise self-refresh the clock forever (Sep 10 zombie).
+        // a dead link otherwise self-refresh the clock forever.
         if bunker_coin_radio::pactor_framing::is_framed_line(&payload) {
             *self.last_rx.lock().unwrap() = Instant::now();
         }

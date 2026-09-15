@@ -2957,8 +2957,8 @@ fn b58(bytes: &[u8]) -> String {
 
 /// Highest finalized slot exposed as wallet-visible context.
 // The /nodes sampler lags after a restart; the pool's finalized slot keeps
-// every tip-anchored scan window near the real tip (a collapsed window sent
-// the /blocks chain walk unbounded to genesis — the 79780 hang).
+// every tip-anchored scan window near the real tip, else a collapsed window
+// walks the chain unbounded to genesis.
 async fn current_slot(state: &SharedState) -> u64 {
     let sampled = state
         .nodes

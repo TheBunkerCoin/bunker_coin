@@ -159,18 +159,16 @@ pub async fn init_modem(cfg: &PactorInitConfig) -> anyhow::Result<UsbPactorTrans
     let commands = [
         format!("MYcall {}", cfg.callsign),
         format!("PTCH {PACTOR_CHANNEL}"),
-        // Max fade ride-through (~5 min); 35 (~45s) tore the link down on every
-        // deep fade and each reconnect costs minutes plus a risky handshake.
+        // Max fade ride-through (~5 min): a short budget tears the link down on
+        // every deep fade, and each reconnect costs minutes.
         "MAXE 255".to_owned(),
         "REM 0".to_owned(),
         "CHOB 0".to_owned(),
         // Ctrl-Z lets the ISS hand the transmit turn to the peer in converse mode.
         "CHO 26".to_owned(),
         // PACTOR duplex: the modem arbitrates the turn itself — as ISS it
-        // changes over once its TX buffer is empty, as IRS it breaks in when
-        // it holds data. Without it the caller stays ISS forever and the
-        // listener's writes never leave its modem (observed: node0 rx 0 for
-        // 13 min while node1 kept transmitting into its own buffer).
+        // changes over once its TX buffer is empty, as IRS it breaks in when it
+        // holds data. Without it the caller stays ISS and the listener is mute.
         PDUPLEX_ON.to_owned(),
         "TONES 4".to_owned(),
         "MARK 1600".to_owned(),

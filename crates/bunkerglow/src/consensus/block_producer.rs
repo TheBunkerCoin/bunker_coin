@@ -150,13 +150,9 @@ where
                 continue;
             }
 
-            // Production starts at the first slot finality has not covered.
-            // After a restart this loop starts at genesis while the pool floor
-            // is ahead, so decided windows are skipped outright; a window whose
-            // PREFIX is finalized (a peer's cert landed for slots we lost) is
-            // resumed right after finality instead of abandoned — its open
-            // slots are still votable, and leaving them unproduced costs the
-            // full crashed-leader timeout budget before anyone can skip them.
+            // Start at the first slot finality has not covered: decided windows
+            // are skipped (a restart begins at genesis), and a window whose
+            // prefix a peer's cert finalized resumes right after it.
             let mut start_slot = first_slot_in_window;
             let first_block = loop {
                 let (finalized, first_slot_skip_certed) = {
@@ -176,9 +172,8 @@ where
                     break None;
                 };
                 start_slot = start_slot.max(resume);
-                // A slot already carrying a skip cert can never be notarized;
-                // a block produced into it only burns airtime (the peer voted
-                // skip long ago when our original block never reached it).
+                // A skip-certified slot can never be notarized; producing into
+                // it only burns airtime.
                 while start_slot <= last_slot_in_window
                     && self.pool.read().await.has_skip_cert(start_slot)
                 {
@@ -199,12 +194,9 @@ where
                     .canonical_block_hash(start_slot)
                     .is_some();
                 if window_already_produced(start_slot, stored) {
-                    // Re-produce would fork (drifted mempool), but a peer that never
-                    // received our tail shreds before a restart cannot repair a block
-                    // it can't name (repair is hash-addressed) — it times out and
-                    // skip-certs our valid block permanently. Re-disseminate the exact
-                    // STORED shreds instead: byte-identical, so no fork, and the peer
-                    // reconstructs and notar-votes the slots it was missing.
+                    // Re-producing with a drifted mempool would fork; re-send the
+                    // stored shreds byte-identical so a peer that missed the tail
+                    // (repair is hash-addressed) can still notar-vote them.
                     info!(
                         "[val {}] window {first_slot_in_window}..{last_slot_in_window} already stored — re-disseminating stored shreds after restart",
                         self.epoch_info.own_id
@@ -493,15 +485,10 @@ where
         unreachable!()
     }
 
-    /// Re-sends the already-stored data shreds from `start_slot` to the end of
-    /// its window, sourced verbatim from the blockstore (no mempool re-read, so
-    /// the block hash is unchanged and no fork is possible). Used on restart for
-    /// a window we produced before crashing: a peer that missed our tail shreds
-    /// cannot repair a block it never learned the hash of, so we must re-push.
-    /// Starts at the first undecided slot — finalized siblings are already on
-    /// the peer, and on the radio 10 KB of stale shreds ahead of the next window
-    /// cost it ten minutes. One-shot, data shreds only, and bounded to the slots
-    /// actually stored (a window truncated mid-crash stops at its last stored slot).
+    /// Re-sends the stored data shreds from `start_slot` to the end of its
+    /// window, verbatim from the blockstore so the hash cannot change. Restart
+    /// path: a peer that missed our tail cannot repair a block it never learned
+    /// the hash of. Decided slots are skipped; stops at the last stored slot.
     async fn redisseminate_stored_window(&self, start_slot: Slot) {
         for slot in start_slot
             .slots_in_window()
@@ -1155,11 +1142,9 @@ mod tests {
         assert_eq!(new_block_info.parent, new_parent);
     }
 
-    /// On restart, an already-produced window must RE-DISSEMINATE its stored
-    /// shreds so a peer that missed the tail (and cannot repair a block it never
-    /// learned the hash of) receives and notar-votes it — instead of timing out
-    /// and skip-certing a valid block permanently. Iteration stops at the first
-    /// slot with no stored block (a window truncated by a mid-window crash).
+    /// A window produced before a restart re-sends its stored shreds so a peer
+    /// that missed the tail can still vote; iteration stops at the first slot
+    /// without a stored block.
     #[tokio::test]
     async fn redisseminate_stored_window_resends_stored_shreds() {
         use crate::test_utils::create_random_shredded_block;

@@ -7,15 +7,12 @@
 //! SCS "PACTOR duplex" (`PDUPLEX 1`, see `pactor_init`), where the ISS
 //! changes over as soon as its TX buffer is empty and an IRS holding data
 //! breaks in after ~12s, so both sides simply write when they have something
-//! to say. An earlier software turn protocol (grant lines, Ctrl-Z
-//! changeovers, silence reclaims, a caller ceiling) fought that arbiter —
-//! stranded grants, 200–300s reclaim ladders, force-takes chopping frames —
-//! and was removed.
+//! to say; a software turn protocol layered on top fought that arbiter and
+//! was removed.
 //!
 //! What remains: priority lanes; a byte window on the bulk lane so shreds
 //! never bury a vote inside the modem's FIFO (priority is meaningless once
-//! bytes are in the modem, and a repair burst once buried a finalization
-//! cert for 20 minutes), acked cumulatively and lazily — the receiver's
+//! bytes are in the modem), acked cumulatively and lazily — the receiver's
 //! acks ride on lines it sends anyway, because every receiver break-in
 //! costs the streaming side a changeover; whole-message bursts (never
 //! starve the modem mid-message, or it changes over per line); a serial
@@ -51,10 +48,8 @@ const DEFAULT_MAX_READ_LEN: usize = 8192;
 /// Per-channel queue bound before backpressure reaches the single reader task.
 const CHANNEL_QUEUE_DEPTH: usize = 1024;
 
-/// Bulk lane depth: roughly one block of shreds. A leader that queues a whole
-/// window ahead keeps pushing the shreds of slots the peer has meanwhile
-/// skip-certified — ~35 KB of doomed traffic hogging a 10 B/s channel was
-/// observed. Backpressure makes production wait for the link instead.
+/// Bulk lane depth, roughly one block of shreds: a leader queuing a whole
+/// window ahead keeps pushing shreds for slots the peer has since skip-certified.
 const BULK_QUEUE_DEPTH: usize = 8;
 
 /// Legacy control tag from the removed software turn protocol; still ignored
@@ -88,13 +83,11 @@ const BULK_ACK_FLUSH_BYTES: usize = BULK_WINDOW_BYTES / 2;
 const BULK_ACK_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Send a keepalive once WE have not transmitted for this long, whatever the
-/// peer is doing. On a half-duplex link a station streaming for minutes
-/// hears nothing, so its rx-stall watchdog and Votor liveness depend on the
-/// receiving side breaking in with a line now and then; suppressing that on
-/// inbound left the caller at `rx 0` while the listener stayed politely
-/// silent. Each break-in costs the streaming peer a changeover, so this is
-/// as long as the 600s watchdog allows with room for two lost attempts; a
-/// pending bulk ack rides in place of the keepalive.
+/// peer is doing: a station streaming for minutes hears nothing, so its
+/// rx-stall watchdog and Votor liveness depend on the receiver's lines. Each
+/// break-in costs the streaming peer a changeover, so this is as long as the
+/// 600s watchdog allows with room for two lost attempts; a pending bulk ack
+/// rides in place of the keepalive.
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(180);
 
 /// Periodic traffic summary interval.
@@ -103,13 +96,10 @@ const STATS_INTERVAL: Duration = Duration::from_secs(60);
 /// Write-retry back-off; a writer that exits on error mutes the node forever.
 const WRITE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Serial feed cap for the modem TX buffer, bytes/sec of hex line text. This
-/// is an overflow guard, NOT link pacing: under PACTOR duplex the modem
-/// changes over the moment its buffer runs dry, so feeding it slower than it
-/// transmits would hand the turn away between every line and cost a ~12s
-/// break-in per line. The default sits far above any PACTOR speed; pin lower
-/// via BUNKER_LINK_PACE_BPS only to experiment. Tests run unpaced unless
-/// they pin a rate.
+/// Serial feed cap for the modem TX buffer (hex line bytes/sec). An overflow
+/// guard, not link pacing: under PACTOR duplex the modem changes over the
+/// moment its buffer runs dry, so under-feeding costs a break-in per line.
+/// Pin via BUNKER_LINK_PACE_BPS only to experiment; tests run unpaced.
 fn pace_bytes_per_sec() -> u64 {
     let pinned = std::env::var("BUNKER_LINK_PACE_BPS")
         .ok()
@@ -739,10 +729,8 @@ pub struct MuxLiveness {
 /// Inbound-activity window for link liveness; must exceed the longest normal
 /// inbound gap (fades), else Votor reads the link as dead and skips a leader's
 /// still-in-transit block. It MUST be at least the RX-stall watchdog threshold
-/// (BUNKER_RX_STALL_SECS, default 600s): the watchdog treats the link as UP
-/// until that much silence, so liveness must too — otherwise there is a window
-/// where the session is still up (block crawling across) yet Votor sees "dead"
-/// and skips it. Observed fades run 110–559s of silence.
+/// (BUNKER_RX_STALL_SECS, default 600s) so liveness and the watchdog agree on
+/// when the link is actually down.
 fn liveness_window() -> Duration {
     std::env::var("BUNKER_LIVENESS_WINDOW_MS")
         .ok()
@@ -920,12 +908,9 @@ where
 mod tests {
     use super::*;
 
-    /// The default liveness window must span a realistic fade — the link stays
-    /// silent 110–559s but is NOT down (RX-stall watchdog only fires at 600s).
-    /// A shorter window made Votor read "dead" mid-fade and skip a leader's
-    /// still-in-transit block (node1's trailing window slot was lost this way).
-    /// The window must sit above the worst fade yet at/above the 600s watchdog,
-    /// so liveness and the watchdog agree on when the link is actually down.
+    /// The default liveness window must span a realistic fade (minutes of
+    /// silence with the link still up) and sit at or above the 600s RX-stall
+    /// watchdog, so liveness and the watchdog agree on when the link is down.
     #[test]
     fn default_liveness_window_spans_a_realistic_fade() {
         // No env override: exercise the shipped default.

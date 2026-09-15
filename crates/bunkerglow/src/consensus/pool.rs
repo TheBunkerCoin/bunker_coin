@@ -457,13 +457,9 @@ impl PoolImpl {
         Vec::new()
     }
 
-    /// Reads persisted FINALIZATION certs for slots in `[lower, upper)` from the
-    /// DB (newest first). These slots sit below the floor, so they are gone from
-    /// in-memory `slot_states` after `prune`, but their `cert|` rows survive.
-    /// Re-sending them lets a lagging peer, whose floor is behind ours, catch up
-    /// directly from a single fast-final cert — the standstill bundle is
-    /// otherwise floor-relative on each node, so neither ever re-sends the
-    /// finalizing certs the other is missing below its own floor.
+    /// Persisted FINALIZATION certs for slots in `[lower, upper)`, newest first.
+    /// They sit below the floor (pruned from memory, rows survive); re-sending
+    /// them lets a peer whose floor is behind ours catch up from one cert.
     fn get_persisted_final_certs(&self, lower: Slot, upper: Slot) -> Vec<Cert> {
         let mut out = Vec::new();
         for s in (lower.inner()..upper.inner()).rev() {
@@ -741,10 +737,8 @@ impl Pool for PoolImpl {
         certs.extend(self.get_certs(slot..));
         let mut votes = self.get_own_votes(slot..);
 
-        // A peer whose floor is behind ours needs the finalizing certs for the
-        // slots between the two floors — which are below OUR floor and thus
-        // absent from the range above. Re-send a bounded sub-floor tail (the
-        // prior window) from the DB so standstill recovery is self-healing.
+        // A peer whose floor is behind ours needs finalizing certs below OUR
+        // floor; re-send a bounded sub-floor tail (the prior window) from the DB.
         let floor_win = slot.first_slot_in_window();
         let lower = Slot::new(floor_win.inner().saturating_sub(SLOTS_PER_WINDOW));
         let mut sub_floor = self.get_persisted_final_certs(lower, slot);
@@ -1250,10 +1244,8 @@ mod tests {
         assert_eq!(pool.finalized_slot(), Slot::new(1));
     }
 
-    /// Standstill recovery must re-send finalization certs for slots BELOW the
-    /// floor so a lagging peer catches up. Without this, an ahead node never
-    /// re-sends the certs a behind node needs (both bundles are floor-relative),
-    /// and the two floors diverge permanently (node0 79823 / node1 79827).
+    /// Standstill recovery must re-send finalization certs BELOW the floor so a
+    /// lagging peer catches up; floor-relative bundles otherwise diverge forever.
     #[tokio::test]
     async fn standstill_resends_sub_floor_finalization_certs() {
         let (sks, epoch_info) = generate_validators(11);
@@ -2143,10 +2135,9 @@ mod tests {
     }
 
     /// A node that skip-voted a slot must still emit SafeToNotar once it repairs
-    /// the block and sees a peer notar vote — even when the parent was certified
-    /// by a plain notar/finalization cert rather than a notar-fallback. This is
-    /// the fork-reconciliation path: without it two nodes that split (one
-    /// notarized, one skipped) can never converge (production slots 79796-99).
+    /// the block and sees a peer notar vote, even when the parent holds a plain
+    /// notar/finalization cert rather than a notar-fallback — the fork
+    /// reconciliation path.
     #[tokio::test]
     async fn skip_voter_reconciles_via_safe_to_notar_with_finalized_parent() {
         let (sks, epoch_info) = generate_validators(2);
@@ -2166,10 +2157,8 @@ mod tests {
         let parent_hash: BlockHash = Hash::random_for_test().into();
         let child_hash: BlockHash = Hash::random_for_test().into();
 
-        // Reproduce the post-restart parent state: load_from_db replays a
-        // persisted NOTAR cert (add_cert sets only `notar`, never the
-        // vote-derived `notar_fallback`). This is exactly what a finalized
-        // parent looks like after a reconnect — the state the bug mishandled.
+        // Post-restart parent state: load_from_db replays a persisted NOTAR
+        // cert (add_cert sets `notar`, never the vote-derived `notar_fallback`).
         let parent_votes: Vec<Vote> = (0..2)
             .map(|v| Vote::new_notar(parent, parent_hash.clone(), &sks[v as usize], v as u64))
             .collect();

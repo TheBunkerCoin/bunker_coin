@@ -82,10 +82,8 @@ pub struct Votor<A: All2All> {
     restored_votes: Vec<Vote>,
     /// Re-armed after restart so slow-final liveness survives a grace-window crash.
     restored_final_deadlines: Vec<(Slot, BlockHash)>,
-    /// Slots with a deferred-final intent restored at startup: their grace
-    /// already elapsed pre-crash, so cast the finalize vote as soon as the
-    /// enabling notar cert arrives rather than waiting a fresh grace (a node
-    /// restarting faster than the grace would otherwise never finalize them).
+    /// Deferred-final intents restored at startup: their grace elapsed
+    /// pre-crash, so finalize as soon as the enabling notar cert arrives.
     finalize_on_notar_cert: BTreeSet<Slot>,
     /// Events below this pruned floor are dropped to avoid conflicting stale votes.
     finalized_floor: Slot,
@@ -225,11 +223,8 @@ impl<A: All2All> Votor<A> {
             debug!("rebroadcasting restored vote for slot {}", vote.slot());
             self.all2all.broadcast(&vote.into()).await.unwrap();
         }
-        // Timer fallback for restored deferred-finals. The primary driver is the
-        // CertCreated(Notar) arm firing `finalize_on_notar_cert` — a node that
-        // restarts faster than the grace would otherwise never reach this
-        // deadline, freezing the floor. The timer still backstops the case where
-        // the notar cert never re-arrives (only the block does).
+        // Timer fallback for restored deferred-finals; the CertCreated(Notar)
+        // arm is the primary driver, this backstops a cert that never re-arrives.
         for (slot, hash) in std::mem::take(&mut self.restored_final_deadlines) {
             debug!("re-arming deferred-final deadline for slot {slot} after restart");
             let sender = self.event_sender.clone();
@@ -292,12 +287,9 @@ impl<A: All2All> Votor<A> {
                             let cslot = cert.slot();
                             let chash = cert.block_hash().cloned().unwrap();
                             self.block_notarized.insert(cslot, chash.clone());
-                            // Non-deferred: finalize on the cert. Deferred: normally
-                            // wait for the grace, EXCEPT a slot whose deferred-final
-                            // intent was restored at startup — its grace already
-                            // elapsed pre-crash, so finalize now that the enabling
-                            // notar cert is in hand (else a node restarting faster
-                            // than the grace never finalizes it).
+                            // Non-deferred: finalize on the cert. Deferred: wait for
+                            // the grace, except a restored intent whose grace already
+                            // elapsed pre-crash.
                             if !self.defer_final_vote || self.finalize_on_notar_cert.remove(&cslot)
                             {
                                 self.try_final(cslot, chash).await;
@@ -357,14 +349,10 @@ impl<A: All2All> Votor<A> {
                 VotorEvent::Timeout(slot) => {
                     trace!("timeout for slot {slot}");
                     if !self.voted.contains(&slot) {
-                        // Same liveness gate as TimeoutCrashedLeader: on a slow
-                        // but alive link a leader's blocks are still crossing
-                        // when this fires — a 7 KB block at 10 B/s takes longer
-                        // than delta_block. Skipping one that is mid-flight
-                        // wastes the airtime already spent and poisons the slot
-                        // with mixed votes, so a block with shreds seen gets the
-                        // same bounded patience as an absent one; skip once the
-                        // link is down or the re-arm budget is spent.
+                        // Liveness gate (as TimeoutCrashedLeader): on a slow but
+                        // alive link a block can take longer than delta_block to
+                        // cross, and skipping it mid-flight poisons the slot; re-arm
+                        // (bounded) and skip only once the link is down.
                         let rearms = self.crashed_leader_rearms.entry(slot).or_insert(0);
                         if self.link_liveness.is_link_alive()
                             && *rearms < Self::MAX_CRASHED_LEADER_REARMS
@@ -648,10 +636,8 @@ mod tests {
         );
     }
 
-    /// A plain per-slot Timeout (the trailing window slots) must ALSO pause
-    /// when the link is alive — a leader's later slots are still crossing a slow
-    /// link. Without this only the window's first slot was liveness-gated, so
-    /// node1's 4th slot was repeatedly skip-certed while its block was in transit.
+    /// A plain per-slot Timeout (the trailing window slots) must also pause
+    /// while the link is alive; a leader's later slots are still crossing it.
     #[tokio::test]
     async fn plain_timeout_pauses_when_link_alive() {
         let (other_a2a, tx, _) =
@@ -1047,12 +1033,8 @@ mod tests {
         };
         assert!(rebroadcast.is_notar());
 
-        // A restored deferred-final slot must finalize as soon as its enabling
-        // notar cert arrives — its grace already elapsed pre-crash. A node that
-        // restarts faster than a fresh grace (a lossy radio link) would otherwise
-        // never cast this vote, freezing the floor (production stuck at 79811,
-        // 2026-09-10). So the FINAL vote must arrive PROMPTLY after the cert, not
-        // after another full delta_final_vote_grace.
+        // A restored deferred-final slot finalizes as soon as its enabling notar
+        // cert arrives (its grace elapsed pre-crash), not after a fresh grace.
         let notar_cert = Cert::Notar(NotarCert::new_unchecked(
             std::slice::from_ref(&rebroadcast),
             &epoch_info.validators,

@@ -470,11 +470,9 @@ impl SlotState {
             .any(|n| n.block_hash() == block_hash)
     }
 
-    /// Returns whether `block_hash` is certified as a valid parent: any
-    /// notar, notar-fallback, or finalization cert names it. A plain notar or
-    /// finalization is a stronger guarantee than notar-fallback, so a child
-    /// whose parent holds one is safe-to-notar just the same — without this a
-    /// repaired block whose parent finalized normally never fires SafeToNotar.
+    /// Whether `block_hash` is certified as a valid parent by any notar,
+    /// notar-fallback, or finalization cert; the stronger certs must count too,
+    /// or a repaired block whose parent finalized normally never fires SafeToNotar.
     pub fn is_parent_certified(&self, block_hash: &BlockHash) -> bool {
         if self.is_notar_fallback(block_hash) {
             return true;

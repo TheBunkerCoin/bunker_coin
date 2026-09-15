@@ -21,10 +21,8 @@ use crate::shredder::{Shred, ShredIndex};
 use crate::types::SliceIndex;
 use crate::{BlockId, ValidatorId};
 
-/// Doubling cap for repair retries: a slow radio link delivers a shred
-/// response in minutes, so a flat timeout re-requested every in-flight
-/// shred several times before it could land and the duplicates buried
-/// everything else in the peer's modem buffer.
+/// Doubling cap for repair retries: on a slow link a flat timeout re-requests
+/// in-flight shreds before their responses can land.
 const MAX_REPAIR_BACKOFF_EXP: u32 = 3;
 
 /// Retry delay after `retries` unanswered attempts.
@@ -32,10 +30,8 @@ fn retry_delay(retries: u32) -> Duration {
     repair_timeout() * 2u32.pow(retries.min(MAX_REPAIR_BACKOFF_EXP))
 }
 
-/// Repair response timeout before retrying. A response is bulk: on the radio
-/// it queues behind whatever the peer is already streaming, so anything
-/// shorter than a block's dissemination budget re-requests before the first
-/// answer can land, and the duplicates become the peer's next backlog.
+/// Repair response timeout before retrying; responses are bulk and queue
+/// behind the peer's stream, so this must cover a block's dissemination budget.
 fn repair_timeout() -> Duration {
     delta_block()
 }
