@@ -553,7 +553,8 @@ impl PactorMux {
                         tx.tx_msgs += 1;
                         tx.tx_bytes += serial as u64;
                         if is_bulk_tag(tag) {
-                            tx.inflight.push_back((id, tokio::time::Instant::now(), serial));
+                            tx.inflight
+                                .push_back((id, tokio::time::Instant::now(), serial));
                             tx.inflight_bytes += serial;
                             tx.unacked_gauge
                                 .store(tx.inflight.len() as u64, Ordering::Relaxed);
@@ -577,7 +578,16 @@ impl PactorMux {
                 epoch: tokio::time::Instant,
             ) {
                 let Some(id) = tx.ack_pending else { return };
-                if emit(tx, transport, counter, epoch, BULK_ACK_TAG, &id.to_le_bytes()).await {
+                if emit(
+                    tx,
+                    transport,
+                    counter,
+                    epoch,
+                    BULK_ACK_TAG,
+                    &id.to_le_bytes(),
+                )
+                .await
+                {
                     tx.ack_pending = None;
                     tx.ack_pending_bytes = 0;
                 }
@@ -613,8 +623,8 @@ impl PactorMux {
                     tx.tx_bytes = 0;
                 }
                 let now_tick = epoch.elapsed().as_millis() as u64;
-                let keepalive_in =
-                    KEEPALIVE_IDLE.saturating_sub(Duration::from_millis(now_tick - tx.last_tx_tick));
+                let keepalive_in = KEEPALIVE_IDLE
+                    .saturating_sub(Duration::from_millis(now_tick - tx.last_tx_tick));
                 let window_open = tx.inflight_bytes < BULK_WINDOW_BYTES;
                 // Disabled select branches still evaluate their future, so
                 // always hand `sleep_until` a real instant.
@@ -682,8 +692,15 @@ impl PactorMux {
                         if tx.ack_pending.is_some() {
                             flush_ack(&mut tx, &writer_transport, &counter, epoch).await;
                         } else {
-                            emit(&mut tx, &writer_transport, &counter, epoch, KEEPALIVE_TAG, &[])
-                                .await;
+                            emit(
+                                &mut tx,
+                                &writer_transport,
+                                &counter,
+                                epoch,
+                                KEEPALIVE_TAG,
+                                &[],
+                            )
+                            .await;
                         }
                     }
                     // Piggyback: we are breaking in anyway, so the ack rides for free.
@@ -1241,7 +1258,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let in_window = shreds_in_window(bulk_cost(&[0u8; 1024]));
-        assert!(in_window < 12, "test needs more shreds than one window holds");
+        assert!(
+            in_window < 12,
+            "test needs more shreds than one window holds"
+        );
         let tags = transport.written_tags().await;
         assert_eq!(
             tags.len(),
@@ -1272,7 +1292,10 @@ mod tests {
         mux.set_queued_gauge(gauge.clone());
         let shred = vec![7u8; 1024];
         let in_window = shreds_in_window(bulk_cost(&shred));
-        assert!(in_window > 3, "window must hold more than the three shreds acked below");
+        assert!(
+            in_window > 3,
+            "window must hold more than the three shreds acked below"
+        );
         let total = 2 * in_window;
         let _h = mux.spawn();
         for _ in 0..total {
@@ -1661,4 +1684,3 @@ mod tests {
         );
     }
 }
-

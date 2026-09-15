@@ -315,7 +315,9 @@ where
                 continue;
             }
             if extensions < MAX_START_EXTENSIONS && self.stream_in_progress(*slot).await {
-                debug!("leader still streaming window of slot {slot}; extending repair grace for {h}");
+                debug!(
+                    "leader still streaming window of slot {slot}; extending repair grace for {h}"
+                );
                 self.deferred
                     .insert(block_id, (now + self.start_grace, extensions + 1));
                 continue;
@@ -803,7 +805,10 @@ mod tests {
             .add_shred_from_disseminator(shreds[0][0].clone().into_shred())
             .await
             .unwrap();
-        repair_channel.send((slot, block_hash.clone())).await.unwrap();
+        repair_channel
+            .send((slot, block_hash.clone()))
+            .await
+            .unwrap();
 
         let extended = grace * (MAX_START_EXTENSIONS + 1);
         assert!(

@@ -1147,8 +1147,9 @@ mod tests {
     /// without a stored block.
     #[tokio::test]
     async fn redisseminate_stored_window_resends_stored_shreds() {
-        use crate::test_utils::create_random_shredded_block;
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::test_utils::create_random_shredded_block;
 
         let sk = signature::SecretKey::new(&mut rand::rng());
         let first = Slot::windows().nth(10).unwrap();
