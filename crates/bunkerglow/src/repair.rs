@@ -8,11 +8,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 use tokio::sync::RwLock;
 use wincode::{SchemaRead, SchemaWrite};
 
-use crate::consensus::{Blockstore, EpochInfo, Pool, delta};
+use crate::consensus::{Blockstore, EpochInfo, Pool, delta_block};
 use crate::crypto::merkle::{DoubleMerkleProof, DoubleMerkleTree, MerkleRoot, SliceRoot};
 use crate::crypto::{Hash, hash};
 use crate::disseminator::rotor::{SamplingStrategy, StakeWeightedSampler};
@@ -21,10 +21,32 @@ use crate::shredder::{Shred, ShredIndex};
 use crate::types::SliceIndex;
 use crate::{BlockId, ValidatorId};
 
-/// Repair response timeout before retrying another peer.
-fn repair_timeout() -> Duration {
-    delta() * 2
+/// Doubling cap for repair retries: on a slow link a flat timeout re-requests
+/// in-flight shreds before their responses can land.
+const MAX_REPAIR_BACKOFF_EXP: u32 = 3;
+
+/// Retry delay after `retries` unanswered attempts.
+fn retry_delay(retries: u32) -> Duration {
+    repair_timeout() * 2u32.pow(retries.min(MAX_REPAIR_BACKOFF_EXP))
 }
+
+/// Repair response timeout before retrying; responses are bulk and queue
+/// behind the peer's stream, so this must cover a block's dissemination budget.
+fn repair_timeout() -> Duration {
+    delta_block()
+}
+
+/// Wait before the first request for a block we only know from votes. The
+/// leader's notar vote always outruns its shreds on the radio (votes take the
+/// priority lane), so a freshly "missing" block is almost always in flight;
+/// repairing it would fetch a duplicate over the same link.
+fn repair_start_grace() -> Duration {
+    delta_block()
+}
+
+/// Extra grace periods granted while the leader's stream for that window is
+/// still arriving: a later block in the window waits behind its siblings.
+const MAX_START_EXTENSIONS: u32 = 3;
 
 /// Repair request kind.
 #[derive(Clone, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
@@ -38,6 +60,12 @@ pub enum RepairRequestType {
 }
 
 impl RepairRequestType {
+    fn block_id(&self) -> &BlockId {
+        match self {
+            Self::LastSliceRoot(id) | Self::SliceRoot(id, _) | Self::Shred(id, _, _) => id,
+        }
+    }
+
     /// Hashes this request type for retry tracking.
     fn hash(&self) -> Hash {
         let repair = RepairRequest {
@@ -168,6 +196,11 @@ pub struct Repair<N: Network> {
     outstanding_requests: BTreeMap<Hash, RepairRequestType>,
     /// Retry deadlines, soonest first; `Reverse` makes the heap pop earliest due.
     request_timeouts: BinaryHeap<std::cmp::Reverse<(Instant, Hash)>>,
+    /// Unanswered retries per outstanding request, driving the backoff.
+    retries: BTreeMap<Hash, u32>,
+    /// Blocks waiting out the start grace: (first request due, extensions granted).
+    deferred: BTreeMap<BlockId, (Instant, u32)>,
+    start_grace: Duration,
     network: N,
     sampler: StakeWeightedSampler,
     epoch_info: Arc<EpochInfo>,
@@ -192,20 +225,34 @@ where
             slice_roots: BTreeMap::new(),
             outstanding_requests: BTreeMap::new(),
             request_timeouts: BinaryHeap::new(),
+            retries: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            start_grace: repair_start_grace(),
             network,
             sampler,
             epoch_info,
         }
     }
 
-    /// Runs repair requests, responses, and retry timeouts.
+    /// Override the start grace (tests; lossless full-duplex transports).
+    pub fn with_start_grace(mut self, grace: Duration) -> Self {
+        self.start_grace = grace;
+        self
+    }
+
+    /// Runs repair requests, responses, deferred starts, and retry timeouts.
     pub async fn repair_loop(&mut self, mut repair_receiver: tokio::sync::mpsc::Receiver<BlockId>) {
         loop {
-            let next_timeout = self
+            let next_retry = self
                 .request_timeouts
                 .peek()
-                .map(|std::cmp::Reverse((t, _))| t);
-            let sleep_duration = match next_timeout {
+                .map(|std::cmp::Reverse((t, _))| *t);
+            let next_start = self.deferred.values().map(|(t, _)| *t).min();
+            let next_due = match (next_retry, next_start) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let sleep_duration = match next_due {
                 None => std::time::Duration::MAX,
                 Some(t) => t.saturating_duration_since(Instant::now()),
             };
@@ -215,30 +262,126 @@ where
                     self.repair_block(block_id).await;
                 }
                 () = tokio::time::sleep(sleep_duration) => {
-                    let Some(std::cmp::Reverse((_, hash))) = self.request_timeouts.pop() else {
-                        continue;
-                    };
-                    if let Some(request) = self.outstanding_requests.remove(&hash) {
-                        debug!("retrying timed-out repair request {request:?}");
-                        self.send_request(request).await.unwrap();
-                    }
+                    let now = Instant::now();
+                    self.start_due_repairs(now).await;
+                    self.retry_due_requests(now).await;
                 }
             }
         }
     }
 
-    /// Starts repair for `block_id`.
+    /// Schedules repair for `block_id` after the start grace, unless it is
+    /// already stored or already being repaired.
     pub async fn repair_block(&mut self, block_id: BlockId) {
         let (slot, block_hash) = &block_id;
         let h = &hex::encode(block_hash.as_hash())[..8];
-        if self.blockstore.read().await.get_block(&block_id).is_some() {
+        if self.have_block(&block_id).await {
             trace!("ignoring repair for block {h} in slot {slot}, already have the block");
             return;
         }
+        if self.deferred.contains_key(&block_id)
+            || self
+                .outstanding_requests
+                .values()
+                .any(|r| r.block_id() == &block_id)
+        {
+            trace!("repair of block {h} in slot {slot} already in progress");
+            return;
+        }
+        info!(
+            "deferring repair of block {h} in slot {slot} for {:?}: its shreds may still be in flight",
+            self.start_grace
+        );
+        self.deferred
+            .insert(block_id, (Instant::now() + self.start_grace, 0));
+    }
 
-        debug!("repairing block {h} in slot {slot}");
-        let req = RepairRequestType::LastSliceRoot(block_id);
-        self.send_request(req).await.unwrap();
+    /// Fires deferred starts whose grace has elapsed: drop blocks that arrived
+    /// meanwhile, extend while the leader's stream for that window is still
+    /// arriving, request the rest.
+    async fn start_due_repairs(&mut self, now: Instant) {
+        let due: Vec<(BlockId, u32)> = self
+            .deferred
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(id, (_, ext))| (id.clone(), *ext))
+            .collect();
+        for (block_id, extensions) in due {
+            self.deferred.remove(&block_id);
+            let (slot, block_hash) = &block_id;
+            let h = &hex::encode(block_hash.as_hash())[..8];
+            if self.have_block(&block_id).await {
+                debug!("block {h} in slot {slot} arrived during the repair grace");
+                continue;
+            }
+            if extensions < MAX_START_EXTENSIONS && self.stream_in_progress(*slot).await {
+                debug!(
+                    "leader still streaming window of slot {slot}; extending repair grace for {h}"
+                );
+                self.deferred
+                    .insert(block_id, (now + self.start_grace, extensions + 1));
+                continue;
+            }
+            info!("repairing block {h} in slot {slot}");
+            let req = RepairRequestType::LastSliceRoot(block_id);
+            self.send_request(req).await.unwrap();
+        }
+    }
+
+    /// Re-sends timed-out requests, dropping any whose block has since arrived.
+    async fn retry_due_requests(&mut self, now: Instant) {
+        while let Some(std::cmp::Reverse((at, _))) = self.request_timeouts.peek() {
+            if *at > now {
+                break;
+            }
+            let std::cmp::Reverse((_, hash)) = self.request_timeouts.pop().unwrap();
+            let Some(request) = self.outstanding_requests.remove(&hash) else {
+                continue;
+            };
+            if self.have_block(request.block_id()).await {
+                self.forget_block(&request.block_id().clone());
+                continue;
+            }
+            debug!("retrying timed-out repair request {request:?}");
+            *self.retries.entry(hash).or_insert(0) += 1;
+            self.send_request(request).await.unwrap();
+        }
+    }
+
+    async fn have_block(&self, block_id: &BlockId) -> bool {
+        self.blockstore.read().await.get_block(block_id).is_some()
+    }
+
+    /// Whether disseminated shreds for `slot` or an earlier slot of the same
+    /// leader window are stored without completing: the leader is mid-stream,
+    /// and it sends its window in slot order.
+    async fn stream_in_progress(&self, slot: crate::Slot) -> bool {
+        let bs = self.blockstore.read().await;
+        slot.first_slot_in_window()
+            .slots_in_window()
+            .take_while(|s| *s <= slot)
+            .any(|s| bs.has_partial_disseminated_block(s))
+    }
+
+    /// Drops every outstanding request and retry for a block we now hold.
+    fn forget_block(&mut self, block_id: &BlockId) {
+        let (slot, block_hash) = block_id;
+        debug!(
+            "block {} in slot {slot} is complete; dropping its repair",
+            &hex::encode(block_hash.as_hash())[..8]
+        );
+        let hashes: Vec<Hash> = self
+            .outstanding_requests
+            .iter()
+            .filter(|(_, r)| r.block_id() == block_id)
+            .map(|(h, _)| h.clone())
+            .collect();
+        for h in &hashes {
+            self.outstanding_requests.remove(h);
+            self.retries.remove(h);
+        }
+        self.request_timeouts
+            .retain(|std::cmp::Reverse((_, h))| !hashes.contains(h));
     }
 
     /// Handles a repair response, storing verified metadata or shreds.
@@ -251,6 +394,13 @@ where
             debug!("received repair response for already-settled request");
             return;
         };
+        self.retries.remove(&request_hash);
+        // Dissemination usually wins the race on the radio; never request
+        // slices and shreds for a block we already hold.
+        if self.have_block(pending.block_id()).await {
+            self.forget_block(&pending.block_id().clone());
+            return;
+        }
         // Re-arm malformed responses; one bad response must not kill repair.
         let handled: bool = 'validate: {
             match response {
@@ -359,7 +509,8 @@ where
     async fn send_request(&mut self, req_type: RepairRequestType) -> std::io::Result<()> {
         let hash = req_type.hash();
 
-        let expiry = Instant::now() + repair_timeout();
+        let retries = self.retries.get(&hash).copied().unwrap_or(0);
+        let expiry = Instant::now() + retry_delay(retries);
         self.outstanding_requests
             .insert(hash.clone(), req_type.clone());
         self.request_timeouts
@@ -400,8 +551,20 @@ mod tests {
     use std::collections::BTreeSet;
 
     use tokio::sync::mpsc::Sender;
+    use tokio::time::timeout;
 
     use super::*;
+
+    /// Retries double until the cap so an in-flight response is never
+    /// re-requested more than once before it can land on a slow link.
+    #[test]
+    fn retry_delay_backs_off_and_caps() {
+        let base = repair_timeout();
+        assert_eq!(retry_delay(0), base);
+        assert_eq!(retry_delay(1), base * 2);
+        assert_eq!(retry_delay(3), base * 8);
+        assert_eq!(retry_delay(9), base * 8);
+    }
     use crate::consensus::{BlockstoreImpl, PoolImpl};
     use crate::crypto::signature::SecretKey;
     use crate::network::simulated::SimulatedNetworkCore;
@@ -411,8 +574,10 @@ mod tests {
     use crate::types::Slot;
     use crate::types::slice_index::MAX_SLICES_PER_BLOCK;
 
-    /// Creates a two-validator repair test fixture.
-    async fn create_repair_instance() -> (
+    /// Creates a two-validator repair test fixture with the given start grace.
+    async fn create_repair_instance(
+        grace: Duration,
+    ) -> (
         Sender<BlockId>,
         Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
         SimulatedNetwork<RepairResponse, RepairRequest>,
@@ -464,7 +629,8 @@ mod tests {
             pool,
             v1_repair_network,
             epoch_info.clone(),
-        );
+        )
+        .with_start_grace(grace);
         tokio::spawn(async move {
             repair.repair_loop(repair_rx).await;
             drop(votor_rx);
@@ -502,7 +668,7 @@ mod tests {
 
     async fn repair_block(num_slices: usize) {
         let (repair_channel, blockstore, other_network_request, _other_network_reply, sk) =
-            create_repair_instance().await;
+            create_repair_instance(Duration::ZERO).await;
 
         let slot = Slot::genesis().next();
         let (block_hash, merkle_tree, shreds) = create_random_shredded_block(slot, num_slices, &sk);
@@ -578,11 +744,138 @@ mod tests {
         );
     }
 
+    /// A block known only from votes waits out the start grace before its
+    /// first request, and is dropped if dissemination delivers it meanwhile.
+    #[tokio::test]
+    async fn repair_start_waits_grace_and_drops_on_arrival() {
+        let grace = Duration::from_millis(400);
+        let (repair_channel, blockstore, other_network_request, _other_network_reply, sk) =
+            create_repair_instance(grace).await;
+
+        let slot = Slot::genesis().next();
+        let (block_hash, _, _) = create_random_shredded_block(slot, 1, &sk);
+        let missing = (slot, block_hash);
+        repair_channel.send(missing.clone()).await.unwrap();
+        assert!(
+            timeout(grace / 2, other_network_request.receive())
+                .await
+                .is_err(),
+            "no request inside the grace"
+        );
+        let msg = timeout(grace * 2, other_network_request.receive())
+            .await
+            .expect("request once the grace elapses")
+            .unwrap();
+        assert_eq!(msg.req_type, RepairRequestType::LastSliceRoot(missing));
+
+        let slot = slot.next();
+        let (block_hash, _, shreds) = create_random_shredded_block(slot, 1, &sk);
+        let arriving = (slot, block_hash);
+        repair_channel.send(arriving.clone()).await.unwrap();
+        for shred in shreds[0].clone() {
+            let _ = blockstore
+                .write()
+                .await
+                .add_shred_from_disseminator(shred.into_shred())
+                .await;
+        }
+        assert!(blockstore.read().await.get_block(&arriving).is_some());
+        assert!(
+            timeout(grace * 2, other_network_request.receive())
+                .await
+                .is_err(),
+            "a block that arrived during the grace is not requested"
+        );
+    }
+
+    /// While the leader's shreds for that window are still arriving the grace
+    /// is extended, a bounded number of times, before the first request.
+    #[tokio::test]
+    async fn repair_grace_extends_while_stream_in_progress() {
+        let grace = Duration::from_millis(300);
+        let (repair_channel, blockstore, other_network_request, _other_network_reply, sk) =
+            create_repair_instance(grace).await;
+
+        let slot = Slot::genesis().next();
+        let (block_hash, _, shreds) = create_random_shredded_block(slot, 1, &sk);
+        // One shred stored: dissemination is mid-flight for this slot.
+        blockstore
+            .write()
+            .await
+            .add_shred_from_disseminator(shreds[0][0].clone().into_shred())
+            .await
+            .unwrap();
+        repair_channel
+            .send((slot, block_hash.clone()))
+            .await
+            .unwrap();
+
+        let extended = grace * (MAX_START_EXTENSIONS + 1);
+        assert!(
+            timeout(extended - grace / 2, other_network_request.receive())
+                .await
+                .is_err(),
+            "no request while the stream is in progress and extensions remain"
+        );
+        let msg = timeout(grace * 2, other_network_request.receive())
+            .await
+            .expect("request once the extensions are spent")
+            .unwrap();
+        assert_eq!(
+            msg.req_type,
+            RepairRequestType::LastSliceRoot((slot, block_hash))
+        );
+    }
+
+    /// A block completed by dissemination cancels its outstanding repair: the
+    /// last-slice-root answer must not fan out into slice and shred requests.
+    #[tokio::test]
+    async fn completed_block_cancels_outstanding_repair() {
+        let (repair_channel, blockstore, other_network_request, _other_network_reply, sk) =
+            create_repair_instance(Duration::ZERO).await;
+
+        let slot = Slot::genesis().next();
+        let (block_hash, merkle_tree, shreds) = create_random_shredded_block(slot, 2, &sk);
+        let block_id = (slot, block_hash);
+        repair_channel.send(block_id.clone()).await.unwrap();
+        let msg = other_network_request.receive().await.unwrap();
+        let req_type = RepairRequestType::LastSliceRoot(block_id.clone());
+        assert_eq!(msg.req_type, req_type);
+
+        for slice in &shreds {
+            for shred in slice.clone() {
+                let _ = blockstore
+                    .write()
+                    .await
+                    .add_shred_from_disseminator(shred.into_shred())
+                    .await;
+            }
+        }
+        assert!(blockstore.read().await.get_block(&block_id).is_some());
+
+        let response = RepairResponse::LastSliceRoot(
+            req_type,
+            SliceIndex::new_unchecked(1),
+            shreds[1][0].merkle_root.clone(),
+            merkle_tree.create_proof(1),
+        );
+        other_network_request
+            .send(&response, localhost_ip_sockaddr(3))
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(500), other_network_request.receive())
+                .await
+                .is_err(),
+            "no slice-root requests for a block we already hold"
+        );
+    }
+
     #[tokio::test]
     async fn answer_requests() {
         const SLICES: usize = 2;
         let (_sender, blockstore, _other_network_request, other_network, sk) =
-            create_repair_instance().await;
+            create_repair_instance(Duration::ZERO).await;
 
         let slot = Slot::genesis().next();
         let (block_hash, _, shreds) = create_random_shredded_block(slot, SLICES, &sk);

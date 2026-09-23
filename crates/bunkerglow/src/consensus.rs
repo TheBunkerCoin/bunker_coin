@@ -62,12 +62,8 @@ fn scaled(base_ms: u64) -> Duration {
     Duration::from_millis((base_ms as f64 * *DELTA_MULT) as u64)
 }
 
-/// Time bound assumed on network transmission delays during periods of synchrony.
-pub(crate) fn delta() -> Duration {
-    scaled(8_000)
-}
 /// Time the leader has for producing and sending the block.
-fn delta_block() -> Duration {
+pub(crate) fn delta_block() -> Duration {
     scaled(120_000)
 }
 /// Timeout to use when we have seen at least one shred from the leader's block.
@@ -473,7 +469,9 @@ where
             ) {
                 self.pool.read().await.recover_from_standstill().await;
                 last_progress = Instant::now();
-                dry_recoveries = (dry_recoveries + 1).min(2);
+                // Repeated bundles are pure duplicates (new certs/votes broadcast
+                // live); back off hard or they starve repair of airtime.
+                dry_recoveries = (dry_recoveries + 1).min(4);
             }
             // Fixed cadence avoids adding a full scaled block window of detection latency.
             tokio::time::sleep(delta_block().min(Duration::from_secs(60))).await;

@@ -457,6 +457,30 @@ impl PoolImpl {
         Vec::new()
     }
 
+    /// Persisted FINALIZATION certs for slots in `[lower, upper)`, newest first.
+    /// They sit below the floor (pruned from memory, rows survive); re-sending
+    /// them lets a peer whose floor is behind ours catch up from one cert.
+    fn get_persisted_final_certs(&self, lower: Slot, upper: Slot) -> Vec<Cert> {
+        let mut out = Vec::new();
+        for s in (lower.inner()..upper.inner()).rev() {
+            // Prefer FastFinal (one message finalizes the slot); else Final + its Notar.
+            for kind in [3u8, 4u8, 0u8] {
+                let key = format!("cert|{s:016X}|{kind}");
+                if let Ok(Some(v)) = self.db.get(key.as_bytes())
+                    && let Ok(cert) = wincode::deserialize::<Cert>(&v)
+                    && cert.check_threshold(&self.epoch_info)
+                {
+                    let is_fast_final = matches!(cert, Cert::FastFinal(_));
+                    out.push(cert);
+                    if is_fast_final {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Fetches all votes cast by myself for the provided range of `slots`.
     fn get_own_votes(&self, slots: impl RangeBounds<Slot>) -> Vec<Vote> {
         let mut votes = Vec::new();
@@ -676,8 +700,11 @@ impl Pool for PoolImpl {
 
         self.slot_state(*slot)
             .notify_parent_known(block_hash.clone());
+        // A repaired block whose parent finalized normally must still promote:
+        // gating only on a notar-FALLBACK parent left forked nodes unable to
+        // reconcile once the real (notar/finalized) parent cert was in hand.
         if let Some(parent_state) = self.slot_states.get(parent_slot)
-            && parent_state.is_notar_fallback(parent_hash)
+            && parent_state.is_parent_certified(parent_hash)
             && let Some(output) = self
                 .slot_state(*slot)
                 .notify_parent_certified(block_hash.clone())
@@ -708,11 +735,25 @@ impl Pool for PoolImpl {
         }
         // Include the floor slot itself; lagging peers may need its certs/votes.
         certs.extend(self.get_certs(slot..));
-        let votes = self.get_own_votes(slot..);
-        if certs.is_empty() && votes.is_empty() {
+        let mut votes = self.get_own_votes(slot..);
+
+        // A peer whose floor is behind ours needs finalizing certs below OUR
+        // floor; re-send a bounded sub-floor tail (the prior window) from the DB.
+        let floor_win = slot.first_slot_in_window();
+        let lower = Slot::new(floor_win.inner().saturating_sub(SLOTS_PER_WINDOW));
+        let mut sub_floor = self.get_persisted_final_certs(lower, slot);
+
+        if certs.is_empty() && votes.is_empty() && sub_floor.is_empty() {
             warn!("standstill recovery at slot {slot}: nothing at all to re-broadcast");
             return;
         }
+        // Newest first: short radio sessions truncate the bundle, and the tip
+        // messages are the ones the peer is missing; the old ones only dedupe.
+        certs.reverse();
+        votes.reverse();
+        // Sub-floor catch-up certs go LAST (lowest priority): a current peer just
+        // dedupes them, but a lagging peer still gets them when the link holds.
+        certs.append(&mut sub_floor);
 
         warn!("recovering from standstill at slot {slot}");
         debug!(
@@ -1201,6 +1242,109 @@ mod tests {
         }
         assert!(!pool.has_final_cert(Slot::new(2)));
         assert_eq!(pool.finalized_slot(), Slot::new(1));
+    }
+
+    /// Standstill recovery must re-send finalization certs BELOW the floor so a
+    /// lagging peer catches up; floor-relative bundles otherwise diverge forever.
+    #[tokio::test]
+    async fn standstill_resends_sub_floor_finalization_certs() {
+        let (sks, epoch_info) = generate_validators(11);
+        let db_path = format!(
+            "{}/bunker-pool-subfloor-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let (votor_tx, mut votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let mut pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
+
+        // Fast-finalize a run of slots crossing a window boundary so the floor
+        // advances well past the earliest finalized slot. is_strong_quorum with
+        // 11 validators = 9 notar votes → FastFinal cert.
+        let first = Slot::windows().nth(1).unwrap(); // window start, e.g. 4
+        let last = first.inner() + SLOTS_PER_WINDOW + 1; // cross into the next window
+        let mut hashes = std::collections::BTreeMap::new();
+        for s in first.inner()..=last {
+            let slot = Slot::new(s);
+            let hash: BlockHash = Hash::random_for_test().into();
+            hashes.insert(s, hash.clone());
+            for v in 0..9 {
+                assert_eq!(
+                    pool.add_vote(Vote::new_notar(slot, hash.clone(), &sks[v as usize], v))
+                        .await,
+                    Ok(())
+                );
+            }
+        }
+        let floor = pool.finalized_slot();
+        assert!(
+            floor.inner() >= first.inner() + SLOTS_PER_WINDOW,
+            "floor {floor} must have advanced past the first window"
+        );
+        // A slot at least one full window below the floor: pruned from memory,
+        // but its fast-final cert row survives in the DB.
+        let sub = floor.inner() - SLOTS_PER_WINDOW;
+        assert!(
+            sub >= first.inner(),
+            "sub-floor slot must be one we finalized"
+        );
+        assert!(
+            !pool.slot_states.contains_key(&Slot::new(sub)),
+            "sub-floor slot {sub} must be pruned from in-memory state"
+        );
+
+        while votor_rx.try_recv().is_ok() {}
+        pool.recover_from_standstill().await;
+
+        let certs = loop {
+            match votor_rx.recv().await.expect("standstill event") {
+                VotorEvent::Standstill(_, certs, _) => break certs,
+                _ => continue,
+            }
+        };
+        assert!(
+            certs
+                .iter()
+                .any(|c| c.slot() == Slot::new(sub) && matches!(c, Cert::FastFinal(_))),
+            "standstill must re-send the sub-floor fast-final cert for slot {sub} \
+             so a lagging peer can catch up"
+        );
+
+        let _ = std::fs::remove_dir_all(&db_path);
+    }
+
+    /// Standstill bundles lead with the newest certs and votes; truncated radio
+    /// sessions must carry the tip, not old duplicates.
+    #[tokio::test]
+    async fn standstill_bundle_is_newest_first() {
+        let (sks, epoch_info) = generate_validators(11);
+        let db_path = format!(
+            "{}/bunker-pool-standstill-order-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let (votor_tx, mut votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        let mut pool = PoolImpl::new_at(epoch_info, votor_tx, repair_tx, &db_path);
+
+        for s in 1..=2u64 {
+            for v in 0..7 {
+                let vote = Vote::new_skip(Slot::new(s), &sks[v as usize], v);
+                assert_eq!(pool.add_vote(vote).await, Ok(()));
+            }
+        }
+        pool.recover_from_standstill().await;
+
+        let (certs, votes) = loop {
+            match votor_rx.recv().await.expect("standstill event") {
+                VotorEvent::Standstill(_, certs, votes) => break (certs, votes),
+                _ => continue,
+            }
+        };
+        assert!(certs.first().unwrap().slot() > certs.last().unwrap().slot());
+        assert!(votes.first().unwrap().slot() > votes.last().unwrap().slot());
     }
 
     /// Skip certs above the floor must survive a reload or reconnects re-earn them on air.
@@ -1988,5 +2132,78 @@ mod tests {
             }
             _ => unreachable!("unexpected event {event:?}"),
         }
+    }
+
+    /// A node that skip-voted a slot must still emit SafeToNotar once it repairs
+    /// the block and sees a peer notar vote, even when the parent holds a plain
+    /// notar/finalization cert rather than a notar-fallback — the fork
+    /// reconciliation path.
+    #[tokio::test]
+    async fn skip_voter_reconciles_via_safe_to_notar_with_finalized_parent() {
+        let (sks, epoch_info) = generate_validators(2);
+        let db_path = format!(
+            "{}/bunker-pool-reconcile-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+        let (votor_tx, mut votor_rx) = mpsc::channel(1024);
+        let (repair_tx, _repair_rx) = mpsc::channel(1024);
+        // own_id defaults to 0; validator 1 is the peer.
+        let mut pool = PoolImpl::new_at(epoch_info.clone(), votor_tx, repair_tx, &db_path);
+
+        let parent = Slot::windows().nth(1).unwrap();
+        let child = parent.next();
+        let parent_hash: BlockHash = Hash::random_for_test().into();
+        let child_hash: BlockHash = Hash::random_for_test().into();
+
+        // Post-restart parent state: load_from_db replays a persisted NOTAR
+        // cert (add_cert sets `notar`, never the vote-derived `notar_fallback`).
+        let parent_votes: Vec<Vote> = (0..2)
+            .map(|v| Vote::new_notar(parent, parent_hash.clone(), &sks[v as usize], v as u64))
+            .collect();
+        let notar_cert = NotarCert::try_new(&parent_votes, &epoch_info.validators).unwrap();
+        pool.add_cert(Cert::Notar(notar_cert)).await.unwrap();
+        assert!(pool.has_notar_cert(parent), "parent must hold a notar cert");
+        assert!(
+            !pool.slot_states[&parent].is_notar_fallback(&parent_hash),
+            "post-restart parent is notar-certified only, NOT notar-fallback — the bug's blind spot"
+        );
+
+        // Our node (v0) skip-voted the child; the peer (v1) notar-voted it.
+        assert_eq!(
+            pool.add_vote(Vote::new_skip(child, &sks[0], 0)).await,
+            Ok(())
+        );
+        assert_eq!(
+            pool.add_vote(Vote::new_notar(child, child_hash.clone(), &sks[1], 1))
+                .await,
+            Ok(())
+        );
+
+        // Drain the events emitted so far so we can isolate what add_block drives.
+        while votor_rx.try_recv().is_ok() {}
+
+        // The repaired child block finally lands: add_block must re-run the
+        // safe-to-notar check and, because the parent is certified (finalized),
+        // emit SafeToNotar for the child.
+        pool.add_block((child, child_hash.clone()), (parent, parent_hash.clone()))
+            .await;
+
+        let mut saw_safe_to_notar = false;
+        while let Ok(event) = votor_rx.try_recv() {
+            if let VotorEvent::SafeToNotar(s, h) = event {
+                assert_eq!(s, child);
+                assert_eq!(h, child_hash);
+                saw_safe_to_notar = true;
+            }
+        }
+        assert!(
+            saw_safe_to_notar,
+            "skip-voter must emit SafeToNotar for the repaired child once its \
+             finalized parent is certified — otherwise the fork never heals"
+        );
+
+        let _ = std::fs::remove_dir_all(&db_path);
     }
 }

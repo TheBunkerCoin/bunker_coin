@@ -82,6 +82,9 @@ pub struct Votor<A: All2All> {
     restored_votes: Vec<Vote>,
     /// Re-armed after restart so slow-final liveness survives a grace-window crash.
     restored_final_deadlines: Vec<(Slot, BlockHash)>,
+    /// Deferred-final intents restored at startup: their grace elapsed
+    /// pre-crash, so finalize as soon as the enabling notar cert arrives.
+    finalize_on_notar_cert: BTreeSet<Slot>,
     /// Events below this pruned floor are dropped to avoid conflicting stale votes.
     finalized_floor: Slot,
 }
@@ -132,6 +135,7 @@ impl<A: All2All> Votor<A> {
             vote_history: VoteHistory::disabled(),
             restored_votes: Vec::new(),
             restored_final_deadlines: Vec::new(),
+            finalize_on_notar_cert: BTreeSet::new(),
             finalized_floor: Slot::genesis(),
         };
         votor.set_timeouts(Slot::new(0));
@@ -172,6 +176,9 @@ impl<A: All2All> Votor<A> {
             .load_and_prune_pending_finals(finalized_slot)
         {
             if !self.retired_slots.contains(&slot) {
+                // The notar cert may already be present (restored) or arrive
+                // shortly; fire on its arrival, and keep the timer as a fallback.
+                self.finalize_on_notar_cert.insert(slot);
                 self.restored_final_deadlines.push((slot, hash));
             } else {
                 self.vote_history.clear_pending_final(slot, &hash);
@@ -200,6 +207,7 @@ impl<A: All2All> Votor<A> {
         self.pending_blocks = self.pending_blocks.split_off(&floor);
         self.retired_slots = self.retired_slots.split_off(&floor);
         self.fast_finalized = self.fast_finalized.split_off(&floor);
+        self.finalize_on_notar_cert = self.finalize_on_notar_cert.split_off(&floor);
         self.parents_ready.retain(|(slot, _, _)| *slot >= floor);
     }
 
@@ -209,12 +217,14 @@ impl<A: All2All> Votor<A> {
     /// Handle consensus voting events and broadcast resulting votes.
     #[fastrace::trace]
     pub async fn voting_loop(&mut self) -> Result<()> {
-        // Re-send restored votes once; peers deduplicate identical votes.
-        for vote in std::mem::take(&mut self.restored_votes) {
+        // Re-send restored votes once, newest first: short radio sessions truncate
+        // the queue, and the tip votes are the ones the peer is missing.
+        for vote in std::mem::take(&mut self.restored_votes).into_iter().rev() {
             debug!("rebroadcasting restored vote for slot {}", vote.slot());
             self.all2all.broadcast(&vote.into()).await.unwrap();
         }
-        // Use the live-path grace delay; the enabling notar cert may arrive after restart.
+        // Timer fallback for restored deferred-finals; the CertCreated(Notar)
+        // arm is the primary driver, this backstops a cert that never re-arrives.
         for (slot, hash) in std::mem::take(&mut self.restored_final_deadlines) {
             debug!("re-arming deferred-final deadline for slot {slot} after restart");
             let sender = self.event_sender.clone();
@@ -274,12 +284,15 @@ impl<A: All2All> Votor<A> {
                 VotorEvent::CertCreated(cert) => {
                     match cert.as_ref() {
                         Cert::Notar(_) => {
-                            self.block_notarized
-                                .insert(cert.slot(), cert.block_hash().cloned().unwrap());
-                            // Deferred mode waits for the grace deadline before slow-final voting.
-                            if !self.defer_final_vote {
-                                self.try_final(cert.slot(), cert.block_hash().cloned().unwrap())
-                                    .await;
+                            let cslot = cert.slot();
+                            let chash = cert.block_hash().cloned().unwrap();
+                            self.block_notarized.insert(cslot, chash.clone());
+                            // Non-deferred: finalize on the cert. Deferred: wait for
+                            // the grace, except a restored intent whose grace already
+                            // elapsed pre-crash.
+                            if !self.defer_final_vote || self.finalize_on_notar_cert.remove(&cslot)
+                            {
+                                self.try_final(cslot, chash).await;
                             }
                         }
                         Cert::FastFinal(_) => {
@@ -336,6 +349,22 @@ impl<A: All2All> Votor<A> {
                 VotorEvent::Timeout(slot) => {
                     trace!("timeout for slot {slot}");
                     if !self.voted.contains(&slot) {
+                        // Liveness gate (as TimeoutCrashedLeader): on a slow but
+                        // alive link a block can take longer than delta_block to
+                        // cross, and skipping it mid-flight poisons the slot; re-arm
+                        // (bounded) and skip only once the link is down.
+                        let rearms = self.crashed_leader_rearms.entry(slot).or_insert(0);
+                        if self.link_liveness.is_link_alive()
+                            && *rearms < Self::MAX_CRASHED_LEADER_REARMS
+                        {
+                            *rearms += 1;
+                            let sender = self.event_sender.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delta_timeout()).await;
+                                let _ = sender.send(VotorEvent::Timeout(slot)).await;
+                            });
+                            continue;
+                        }
                         self.try_skip_window(slot).await;
                     }
                 }
@@ -607,6 +636,44 @@ mod tests {
         );
     }
 
+    /// A plain per-slot Timeout (the trailing window slots) must also pause
+    /// while the link is alive; a leader's later slots are still crossing it.
+    #[tokio::test]
+    async fn plain_timeout_pauses_when_link_alive() {
+        let (other_a2a, tx, _) =
+            start_votor_with_liveness(Some(Arc::new(TestLiveness(true)))).await;
+
+        // A trailing window slot with no shred received yet.
+        let slot = Slot::new(6);
+        assert!(!slot.is_start_of_window());
+        tx.send(VotorEvent::Timeout(slot)).await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await;
+        assert!(
+            got.is_err(),
+            "link alive: plain timeout must pause, not skip — but saw a vote: {got:?}"
+        );
+    }
+
+    /// A plain per-slot Timeout still skips when the link is down, so a genuinely
+    /// crashed leader is not deferred forever.
+    #[tokio::test]
+    async fn plain_timeout_skips_when_link_down() {
+        let (other_a2a, tx, _) =
+            start_votor_with_liveness(Some(Arc::new(TestLiveness(false)))).await;
+
+        let slot = Slot::new(6);
+        assert!(!slot.is_start_of_window());
+        tx.send(VotorEvent::Timeout(slot)).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), other_a2a.receive()).await {
+            Ok(Ok(ConsensusMessage::Vote(v))) => {
+                assert!(v.is_skip(), "expected skip vote, got {v:?}");
+            }
+            other => panic!("expected a skip vote, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn timeouts() {
         let (other_a2a, _, _) = start_votor().await;
@@ -834,6 +901,76 @@ mod tests {
         );
     }
 
+    /// Restored votes rebroadcast newest first; truncated radio sessions must
+    /// carry the tip votes the peer is missing, not old duplicates.
+    #[tokio::test]
+    async fn restored_votes_rebroadcast_newest_first() {
+        let db_path = format!(
+            "{}/bunkerglow-votor-newestfirst-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&db_path);
+
+        let (sks, epoch_info) = generate_validators(2);
+        let slot1 = Slot::genesis().next();
+        let slot2 = slot1.next();
+        let hash1: BlockHash = Hash::random_for_test().into();
+        let hash2: BlockHash = Hash::random_for_test().into();
+
+        // First life records notar votes for two chained slots.
+        {
+            let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
+            let (tx, rx) = mpsc::channel(100);
+            let other_a2a = a2a.pop().unwrap();
+            let votor_a2a = a2a.pop().unwrap();
+            let mut votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+            votor.set_vote_history(VoteHistory::open_at(&db_path), Slot::genesis());
+            tokio::spawn(async move {
+                votor.voting_loop().await.unwrap();
+            });
+
+            for (slot, hash, parent) in [
+                (slot1, hash1.clone(), (Slot::genesis(), GENESIS_BLOCK_HASH)),
+                (slot2, hash2.clone(), (slot1, hash1.clone())),
+            ] {
+                tx.send(VotorEvent::Block {
+                    slot,
+                    block_info: BlockInfo { hash, parent },
+                })
+                .await
+                .unwrap();
+                let vote = match other_a2a.receive().await.unwrap() {
+                    ConsensusMessage::Vote(v) => v,
+                    m => panic!("expected notar vote, got {m:?}"),
+                };
+                assert!(vote.is_notar());
+                assert_eq!(vote.slot(), slot);
+            }
+        }
+
+        // Restart: the newest vote must be rebroadcast first.
+        let mut a2a = generate_all2all_instances(epoch_info.validators.clone()).await;
+        let (tx, rx) = mpsc::channel(100);
+        let other_a2a = a2a.pop().unwrap();
+        let votor_a2a = a2a.pop().unwrap();
+        let mut votor = Votor::new(0, sks[0].clone(), tx.clone(), rx, Arc::new(votor_a2a));
+        votor.set_vote_history(VoteHistory::open_at(&db_path), Slot::genesis());
+        tokio::spawn(async move {
+            votor.voting_loop().await.unwrap();
+        });
+
+        let first = match other_a2a.receive().await.unwrap() {
+            ConsensusMessage::Vote(v) => v,
+            m => panic!("expected rebroadcast vote, got {m:?}"),
+        };
+        assert_eq!(
+            first.slot(),
+            slot2,
+            "restored rebroadcast must lead with the newest vote"
+        );
+    }
+
     /// Pending-final markers re-arm slow-final liveness after restart.
     #[tokio::test]
     async fn deferred_final_vote_rearmed_after_crash() {
@@ -896,6 +1033,8 @@ mod tests {
         };
         assert!(rebroadcast.is_notar());
 
+        // A restored deferred-final slot finalizes as soon as its enabling notar
+        // cert arrives (its grace elapsed pre-crash), not after a fresh grace.
         let notar_cert = Cert::Notar(NotarCert::new_unchecked(
             std::slice::from_ref(&rebroadcast),
             &epoch_info.validators,
@@ -903,23 +1042,19 @@ mod tests {
         tx.send(VotorEvent::CertCreated(Box::new(notar_cert)))
             .await
             .unwrap();
-        match other_a2a.receive().await.unwrap() {
-            ConsensusMessage::Cert(c) => assert!(matches!(c, Cert::Notar(_))),
-            ConsensusMessage::Vote(v) => panic!("unexpected vote before deadline: {v:?}"),
-        }
 
-        // Allow for the re-armed grace timer to drive the final vote.
-        let final_vote = tokio::time::timeout(Duration::from_secs(30), async {
+        let final_vote = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match other_a2a.receive().await.unwrap() {
                     ConsensusMessage::Vote(v) if v.is_final() => break v,
                     ConsensusMessage::Vote(v) => panic!("unexpected non-final vote: {v:?}"),
+                    // The re-broadcast notar cert may echo back first; skip it.
                     ConsensusMessage::Cert(_) => continue,
                 }
             }
         })
         .await
-        .expect("re-armed deferred-final deadline must send the finalization vote");
+        .expect("restored deferred-final must fire on the notar cert, not a fresh full grace");
         assert!(final_vote.is_final());
         assert_eq!(final_vote.slot(), slot);
     }
