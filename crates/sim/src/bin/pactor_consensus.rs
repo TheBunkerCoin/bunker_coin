@@ -49,7 +49,7 @@ type Node =
     Alpenglow<TrivialAll2All<MuxAll2All>, Rotor<MuxShred, StakeWeightedSampler>, NodeMempool>;
 
 #[derive(Parser)]
-#[command(version, about = "Empty-block Alpenglow consensus over PACTOR", long_about = None)]
+#[command(version, about = "Alpenglow consensus over PACTOR", long_about = None)]
 struct Args {
     /// Run both validators in-process over a simulated PACTOR pair.
     #[arg(long)]
