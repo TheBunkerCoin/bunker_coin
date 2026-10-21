@@ -419,13 +419,15 @@ impl StakingLedger {
         self.delegations.values().sum()
     }
 
+    fn is_active(&self, validator: &PublicKey) -> bool {
+        !self.jailed.contains_key(validator)
+            && self.self_bonds.get(validator).copied().unwrap_or(0) >= MIN_SELF_STAKE
+    }
+
     pub fn total_active_stake(&self) -> Amount {
         self.delegations
             .iter()
-            .filter(|(pk, _)| {
-                !self.jailed.contains_key(*pk)
-                    && self.self_bonds.get(*pk).copied().unwrap_or(0) >= MIN_SELF_STAKE
-            })
+            .filter(|(pk, _)| self.is_active(pk))
             .map(|(_, &stake)| stake)
             .sum()
     }
@@ -433,11 +435,7 @@ impl StakingLedger {
     pub fn validator_set(&self) -> Vec<(PublicKey, Amount)> {
         self.delegations
             .iter()
-            .filter(|(pk, &stake)| {
-                stake > 0
-                    && !self.jailed.contains_key(*pk)
-                    && self.self_bonds.get(*pk).copied().unwrap_or(0) >= MIN_SELF_STAKE
-            })
+            .filter(|(pk, &stake)| stake > 0 && self.is_active(pk))
             .map(|(&pk, &stake)| (pk, stake))
             .collect()
     }
